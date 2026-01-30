@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+qdrant_data/
+postgres_data/
+processed_emails.json
+brain/
+*.pst

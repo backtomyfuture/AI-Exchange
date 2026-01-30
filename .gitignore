@@ -1,0 +1,27 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+
+# Local data (Databases)
+postgres_data/
+qdrant_data/
+processed_emails.json
+
+# macOS
+.DS_Store
+
+# IDEs
+.claude/
+.vscode/
+.idea/
+
+# Docker logs
+*.log
