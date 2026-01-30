@@ -1,10 +1,8 @@
 import os
 import logging
-import os
-import logging
 import psycopg2
-from psycopg2.extras import execute_values
-from typing import List, Set, Optional, Dict, Any
+from psycopg2 import OperationalError, IntegrityError, DatabaseError
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +30,11 @@ class DatabaseManager:
                 )
                 self._conn.autocommit = True
                 self._init_db()
-            except Exception as e:
-                logger.error(f"Failed to connect to PostgreSQL: {e}")
+            except OperationalError as e:
+                logger.error(f"Failed to connect to PostgreSQL (connection error): {e}")
+                raise
+            except DatabaseError as e:
+                logger.error(f"Database error during connection: {e}")
                 raise
         return self._conn
 
@@ -43,14 +44,13 @@ class DatabaseManager:
         """
         try:
             with self._conn.cursor() as cur:
-                # Create a more comprehensive log table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS emails_log (
                         id TEXT PRIMARY KEY,
                         subject TEXT,
                         sender TEXT,
                         received_at TIMESTAMP,
-                        status TEXT DEFAULT 'pending', -- pending, analyzed, drafting, waiting_approval, approved, sent, skipped
+                        status TEXT DEFAULT 'pending',
                         classification JSONB,
                         draft_content TEXT,
                         processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -58,7 +58,6 @@ class DatabaseManager:
                     );
                 """)
                 
-                # Create key-value store for app state (e.g., sync_state)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_kv_store (
                         key TEXT PRIMARY KEY,
@@ -67,14 +66,11 @@ class DatabaseManager:
                     );
                 """)
                 
-                # Check column existence to avoid errors on restart if schema changed (basic migration)
-                # Ideally use 'aerich' or 'alembic', but for this setup we do safe checks
                 cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='emails_log';")
                 columns = [row[0] for row in cur.fetchall()]
                 if 'classification' not in columns:
-                     cur.execute("ALTER TABLE emails_log ADD COLUMN classification JSONB;")
+                    cur.execute("ALTER TABLE emails_log ADD COLUMN classification JSONB;")
 
-                # Migration: if processed_emails is a table, drop it to make it a view
                 cur.execute("""
                     DO $$ 
                     BEGIN 
@@ -84,12 +80,11 @@ class DatabaseManager:
                     END $$;
                 """)
 
-                # For backward compatibility / dedup cache
                 cur.execute("""
                     CREATE OR REPLACE VIEW processed_emails AS 
                     SELECT id, processed_at FROM emails_log;
                 """)
-        except Exception as e:
+        except DatabaseError as e:
             logger.error(f"DB Initialization failed: {e}")
 
     def log_initial_email(self, email_data: Dict[str, Any]) -> bool:
@@ -100,7 +95,6 @@ class DatabaseManager:
         try:
             conn = self.get_connection()
             with conn.cursor() as cur:
-                # Use implicit transaction
                 cur.execute("""
                     INSERT INTO emails_log (id, subject, sender, received_at, status)
                     VALUES (%s, %s, %s, %s, 'pending')
@@ -108,11 +102,14 @@ class DatabaseManager:
                 """, (
                     email_data.get("id"),
                     email_data.get("subject"),
-                    email_data.get("sender"),
+                    str(email_data.get("sender")),
                     email_data.get("received_at")
                 ))
                 return cur.rowcount > 0
-        except Exception as e:
+        except IntegrityError as e:
+            logger.warning(f"Duplicate email entry {email_data.get('id')}: {e}")
+            return False
+        except DatabaseError as e:
             logger.error(f"Failed to log initial email {email_data.get('id')}: {e}")
             return False
 
@@ -120,6 +117,7 @@ class DatabaseManager:
         """
         Update the status and optional fields of an email log.
         """
+        import json
         try:
             conn = self.get_connection()
             update_fields = ["status = %s", "updated_at = CURRENT_TIMESTAMP"]
@@ -127,7 +125,6 @@ class DatabaseManager:
             
             for key, value in kwargs.items():
                 if key == "classification":
-                    import json
                     update_fields.append(f"{key} = %s")
                     params.append(json.dumps(value))
                 else:
@@ -139,20 +136,19 @@ class DatabaseManager:
             
             with conn.cursor() as cur:
                 cur.execute(query, tuple(params))
-        except Exception as e:
+        except DatabaseError as e:
             logger.error(f"Failed to update status for {email_id}: {e}")
 
     def check_email_exists(self, email_id: str) -> bool:
         """
         Check if an email ID has already been logged/processed.
-        More efficient than loading all IDs into memory.
         """
         try:
             conn = self.get_connection()
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM emails_log WHERE id = %s", (email_id,))
                 return cur.fetchone() is not None
-        except Exception as e:
+        except DatabaseError as e:
             logger.error(f"Failed to check email existence for {email_id}: {e}")
             return False
 
@@ -165,7 +161,8 @@ class DatabaseManager:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM emails_log")
                 return cur.fetchone()[0]
-        except Exception:
+        except DatabaseError as e:
+            logger.error(f"Failed to get processed count: {e}")
             return 0
 
     def mark_as_processed(self, email_id: str):
@@ -184,7 +181,7 @@ class DatabaseManager:
                 cur.execute("SELECT value FROM app_kv_store WHERE key = %s", (f"sync_state_{account_id}_{folder}",))
                 result = cur.fetchone()
                 return result[0] if result else None
-        except Exception as e:
+        except DatabaseError as e:
             logger.error(f"Failed to get sync state for {folder}: {e}")
             return None
 
@@ -202,7 +199,7 @@ class DatabaseManager:
                         value = EXCLUDED.value,
                         updated_at = CURRENT_TIMESTAMP;
                 """, (f"sync_state_{account_id}_{folder}", state))
-        except Exception as e:
+        except DatabaseError as e:
             logger.error(f"Failed to save sync state for {folder}: {e}")
 
     def close(self):

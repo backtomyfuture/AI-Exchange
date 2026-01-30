@@ -6,12 +6,12 @@ import uuid
 from typing import List, Dict, Any, Optional
 
 from qdrant_client import QdrantClient, models
-from openai import OpenAI
+from qdrant_client.http.exceptions import UnexpectedResponse
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from tenacity import retry, stop_after_attempt, wait_exponential, wait_random_exponential
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-
 
 logger = logging.getLogger(__name__)
 
@@ -60,15 +60,18 @@ class EmailProcessor:
             dim = len(test_resp.data[0].embedding)
             logger.info(f"Detected embedding dimension: {dim}")
             return dim
-        except Exception as e:
-            logger.error(f"Failed to connect to Ollama or retrieve embedding dimension: {e}")
+        except APIConnectionError as e:
+            logger.error(f"Failed to connect to embedding service: {e}")
+            raise
+        except APIError as e:
+            logger.error(f"API error retrieving embedding dimension: {e}")
             raise
 
     def init_collection(self):
         try:
             self.qdrant_client.get_collection(self.collection_name)
             logger.info(f"Collection {self.collection_name} exists.")
-        except Exception:
+        except UnexpectedResponse:
             logger.info(f"Collection {self.collection_name} does not exist. Creating...")
             self.qdrant_client.create_collection(
                 collection_name=self.collection_name,
@@ -95,12 +98,9 @@ class EmailProcessor:
         Use an LLM to generate a text description for an image.
         """
         try:
-            # Re-use the configured OpenAI client settings, but we need a Chat model for this.
-            # Using Gemini-3-Flash as requested for multimodal tasks.
             from src.utils.llm_factory import LLMFactory
             llm = LLMFactory.create_llm(temperature=0.3)
             
-            # Construct the multimodal message
             message = HumanMessage(
                 content=[
                     {"type": "text", "text": "请详细描述这张图片的内容，捕捉关键信息、文字和视觉元素。如果是一张图表或文档，请总结其核心数据或要点。请用中文回答。"},
@@ -123,8 +123,14 @@ class EmailProcessor:
 
             response = invoke_with_retry(message)
             return response.content
-        except Exception as e:
-            logger.error(f"Image analysis failed: {e}")
+        except RateLimitError as e:
+            logger.warning(f"Image analysis rate limited: {e}")
+            return "[图片解析失败: 请求限制]"
+        except APIConnectionError as e:
+            logger.error(f"Image analysis connection failed: {e}")
+            return "[图片解析失败: 连接错误]"
+        except APIError as e:
+            logger.error(f"Image analysis API error: {e}")
             return "[图片解析失败]"
 
     @retry(stop=stop_after_attempt(5), wait=wait_random_exponential(multiplier=1, max=60))
@@ -196,42 +202,38 @@ class EmailProcessor:
             if not chunks:
                 continue
 
+            base_id = email.get("id") or email.get("message_id") or str(uuid.uuid4())
+            
             try:
                 responses = self.openai_client.embeddings.create(input=chunks, model=self.embedding_model)
                 embeddings = [data.embedding for data in responses.data]
                 
-                # Use 'id' (Exchange ID) or 'message_id' for deterministic chunk IDs
-                base_id = email.get("id") or email.get("message_id")
-                if not base_id:
-                     base_id = str(uuid.uuid4())
-                
                 for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-                    # Create a unique ID for each chunk using deterministic UUID
                     chunk_id = self.generate_deterministic_uuid(f"{base_id}_{i}_{chunk[:20]}")
                     
                     payload = email.copy()
-                    
-                    # Store enriched data in payload
                     payload["attachments_metadata"] = valid_attachments_metadata
-                    # We generally don't store the raw base64 content in vector DB to save space
                     if "attachments" in payload:
                         del payload["attachments"]
                         
                     payload["chunk_index"] = i
                     payload["chunk_text"] = chunk
-                    # Truncate body in payload to save space if needed
                     if len(payload.get("body", "")) > 5000:
                         payload["body_preview"] = payload["body"][:2000]
-                        # Keep full body logic if needed, but usually preview is enough for Context
-                        # del payload["body"] 
                     
                     points.append(models.PointStruct(
                         id=chunk_id,
                         vector=vector,
                         payload=payload
                     ))
-            except Exception as e:
-                logger.error(f"Failed to embed email {base_id}: {e}")
+            except RateLimitError as e:
+                logger.warning(f"Rate limited while embedding email {base_id}: {e}")
+                continue
+            except APIConnectionError as e:
+                logger.error(f"Connection error embedding email {base_id}: {e}")
+                continue
+            except APIError as e:
+                logger.error(f"API error embedding email {base_id}: {e}")
                 continue
 
         if points:
@@ -243,40 +245,34 @@ class EmailProcessor:
                 )
                 logger.info(f"Successfully upserted {len(points)} points to Qdrant.")
                 return len(points)
-            except Exception as e:
-                logger.error(f"Failed to upsert batch to Qdrant: {e}")
+            except UnexpectedResponse as e:
+                logger.error(f"Qdrant upsert failed (unexpected response): {e}")
+                return 0
+            except ConnectionError as e:
+                logger.error(f"Qdrant connection error during upsert: {e}")
                 return 0
         return 0
 
     def process_sent_email(self, original_email_data: dict, reply_content: str, reply_id: str = None) -> bool:
         """
         Create a synthetic email object for the sent reply and index it into Qdrant.
-        This ensures the RAG context includes our own replies.
         """
-        try:
-            # Generate a new ID if not provided
-            if not reply_id:
-                reply_id = str(uuid.uuid4())
-                
-            sender = "me" # Or specific account email if available
-            subject = f"Re: {original_email_data.get('subject', 'No Subject')}"
+        if not reply_id:
+            reply_id = str(uuid.uuid4())
             
-            # Create synthetic email object
-            sent_email = {
-                "id": reply_id,
-                "subject": subject,
-                "body": reply_content,
-                "sender": sender,
-                "to": original_email_data.get("sender"),
-                "recipients": original_email_data.get("sender"), # For completeness
-                "received_at": "Now", # Timestamp
-                "type": "sent_reply",
-                "attachments": [] # Usually no attachments in simple text replies
-            }
-            
-            logger.info(f"Indexing sent reply: {reply_id} (Subject: {subject})")
-            return self.process_email(sent_email)
-            
-        except Exception as e:
-            logger.error(f"Failed to process sent email: {e}")
-            return False
+        subject = f"Re: {original_email_data.get('subject', 'No Subject')}"
+        
+        sent_email = {
+            "id": reply_id,
+            "subject": subject,
+            "body": reply_content,
+            "sender": "me",
+            "to": original_email_data.get("sender"),
+            "recipients": original_email_data.get("sender"),
+            "received_at": "Now",
+            "type": "sent_reply",
+            "attachments": []
+        }
+        
+        logger.info(f"Indexing sent reply: {reply_id} (Subject: {subject})")
+        return self.process_email(sent_email)

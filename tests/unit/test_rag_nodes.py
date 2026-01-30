@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 from src.graph.state import AgentState
 from src.nodes.retriever_node import retrieve_context
 from src.nodes.drafter import generate_draft
@@ -25,36 +25,41 @@ def mock_state() -> AgentState:
         "next_step": ""
     }
 
+@pytest.mark.asyncio
 @patch("src.nodes.retriever_node.EmailRetriever")
-def test_retrieve_context(MockRetriever, mock_state):
-    # 模拟检索器返回结果
+async def test_retrieve_context(MockRetriever, mock_state):
     mock_instance = MockRetriever.return_value
     mock_instance.search.return_value = [
         {"sender": "boss@example.com", "subject": "上次会议纪要", "body": "这是上次会议的纪要..."}
     ]
 
-    new_state = retrieve_context(mock_state)
+    new_state = await retrieve_context(mock_state)
 
     assert len(new_state["context"]) == 1
     assert new_state["context"][0]["subject"] == "上次会议纪要"
     assert new_state["next_step"] == "drafter"
     mock_instance.search.assert_called()
 
-@patch("src.nodes.drafter.ChatOpenAI")
-def test_generate_draft(MockChatOpenAI, mock_state):
-    # 模拟 LLM 返回
+@pytest.mark.asyncio
+@patch("src.utils.llm_factory.LLMFactory.create_llm")
+@patch("src.nodes.drafter.ChatPromptTemplate")
+async def test_generate_draft(mock_prompt_class, mock_create_llm, mock_state):
     mock_llm_instance = MagicMock()
-    MockChatOpenAI.return_value = mock_llm_instance
+    mock_create_llm.return_value = mock_llm_instance
 
     mock_response = MagicMock()
-    mock_response.content = "<thought>参考了上次会议纪要。</thought>\n<draft>下周一上午我有空。</draft>"
-    mock_llm_instance.invoke.return_value = mock_response
+    mock_response.content = "下周一上午我有空，可以开会讨论项目进度。"
+    
+    mock_chain = MagicMock()
+    mock_chain.ainvoke = AsyncMock(return_value=mock_response)
+    
+    mock_prompt = MagicMock()
+    mock_prompt_class.from_messages.return_value = mock_prompt
+    mock_prompt.__or__.return_value = mock_chain
 
     mock_state["context"] = [{"sender": "boss@example.com", "subject": "上次会议纪要", "body": "这是上次会议的纪要..."}]
 
-    new_state = generate_draft(mock_state)
+    new_state = await generate_draft(mock_state)
 
-    assert "<thought>" in new_state["draft"]
-    assert "<draft>" in new_state["draft"]
+    assert "下周一" in new_state["draft"]
     assert new_state["next_step"] == "approval"
-    mock_llm_instance.invoke.assert_called()

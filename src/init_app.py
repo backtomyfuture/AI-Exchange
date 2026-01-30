@@ -9,7 +9,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from src.graph.builder import build_graph
 from src.utils.exchange_api import ExchangeClient
 from src.utils.email_processor import EmailProcessor
-from src.utils.db import DatabaseManager
+from src.utils.db_async import AsyncDatabaseManager
+from src.config import get_settings
 
 # Configure logging
 logging.basicConfig(
@@ -34,34 +35,20 @@ class AppContext:
         """
         logger.info("Initializing Application Context...")
         
+        settings = get_settings()
+
         # 1. Core Components
-        self.exchange_client = ExchangeClient()
+        self.exchange_client = ExchangeClient(settings)
         self.email_processor = EmailProcessor()
-        self.db_manager = DatabaseManager()
+        # Async DB Manager (initialized in setup_async)
+        self.db_manager = AsyncDatabaseManager()
         
         # 2. Postgres Connection Pool for LangGraph Checkpointer
-        # Use the same connection details as the main DB or specific one
-        # Docker internal: host='postgres', but we might need construction from env
-        pg_host = os.getenv("POSTGRES_HOST", "localhost")
-        pg_user = os.getenv("POSTGRES_USER", "user")
-        pg_pass = os.getenv("POSTGRES_PASSWORD", "password")
-        pg_db = os.getenv("POSTGRES_DB", "email_agent")
-        pg_port = os.getenv("POSTGRES_PORT", "5432")
-        
-        dsn = f"postgresql://{pg_user}:{pg_pass}@{pg_host}:{pg_port}/{pg_db}"
+        dsn = f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
         
         # 3. Setup Checkpointer and Graph
-        # Hack: Run setup() with a dedicated autocommit connection to allow CREATE INDEX CONCURRENTLY
-        # For setup, we can stick to sync (using PostgresSaver) or just assume it's done via migration script.
-        # But let's keep the sync setup logic for now as it's cleaner than async setup in __init__.
-        try:
-            with psycopg.connect(dsn, autocommit=True) as temp_conn:
-                from langgraph.checkpoint.postgres import PostgresSaver as SyncPostgresSaver
-                temp_cp = SyncPostgresSaver(temp_conn)
-                temp_cp.setup()
-        except Exception as e:
-            logger.warning(f"Checkpointer setup warning (might be already done): {e}")
-
+        # We skip sync setup logic here assuming DB is initialized or will be by AsyncDatabaseManager
+        
         self.pool = AsyncConnectionPool(conninfo=dsn, max_size=20, open=False)
         # checkpointer and graph will be initialized in setup_async() to ensure loop exists.
         logger.info("Application Context Initialized (Pool created, Graph deferred).")
@@ -77,14 +64,16 @@ class AppContext:
         
         if self.graph is None:
             checkpointer = AsyncPostgresSaver(self.pool)
+            await checkpointer.setup() 
             self.graph = build_graph(checkpointer=checkpointer)
             logger.info("Graph initialized with AsyncPostgresSaver.")
 
-    def close(self):
+    async def close(self):
         if self.db_manager:
-            self.db_manager.close()
-        # Async pool close is usually async, skipping sync close here for now.
-        pass
+            await self.db_manager.close()
+        # Async pool close
+        if self.pool:
+             await self.pool.close()
 
 # Singleton instance
 app_context = AppContext()

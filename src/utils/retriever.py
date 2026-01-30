@@ -2,7 +2,8 @@ import os
 import logging
 from typing import List, Optional
 from qdrant_client import QdrantClient, models
-from openai import OpenAI
+from qdrant_client.http.exceptions import UnexpectedResponse
+from openai import OpenAI, APIError, APIConnectionError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,8 +42,11 @@ class EmailRetriever:
                 model=self.embedding_model
             )
             return response.data[0].embedding
-        except Exception as e:
-            logger.error(f"Failed to generate embedding: {e}")
+        except APIConnectionError as e:
+            logger.error(f"Failed to connect to embedding service: {e}")
+            return []
+        except APIError as e:
+            logger.error(f"API error generating embedding: {e}")
             return []
 
     def search(
@@ -71,7 +75,6 @@ class EmailRetriever:
                 ]
             )
 
-        # 3. Execute search
         try:
             search_result = self.client.query_points(
                 collection_name=self.collection_name,
@@ -80,8 +83,10 @@ class EmailRetriever:
                 limit=limit,
                 with_payload=True
             )
-            # 4. Extract payload
             return [hit.payload for hit in search_result.points]
-        except Exception as e:
-            logger.error(f"Search failed: {e}")
+        except UnexpectedResponse as e:
+            logger.error(f"Qdrant search failed (unexpected response): {e}")
+            return []
+        except ConnectionError as e:
+            logger.error(f"Qdrant connection error during search: {e}")
             return []

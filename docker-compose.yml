@@ -22,33 +22,10 @@ services:
       timeout: 5s
       retries: 5
 
-  exchange-service:
+  ai-assistant-service:
     build: .
     restart: always
-    command: python -m src.exchange_service
-    env_file:
-      - .env
-    environment:
-      - PYTHONPATH=/app
-      - PYTHONUNBUFFERED=1
-      - QDRANT_URL=http://qdrant:6333
-      - POSTGRES_HOST=postgres
-      - TZ=Asia/Shanghai
-    depends_on:
-      qdrant:
-        condition: service_started
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./tests:/app/tests
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  lark-service:
-    build: .
-    restart: always
-    command: python -m src.lark_service
+    command: python -m src.main
     env_file:
       - .env
     environment:

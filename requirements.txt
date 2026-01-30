@@ -16,3 +16,4 @@ tenacity
 httpx
 pydantic
 lark-oapi
+pydantic-settings

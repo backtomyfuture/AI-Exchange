@@ -26,7 +26,7 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
         logger.info(f"Email has {len(email_data['attachments'])} attachments.")
     
     # 1. Log to PostgreSQL (Initial Audit)
-    is_new = ctx.db_manager.log_initial_email(email_data)
+    is_new = await ctx.db_manager.log_initial_email(email_data)
     
     if is_new:
         logger.info(f"Email {thread_id} logged to DB as 'pending'.")
@@ -35,7 +35,7 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
         try:
             ctx.email_processor.process_email(email_data)
             logger.info(f"Email {thread_id} ingested to Qdrant.")
-            ctx.db_manager.update_status(thread_id, "ingested")
+            await ctx.db_manager.update_status(thread_id, "ingested")
         except Exception as e:
             logger.error(f"Failed to ingest email {thread_id}: {e}")
         
@@ -56,11 +56,11 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
                     # Intercept categorization
                     if "categorizer" in event:
                         classification = event["categorizer"].get("classification", {})
-                        ctx.db_manager.update_status(thread_id, "analyzed", classification=classification)
+                        await ctx.db_manager.update_status(thread_id, "analyzed", classification=classification)
                     # Intercept drafting
                     if "drafter" in event:
                         draft = event["drafter"].get("draft", "")
-                        ctx.db_manager.update_status(thread_id, "drafted", draft_content=draft)
+                        await ctx.db_manager.update_status(thread_id, "drafted", draft_content=draft)
                 
                 # Retrieve final (or current paused) state
                 state = await ctx.graph.aget_state(config)
@@ -86,16 +86,16 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
                         email_data=state.values.get("email", {}),
                         classification=classification
                     )
-                    ctx.db_manager.update_status(thread_id, "waiting_approval")
+                    await ctx.db_manager.update_status(thread_id, "waiting_approval")
                 else:
                     logger.info(f"No reply needed for email: {thread_id}")
-                    ctx.db_manager.update_status(thread_id, "skipped")
+                    await ctx.db_manager.update_status(thread_id, "skipped")
 
             except Exception as e:
                 logger.exception(f"Error executing graph for {thread_id}: {e}")
         else:
             logger.info(f"Skipping AI analysis for email: {thread_id}")
-            ctx.db_manager.update_status(thread_id, "archived")
+            await ctx.db_manager.update_status(thread_id, "archived")
     else:
         logger.info(f"Email {thread_id} already exists in DB.")
 
@@ -154,7 +154,7 @@ async def main_loop():
     
     sync_states = {}
     for folder in all_folders:
-        state = ctx.db_manager.get_sync_state(current_account_id, folder)
+        state = await ctx.db_manager.get_sync_state(current_account_id, folder)
         sync_states[folder] = state
         logger.info(f"Initial sync state for {folder}: {'None' if state is None else 'Present'}")
 
@@ -185,7 +185,7 @@ async def main_loop():
                                         await queue.put((email_content, skip_analysis))
                         
                         if new_sync_state != current_sync_state:
-                            ctx.db_manager.save_sync_state(current_account_id, new_sync_state, folder=folder)
+                            await ctx.db_manager.save_sync_state(current_account_id, new_sync_state, folder=folder)
                             sync_states[folder] = new_sync_state
                     
                 except Exception as e:
@@ -200,7 +200,7 @@ async def main_loop():
         logger.critical(f"Critical error: {e}")
     finally:
         worker_task.cancel()
-        ctx.close()
+        await ctx.close()
 
 if __name__ == "__main__":
     asyncio.run(main_loop())

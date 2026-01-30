@@ -10,14 +10,15 @@ class ExchangeClient:
     """
     Exchange 接口客户端，封装 HTTP 调用逻辑。
     """
-    def __init__(self):
-        self.api_url = os.getenv("EXCHANGE_API_URL", "").rstrip("/")
-        self.api_key = os.getenv("EXCHANGE_API_KEY")
-        # 确保转换为整数，API 可能对类型敏感
-        try:
-            self.account_id = int(os.getenv("EXCHANGE_ACCOUNT_ID", "8"))
-        except ValueError:
-            self.account_id = 8
+    def __init__(self, settings=None):
+        if settings is None:
+            from src.config import get_settings
+            settings = get_settings()
+            
+        self.api_url = settings.EXCHANGE_API_URL.rstrip("/")
+        self.api_key = settings.EXCHANGE_API_KEY
+        self.account_id = settings.EXCHANGE_ACCOUNT_ID
+        self.ssl_verify = settings.EXCHANGE_SSL_VERIFY
 
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
@@ -39,8 +40,8 @@ class ExchangeClient:
             "unread_only": "True"  # 尝试字符串 "True" 以匹配 requests 的行为
         }
 
-        # 增加 verify=False 以支持内网自签名证书
-        async with httpx.AsyncClient(verify=False) as client:
+        # Use configured SSL verification
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 # 1. 获取列表
                 list_url = f"{self.api_url}/list"
@@ -123,7 +124,7 @@ class ExchangeClient:
             "sync_state": sync_state
         }
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 # print(f"Syncing emails with state: {sync_state}")
                 response = await client.post(
@@ -186,7 +187,7 @@ class ExchangeClient:
             "folder": "Drafts"
         }
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 print(f"正在请求保存草稿接口: {endpoint}")
                 response = await client.post(
@@ -237,7 +238,7 @@ class ExchangeClient:
         else:
             endpoint = f"{self.api_url}/send"
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 action = "保存草稿" if is_draft else "发送邮件"
                 print(f"正在请求{action}接口: {endpoint}")
@@ -277,7 +278,7 @@ class ExchangeClient:
             "is_read": is_read
         }
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 response = await client.put(endpoint, params=params, headers=headers, timeout=10.0)
                 if response.status_code == 200:
@@ -299,7 +300,7 @@ class ExchangeClient:
         endpoint = f"{self.api_url}/{email_id}/move"
         payload = {"folder_id": folder_id}
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=5.0)
                 return response.status_code == 200
@@ -314,7 +315,7 @@ class ExchangeClient:
         headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/{email_id}"
         
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 response = await client.delete(endpoint, headers=headers, timeout=5.0)
                 return response.status_code == 200
@@ -331,7 +332,7 @@ class ExchangeClient:
         encoded_id = quote(email_id, safe='')
         endpoint = f"{self.api_url}/{encoded_id}"
         
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 response = await client.get(
                     endpoint, 
@@ -347,7 +348,7 @@ class ExchangeClient:
                 print(f"Exception getting email {email_id}: {e}")
         return {}
 
-    async def reply_email(self, email_id: str, body: str) -> bool:
+    async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
         """
         New Interface: Reply to an existing email.
         """
@@ -360,8 +361,12 @@ class ExchangeClient:
             "body": body,
             "body_type": "html"
         }
+        if to:
+            payload["to"] = to
+        if cc:
+            payload["cc"] = cc
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 print(f"正在请求回复接口: {endpoint}")
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
@@ -389,7 +394,7 @@ class ExchangeClient:
             "body_type": "html"
         }
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 print(f"正在请求转发接口: {endpoint}")
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
