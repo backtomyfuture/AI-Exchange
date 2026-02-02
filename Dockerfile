@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     python3-dev \
     libpq-dev \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libjpeg-dev \
+    libopenjp2-7-dev \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 
@@ -18,6 +23,9 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     --upgrade pip setuptools wheel Cython && \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     -r requirements.txt
+
+# 复制字体文件
+COPY fonts /usr/share/fonts/truetype/custom
 
 # 复制源代码
 COPY . .

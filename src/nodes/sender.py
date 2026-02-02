@@ -14,8 +14,8 @@ async def send_final_email(state: AgentState, config: dict = None) -> AgentState
 
     if approval_status == "approved":
         from src.init_app import get_app_context
-        # Import internally to avoid circular dependency
-        from src.utils.lark_app import lark_api_client
+        # Import module to ensure we access the latest global variable
+        import src.utils.lark_app as lark_app
         from lark_oapi.api.contact.v3 import GetUserRequest
         import re
 
@@ -26,18 +26,22 @@ async def send_final_email(state: AgentState, config: dict = None) -> AgentState
             # Check for open_id=xxx
             if "open_id=" in str(recipient_str):
                 open_id = str(recipient_str).replace("open_id=", "").strip()
-                if not lark_api_client:
-                    logger.warning(f"Lark client missing, cannot resolve open_id: {open_id}")
+                
+                # Access client from module to get current instance
+                client = lark_app.lark_api_client
+                if not client:
+                    logger.warning(f"Lark client missing in lark_app module, cannot resolve open_id: {open_id}")
                     return None
                 try:
                     req = GetUserRequest.builder().user_id(open_id).user_id_type("open_id").build()
-                    resp = lark_api_client.contact.v3.user.get(req)
+                    resp = client.contact.v3.user.get(req)
                     if resp.success() and resp.data and resp.data.user:
                          # Prioritize enterprise_email, then email
                          email = resp.data.user.enterprise_email or resp.data.user.email
                          if email:
+                             logger.info(f"Resolved {open_id} -> {email}")
                              return email
-                    logger.warning(f"Could not resolve open_id {open_id} to email.")
+                    logger.warning(f"Could not resolve open_id {open_id} to email. Code: {resp.code}, Msg: {resp.msg}")
                     return None
                 except Exception as e:
                     logger.error(f"Error resolving open_id {open_id}: {e}")

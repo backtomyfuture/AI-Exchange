@@ -24,6 +24,20 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
     
     if 'attachments' in email_data:
         logger.info(f"Email has {len(email_data['attachments'])} attachments.")
+        
+        # Upload to Lark Drive
+        try:
+            import base64
+            for att in email_data['attachments']:
+                if att.get('content'):
+                    content_bytes = base64.b64decode(att['content'])
+                    res = lark_app.upload_file_to_drive(att.get('name', 'unknown'), content_bytes, len(content_bytes))
+                    if res:
+                        att['lark_file_token'] = res['file_token']
+                        att['lark_file_url'] = res['url']
+                        logger.info(f"Uploaded {att.get('name')} to Lark Drive: {res['url']}")
+        except Exception as e:
+            logger.error(f"Error uploading attachments to Lark: {e}")
     
     # 1. Log to PostgreSQL (Initial Audit)
     is_new = await ctx.db_manager.log_initial_email(email_data)
@@ -79,12 +93,17 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
                     # But if we paused, next is empty or pointing to next node?
                     
                     logger.info(f"Email requires reply. Sending Lark approval request: {thread_id}")
+                    
+                    # Pre-generate PDF for better UX
+                    pdf_url = await lark_app.generate_and_upload_pdf(thread_id, state.values.get("email", {}))
+                    
                     lark_app.send_approval_card(
                         email_id=thread_id,
                         draft=state.values.get("draft", ""),
                         context=state.values.get("context", []),
                         email_data=state.values.get("email", {}),
-                        classification=classification
+                        classification=classification,
+                        pdf_url=pdf_url
                     )
                     await ctx.db_manager.update_status(thread_id, "waiting_approval")
                 else:

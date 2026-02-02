@@ -71,10 +71,11 @@ class ExchangeClient:
                         continue
                     
                     # 优化：如果列表接口已经返回了 body，则直接使用，不再请求详情
-                    if item.get("body"):
-                         print(f"列表已包含邮件内容，跳过详情请求 (ID: {email_id})")
-                         full_emails.append(item)
-                         continue
+                    # FIX: 列表返回的 body 可能不完整，强制获取详情
+                    # if item.get("body"):
+                    #      print(f"列表已包含邮件内容，跳过详情请求 (ID: {email_id})")
+                    #      full_emails.append(item)
+                    #      continue
 
                     # URL encode the ID to handle special characters like '/'
                     encoded_id = quote(email_id, safe='')

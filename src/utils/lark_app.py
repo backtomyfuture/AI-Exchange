@@ -3,6 +3,8 @@ import json
 import logging
 import asyncio
 import re
+import html
+import io
 from typing import Dict, Any, List, Optional
 import lark_oapi
 from lark_oapi.api.im.v1 import *
@@ -11,6 +13,9 @@ from lark_oapi.ws import Client as WsClient
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse, CallBackCard, CallBackToast
 
 from src.utils.card_builder import LarkCardBuilder, html_to_lark_md
+from src.config import get_settings
+from src.utils.email_renderer import render_email_html
+from src.utils.pdf_generator import convert_html_to_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +29,104 @@ exchange_client = None
 worker_loop = None
 _mock_store = {} # Store for test card states
 
+def _format_address_str(raw_str: str) -> str:
+    """Format address string like 'name=..., email=...' to 'Name <email>'"""
+    if not raw_str:
+        return ""
+    try:
+        # Check for our project's specific string format
+        m = re.search(r"name=['\"](.*?)['\"],?\s*email_address=['\"](.*?)['\"]", str(raw_str))
+        if m:
+            name, email = m.groups()
+            return f"{html.escape(name)} &lt;{html.escape(email)}&gt;"
+        
+        # Check for standard "Name <email>" format
+        m2 = re.search(r"(.*?) <(.*?)>", str(raw_str))
+        if m2:
+            return f"{html.escape(m2.group(1).strip())} &lt;{html.escape(m2.group(2).strip())}&gt;"
+
+        return html.escape(str(raw_str))
+    except Exception:
+        return html.escape(str(raw_str))
+
+def upload_file_to_drive(name: str, content: bytes, size: int) -> Optional[dict]:
+    """
+    Upload file to Lark Drive. Returns dict with 'file_token' and 'url'.
+    Requires LARK_DRIVE_FOLDER_TOKEN in env.
+    """
+    if not lark_api_client:
+        logger.warning("Lark Client not initialized.")
+        return None
+        
+    settings = get_settings()
+    folder_token = settings.LARK_DRIVE_FOLDER_TOKEN
+    if not folder_token:
+        logger.warning("Lark Drive Folder Token not configured (LARK_DRIVE_FOLDER_TOKEN). Skipping upload.")
+        return None
+
+    try:
+        from lark_oapi.api.drive.v1 import UploadAllFileRequest, UploadAllFileRequestBody
+        
+        request = UploadAllFileRequest.builder() \
+            .request_body(UploadAllFileRequestBody.builder()
+                .file_name(name)
+                .parent_type("explorer")
+                .parent_node(folder_token)
+                .size(size)
+                .file(io.BytesIO(content))
+                .build()) \
+            .build()
+            
+        response = lark_api_client.drive.v1.file.upload_all(request)
+        if not response.success():
+            logger.error(f"Failed to upload file {name}: {response.code} - {response.msg}")
+            return None
+            
+        data = response.data
+        file_token = data.file_token
+        # Construct URL manually as API doesn't return it
+        # Format: https://www.feishu.cn/file/{file_token}
+        url = getattr(data, "url", "")
+        if not url and file_token:
+            url = f"https://www.feishu.cn/file/{file_token}"
+            
+        logger.info(f"File uploaded. Token: {file_token}, Constructed URL: {url}")
+            
+        return {
+            "file_token": file_token,
+            "url": url
+        }
+    except Exception as e:
+        logger.error(f"Exception uploading file {name}: {e}")
+        return None
+
+def delete_file_from_drive(file_token: str) -> bool:
+    """
+    Delete a file from Lark Drive (trash).
+    """
+    if not lark_api_client or not file_token:
+        return False
+        
+    try:
+        from lark_oapi.api.drive.v1 import DeleteFileRequest
+        
+        # Note: Drive v1 Delete puts file in trash
+        request = DeleteFileRequest.builder() \
+            .file_token(file_token) \
+            .type("file") \
+            .build()
+            
+        response = lark_api_client.drive.v1.file.delete(request)
+        if not response.success():
+            logger.warning(f"Failed to delete file {file_token}: {response.code} - {response.msg}")
+            return False
+            
+        logger.info(f"File deleted (moved to trash): {file_token}")
+        return True
+    except Exception as e:
+        logger.error(f"Exception deleting file {file_token}: {e}")
+        return False
+
 def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     """
     Initialize global dependencies
@@ -35,35 +138,100 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     if worker_loop_arg:
         worker_loop = worker_loop_arg
     
-    app_id = os.environ.get("LARK_APP_ID")
-    app_secret = os.environ.get("LARK_APP_SECRET")
+    settings = get_settings()
+    app_id = settings.LARK_APP_ID
+    app_secret = settings.LARK_APP_SECRET
     
     if app_id and app_secret:
         lark_api_client = lark_oapi.Client.builder() \
             .app_id(app_id) \
             .app_secret(app_secret) \
-            .log_level(lark_oapi.LogLevel.DEBUG) \
+            .log_level(lark_oapi.LogLevel.INFO) \
             .build()
+            
+        # Optimize Identity Logic: Resolve "Me" from Chat ID
+        if settings.LARK_CHAT_ID:
+            _resolve_current_user_email(settings.LARK_CHAT_ID)
+            
         card_builder = LarkCardBuilder(lark_api_client)
-        logger.info("Lark API Client initialized with DEBUG level.")
+        logger.info("Lark API Client initialized.")
     else:
         card_builder = LarkCardBuilder(None)
         logger.warning("Lark App ID or Secret missing. Lark features disabled.")
 
-def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict, classification: dict):
+def _resolve_current_user_email(chat_id: str):
+    """
+    Dynamically resolve the current user's email based on LARK_CHAT_ID.
+    Logic: GetChat -> OwnerID (OpenID) -> GetUser -> Email/Username
+    """
+    if not lark_api_client: return
+
+    try:
+        # Import models here to avoid circular/early import issues if sdk not ready
+        from lark_oapi.api.im.v1.model.get_chat_request import GetChatRequest
+        from lark_oapi.api.contact.v3.model.get_user_request import GetUserRequest
+        
+        logger.info(f"Resolving identity for Chat ID: {chat_id}")
+        
+        # 1. Get Chat Owner (P2P Owner = User)
+        req = GetChatRequest.builder().chat_id(chat_id).build()
+        resp = lark_api_client.im.v1.chat.get(req)
+        
+        if not resp.success():
+            logger.warning(f"Failed to resolve identity (GetChat): {resp.code} - {resp.msg}")
+            return
+            
+        owner_id = resp.data.owner_id
+        if not owner_id:
+            return
+
+        # 2. Get User Profile
+        user_req = GetUserRequest.builder().user_id(owner_id).user_id_type("open_id").build()
+        user_resp = lark_api_client.contact.v3.user.get(user_req)
+        
+        if not user_resp.success():
+             logger.warning(f"Failed to resolve identity (GetUser): {user_resp.code} - {user_resp.msg}")
+             return
+             
+        user = user_resp.data.user
+        logger.info(f"Identity Resolved: {user.name} ({user.email})")
+        
+        # 3. Derive Exchange Email
+        # Strategy: Use local part of Lark email, or full email if matches user preference
+        # User Instruction: "Append tianjin-air.com"
+        
+        effective_email = user.email
+        if user.email:
+            # Extract local part "q-fu" from "q-fu@hnair.com"
+            local_part = user.email.split("@")[0]
+            # We set this as EXCHANGE_ACCOUNT_EMAIL. 
+            # The card builder logic checks `if my_email in recipient_email`. 
+            # Setting it to the local part "q-fu" is the most robust way to match "q-fu@tianjin-air.com" AND "q-fu@hnair.com"
+            effective_email = local_part
+            
+        if effective_email:
+            settings = get_settings()
+            settings.EXCHANGE_ACCOUNT_EMAIL = effective_email
+            logger.info(f"Global Identity Configured: EXCHANGE_ACCOUNT_EMAIL = {effective_email}")
+            
+    except Exception as e:
+        logger.error(f"Error resolving identity: {e}")
+
+def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
     """
     Send an interactive card to the configured Lark group/user.
     """
     if not lark_api_client:
         logger.error("Lark Client not initialized. Cannot send card.")
         return
-
-    chat_id = os.environ.get("LARK_CHAT_ID")
+    
+    settings = get_settings()
+    chat_id = settings.LARK_CHAT_ID
     if not chat_id:
         logger.error("LARK_CHAT_ID not configured.")
         return
 
-    card_content = card_builder.build_approval_card(email_id, draft, context, email_data, classification)
+    card_content = card_builder.build_approval_card(email_id, draft, context, email_data, classification, pdf_url=pdf_url)
     
     request = CreateMessageRequest.builder() \
         .receive_id_type("chat_id") \
@@ -174,7 +342,10 @@ def handle_card_action(event):
                                  "cc": ["name='Jarod-CC', email_address='q-fu@tianjin-air.com'", "name='Zhang-CC', email_address='yy-zhang1@tianjin-air.com'"],
                                  "attachments": [{"name": "itinerary.pdf"}, {"name": "invoice_scan.jpg"}]
                              },
-                             "classification": {"reasoning": "This is a test notification sent manually."}
+                             "classification": {
+                                "reasoning": "This is a test notification sent manually.",
+                                "summary": "这是一封系统生成的测试邮件，包含两个模拟附件（行程单和发票扫描件）。请确认系统是否正确解析并显示了这些内容。"
+                            }
                          }
                  state = MockState()
                  _mock_store[email_id] = state
@@ -194,66 +365,70 @@ def handle_card_action(event):
         response = P2CardActionTriggerResponse()
         
         if action_type == "view_original":
-            logger.info("Executing Request: View Original (File Strategy)")
-            full_body_html = email_data.get('body', '')
-            subject_safe = re.sub(r'[\\/*?:"<>|]', "", subject)
-            filename = f"Original_{subject_safe[:30]}.html"
+            logger.info("Executing Request: View Original (H5 Strategy)")
             
-            # Create Temp File
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w+', suffix=".html", delete=False, encoding='utf-8') as tmp:
-                tmp.write(full_body_html)
-                tmp_path = tmp.name
+            # Get External URL
+            settings = get_settings()
+            external_url = settings.EXTERNAL_URL
+            h5_url = f"{external_url}/email/{email_id}"
             
+            # Build Simple Card with Button
+            card_content = {
+                "header": {
+                    "template": "blue",
+                    "title": {"content": "📄 原始邮件 (Web版)", "tag": "plain_text"}
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {"tag": "lark_md", "content": "点击下方按钮在浏览器中查看完整邮件内容："}
+                    },
+                    {
+                        "tag": "action",
+                        "actions": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "🔗 点击查看完整原文"},
+                            "type": "primary",
+                            "url": h5_url
+                        }]
+                    }
+                ]
+            }
+
             try:
-                # 1. Upload File
-                logger.info(f"Uploading file: {tmp_path}")
-                file_key = None
-                with open(tmp_path, "rb") as f:
-                    # Note: Lark OAPI 'create' usually takes a tuple/file-like object
-                    # We use the im.v1.file.create endpoint logic
-                    req_file = lark_oapi.api.im.v1.model.CreateFileRequest.builder() \
-                        .request_body(lark_oapi.api.im.v1.model.CreateFileRequestBody.builder()
-                            .file_type("stream")
-                            .file_name(filename)
-                            .file(f)
-                            .build()) \
-                        .build()
-                    
-                    resp_file = lark_api_client.im.v1.file.create(req_file)
-                    
-                    if not resp_file.success():
-                        logger.error(f"Failed to upload file: {resp_file.code} - {resp_file.msg}")
-                        raise Exception(f"File upload failed: {resp_file.msg}")
-                    
-                    file_key = resp_file.data.file_key
-                    logger.info(f"File uploaded. Key: {file_key}")
+                # Use ReplyMessageRequest to reply in thread
+                req_msg = ReplyMessageRequest.builder() \
+                    .message_id(message_id) \
+                    .request_body(ReplyMessageRequestBody.builder()
+                        .msg_type("interactive")
+                        .content(json.dumps(card_content))
+                        .build()) \
+                    .build()
+                
+                lark_api_client.im.v1.message.reply(req_msg)
 
-                # 2. Send File Message
-                if file_key:
-                    content = {"file_key": file_key}
-                    req_msg = CreateMessageRequest.builder() \
-                        .receive_id_type("open_id") \
-                        .request_body(CreateMessageRequestBody.builder()
-                            .receive_id(user_id)
-                            .msg_type("file")
-                            .content(json.dumps(content))
-                            .build()) \
-                        .build()
-                    
-                    lark_api_client.im.v1.message.create(req_msg)
-
-                    toast = CallBackToast()
-                    toast.type = "success"
-                    toast.content = "原文已作为文件发送"
-                    response.toast = toast
-                    return response
+                return {
+                    "toast": {
+                        "type": "success",
+                        "content": "已发送链接至评论区"
+                    }
+                }
             except Exception as e:
-                logger.error(f"Error sending file: {e}")
+                logger.error(f"Error sending reply: {e}")
                 raise e
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+
+        elif action_type == "view_original_pdf":
+            logger.info("Executing Request: View Original PDF")
+            # Trigger background task
+            safe_async_run(process_pdf_generation_and_reply(email_id, state, message_id))
+            
+            return {
+                "toast": {
+                    "type": "info",
+                    "content": "正在生成PDF文件，请稍候..."
+                }
+            }
+
 
         elif action_type == "approve":
             process_approval(email_id, user_id)
@@ -521,6 +696,13 @@ def process_approval(email_id, user_id):
     safe_async_wait(db_manager.update_status(email_id, "approved"))
     logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
     # Execute graph
+    # Remove attachment if exists
+    state = safe_async_wait(graph.aget_state(config))
+    pdf_token = state.values.get("pdf_token")
+    if pdf_token:
+        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
+        safe_async_run(asyncio.to_thread(delete_file_from_drive, pdf_token))
+
     safe_async_run(graph.ainvoke(None, config=config))
 
 def process_rejection(email_id, user_id):
@@ -528,6 +710,13 @@ def process_rejection(email_id, user_id):
     safe_async_wait(graph.aupdate_state(config, {"approval_status": "rejected"}))
     safe_async_wait(db_manager.update_status(email_id, "rejected"))
     logger.info(f"Rejection processed for {email_id} by {user_id}. Executing graph...")
+    # Remove attachment if exists
+    state = safe_async_wait(graph.aget_state(config))
+    pdf_token = state.values.get("pdf_token")
+    if pdf_token:
+        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
+        safe_async_run(asyncio.to_thread(delete_file_from_drive, pdf_token))
+
     safe_async_run(graph.ainvoke(None, config=config))
     
 def process_modification(email_id, new_draft):
@@ -549,12 +738,151 @@ async def process_save_draft(email_id, state):
          await exchange_client.create_draft(str(to), subject, body)
     await db_manager.update_status(email_id, "draft_saved")
 
+    # Remove attachment if exists
+    pdf_token = state.values.get("pdf_token")
+    if pdf_token:
+        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
+        # Running in async context, but delete is sync (using client), wrapping in thread or simple call if safe
+        # delete_file_from_drive uses lark_api_client which is thread safe for HTTP calls
+        delete_file_from_drive(pdf_token)
+
+async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[str]:
+    """
+    Generate PDF and upload to Lark Drive. Returns dict with url and token if successful.
+    """
+    try:
+        logger.info(f"Starting PDF generation for {email_id}")
+        
+        # 1. Render HTML (CPU bound)
+        loop = asyncio.get_running_loop()
+        html_content = await loop.run_in_executor(None, render_email_html, email_data)
+        
+        # 2. Convert to PDF (CPU/IO bound)
+        pdf_bytes = await loop.run_in_executor(None, convert_html_to_pdf, html_content)
+        
+        if not pdf_bytes:
+            logger.error("PDF generation returned empty bytes.")
+            return None
+
+        # 3. Upload to Drive (Network bound)
+        filename = f"Email_Export_{email_id}.pdf"
+        upload_resp = await loop.run_in_executor(None, upload_file_to_drive, filename, pdf_bytes, len(pdf_bytes))
+        
+        if not upload_resp:
+            logger.error("PDF Upload failed.")
+            return None
+
+        file_url = upload_resp["url"]
+        file_token = upload_resp["file_token"]
+        logger.info(f"PDF Uploaded: {file_url} (Token: {file_token})")
+        return {"url": file_url, "file_token": file_token}
+        
+    except Exception as e:
+        logger.error(f"Error in generate_and_upload_pdf: {e}", exc_info=True)
+        return None
+
+async def process_pdf_generation_and_reply(email_id, state, message_id):
+    """
+    Generate PDF and reply with file link. (Deprecated Action Handler)
+    """
+    try:
+        email_data = state.values.get("email", {})
+        result = await generate_and_upload_pdf(email_id, email_data)
+        
+        if not result:
+            return
+
+        file_url = result["url"]
+        file_token = result["file_token"]
+
+        # Store token in state for later cleanup
+        config = {"configurable": {"thread_id": email_id}}
+        safe_async_wait(graph.aupdate_state(config, {"pdf_token": file_token}))
+
+        filename = f"Email_Export_{email_id}.pdf"
+
+        # 4. Reply with Card
+        card_content = {
+            "header": {
+                "template": "blue",
+                "title": {"content": "📄 PDF 原文已生成", "tag": "plain_text"}
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": f"点击下方按钮查看 PDF 文件：\\nFilename: *{filename}*"}
+                },
+                {
+                    "tag": "action",
+                    "actions": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📂 打开 PDF"},
+                        "type": "primary",
+                        "url": file_url
+                    }]
+                }
+            ]
+        }
+        
+        req_msg = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(ReplyMessageRequestBody.builder() \
+                .msg_type("interactive") \
+                .content(json.dumps(card_content)) \
+                .build()) \
+            .build()
+        
+        lark_api_client.im.v1.message.reply(req_msg)
+        logger.info("PDF Reply sent successfully.")
+
+    except Exception as e:
+        logger.error(f"Error in PDF generation process: {e}", exc_info=True)
+
+        # 4. Reply with Card
+        card_content = {
+            "header": {
+                "template": "blue",
+                "title": {"content": "📄 PDF 原文已生成", "tag": "plain_text"}
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": f"点击下方按钮查看 PDF 文件：\nFilename: *{filename}*"}
+                },
+                {
+                    "tag": "action",
+                    "actions": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📂 打开 PDF"},
+                        "type": "primary",
+                        "url": file_url
+                    }]
+                }
+            ]
+        }
+        
+        req_msg = ReplyMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(ReplyMessageRequestBody.builder() \
+                .msg_type("interactive") \
+                .content(json.dumps(card_content)) \
+                .build()) \
+            .build()
+        
+        lark_api_client.im.v1.message.reply(req_msg)
+        logger.info("PDF Reply sent successfully.")
+
+    except Exception as e:
+        logger.error(f"Error in PDF generation process: {e}", exc_info=True)
+
+
 def start_lark_ws():
     """
     Start WebSocket Client in a background thread
     """
-    app_id = os.environ.get("LARK_APP_ID")
-    app_secret = os.environ.get("LARK_APP_SECRET")
+    settings = get_settings()
+    app_id = settings.LARK_APP_ID
+    app_secret = settings.LARK_APP_SECRET
     
     if not (app_id and app_secret):
         logger.warning("Lark App ID/Secret missing. WS Client not started.")

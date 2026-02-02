@@ -1,6 +1,7 @@
 
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
 
 class Settings(BaseSettings):
     # Database
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     EXCHANGE_API_URL: str = ""
     EXCHANGE_API_KEY: str = ""
     EXCHANGE_ACCOUNT_ID: int = 8
+    EXCHANGE_ACCOUNT_EMAIL: str = "" # Identify "Me"
     EXCHANGE_AI_FOLDERS: str = "INBOX"
     EXCHANGE_ARCHIVE_FOLDERS: str = ""
     EXCHANGE_SSL_VERIFY: bool = False
@@ -23,11 +25,27 @@ class Settings(BaseSettings):
     LARK_APP_SECRET: str = ""
     LARK_VERIFICATION_TOKEN: str = ""
     LARK_ENCRYPT_KEY: str = ""
+    LARK_CHAT_ID: str = ""
+    LARK_DRIVE_FOLDER_TOKEN: str = ""
+
+    # Server
+    EXTERNAL_URL: str = "http://localhost:8000"
+
+    # Slack
+    SLACK_BOT_TOKEN: str = ""
+    SLACK_APP_TOKEN: str = ""
+    SLACK_CHANNEL_ID: str = ""
 
     # LLM
     OPENAI_API_KEY: str = ""
-    OPENAI_BASE_URL: str = ""
+    OPENAI_API_BASE: str = ""  # 与 .env 保持一致
     LLM_MODEL: str = "gemini-3-flash"
+    LLM_RATE_LIMIT_DELAY: int = 10
+
+    # Embedding
+    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_BASE_URL: str = ""
+    EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"
 
     # App
     LOG_LEVEL: str = "INFO"

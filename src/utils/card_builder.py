@@ -7,6 +7,8 @@ import re
 import logging
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
+from urllib.parse import quote
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +288,8 @@ class LarkCardBuilder:
         email_data: dict,
         classification: dict,
         edit_field: str = None,  # None=普通模式, "to"/"cc"/"draft"=编辑对应字段
-        feedback_value: str = ""
+        feedback_value: str = "",
+        pdf_url: str = None
     ) -> dict:
         """
         Constructs the Lark Card JSON for approval workflow.
@@ -341,7 +344,7 @@ class LarkCardBuilder:
         })
 
         # Sender/Recipient compact row
-        compact_columns = self._build_compact_sender_row(raw_sender, email_data, user_map)
+        compact_columns = self._build_compact_header_row(raw_sender, email_data, user_map)
         elements.append({
             "tag": "column_set",
             "flex_mode": "none",
@@ -352,26 +355,70 @@ class LarkCardBuilder:
         elements.append({"tag": "hr"})
 
         # Original email summary
-        elements.append({"tag": "markdown", "content": "**📄 原始邮件摘要:**"})
+        header_text = "**📄 原始邮件摘要:**"
+        if pdf_url:
+            header_text = f"**📄 原始邮件摘要:** ([📄 查看完整原文 (PDF)]({pdf_url}))"
+        elements.append({"tag": "markdown", "content": header_text})
+        
+        # Optimize summary: Priority 1 - LLM Summary, Priority 2 - Body, Priority 3 - Context
+        llm_summary = classification.get("summary")
+        if llm_summary:
+             original_snippet = llm_summary
+        else:
+             # Fallback: existing logic
+             raw_body = email_data.get("body", "")
+             if raw_body:
+                 # Strip HTML tags
+                 try:
+                     soup = BeautifulSoup(raw_body, "html.parser")
+                     text = soup.get_text(separator=" ", strip=True)
+                     original_snippet = text[:200] + "..." if len(text) > 200 else text
+                 except Exception:
+                     original_snippet = raw_body[:200]
+             elif context:
+                 # Fallback to context if body is missing
+                 text = context[0].get('chunk_text') or context[0].get('body') or ""
+                 text = text.strip()
+                 # Try to remove Subject/Attachment lines if present in chunk
+                 clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
+                 text = " ".join(clean_lines)
+                 original_snippet = text[:200] + "..." if len(text) > 200 else text
+
+        summary_content = f"*{original_snippet}*"
+        
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": f"*{original_snippet}*"}
+            "text": {"tag": "lark_md", "content": summary_content}
         })
 
         attachments = email_data.get("attachments", [])
         if attachments:
-            att_text = "\n".join([f"📎 {att.get('name', 'Unknown File')}" for att in attachments[:3]])
+            att_lines = []
+            for att in attachments[:5]:
+                name = att.get('name', 'Unknown File')
+                if att.get('lark_file_url'):
+                    att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
+                else:
+                    att_lines.append(f"📎 {name}")
+            
+            att_text = "\n".join(att_lines)
             elements.append({"tag": "div", "text": {"tag": "lark_md", "content": att_text}})
 
-        elements.append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "👀 查看完整原文 (HTML)"},
-                "type": "default",
-                "value": {"action": "view_original", "id": email_id}
-            }]
-        })
+        # Web view link hidden by request
+        # settings = get_settings()
+        # external_url = settings.EXTERNAL_URL
+        # h5_url = f"{external_url}/email/{email_id}"
+        # encoded_url = quote(h5_url, safe="")
+        # sidebar_url = f"https://applink.feishu.cn/client/web_url/open?url={encoded_url}&mode=sidebar-semi"
+        # elements.append({
+        #     "tag": "action",
+        #     "actions": [{
+        #         "tag": "button",
+        #         "text": {"tag": "plain_text", "content": "👀 查看完整原文 (Web)"},
+        #         "type": "default",
+        #         "url": sidebar_url
+        #     }]
+        # })
         elements.append({"tag": "hr"})
 
         # Draft section
@@ -419,77 +466,139 @@ class LarkCardBuilder:
 
         return {"header": header, "elements": elements}
 
-    def _build_compact_sender_row(
+    def _build_compact_header_row(
         self,
         raw_sender: str,
         email_data: dict,
         user_map: Dict[str, Dict[str, str]]
     ) -> List[dict]:
-        """Build compact sender/recipient row columns"""
-        compact_columns = []
-
-        compact_columns.append({
+        """
+        Build compact header row: Sender | To | Cc
+        Logic: Show only 1 person per field. Prioritize 'Me' in To/Cc.
+        """
+        settings = get_settings()
+        my_email = settings.EXCHANGE_ACCOUNT_EMAIL or ""
+        
+        columns = []
+        
+        # Helper to get ONE representative
+        def get_one_person_and_count(people_list):
+            if not people_list:
+                return None, 0
+                
+            total = len(people_list)
+            selected = people_list[0]
+            
+            # Try to find 'Me'
+            if my_email:
+                for p in people_list:
+                    e = extract_email_address(p)
+                    if e and my_email.lower() in e.lower():
+                        selected = p
+                        break
+            
+            return selected, total - 1
+            
+        # --- 1. Sender ---
+        columns.append({
             "tag": "column", "width": "auto", "vertical_align": "center",
             "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👤 发件人:**"}}]
         })
-
+        
         sender_email = extract_email_address(raw_sender)
         sender_uid = user_map.get(sender_email, {}).get('open_id') if sender_email else None
-
+        
         if sender_uid:
-            compact_columns.append({
+            columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
                 "elements": [{"tag": "person", "user_id": sender_uid, "style": "normal"}]
             })
         else:
-            s_name = sender_email.split("@")[0] if sender_email else "Unknown"
-            compact_columns.append({
+             # Just show name (Full Email as fallback)
+            s_name = sender_email if sender_email else "Unknown"
+            columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
                 "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": s_name}}]
             })
 
-        compact_columns.append({
+        # Separator
+        columns.append({
             "tag": "column", "width": "auto", "vertical_align": "center",
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;&nbsp;|&nbsp;&nbsp;</font>"}}]
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;|&nbsp;</font>"}}]
         })
 
-        label_text = "**👥 收件人:**"
-        target_list = email_data.get("to", [])
-        if not target_list and email_data.get("cc"):
-            label_text = "**👀 抄送人:**"
-            target_list = email_data.get("cc", [])
-
-        compact_columns.append({
-            "tag": "column", "width": "auto", "vertical_align": "center",
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": label_text}}]
-        })
-
-        recip_matched = []
-        recip_leftover = []
-        for r in target_list:
-            e = extract_email_address(r)
-            name = e.split("@")[0] if e else str(r)
-            if e and e in user_map:
-                recip_matched.append(user_map[e]['open_id'])
+        # --- 2. To ---
+        to_list = email_data.get("to", [])
+        to_person, to_count = get_one_person_and_count(to_list)
+        
+        if to_person:
+            columns.append({
+                "tag": "column", "width": "auto", "vertical_align": "center",
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👥 收件人:**"}}]
+            })
+            
+            e = extract_email_address(to_person)
+            uid = user_map.get(e, {}).get('open_id') if e else None
+            
+            if uid:
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
+                })
             else:
-                recip_leftover.append(name)
+                name = e if e else "Unknown"
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": name}}]
+                })
+                
+            if to_count > 0:
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f" +{to_count}"}}]
+                })
 
-        for uid in recip_matched[:1]:
-            compact_columns.append({
+        # --- 3. Cc (Optional) ---
+        cc_list = email_data.get("cc", [])
+        if cc_list:
+            # Separator
+            columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
-                "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;|&nbsp;</font>"}}]
             })
-
-        count_others = (len(recip_matched) - 1 if len(recip_matched) > 1 else 0) + len(recip_leftover)
-        if count_others > 0:
-            compact_columns.append({
+            
+            cc_person, cc_count = get_one_person_and_count(cc_list)
+            
+            columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
-                "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f" +{count_others}"}}]
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👀 抄送:**"}}]
             })
+            
+            e = extract_email_address(cc_person)
+            uid = user_map.get(e, {}).get('open_id') if e else None
+            
+            if uid:
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
+                })
+            else:
+                name = e if e else "Unknown"
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": name}}]
+                })
+                
+            if cc_count > 0:
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f" +{cc_count}"}}]
+                })
 
-        compact_columns.append({"tag": "column", "width": "weighted", "weight": 1, "elements": []})
+        # Filler
+        columns.append({"tag": "column", "width": "weighted", "weight": 1, "elements": []})
 
-        return compact_columns
+        return columns
 
     def _build_recipient_section(
         self,

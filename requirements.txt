@@ -17,3 +17,6 @@ httpx
 pydantic
 lark-oapi
 pydantic-settings
+fastapi
+uvicorn
+WeasyPrint

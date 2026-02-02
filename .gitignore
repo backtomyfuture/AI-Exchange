@@ -25,3 +25,4 @@ processed_emails.json
 
 # Docker logs
 *.log
+*.txt
