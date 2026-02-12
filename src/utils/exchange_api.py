@@ -41,28 +41,42 @@ class ExchangeClient:
             return self._folder_cache
 
         headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        endpoint = f"{self.api_url}/folders/all"
+        base_url = re.sub(r"/emails/?$", "", self.api_url)
+        endpoints = [
+            f"{self.api_url}/folders/all",
+            f"{base_url}/folders/all",
+        ]
         params = {"account_id": self.account_id}
 
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
-                response = await client.get(
-                    endpoint,
-                    params=params,
-                    headers=headers,
-                    timeout=15.0,
-                )
-                if response.status_code == 200:
-                    folders = response.json().get("data", {}).get("folders", [])
-                    self._build_folder_cache(folders)
-                    logger.info(
-                        "Folder cache loaded: %s folders. sentitems=%s, drafts=%s",
-                        len(self._folder_cache),
-                        self.sentitems_folder_id,
-                        self.drafts_folder_id,
+                for endpoint in dict.fromkeys(endpoints):
+                    response = await client.get(
+                        endpoint,
+                        params=params,
+                        headers=headers,
+                        timeout=15.0,
                     )
-                    return self._folder_cache
-                logger.error("Failed to get folders: %s", response.status_code)
+                    if response.status_code == 200:
+                        folders = response.json().get("data", {}).get("folders", [])
+                        self._build_folder_cache(folders)
+                        logger.info(
+                            "Folder cache loaded from %s: %s folders. sentitems=%s, drafts=%s",
+                            endpoint,
+                            len(self._folder_cache),
+                            self.sentitems_folder_id,
+                            self.drafts_folder_id,
+                        )
+                        return self._folder_cache
+                    logger.warning(
+                        "Folder endpoint returned %s: %s",
+                        response.status_code,
+                        endpoint,
+                    )
+                logger.warning(
+                    "Failed to get folders from all candidate endpoints. "
+                    "Routing will use safe fallback mode."
+                )
             except Exception as e:
                 logger.error("Exception getting folders: %s", e)
 

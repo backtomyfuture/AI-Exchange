@@ -724,4 +724,94 @@ process_batch[仅元数据] → categorizer(纯文本) → need_reply?
 
 ---
 
-**Last Updated**: 2026-02-12 (Production Hardening Completed Locally, Full Tests Green)
+## 12. Webhook-Only 迁移与启动修复纪要 (2026-02-12)
+
+> [!IMPORTANT]
+> 本节记录一次线上运行排障与架构收敛：修复容器启动失败，并将 Exchange 接入路径从 `sync` 轮询彻底切换为 `webhook` 驱动。
+
+### 12.1 问题背景
+
+#### 问题 A：服务启动后反复重启
+- **症状**：`ai-assistant-service` 容器持续 `Restarting`，日志报错：
+  - `AttributeError: 'Settings' object has no attribute 'QDRANT_URL'`
+- **根因**：`EmailProcessor` 读取 `settings.QDRANT_URL`，但 `src/config.py` 未声明该字段。
+- **修复**：
+  - `src/config.py` 新增 `QDRANT_URL: str = "http://localhost:6333"`
+  - `.env.example` 增加 `QDRANT_URL` 示例配置
+  - 强制重建容器后恢复正常启动
+
+#### 问题 B：日志仍出现 `Sync request successful`
+- **症状**：尽管已接入 webhook，运行日志仍出现 `/emails/sync` 调用与 `Sync cycle complete`。
+- **根因**：旧轮询路径仍在运行：
+  - `main.py` 仍启动 `exchange_loop`
+  - `exchange_service.py` 保留 `main_loop + sync_emails` 轮询
+  - `exchange_api.py` 保留 `sync_emails()` 与调试输出
+
+---
+
+### 12.2 架构收敛（Sync -> Webhook-Only）
+
+#### 核心目标
+仅保留 Exchange webhook 入口触发处理，删除所有 sync 轮询/状态同步相关逻辑。
+
+#### 关键改动
+- `src/main.py`
+  - 移除 `exchange_loop` 启动与取消流程
+  - 改为生命周期内显式调用：
+    - `exchange_start_worker(ctx)`
+    - `exchange_stop_worker()`
+
+- `src/exchange_service.py`
+  - 删除 `main_loop()` 及其轮询逻辑
+  - 新增 webhook 队列工作流：
+    - `_worker_loop()`
+    - `start_worker()`
+    - `stop_worker()`
+    - `enqueue_webhook_event(payload, header_event)`
+  - `enqueue_webhook_event` 负责：
+    - 事件类型过滤（`NewMailEvent` / `CreatedEvent`）
+    - 从 payload 组装最小邮件数据
+    - 入队交由统一 worker 调用 `process_and_archive_email`
+
+- `src/server.py`
+  - 保持 `/webhooks/exchange` 签名校验后调用 `enqueue_exchange_webhook(...)`
+  - 通过 `exchange_service.enqueue_webhook_event(...)` 接入新 worker 队列
+
+- `src/utils/exchange_api.py`
+  - 删除 `sync_emails()` 方法（连同 `"Sync request successful"` 调试输出）
+
+- `src/utils/db_async.py` / `src/utils/db.py`
+  - 删除 sync state 读写接口：
+    - `get_sync_state(...)`
+    - `save_sync_state(...)`
+
+- `src/config.py` / `.env.example`
+  - 删除已废弃的 sync 配置：
+    - `EXCHANGE_AI_FOLDERS`
+    - `EXCHANGE_ARCHIVE_FOLDERS`
+  - 保留 webhook 相关配置（如 `EXCHANGE_WEBHOOK_SECRET`）
+
+---
+
+### 12.3 测试与运行验证
+
+- 单测验证（项目 `.venv`）：
+  - `tests/test_consolidation.py`
+  - `tests/unit/test_exchange_api.py`
+  - `tests/unit/test_exchange_webhook.py`
+  - 结果：**9 passed**
+
+- 运行态验证（Docker）：
+  - 服务启动日志出现：`Exchange webhook worker started.`
+  - 新启动后日志中不再出现新的 `/emails/sync` 调用与 `Sync cycle complete` 轮询输出
+
+---
+
+### 12.4 本次变更提交
+
+- 提交哈希：`7a2a4c9`
+- 提交信息：`refactor: remove Exchange sync polling and fully switch to webhook processing`
+
+---
+
+**Last Updated**: 2026-02-12 (Webhook-Only Migration + QDRANT_URL Startup Fix)
