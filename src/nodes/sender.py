@@ -1,9 +1,10 @@
 import logging
+from langchain_core.runnables import RunnableConfig
 from src.graph.state import AgentState
 
 logger = logging.getLogger(__name__)
 
-async def send_final_email(state: AgentState, config: dict = None) -> AgentState:
+async def send_final_email(state: AgentState, config: RunnableConfig | None = None) -> AgentState:
     """
     发送最终审批通过的邮件，并将发送记录存入 Qdrant。
     通过 AppContext 单例获取共享资源，避免重复创建实例。

@@ -111,26 +111,7 @@ async def test_create_draft_success(mock_settings):
         endpoint = mock_http_client.post.call_args[0][0]
         assert "/drafts" in endpoint
 
-@pytest.mark.asyncio
-async def test_sync_emails(mock_settings):
-    """Test incremental sync."""
+def test_sync_api_removed(mock_settings):
+    """sync_emails has been removed after webhook migration."""
     client = ExchangeClient(settings=mock_settings)
-    
-    with patch("httpx.AsyncClient") as mock_http_client_cls:
-        mock_http_client = AsyncMock()
-        mock_http_client_cls.return_value.__aenter__.return_value = mock_http_client
-        
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "code": 200,
-            "data": {
-                "sync_state": "new_state",
-                "items": [{"change_type": "create", "id": "123"}]
-            }
-        }
-        mock_http_client.post.return_value = mock_resp
-        
-        result = await client.sync_emails(sync_state="old_state")
-        assert result["sync_state"] == "new_state"
-        assert len(result["items"]) == 1
+    assert not hasattr(client, "sync_emails")

@@ -171,37 +171,6 @@ class DatabaseManager:
         """
         self.update_status(email_id, "ingested")
 
-    def get_sync_state(self, account_id: str, folder: str = "INBOX") -> Optional[str]:
-        """
-        Retrieve the last sync state for a given account and folder.
-        """
-        try:
-            conn = self.get_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT value FROM app_kv_store WHERE key = %s", (f"sync_state_{account_id}_{folder}",))
-                result = cur.fetchone()
-                return result[0] if result else None
-        except DatabaseError as e:
-            logger.error(f"Failed to get sync state for {folder}: {e}")
-            return None
-
-    def save_sync_state(self, account_id: str, state: str, folder: str = "INBOX"):
-        """
-        Save the sync state for a given account and folder.
-        """
-        try:
-            conn = self.get_connection()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO app_kv_store (key, value, updated_at)
-                    VALUES (%s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (key) DO UPDATE SET 
-                        value = EXCLUDED.value,
-                        updated_at = CURRENT_TIMESTAMP;
-                """, (f"sync_state_{account_id}_{folder}", state))
-        except DatabaseError as e:
-            logger.error(f"Failed to save sync state for {folder}: {e}")
-
     def close(self):
         if self._conn and not self._conn.closed:
             self._conn.close()

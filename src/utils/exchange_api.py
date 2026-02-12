@@ -110,53 +110,6 @@ class ExchangeClient:
                 print(f"获取邮件异常: {e}")
                 return []
 
-    async def sync_emails(self, sync_state: str = None, folder: str = "INBOX", limit: int = 50) -> Dict[str, Any]:
-        """
-        Sync emails using the incremental sync API.
-        Returns a dict containing 'sync_state' and 'items'.
-        """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        endpoint = f"{self.api_url}/sync"
-        
-        payload = {
-            "account_id": self.account_id,
-            "folder": folder,
-            "limit": limit,
-            "sync_state": sync_state
-        }
-
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                # print(f"Syncing emails with state: {sync_state}")
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=30.0 
-                )
-                
-                if response.status_code == 200:
-                    print("DEBUG: Sync request successful (200 OK). Starting response.json()...")
-                    try:
-                        data = response.json()
-                        print("DEBUG: response.json() successful.")
-                    except Exception as json_err:
-                        print(f"DEBUG: response.json() failed: {json_err}")
-                        return {}
-                    
-                    if data.get('code') == 200:
-                        sync_data = data.get('data', {})
-                        print(f"DEBUG: Sync data received. Sync state present: {'sync_state' in sync_data}, Items count: {len(sync_data.get('items', [])) if sync_data else 'N/A'}")
-                        return sync_data
-                    else:
-                        print(f"Sync API failed: {data.get('msg')}")
-                else:
-                    print(f"Sync request failed: {response.status_code} - {response.text}")
-            except Exception as e:
-                print(f"Sync exception: {e}")
-        
-        return {}
-
     async def send_email(self, to: str, subject: str, body: str) -> bool:
         """
         调用接口发送邮件。

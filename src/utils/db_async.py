@@ -182,36 +182,6 @@ class AsyncDatabaseManager:
         """Quick shortcut for dedup, sets status to 'ingested'."""
         await self.update_status(email_id, "ingested")
 
-    async def get_sync_state(self, account_id: str, folder: str = "INBOX") -> Optional[str]:
-        """Retrieve the last sync state for a given account and folder."""
-        try:
-            async with self.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT value FROM app_kv_store WHERE key = %s",
-                        (f"sync_state_{account_id}_{folder}",),
-                    )
-                    result = await cur.fetchone()
-                    return result["value"] if result else None
-        except psycopg.Error as e:
-            logger.error(f"Failed to get sync state for {folder}: {e}")
-            return None
-
-    async def save_sync_state(self, account_id: str, state: str, folder: str = "INBOX"):
-        """Save the sync state for a given account and folder."""
-        try:
-            async with self.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("""
-                    INSERT INTO app_kv_store (key, value, updated_at)
-                    VALUES (%s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (key) DO UPDATE SET 
-                        value = EXCLUDED.value,
-                        updated_at = CURRENT_TIMESTAMP;
-                """, (f"sync_state_{account_id}_{folder}", state))
-        except psycopg.Error as e:
-            logger.error(f"Failed to save sync state for {folder}: {e}")
-
     async def close(self):
         if self._pool:
             await self._pool.close()

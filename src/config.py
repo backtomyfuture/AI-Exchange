@@ -16,9 +16,8 @@ class Settings(BaseSettings):
     EXCHANGE_API_KEY: str = ""
     EXCHANGE_ACCOUNT_ID: int = 8
     EXCHANGE_ACCOUNT_EMAIL: str = "" # Identify "Me"
-    EXCHANGE_AI_FOLDERS: str = "INBOX"
-    EXCHANGE_ARCHIVE_FOLDERS: str = ""
     EXCHANGE_SSL_VERIFY: bool = False
+    EXCHANGE_WEBHOOK_SECRET: str = ""
 
     # Lark
     LARK_APP_ID: str = ""
@@ -44,6 +43,7 @@ class Settings(BaseSettings):
     LLM_MAX_RPM: float = 15.0
 
     # Embedding
+    QDRANT_URL: str = "http://localhost:6333"
     EMBEDDING_API_KEY: str = ""
     EMBEDDING_BASE_URL: str = ""
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"

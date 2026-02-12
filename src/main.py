@@ -8,7 +8,8 @@ from fastapi import FastAPI
 
 from src.init_app import get_app_context
 from src.utils import lark_app
-from src.exchange_service import main_loop as exchange_loop
+from src.exchange_service import start_worker as exchange_start_worker
+from src.exchange_service import stop_worker as exchange_stop_worker
 from src.server import app
 
 # Configure logging
@@ -17,9 +18,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("MainService")
-
-# Global task references to prevent garbage collection
-background_tasks = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,10 +40,8 @@ async def lifespan(app: FastAPI):
     # Start Lark WS in a background thread
     lark_app.start_lark_ws()
     
-    # 3. Run Exchange Loop as a background Task
-    exchange_task = asyncio.create_task(exchange_loop())
-    background_tasks.add(exchange_task)
-    exchange_task.add_done_callback(background_tasks.discard)
+    # 3. Start webhook-driven Exchange worker
+    await exchange_start_worker(ctx)
     
     logger.info("Service is fully operational (Web Server running).")
     
@@ -54,12 +50,7 @@ async def lifespan(app: FastAPI):
     logger.info("Stopping services...")
     
     # Shutdown logic
-    exchange_task.cancel()
-    try:
-        await exchange_task
-    except asyncio.CancelledError:
-        logger.info("Exchange loop cancelled.")
-        
+    await exchange_stop_worker()
     await ctx.close()
     logger.info("Shutdown complete.")
 
@@ -73,12 +64,11 @@ async def main():
     lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=worker_loop)
     lark_app.start_lark_ws()
 
-    exchange_task = asyncio.create_task(exchange_loop())
     try:
+        await exchange_start_worker(ctx)
         await asyncio.Future()
     except asyncio.CancelledError:
-        exchange_task.cancel()
-        await asyncio.gather(exchange_task, return_exceptions=True)
+        await exchange_stop_worker()
         await ctx.close()
         raise
 

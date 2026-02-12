@@ -1,6 +1,5 @@
 import asyncio
 import time
-import os
 import logging
 from src.init_app import get_app_context
 from src.utils import lark_app
@@ -11,6 +10,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("ExchangeService")
+_webhook_queue: asyncio.Queue | None = None
+_worker_task: asyncio.Task | None = None
+_worker_ctx = None
 
 async def _upload_attachments_to_lark(email_data: dict) -> None:
     """Upload attachments to Lark Drive and append tokens/urls."""
@@ -134,98 +136,73 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
 
     await _mark_email_read(thread_id, ctx)
 
-async def main_loop():
-    logger.info("Starting Exchange Service...")
-    
-    ctx = get_app_context()
-    await ctx.setup_async()
-    
-    # Initialize Lark App (for API usage only, no WS)
-    # Pass the running loop to ensure thread-safe operations from Lark WS thread
-    lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=asyncio.get_running_loop())
-    logger.info("Lark App Initialized (API Mode).")
-    
-    queue = asyncio.Queue()
+async def _worker_loop():
+    """Webhook-driven background worker. No polling/sync logic."""
+    global _webhook_queue, _worker_ctx
+    logger.info("Exchange webhook worker started.")
+    while True:
+        email_data, skip_analysis = await _webhook_queue.get()
+        try:
+            # Fetch full details if body missing
+            if "body" not in email_data:
+                email_id = email_data.get("id")
+                logger.info(f"Fetching details for {email_id}...")
+                full_details = await _worker_ctx.exchange_client.get_email(email_id)
+                if full_details:
+                    email_data.update(full_details)
 
-    async def worker():
-        logger.info("Worker started.")
-        while True:
-            email_task = await queue.get()
-            email_data, skip_analysis = email_task
-            try:
-                # Fetch full details if body missing
-                if 'body' not in email_data:
-                    email_id = email_data.get('id')
-                    logger.info(f"Fetching details for {email_id}...")
-                    full_details = await ctx.exchange_client.get_email(email_id)
-                    if full_details:
-                        email_data.update(full_details)
-                
-                await process_and_archive_email(email_data, ctx, skip_analysis)
-            except Exception as e:
-                logger.error(f"Worker processing error: {e}")
-            finally:
-                queue.task_done()
-                await asyncio.sleep(1)
+            await process_and_archive_email(email_data, _worker_ctx, skip_analysis)
+        except Exception as e:
+            logger.error(f"Worker processing error: {e}")
+        finally:
+            _webhook_queue.task_done()
+            await asyncio.sleep(1)
 
-    # Start Worker
-    worker_task = asyncio.create_task(worker())
 
-    # Sync Configuration
-    current_account_id = str(ctx.exchange_client.account_id)
-    ai_folders = [f.strip() for f in os.getenv("EXCHANGE_AI_FOLDERS", "INBOX").split(",") if f.strip()]
-    archive_folders = [f.strip() for f in os.getenv("EXCHANGE_ARCHIVE_FOLDERS", "").split(",") if f.strip()]
-    all_folders = list(set(ai_folders + archive_folders))
-    
-    sync_states = {}
-    for folder in all_folders:
-        state = await ctx.db_manager.get_sync_state(current_account_id, folder)
-        sync_states[folder] = state
-        logger.info(f"Initial sync state for {folder}: {'None' if state is None else 'Present'}")
+async def start_worker(ctx=None):
+    """Start webhook worker once."""
+    global _webhook_queue, _worker_task, _worker_ctx
+    if _worker_task and not _worker_task.done():
+        return
+    _worker_ctx = ctx or get_app_context()
+    _webhook_queue = asyncio.Queue()
+    _worker_task = asyncio.create_task(_worker_loop())
 
+
+async def stop_worker():
+    """Stop webhook worker and cleanup task."""
+    global _worker_task, _webhook_queue
+    if _worker_task is None:
+        return
+    _worker_task.cancel()
     try:
-        while True:
-            for folder in all_folders:
-                try:
-                    current_sync_state = sync_states.get(folder)
-                    skip_analysis = folder in archive_folders and folder not in ai_folders
-                    
-                    limit = 5 if current_sync_state is None else 50
-                    sync_data = await ctx.exchange_client.sync_emails(sync_state=current_sync_state, folder=folder, limit=limit)
-                    
-                    if 'sync_state' in sync_data:
-                        new_sync_state = sync_data['sync_state']
-                        items = sync_data.get('items', [])
-                        
-                        if items:
-                            logger.info(f"Sync: Folder '{folder}' has {len(items)} changes.")
-                            if current_sync_state is None and len(items) > 10:
-                                items = items[-10:]
-                            
-                            for item in items:
-                                if item.get('change_type') == 'create':
-                                    email_content = item.get('item', {})
-                                    if email_content:
-                                        email_content['id'] = item.get('id')
-                                        await queue.put((email_content, skip_analysis))
-                        
-                        if new_sync_state != current_sync_state:
-                            await ctx.db_manager.save_sync_state(current_account_id, new_sync_state, folder=folder)
-                            sync_states[folder] = new_sync_state
-                    
-                except Exception as e:
-                    logger.error(f"Error syncing folder {folder}: {e}")
-                
-            logger.info(f"Sync cycle complete. Queue: {queue.qsize()}. Sleep 60s.")
-            await asyncio.sleep(60)
+        await _worker_task
+    except asyncio.CancelledError:
+        logger.info("Exchange webhook worker cancelled.")
+    _worker_task = None
+    _webhook_queue = None
 
-    except KeyboardInterrupt:
-        logger.info("Stopping...")
-    except Exception as e:
-        logger.critical(f"Critical error: {e}")
-    finally:
-        worker_task.cancel()
-        await ctx.close()
 
-if __name__ == "__main__":
-    asyncio.run(main_loop())
+async def enqueue_webhook_event(payload: dict, header_event: str | None = None) -> dict:
+    """
+    Convert webhook payload to queue task and enqueue.
+    """
+    if _webhook_queue is None:
+        raise RuntimeError("Exchange worker is not running")
+
+    event_type = header_event or payload.get("event_type") or payload.get("event")
+    if event_type and event_type not in {"NewMailEvent", "CreatedEvent"}:
+        return {"queued": False, "ignored": True, "event_type": event_type}
+
+    email_id = payload.get("item_id") or payload.get("id")
+    if not email_id:
+        raise ValueError("Missing item_id in webhook payload")
+
+    email_data = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+    email_data.setdefault("id", email_id)
+    email_data.setdefault("subject", payload.get("subject", ""))
+    email_data.setdefault("sender", payload.get("sender", ""))
+    email_data.setdefault("received_at", payload.get("received_time", ""))
+
+    await _webhook_queue.put((email_data, False))
+    return {"queued": True, "email_id": email_id, "queue_size": _webhook_queue.qsize()}
