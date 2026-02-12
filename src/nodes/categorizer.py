@@ -6,6 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
 from src.utils.retry_decorator import with_llm_retry
+from src.router.engine import get_routing_engine
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,12 @@ class EmailClassification(BaseModel):
 
 async def categorize_email(state: AgentState) -> AgentState:
     """
-    分类节点：根据邮件内容进行优先级和意图分类。
+    分类节点：先执行路由引擎（Tier 1/2/3），再根据邮件内容进行优先级和意图分类。
     """
+    # Step 0: Execute Routing Engine (Tier 1/2/3)
+    engine = get_routing_engine()
+    state = await engine.execute_router(state)
+
     email = state.get("email", {})
     subject = email.get("subject", "")
     body = email.get("body", "")
