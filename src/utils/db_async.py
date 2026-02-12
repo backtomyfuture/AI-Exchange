@@ -14,6 +14,16 @@ from psycopg_pool import AsyncConnectionPool
 logger = logging.getLogger(__name__)
 
 
+def normalize_timestamp_input(value: Any) -> Any:
+    """Normalize timestamp input before DB write."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
 class AsyncDatabaseManager:
     """
     Manages PostgreSQL async connection and operations for email tracking.
@@ -126,7 +136,7 @@ class AsyncDatabaseManager:
                     email_data.get("id"),
                     email_data.get("subject"),
                     str(email_data.get("sender")),
-                    email_data.get("received_at")
+                    normalize_timestamp_input(email_data.get("received_at"))
                 ))
                     return cur.rowcount > 0
         except psycopg.Error as e:
