@@ -41,8 +41,7 @@ async def generate_draft(state: AgentState) -> AgentState:
         }
     
     # --- 初始拟稿逻辑 (仅在没有 feedback 时执行) ---
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一个专业的行政助手。
+    base_system_prompt = """你是一个专业的行政助手。
 你的任务是根据提供的【历史背景】和【当前邮件】，代用户拟写一封回复邮件。
 
 要求：
@@ -51,7 +50,14 @@ async def generate_draft(state: AgentState) -> AgentState:
 3. 直接输出最终的邮件回复正文。
 4. 不要输出 <thought> 或 <draft> 标签，也不要包含任何解释性文字。
 
-请使用中文回复。"""),
+请使用中文回复。"""
+
+    modifier = state.get("system_prompt_modifier")
+    if modifier:
+        base_system_prompt = base_system_prompt + "\n\n" + modifier.strip()
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", base_system_prompt),
         ("user", """【历史背景】:
 {context}
 
