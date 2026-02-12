@@ -33,9 +33,16 @@ def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
     mock_builder.build.return_value = mock_instance
     mock_client_cls.builder.return_value = mock_builder
     
-    # Ensure init is called
+    # Ensure init is called with minimal Lark config
     db, graph, ex = mock_lark_deps
-    lark_app.init_lark_app(db, graph, ex)
+    fake_settings = MagicMock(
+        LARK_APP_ID="app_id",
+        LARK_APP_SECRET="app_secret",
+        LARK_CHAT_ID="chat_id",
+        LARK_DRIVE_FOLDER_TOKEN="",
+    )
+    with patch("src.utils.lark_app.get_settings", return_value=fake_settings):
+        lark_app.init_lark_app(db, graph, ex)
     
     # Verify the global was set to our mock
     assert lark_app.lark_api_client == mock_instance
@@ -47,13 +54,14 @@ def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
     
     mock_instance.im.v1.message.create.return_value = mock_resp
     
-    lark_app.send_approval_card(
-        email_id="123", 
-        draft="Hi", 
-        context=[], 
-        email_data={"subject": "Test"}, 
-        classification={}
-    )
+    with patch("src.utils.lark_app.get_settings", return_value=fake_settings):
+        lark_app.send_approval_card(
+            email_id="123",
+            draft="Hi",
+            context=[],
+            email_data={"subject": "Test"},
+            classification={},
+        )
     
     # Check calls
     mock_instance.im.v1.message.create.assert_called_once()
@@ -72,7 +80,14 @@ def test_update_card_ui(mock_client_cls, mock_lark_deps, mock_env):
     mock_client_cls.builder.return_value = mock_builder
 
     db, graph, ex = mock_lark_deps
-    lark_app.init_lark_app(db, graph, ex)
+    fake_settings = MagicMock(
+        LARK_APP_ID="app_id",
+        LARK_APP_SECRET="app_secret",
+        LARK_CHAT_ID="chat_id",
+        LARK_DRIVE_FOLDER_TOKEN="",
+    )
+    with patch("src.utils.lark_app.get_settings", return_value=fake_settings):
+        lark_app.init_lark_app(db, graph, ex)
     
     mock_resp = MagicMock()
     mock_resp.success.return_value = True

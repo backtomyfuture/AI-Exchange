@@ -65,7 +65,28 @@ async def lifespan(app: FastAPI):
 
 app.router.lifespan_context = lifespan
 
-if __name__ == "__main__":
-    # Run uvicorn server
+async def main():
+    """Entrypoint for tests: init components and run background loop."""
+    ctx = get_app_context()
+    await ctx.setup_async()
+    worker_loop = asyncio.get_running_loop()
+    lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=worker_loop)
+    lark_app.start_lark_ws()
+
+    exchange_task = asyncio.create_task(exchange_loop())
+    try:
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        exchange_task.cancel()
+        await asyncio.gather(exchange_task, return_exceptions=True)
+        await ctx.close()
+        raise
+
+
+def run_server():
+    """Entrypoint for CLI runtime."""
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    run_server()
 

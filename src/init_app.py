@@ -41,7 +41,7 @@ class AppContext:
         self.exchange_client = ExchangeClient(settings)
         self.email_processor = EmailProcessor()
         # Async DB Manager (initialized in setup_async)
-        self.db_manager = AsyncDatabaseManager()
+        self.db_manager = AsyncDatabaseManager(settings)
         
         # 2. Postgres Connection Pool for LangGraph Checkpointer
         dsn = f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
@@ -58,6 +58,9 @@ class AppContext:
         Explicitly open the async connection pool and setup graph.
         Must be called from within a running asyncio loop.
         """
+        if self.db_manager:
+            await self.db_manager.open()
+
         if self.pool:
             await self.pool.open()
             logger.info("AsyncConnectionPool opened.")

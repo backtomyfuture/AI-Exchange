@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     OPENAI_API_BASE: str = ""  # 与 .env 保持一致
     LLM_MODEL: str = "gemini-3-flash"
     LLM_RATE_LIMIT_DELAY: int = 10
+    LLM_MAX_RPM: float = 15.0
 
     # Embedding
     EMBEDDING_API_KEY: str = ""

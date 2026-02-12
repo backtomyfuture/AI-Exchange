@@ -26,9 +26,9 @@ def mock_state() -> AgentState:
     }
 
 @pytest.mark.asyncio
-@patch("src.nodes.retriever_node.EmailRetriever")
-async def test_retrieve_context(MockRetriever, mock_state):
-    mock_instance = MockRetriever.return_value
+@patch("src.nodes.retriever_node.get_retriever")
+async def test_retrieve_context(mock_get_retriever, mock_state):
+    mock_instance = mock_get_retriever.return_value
     mock_instance.search.return_value = [
         {"sender": "boss@example.com", "subject": "上次会议纪要", "body": "这是上次会议的纪要..."}
     ]

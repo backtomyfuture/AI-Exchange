@@ -1,8 +1,9 @@
-import os
-from langchain_openai import ChatOpenAI
+import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.graph.state import AgentState
-from src.utils.rate_limiter import llm_rate_limiter
+from src.utils.retry_decorator import with_llm_retry
+
+logger = logging.getLogger(__name__)
 
 async def generate_draft(state: AgentState) -> AgentState:
     """
@@ -27,6 +28,7 @@ async def generate_draft(state: AgentState) -> AgentState:
     prev_draft = state.get("draft")
 
     if feedback:
+        logger.info("Applying user feedback as final draft content.")
         # 用户在弹窗中直接修改了草稿。逻辑：
         # 弹窗输入 (feedback) 就是拟稿的全文正文。
         # 直接使用用户的版本作为新草稿，跳过 LLM 处理以确保 100% 忠于用户的编辑并提高响应速度。
@@ -61,19 +63,12 @@ async def generate_draft(state: AgentState) -> AgentState:
     ])
     chain = prompt | llm
     
-    from tenacity import retry, stop_after_attempt, wait_random_exponential
-    
-    @retry(
-        wait=wait_random_exponential(multiplier=2, max=120),
-        stop=stop_after_attempt(12),
-        reraise=True
-    )
+    @with_llm_retry(max_attempts=3)
     async def invoke_with_retry(payload):
-        # 在调用前获取全局限流许可
-        await llm_rate_limiter.acquire()
         return await chain.ainvoke(payload)
 
     try:
+        logger.info("Generating draft with LLM and retrieved context.")
         response = await invoke_with_retry({
             "context": context_str if context_str else "无相关历史背景",
             "sender": email.get("sender", ""),

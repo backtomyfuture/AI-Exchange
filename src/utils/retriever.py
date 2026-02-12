@@ -1,8 +1,6 @@
 import os
 import logging
-from typing import List, Optional
-from qdrant_client import QdrantClient, models
-from qdrant_client.http.exceptions import UnexpectedResponse
+from typing import List, Optional, Any
 from openai import OpenAI, APIError, APIConnectionError
 from dotenv import load_dotenv
 
@@ -22,7 +20,8 @@ class EmailRetriever:
         embedding_base_url: Optional[str] = None,
         embedding_model: Optional[str] = None
     ):
-        self.client = QdrantClient(url=qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333"))
+        self._qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
+        self.client: Optional[Any] = None
         self.collection_name = collection_name
 
         # Priority: explicit arg > ENV > default
@@ -34,6 +33,14 @@ class EmailRetriever:
             api_key=api_key
         )
         self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
+
+    def _get_client(self):
+        if self.client is None:
+            # Lazy import to avoid hard crash during module import in constrained envs.
+            from qdrant_client import QdrantClient
+
+            self.client = QdrantClient(url=self._qdrant_url)
+        return self.client
 
     def _get_embedding(self, text: str) -> List[float]:
         try:
@@ -66,6 +73,8 @@ class EmailRetriever:
         # 2. Build filter
         query_filter = None
         if sender:
+            from qdrant_client import models
+
             query_filter = models.Filter(
                 must=[
                     models.FieldCondition(
@@ -76,7 +85,8 @@ class EmailRetriever:
             )
 
         try:
-            search_result = self.client.query_points(
+            client = self._get_client()
+            search_result = client.query_points(
                 collection_name=self.collection_name,
                 query=query_vector,
                 query_filter=query_filter,
@@ -84,9 +94,24 @@ class EmailRetriever:
                 with_payload=True
             )
             return [hit.payload for hit in search_result.points]
-        except UnexpectedResponse as e:
+        except Exception as e:
+            # Keep broad handling to avoid hard dependency on qdrant exception classes.
+            if e.__class__.__name__ == "UnexpectedResponse":
+                logger.error(f"Qdrant search failed (unexpected response): {e}")
+                return []
+            if isinstance(e, ConnectionError):
+                logger.error(f"Qdrant connection error during search: {e}")
+                return []
             logger.error(f"Qdrant search failed (unexpected response): {e}")
             return []
-        except ConnectionError as e:
-            logger.error(f"Qdrant connection error during search: {e}")
-            return []
+
+
+_retriever_instance: Optional[EmailRetriever] = None
+
+
+def get_retriever() -> EmailRetriever:
+    """获取 EmailRetriever 全局单例。"""
+    global _retriever_instance
+    if _retriever_instance is None:
+        _retriever_instance = EmailRetriever()
+    return _retriever_instance

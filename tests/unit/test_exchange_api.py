@@ -32,9 +32,10 @@ async def test_get_recent_emails_with_items(mock_settings):
         mock_http_client = AsyncMock()
         mock_http_client_cls.return_value.__aenter__.return_value = mock_http_client
         
-        # Scenario: 
-        # Item 1: No body in list, needs detail fetch.
-        # Item 2: Has body in list, skips detail fetch.
+        # Scenario:
+        # Current implementation always fetches detail for each item.
+        # Item 1: detail overrides body.
+        # Item 2: detail is fetched as well.
         
         mock_list_resp = MagicMock()
         mock_list_resp.status_code = 200
@@ -48,22 +49,25 @@ async def test_get_recent_emails_with_items(mock_settings):
             }
         }
         
-        mock_detail_resp = MagicMock()
-        mock_detail_resp.status_code = 200
-        mock_detail_resp.json.return_value = {"code": 200, "data": {"id": "1", "subject": "Test 1", "body": "Fetched content"}}
+        mock_detail_resp_1 = MagicMock()
+        mock_detail_resp_1.status_code = 200
+        mock_detail_resp_1.json.return_value = {"code": 200, "data": {"id": "1", "subject": "Test 1", "body": "Fetched content"}}
+
+        mock_detail_resp_2 = MagicMock()
+        mock_detail_resp_2.status_code = 200
+        mock_detail_resp_2.json.return_value = {"code": 200, "data": {"id": "2", "subject": "Test 2", "body": "Load content"}}
         
-        # Sequence of return values for .get calls
-        # 1. List call
-        # 2. Detail call for ID 1
-        mock_http_client.get.side_effect = [mock_list_resp, mock_detail_resp]
+        # Sequence of return values for .get calls:
+        # 1) list, 2) detail(id=1), 3) detail(id=2)
+        mock_http_client.get.side_effect = [mock_list_resp, mock_detail_resp_1, mock_detail_resp_2]
         
         emails = await client.get_recent_emails()
         
         assert len(emails) == 2
         assert emails[0]["body"] == "Fetched content" # From detail fetch
-        assert emails[1]["body"] == "Load content"    # From list directly
+        assert emails[1]["body"] == "Load content"    # From detail fetch
         
-        assert mock_http_client.get.call_count == 2
+        assert mock_http_client.get.call_count == 3
 
 
 @pytest.mark.asyncio

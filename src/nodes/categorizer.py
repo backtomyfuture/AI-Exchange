@@ -1,12 +1,13 @@
 
-import os
+import logging
 from typing import Literal
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
-from src.utils.rate_limiter import llm_rate_limiter
+from src.utils.retry_decorator import with_llm_retry
+
+logger = logging.getLogger(__name__)
 
 class EmailClassification(BaseModel):
     """邮件分类结果的结构化定义"""
@@ -39,19 +40,9 @@ async def categorize_email(state: AgentState) -> AgentState:
     chain = prompt | llm | parser
 
     # 调用 LLM 进行分类
-    from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
-    import time
-    
-    @retry(
-        wait=wait_random_exponential(multiplier=2, max=120), # 更激进的等待
-        stop=stop_after_attempt(12), # 增加尝试次数
-        retry=retry_if_exception_type(Exception), # 可以更具体，但暂定捕获所有 LLM 异常
-        reraise=True
-    )
+    @with_llm_retry(max_attempts=3)
     async def invoke_with_retry(payload):
-        # 在调用前获取全局限流许可
-        await llm_rate_limiter.acquire()
-        return await chain.ainvoke(payload) # 使用异步调用
+        return await chain.ainvoke(payload)
 
     try:
         # Expected result is a dict because parser converts it
@@ -60,14 +51,15 @@ async def categorize_email(state: AgentState) -> AgentState:
         
         result = await invoke_with_retry({"subject": subject, "body": body, "image_info": image_info})
         classification_result = EmailClassification(**result)
-        print(f"Classification success: {classification_result}")
+        logger.info(f"Classification success: {classification_result}")
     except Exception as e:
-        print(f"Classification failed (Parsing Error or Max Retries): {e}")
+        logger.error(f"Classification failed (Parsing Error or Max Retries): {e}")
         # Fallback default
         classification_result = EmailClassification(
             priority="P3", 
             need_reply=False, 
             intent="通知", 
+            summary=subject or "分类失败，已降级处理",
             reasoning=f"Auto-fallback due to error: {str(e)[:50]}"
         )
 

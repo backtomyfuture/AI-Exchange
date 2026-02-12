@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,6 @@ class AsyncRateLimiter:
                 self.last_request_time = current_time
 
 # 全局单例
-# 默认为 15 RPM (Gemini Flash Free Tier limit)
-import os
-default_rpm = float(os.getenv("LLM_MAX_RPM", "12")) # 保守起见设为 12
+_settings = get_settings()
+default_rpm = float(getattr(_settings, "LLM_MAX_RPM", 15.0))
 llm_rate_limiter = AsyncRateLimiter(default_rpm)

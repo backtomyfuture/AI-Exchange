@@ -1,6 +1,6 @@
 import asyncio
 from src.graph.state import AgentState
-from src.utils.retriever import EmailRetriever
+from src.utils.retriever import get_retriever
 
 async def retrieve_context(state: AgentState) -> AgentState:
     """
@@ -14,7 +14,7 @@ async def retrieve_context(state: AgentState) -> AgentState:
 
     query_text = f"Subject: {subject}\nBody: {body[:500]}"
 
-    retriever = EmailRetriever()
+    retriever = get_retriever()
 
     # 使用 to_thread 避免阻塞 asyncio 事件循环
     results = await asyncio.to_thread(
