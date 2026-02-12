@@ -112,6 +112,19 @@ class LarkCardBuilder:
         self.exchange_client = exchange_client
         self._user_cache: Dict[str, Dict[str, str]] = {}
 
+    @staticmethod
+    def _normalize_pdf_url(pdf_url: Any) -> Optional[str]:
+        """Support both string URL and {'url': ..., 'file_token': ...} payload."""
+        if not pdf_url:
+            return None
+        if isinstance(pdf_url, str):
+            return pdf_url.strip() or None
+        if isinstance(pdf_url, dict):
+            url = pdf_url.get("url")
+            if isinstance(url, str) and url.strip():
+                return url.strip()
+        return None
+
     def lookup_lark_users(self, emails: List[str]) -> Dict[str, Dict[str, str]]:
         """
         Lookup Lark User IDs by email prefix strategy.
@@ -415,11 +428,12 @@ class LarkCardBuilder:
         elements.append({"tag": "hr"})
 
         logger.info(f"Build Card Debug: Sender={raw_sender}, To={email_data.get('to')}, Cc={cc_list}, PDF={pdf_url}")
+        resolved_pdf_url = self._normalize_pdf_url(pdf_url)
 
         # Original email summary
         header_text = "**📄 原始邮件摘要:**"
-        if pdf_url:
-            header_text = f"**📄 原始邮件摘要:** ([📄 查看完整原文 (PDF)]({pdf_url}))"
+        if resolved_pdf_url:
+            header_text = f"**📄 原始邮件摘要:** ([📄 查看完整原文 (PDF)]({resolved_pdf_url}))"
         
         # Use div+lark_md instead of bare markdown tag for better link support
         elements.append({
@@ -616,10 +630,12 @@ class LarkCardBuilder:
         # Debug logging for recipients
         logger.info(f"Build Read-Only Card: Sender={raw_sender}, To={email_data.get('to')}, Subject={subject}, PDF={pdf_url}")
 
+        resolved_pdf_url = self._normalize_pdf_url(pdf_url)
+
         # Original email summary
         header_text = "**📄 邮件内容摘要:**"
-        if pdf_url:
-            header_text = f"**📄 邮件内容摘要:** ([📄 查看完整原文 (PDF)]({pdf_url}))"
+        if resolved_pdf_url:
+            header_text = f"**📄 邮件内容摘要:** ([📄 查看完整原文 (PDF)]({resolved_pdf_url}))"
         
         elements.append({
             "tag": "div",

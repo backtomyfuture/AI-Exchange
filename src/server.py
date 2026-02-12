@@ -105,6 +105,17 @@ async def exchange_webhook(request: Request):
 
     try:
         result = await enqueue_exchange_webhook(payload, header_event=header_event)
+        logger.info(
+            "Exchange webhook routed: event_header=%s event_payload=%s item_id=%s parent_folder_id=%s queued=%s reason=%s route=%s folder=%s",
+            header_event,
+            payload.get("event_type") or payload.get("event"),
+            payload.get("item_id"),
+            payload.get("parent_folder_id"),
+            result.get("queued"),
+            result.get("reason"),
+            result.get("route"),
+            result.get("folder"),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

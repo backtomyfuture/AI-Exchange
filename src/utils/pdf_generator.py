@@ -65,12 +65,8 @@ def convert_html_to_pdf(html_content: str) -> bytes:
         font_config = FontConfiguration()
         
         css_string = """
-            @font-face {
-                font-family: 'Arial Unicode MS';
-                src: local('Arial Unicode MS');
-            }
-            body { 
-                font-family: 'Noto Sans CJK SC', 'Noto Sans SC', 'Arial Unicode MS', 'Microsoft YaHei', sans-serif; 
+            body {
+                font-family: 'Noto Sans CJK SC', 'Noto Sans CJK JP', 'Noto Sans CJK TC', sans-serif;
                 font-size: 14px;
                 line-height: 1.5;
                 margin: 0;
@@ -125,7 +121,6 @@ def convert_html_to_pdf(html_content: str) -> bytes:
                 word-wrap: break-word;
             }
         """
-        
         # 转换 HTML 到 PDF 字节流
         pdf_bytes = HTML(string=html_content).write_pdf(
             stylesheets=[CSS(string=css_string, font_config=font_config)],

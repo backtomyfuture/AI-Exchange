@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import re
 from src.init_app import get_app_context
 from src.utils import lark_app
 
@@ -165,6 +166,15 @@ async def _worker_loop():
                 full_details = await _worker_ctx.exchange_client.get_email(email_id)
                 if full_details:
                     email_data.update(full_details)
+                else:
+                    # If detail fetch fails (404/stale/malformed id), skip processing to
+                    # avoid generating drafts/cards and avoid malformed mark-as-read calls.
+                    logger.warning(
+                        "Skip webhook event because detail fetch failed (id=%s, event=%s).",
+                        email_id,
+                        email_data.get("_event_type", "unknown"),
+                    )
+                    continue
 
             await process_and_archive_email(email_data, _worker_ctx, skip_analysis)
         except Exception as e:
@@ -203,7 +213,15 @@ def _extract_id(raw) -> str | None:
     if isinstance(raw, dict):
         return raw.get("id")
     if isinstance(raw, str):
-        return raw
+        raw_str = raw.strip()
+        if not raw_str:
+            return None
+        # Handle object-like string repr:
+        # ItemId(id='xxx', changekey='...') / ParentFolderId(id='xxx', ...)
+        match = re.search(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", raw_str)
+        if match:
+            return match.group(1)
+        return raw_str
     return None
 
 

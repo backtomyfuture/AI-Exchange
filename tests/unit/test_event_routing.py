@@ -191,3 +191,29 @@ async def test_folder_cache_empty_fallback():
 
         assert result["queued"] is True
         assert result["route"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_event_ids_in_object_like_string_are_parsed():
+    from src.exchange_service import enqueue_webhook_event
+
+    mock_ctx = MagicMock()
+    mock_ctx.exchange_client = _make_exchange_client_mock()
+
+    with patch("src.exchange_service._worker_ctx", mock_ctx), patch(
+        "src.exchange_service._webhook_queue", asyncio.Queue()
+    ) as q:
+        result = await enqueue_webhook_event(
+            {
+                "event_type": "NewMailEvent",
+                "item_id": "ItemId(id='EMAIL_004', changekey='CQAAAA==')",
+                "parent_folder_id": "ParentFolderId(id='INBOX_FOLDER_ID', changekey='AQAAAA==')",
+            }
+        )
+
+        assert result["queued"] is True
+        assert result["route"] == "full"
+        email_data, skip = await q.get()
+        assert email_data["id"] == "EMAIL_004"
+        assert email_data["_parent_folder_id"] == "INBOX_FOLDER_ID"
+        assert skip is False
