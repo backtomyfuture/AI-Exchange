@@ -1,10 +1,8 @@
 import httpx
-import os
 import re
+import logging
 from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
-
-load_dotenv()
+logger = logging.getLogger("ExchangeClient")
 
 class ExchangeClient:
     """
@@ -22,6 +20,159 @@ class ExchangeClient:
 
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
+
+        # --- Folder cache for webhook routing ---
+        self._folder_cache: dict | None = None
+        self._folder_tree: dict | None = None
+        self._folder_policies: dict | None = None
+        self.sentitems_folder_id: str | None = None
+        self.drafts_folder_id: str | None = None
+        self._sentitems_name = getattr(settings, "EXCHANGE_FOLDER_SENTITEMS", "已发送邮件")
+        self._drafts_name = getattr(settings, "EXCHANGE_FOLDER_DRAFTS", "草稿")
+
+    async def get_all_folders(self, force_refresh: bool = False) -> dict:
+        """
+        Fetch all folders and build in-memory cache/tree.
+
+        Endpoint:
+            GET {api_url}/folders/all?account_id=...
+        """
+        if self._folder_cache is not None and not force_refresh:
+            return self._folder_cache
+
+        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
+        endpoint = f"{self.api_url}/folders/all"
+        params = {"account_id": self.account_id}
+
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
+            try:
+                response = await client.get(
+                    endpoint,
+                    params=params,
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if response.status_code == 200:
+                    folders = response.json().get("data", {}).get("folders", [])
+                    self._build_folder_cache(folders)
+                    logger.info(
+                        "Folder cache loaded: %s folders. sentitems=%s, drafts=%s",
+                        len(self._folder_cache),
+                        self.sentitems_folder_id,
+                        self.drafts_folder_id,
+                    )
+                    return self._folder_cache
+                logger.error("Failed to get folders: %s", response.status_code)
+            except Exception as e:
+                logger.error("Exception getting folders: %s", e)
+
+        self._folder_cache = {}
+        self._folder_tree = {}
+        return self._folder_cache
+
+    def _build_folder_cache(self, folders: list) -> None:
+        """Build folder_id->name mapping and parent-child tree."""
+        self._folder_cache = {}
+        self._folder_tree = {}
+        self.sentitems_folder_id = None
+        self.drafts_folder_id = None
+
+        for folder in folders:
+            folder_id = folder.get("id")
+            folder_name = folder.get("name", "")
+            parent_id = folder.get("parent_id")
+            if not folder_id:
+                continue
+
+            self._folder_cache[folder_id] = folder_name
+            self._folder_tree[folder_id] = {
+                "name": folder_name,
+                "parent_id": parent_id,
+                "children": [],
+                "folder_class": folder.get("folder_class", ""),
+            }
+
+            if folder_name == self._sentitems_name:
+                self.sentitems_folder_id = folder_id
+            elif folder_name == self._drafts_name:
+                self.drafts_folder_id = folder_id
+
+        for folder_id, node in self._folder_tree.items():
+            parent_id = node["parent_id"]
+            if parent_id and parent_id in self._folder_tree:
+                self._folder_tree[parent_id]["children"].append(folder_id)
+
+    def compute_folder_policies(
+        self,
+        folders_full: set[str],
+        folders_archive: set[str],
+    ) -> dict[str, str]:
+        """
+        Compute per-folder policy with explicit override + ancestor inheritance.
+        """
+        if not self._folder_tree:
+            return {}
+
+        policies: dict[str, str] = {}
+
+        def _ancestor_names(folder_id: str) -> list[str]:
+            names = []
+            current = folder_id
+            visited = set()
+            while current and current in self._folder_tree and current not in visited:
+                visited.add(current)
+                parent_id = self._folder_tree[current]["parent_id"]
+                if parent_id and parent_id in self._folder_tree:
+                    names.append(self._folder_tree[parent_id]["name"])
+                current = parent_id
+            return names
+
+        for folder_id, node in self._folder_tree.items():
+            name = node["name"]
+
+            if name in folders_archive:
+                policies[folder_id] = "archive"
+                continue
+            if name in folders_full:
+                policies[folder_id] = "full"
+                continue
+
+            inherited = "ignore"
+            for ancestor_name in _ancestor_names(folder_id):
+                if ancestor_name in folders_full:
+                    inherited = "full"
+                    break
+                if ancestor_name in folders_archive:
+                    inherited = "archive"
+                    break
+
+            policies[folder_id] = inherited
+
+        return policies
+
+    def init_folder_policies(self, folders_full: set[str], folders_archive: set[str]) -> None:
+        """Precompute and cache folder policy map."""
+        self._folder_policies = self.compute_folder_policies(folders_full, folders_archive)
+        full_count = sum(1 for v in self._folder_policies.values() if v == "full")
+        archive_count = sum(1 for v in self._folder_policies.values() if v == "archive")
+        logger.info(
+            "Folder policies computed: %s full, %s archive, %s ignore",
+            full_count,
+            archive_count,
+            len(self._folder_policies) - full_count - archive_count,
+        )
+
+    def get_folder_policy(self, folder_id: str | None) -> str:
+        """Get precomputed policy for folder_id, fallback to ignore."""
+        if not folder_id or not self._folder_policies:
+            return "ignore"
+        return self._folder_policies.get(folder_id, "ignore")
+
+    def get_folder_name(self, folder_id: str | None) -> str | None:
+        """Resolve folder name from cache by folder_id."""
+        if not folder_id or not self._folder_cache:
+            return None
+        return self._folder_cache.get(folder_id)
 
     async def get_recent_emails(self, limit: int = 10, exclude_ids: List[str] = None) -> List[Dict[str, Any]]:
         """
@@ -45,20 +196,24 @@ class ExchangeClient:
             try:
                 # 1. 获取列表
                 list_url = f"{self.api_url}/list"
-                print(f"正在拉取邮件列表: {list_url} (params: {params})")
+                logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
 
                 response = await client.get(list_url, params=params, headers=headers, timeout=10.0)
                 if response.status_code != 200:
-                    print(f"列表获取失败: {response.status_code} - {response.text}")
+                    logger.error("列表获取失败: %s - %s", response.status_code, response.text)
                     return []
 
                 data = response.json()
                 # 打印原始数据结构以供调试
-                print(f"列表接口返回数据状态: {data.get('code')}, 消息: {data.get('message')}")
+                logger.info(
+                    "列表接口返回数据状态: %s, 消息: %s",
+                    data.get("code"),
+                    data.get("message"),
+                )
 
                 items = data.get("data", {}).get("items", [])
                 if not items:
-                    print("目前没有未读邮件。")
+                    logger.info("目前没有未读邮件。")
 
                 full_emails = []
                 from urllib.parse import quote
@@ -82,7 +237,7 @@ class ExchangeClient:
                     detail_url = f"{self.api_url}/{encoded_id}"
 
                     try:
-                        print(f"正在请求详情: {detail_url}")
+                        logger.info("正在请求详情: %s", detail_url)
                         detail_resp = await client.get(
                             detail_url,
                             params={"account_id": self.account_id},
@@ -97,17 +252,22 @@ class ExchangeClient:
                                     detail_data["id"] = email_id
                                 full_emails.append(detail_data)
                             else:
-                                print(f"警告: 邮件详情为空 (ID: {email_id})")
+                                logger.warning("邮件详情为空 (ID: %s)", email_id)
                         else:
-                            print(f"详情获取失败 (ID: {email_id}): {detail_resp.status_code} - {detail_resp.text}")
+                            logger.error(
+                                "详情获取失败 (ID: %s): %s - %s",
+                                email_id,
+                                detail_resp.status_code,
+                                detail_resp.text,
+                            )
                     except Exception as detail_err:
-                        print(f"请求详情异常 (ID: {email_id}): {detail_err}")
+                        logger.error("请求详情异常 (ID: %s): %s", email_id, detail_err)
 
                 if full_emails:
-                    print(f"成功获取 {len(full_emails)} 封邮件的完整详情")
+                    logger.info("成功获取 %s 封邮件的完整详情", len(full_emails))
                 return full_emails
             except Exception as e:
-                print(f"获取邮件异常: {e}")
+                logger.error("获取邮件异常: %s", e)
                 return []
 
     async def send_email(self, to: str, subject: str, body: str) -> bool:
@@ -143,7 +303,7 @@ class ExchangeClient:
 
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
-                print(f"正在请求保存草稿接口: {endpoint}")
+                logger.info("正在请求保存草稿接口: %s", endpoint)
                 response = await client.post(
                     endpoint,
                     json=payload,
@@ -155,9 +315,9 @@ class ExchangeClient:
                 # print(f"Draft saved response: {response.json()}")
                 return True
             except Exception as e:
-                print(f"保存草稿失败: {e}")
+                logger.error("保存草稿失败: %s", e)
                 if hasattr(e, 'response') and e.response:
-                    print(f"Server response: {e.response.text}")
+                    logger.error("Server response: %s", e.response.text)
                 return False
 
     async def _send_payload(self, to: str, subject: str, body: str, is_draft: bool = False) -> bool:
@@ -195,7 +355,7 @@ class ExchangeClient:
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 action = "保存草稿" if is_draft else "发送邮件"
-                print(f"正在请求{action}接口: {endpoint}")
+                logger.info("正在请求%s接口: %s", action, endpoint)
                 response = await client.post(
                     endpoint,
                     json=payload,
@@ -206,13 +366,13 @@ class ExchangeClient:
                     # Fallback: maybe specific param on send?
                     # For now, let's just log and fail gracefully or try 'save=true' on send endpoint if known.
                     # But distinct endpoint is cleaner design to assume first.
-                    print(f"Draft endpoint 404. {response.text}")
+                    logger.warning("Draft endpoint 404. %s", response.text)
                     return False
                     
                 response.raise_for_status()
                 return True
             except Exception as e:
-                print(f"{action}失败: {e}")
+                logger.error("%s失败: %s", action, e)
                 return False
 
     async def mark_as_read(self, email_id: str, is_read: bool = True) -> bool:
@@ -240,10 +400,15 @@ class ExchangeClient:
                     return data.get('code') == 200
                 else:
                     # Log as warning rather than error to avoid panic if object ID is stale
-                    print(f"WARNING: Mark as read failed (ID: {email_id}): {response.status_code} - {response.text}")
+                    logger.warning(
+                        "Mark as read failed (ID: %s): %s - %s",
+                        email_id,
+                        response.status_code,
+                        response.text,
+                    )
                     return False
             except Exception as e:
-                print(f"Failed to mark email {email_id} as read: {e}")
+                logger.error("Failed to mark email %s as read: %s", email_id, e)
                 return False
 
     async def move_email(self, email_id: str, folder_id: str) -> bool:
@@ -259,7 +424,7 @@ class ExchangeClient:
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=5.0)
                 return response.status_code == 200
             except Exception as e:
-                print(f"Failed to move email {email_id} to {folder_id}: {e}")
+                logger.error("Failed to move email %s to %s: %s", email_id, folder_id, e)
                 return False
 
     async def delete_email(self, email_id: str) -> bool:
@@ -274,7 +439,7 @@ class ExchangeClient:
                 response = await client.delete(endpoint, headers=headers, timeout=5.0)
                 return response.status_code == 200
             except Exception as e:
-                print(f"Failed to delete email {email_id}: {e}")
+                logger.error("Failed to delete email %s: %s", email_id, e)
                 return False
 
     async def get_email(self, email_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
@@ -298,9 +463,13 @@ class ExchangeClient:
                 if response.status_code == 200:
                     return response.json().get("data", {})
                 else:
-                    print(f"Failed to get email details for {email_id}: {response.status_code}")
+                    logger.error(
+                        "Failed to get email details for %s: %s",
+                        email_id,
+                        response.status_code,
+                    )
             except Exception as e:
-                print(f"Exception getting email {email_id}: {e}")
+                logger.error("Exception getting email %s: %s", email_id, e)
         return {}
 
     async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
@@ -323,15 +492,15 @@ class ExchangeClient:
 
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
-                print(f"正在请求回复接口: {endpoint}")
+                logger.info("正在请求回复接口: %s", endpoint)
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
                 if response.status_code == 200:
                     return response.json().get("code") == 200
                 else:
-                    print(f"Reply failed: {response.status_code} - {response.text}")
+                    logger.error("Reply failed: %s - %s", response.status_code, response.text)
                     return False
             except Exception as e:
-                print(f"Reply exception: {e}")
+                logger.error("Reply exception: %s", e)
                 return False
 
     async def resolve_contact(self, query: str) -> Optional[str]:
@@ -372,9 +541,13 @@ class ExchangeClient:
                         # Return the first match's name
                         return data["data"][0].get("name")
                 else:
-                    print(f"Contact resolve failed for '{query}': {response.status_code}")
+                    logger.warning(
+                        "Contact resolve failed for '%s': %s",
+                        query,
+                        response.status_code,
+                    )
             except Exception as e:
-                print(f"Contact resolve exception for '{query}': {e}")
+                logger.error("Contact resolve exception for '%s': %s", query, e)
         
         return None
 
@@ -395,13 +568,13 @@ class ExchangeClient:
 
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
-                print(f"正在请求转发接口: {endpoint}")
+                logger.info("正在请求转发接口: %s", endpoint)
                 response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
                 if response.status_code == 200:
                     return response.json().get("code") == 200
                 else:
-                    print(f"Forward failed: {response.status_code} - {response.text}")
+                    logger.error("Forward failed: %s - %s", response.status_code, response.text)
                     return False
             except Exception as e:
-                print(f"Forward exception: {e}")
+                logger.error("Forward exception: %s", e)
                 return False

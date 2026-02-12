@@ -25,6 +25,11 @@ def _get_app_context():
     return get_app_context()
 
 
+def get_app_context():
+    """Backward-compatible alias for tests and legacy imports."""
+    return _get_app_context()
+
+
 async def enqueue_exchange_webhook(
     payload: Dict[str, Any],
     header_event: Optional[str] = None,
@@ -43,7 +48,7 @@ async def health_check():
     服务健康检查 endpoint，用于 Docker healthcheck 和外部监控。
     """
     try:
-        ctx = _get_app_context()
+        ctx = get_app_context()
         
         checks = {
             "db_pool": ctx.pool is not None and not getattr(ctx.pool, 'closed', True),
@@ -172,7 +177,7 @@ async def view_email(email_id: str):
     """
     Serve the email content as Outlook-style HTML.
     """
-    app_ctx = _get_app_context()
+    app_ctx = get_app_context()
     
     # 1. Try to get state from Graph
     if not app_ctx.graph:

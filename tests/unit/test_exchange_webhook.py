@@ -16,7 +16,7 @@ def _build_signed_body(payload: dict, secret: str) -> tuple[bytes, str]:
 
 def test_exchange_webhook_missing_signature_returns_400():
     client = TestClient(app)
-    payload = {"event_type": "NewMailEvent", "item_id": "AAMkAGQ"}
+    payload = {"event_type": "NewMailEvent", "item_id": {"id": "AAMkAGQ"}}
 
     with patch("src.server.get_settings") as mock_settings:
         mock_settings.return_value = MagicMock(EXCHANGE_WEBHOOK_SECRET="test-secret")
@@ -28,7 +28,7 @@ def test_exchange_webhook_missing_signature_returns_400():
 
 def test_exchange_webhook_invalid_signature_returns_403():
     client = TestClient(app)
-    payload = {"event_type": "NewMailEvent", "item_id": "AAMkAGQ"}
+    payload = {"event_type": "NewMailEvent", "item_id": {"id": "AAMkAGQ"}}
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     with patch("src.server.get_settings") as mock_settings:
@@ -52,11 +52,11 @@ def test_exchange_webhook_valid_signature_enqueues_event():
         "event": "NewMailEvent",
         "event_type": "NewMailEvent",
         "account_id": 1,
-        "item_id": "AAMkAGQ",
+        "item_id": {"id": "AAMkAGQ", "changekey": "CQAAABYAAAB"},
+        "parent_folder_id": {"id": "INBOX", "changekey": "AQAAABYAAAB"},
         "subject": "测试邮件",
         "sender": "sender@example.com",
         "received_time": "2023-10-27T10:00:00",
-        "folder_id": "INBOX",
     }
     body, signature = _build_signed_body(payload, "test-secret")
 

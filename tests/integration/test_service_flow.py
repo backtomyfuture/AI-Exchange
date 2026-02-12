@@ -77,8 +77,8 @@ async def test_process_flow_skip_analysis(mock_context):
     
     # Mark as archived
     mock_context.db_manager.update_status.assert_any_call("msg_2", "archived")
-    # Mark as read
-    mock_context.exchange_client.mark_as_read.assert_called()
+    # Archive-only path should not mark sent/archive items as read
+    mock_context.exchange_client.mark_as_read.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_process_flow_duplicate_email(mock_context):

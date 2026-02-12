@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     EXCHANGE_ACCOUNT_EMAIL: str = "" # Identify "Me"
     EXCHANGE_SSL_VERIFY: bool = False
     EXCHANGE_WEBHOOK_SECRET: str = ""
+    EXCHANGE_FOLDERS_FULL: str = "收件箱"
+    EXCHANGE_FOLDERS_ARCHIVE: str = ""
+    EXCHANGE_FOLDER_SENTITEMS: str = "已发送邮件"
+    EXCHANGE_FOLDER_DRAFTS: str = "草稿"
 
     # Lark
     LARK_APP_ID: str = ""

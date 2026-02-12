@@ -111,30 +111,45 @@ async def _mark_email_read(email_id: str, ctx) -> None:
 
 
 async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False):
-    """Process a single email: Ingest -> Analyze -> Notify -> Archive."""
+    """
+    Process a single email based on route decision.
+
+    - skip_analysis=False: upload -> ingest -> AI -> notify -> mark_read
+    - skip_analysis=True: ingest only -> mark archived (no upload/AI/notify/mark_read)
+    """
     thread_id = email_data.get("id", str(time.time()))
     config = {"configurable": {"thread_id": thread_id}}
-    logger.info(f"Starting processing for email: {thread_id} - {email_data.get('subject')} (skip_analysis={skip_analysis})")
-    await _upload_attachments_to_lark(email_data)
+    event_type = email_data.get("_event_type", "unknown")
+    folder_name = email_data.get("_parent_folder_name", "unknown")
+    logger.info(
+        "Starting processing for email: %s - %s (event=%s, folder=%s, skip_analysis=%s)",
+        thread_id,
+        email_data.get("subject"),
+        event_type,
+        folder_name,
+        skip_analysis,
+    )
 
     is_new = await ctx.db_manager.log_initial_email(email_data)
     if not is_new:
-        logger.info(f"Email {thread_id} already exists in DB.")
-        await _mark_email_read(thread_id, ctx)
+        logger.info("Email %s already exists in DB.", thread_id)
+        if not skip_analysis:
+            await _mark_email_read(thread_id, ctx)
         return
 
-    logger.info(f"Email {thread_id} logged to DB as 'pending'.")
-    await _ingest_to_qdrant(thread_id, email_data, ctx)
+    logger.info("Email %s logged to DB as 'pending'.", thread_id)
 
     if skip_analysis:
-        logger.info(f"Skipping AI analysis for email: {thread_id}")
+        await _ingest_to_qdrant(thread_id, email_data, ctx)
         await ctx.db_manager.update_status(thread_id, "archived")
+        logger.info("Email %s archived (Qdrant only, event=%s).", thread_id, event_type)
     else:
+        await _upload_attachments_to_lark(email_data)
+        await _ingest_to_qdrant(thread_id, email_data, ctx)
         pipeline_result = await _run_ai_pipeline(thread_id, email_data, ctx, config)
         if pipeline_result is not None:
             await _dispatch_notification(thread_id, pipeline_result, ctx, config)
-
-    await _mark_email_read(thread_id, ctx)
+        await _mark_email_read(thread_id, ctx)
 
 async def _worker_loop():
     """Webhook-driven background worker. No polling/sync logic."""
@@ -183,26 +198,93 @@ async def stop_worker():
     _webhook_queue = None
 
 
+def _extract_id(raw) -> str | None:
+    """Safely extract ID from nested EWS objects or plain strings."""
+    if isinstance(raw, dict):
+        return raw.get("id")
+    if isinstance(raw, str):
+        return raw
+    return None
+
+
 async def enqueue_webhook_event(payload: dict, header_event: str | None = None) -> dict:
     """
-    Convert webhook payload to queue task and enqueue.
+    Route webhook event by event type + folder policy and enqueue.
     """
     if _webhook_queue is None:
         raise RuntimeError("Exchange worker is not running")
 
     event_type = header_event or payload.get("event_type") or payload.get("event")
-    if event_type and event_type not in {"NewMailEvent", "CreatedEvent"}:
-        return {"queued": False, "ignored": True, "event_type": event_type}
+    if event_type not in {"NewMailEvent", "CreatedEvent"}:
+        return {"queued": False, "reason": "unsupported_event", "event_type": event_type}
 
-    email_id = payload.get("item_id") or payload.get("id")
+    email_id = _extract_id(payload.get("item_id")) or _extract_id(payload.get("id"))
+    parent_folder_id = _extract_id(payload.get("parent_folder_id"))
     if not email_id:
-        raise ValueError("Missing item_id in webhook payload")
+        logger.debug("Ignoring event %s: no item_id", event_type)
+        return {"queued": False, "reason": "no_item_id", "event_type": event_type}
+
+    exchange_client = _worker_ctx.exchange_client if _worker_ctx else None
+    folder_name = exchange_client.get_folder_name(parent_folder_id) if exchange_client else None
+
+    route = None
+    skip_analysis = False
+
+    if event_type == "NewMailEvent":
+        folder_policies = getattr(exchange_client, "_folder_policies", None) if exchange_client else None
+        if folder_policies:
+            policy = exchange_client.get_folder_policy(parent_folder_id)
+        else:
+            policy = "full"
+            logger.warning("Folder policies not loaded; defaulting %s to full pipeline", email_id)
+
+        if policy == "full":
+            route = "full"
+            skip_analysis = False
+        elif policy == "archive":
+            route = "archive"
+            skip_analysis = True
+        else:
+            return {
+                "queued": False,
+                "reason": "folder_not_in_whitelist",
+                "folder": folder_name or parent_folder_id,
+            }
+    else:  # CreatedEvent
+        if exchange_client and parent_folder_id == exchange_client.sentitems_folder_id:
+            route = "archive"
+            skip_analysis = True
+        elif exchange_client and parent_folder_id == exchange_client.drafts_folder_id:
+            return {"queued": False, "reason": "drafts_ignored"}
+        else:
+            return {
+                "queued": False,
+                "reason": "created_other_ignored",
+                "folder": folder_name or parent_folder_id,
+            }
 
     email_data = payload.get("item") if isinstance(payload.get("item"), dict) else {}
     email_data.setdefault("id", email_id)
     email_data.setdefault("subject", payload.get("subject", ""))
     email_data.setdefault("sender", payload.get("sender", ""))
     email_data.setdefault("received_at", payload.get("received_time", ""))
+    email_data["_parent_folder_id"] = parent_folder_id
+    email_data["_parent_folder_name"] = folder_name
+    email_data["_event_type"] = event_type
 
-    await _webhook_queue.put((email_data, False))
-    return {"queued": True, "email_id": email_id, "queue_size": _webhook_queue.qsize()}
+    await _webhook_queue.put((email_data, skip_analysis))
+    logger.info(
+        "Enqueued %s [%s]: %s (folder=%s, skip_analysis=%s)",
+        event_type,
+        route,
+        email_id,
+        folder_name or "unknown",
+        skip_analysis,
+    )
+    return {
+        "queued": True,
+        "email_id": email_id,
+        "route": route,
+        "folder": folder_name,
+        "queue_size": _webhook_queue.qsize(),
+    }

@@ -64,6 +64,28 @@ class AppContext:
         if self.pool:
             await self.pool.open()
             logger.info("AsyncConnectionPool opened.")
+
+        # Initialize folder cache and precompute folder policies for webhook routing.
+        try:
+            await self.exchange_client.get_all_folders()
+            settings = get_settings()
+            folders_full = {
+                folder.strip()
+                for folder in settings.EXCHANGE_FOLDERS_FULL.split(",")
+                if folder.strip()
+            }
+            folders_archive = {
+                folder.strip()
+                for folder in settings.EXCHANGE_FOLDERS_ARCHIVE.split(",")
+                if folder.strip()
+            }
+            self.exchange_client.init_folder_policies(folders_full, folders_archive)
+            logger.info("Exchange folder cache and routing policies initialized.")
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize folder cache (will use safe defaults): %s",
+                e,
+            )
         
         if self.graph is None:
             checkpointer = AsyncPostgresSaver(self.pool)

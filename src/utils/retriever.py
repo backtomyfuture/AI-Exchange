@@ -8,6 +8,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Keep patchable symbols for tests while retaining lazy import behavior.
+QdrantClient = None
+models = None
+
 class EmailRetriever:
     """
     Email retrieval utility class, responsible for searching relevant historical emails from Qdrant.
@@ -22,6 +26,8 @@ class EmailRetriever:
     ):
         self._qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
         self.client: Optional[Any] = None
+        # Capture patchable class at construction time for test compatibility.
+        self._qdrant_client_cls = QdrantClient
         self.collection_name = collection_name
 
         # Priority: explicit arg > ENV > default
@@ -37,9 +43,12 @@ class EmailRetriever:
     def _get_client(self):
         if self.client is None:
             # Lazy import to avoid hard crash during module import in constrained envs.
-            from qdrant_client import QdrantClient
+            qdrant_cls = self._qdrant_client_cls
+            if qdrant_cls is None:
+                from qdrant_client import QdrantClient as qdrant_cls_import
 
-            self.client = QdrantClient(url=self._qdrant_url)
+                qdrant_cls = qdrant_cls_import
+            self.client = qdrant_cls(url=self._qdrant_url)
         return self.client
 
     def _get_embedding(self, text: str) -> List[float]:
@@ -73,13 +82,17 @@ class EmailRetriever:
         # 2. Build filter
         query_filter = None
         if sender:
-            from qdrant_client import models
+            qdrant_models = models
+            if qdrant_models is None:
+                from qdrant_client import models as qdrant_models_import
 
-            query_filter = models.Filter(
+                qdrant_models = qdrant_models_import
+
+            query_filter = qdrant_models.Filter(
                 must=[
-                    models.FieldCondition(
+                    qdrant_models.FieldCondition(
                         key="sender",
-                        match=models.MatchValue(value=sender)
+                        match=qdrant_models.MatchValue(value=sender)
                     )
                 ]
             )
@@ -103,6 +116,39 @@ class EmailRetriever:
                 logger.error(f"Qdrant connection error during search: {e}")
                 return []
             logger.error(f"Qdrant search failed (unexpected response): {e}")
+            return []
+
+    def search_by_thread(self, thread_id: str, limit: int = 20) -> List[dict]:
+        """Search all emails in the same conversation thread."""
+        if not thread_id:
+            return []
+
+        qdrant_models = models
+        if qdrant_models is None:
+            from qdrant_client import models as qdrant_models_import
+
+            qdrant_models = qdrant_models_import
+
+        query_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="thread_id",
+                    match=qdrant_models.MatchValue(value=thread_id),
+                )
+            ]
+        )
+
+        try:
+            client = self._get_client()
+            points, _ = client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return [point.payload for point in points]
+        except Exception as e:
+            logger.error(f"Thread search failed for {thread_id}: {e}")
             return []
 
 

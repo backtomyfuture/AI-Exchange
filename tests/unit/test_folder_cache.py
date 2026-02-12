@@ -1,0 +1,179 @@
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+MOCK_FOLDERS_RESPONSE = {
+    "code": 200,
+    "msg": "success",
+    "data": {
+        "folders": [
+            {
+                "id": "ROOT_ID",
+                "name": "Top of Information Store",
+                "parent_id": None,
+                "folder_class": "IPF.Note",
+                "total_count": 0,
+                "unread_count": 0,
+                "child_folder_count": 5,
+            },
+            {
+                "id": "INBOX_ID",
+                "name": "收件箱",
+                "parent_id": "ROOT_ID",
+                "folder_class": "IPF.Note",
+                "total_count": 1502,
+                "unread_count": 5,
+                "child_folder_count": 2,
+            },
+            {
+                "id": "VIP_ID",
+                "name": "VIP邮件",
+                "parent_id": "INBOX_ID",
+                "folder_class": "IPF.Note",
+                "total_count": 30,
+                "unread_count": 1,
+                "child_folder_count": 0,
+            },
+            {
+                "id": "DAILY_ID",
+                "name": "项目A日报",
+                "parent_id": "INBOX_ID",
+                "folder_class": "IPF.Note",
+                "total_count": 20,
+                "unread_count": 0,
+                "child_folder_count": 0,
+            },
+            {
+                "id": "SENT_ID",
+                "name": "已发送邮件",
+                "parent_id": "ROOT_ID",
+                "folder_class": "IPF.Note",
+                "total_count": 890,
+                "unread_count": 0,
+                "child_folder_count": 0,
+            },
+            {
+                "id": "DRAFTS_ID",
+                "name": "草稿",
+                "parent_id": "ROOT_ID",
+                "folder_class": "IPF.Note",
+                "total_count": 10,
+                "unread_count": 0,
+                "child_folder_count": 0,
+            },
+            {
+                "id": "CAL_ID",
+                "name": "日历",
+                "parent_id": "ROOT_ID",
+                "folder_class": "IPF.Appointment",
+                "total_count": 50,
+                "unread_count": 0,
+                "child_folder_count": 0,
+            },
+        ]
+    },
+}
+
+
+def _make_client():
+    mock_settings = MagicMock()
+    mock_settings.EXCHANGE_API_URL = "http://mock/api/v1/exchange/emails"
+    mock_settings.EXCHANGE_API_KEY = "test-key"
+    mock_settings.EXCHANGE_ACCOUNT_ID = 1
+    mock_settings.EXCHANGE_SSL_VERIFY = False
+    mock_settings.EXCHANGE_FOLDER_SENTITEMS = "已发送邮件"
+    mock_settings.EXCHANGE_FOLDER_DRAFTS = "草稿"
+
+    from src.utils.exchange_api import ExchangeClient
+
+    return ExchangeClient(settings=mock_settings)
+
+
+def _mock_httpx(response_data):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = response_data
+
+    mock_instance = AsyncMock()
+    mock_instance.get = AsyncMock(return_value=mock_response)
+    mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
+    mock_instance.__aexit__ = AsyncMock(return_value=False)
+
+    return patch("httpx.AsyncClient", return_value=mock_instance), mock_instance
+
+
+@pytest.mark.asyncio
+async def test_get_all_folders_returns_id_name_mapping():
+    client = _make_client()
+    patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        result = await client.get_all_folders()
+
+    assert isinstance(result, dict)
+    assert result["INBOX_ID"] == "收件箱"
+    assert result["SENT_ID"] == "已发送邮件"
+    assert result["VIP_ID"] == "VIP邮件"
+
+
+@pytest.mark.asyncio
+async def test_get_all_folders_caches_result():
+    client = _make_client()
+    patcher, mock_inst = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        r1 = await client.get_all_folders()
+        r2 = await client.get_all_folders()
+
+    assert r1 is r2
+    assert mock_inst.get.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sentitems_and_drafts_identified_by_name():
+    client = _make_client()
+    patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        await client.get_all_folders()
+
+    assert client.sentitems_folder_id == "SENT_ID"
+    assert client.drafts_folder_id == "DRAFTS_ID"
+
+
+@pytest.mark.asyncio
+async def test_compute_folder_policies_recursive_inheritance():
+    client = _make_client()
+    patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        await client.get_all_folders()
+
+    folders_full = {"收件箱"}
+    folders_archive = {"项目A日报"}
+    policies = client.compute_folder_policies(folders_full, folders_archive)
+
+    assert policies["INBOX_ID"] == "full"
+    assert policies["VIP_ID"] == "full"
+    assert policies["DAILY_ID"] == "archive"
+    assert policies.get("SENT_ID") == "ignore"
+    assert policies.get("CAL_ID") == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_get_folder_policy_after_init():
+    client = _make_client()
+    patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        await client.get_all_folders()
+
+    client.init_folder_policies(
+        folders_full={"收件箱"},
+        folders_archive={"项目A日报"},
+    )
+
+    assert client.get_folder_policy("INBOX_ID") == "full"
+    assert client.get_folder_policy("VIP_ID") == "full"
+    assert client.get_folder_policy("DAILY_ID") == "archive"
+    assert client.get_folder_policy("UNKNOWN_ID") == "ignore"
