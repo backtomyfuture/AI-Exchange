@@ -160,6 +160,10 @@ async def inject_test_email(data: MockEmailData):
     """
     Inject a test email into the in-memory mock store for viewing.
     """
+    settings = get_settings()
+    if not settings.DEBUG:
+        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+
     logger.info(f"Injecting mock email: {data.id}")
     
     # Construct state-like object

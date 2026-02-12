@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"
 
     # App
+    DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
     class Config:
