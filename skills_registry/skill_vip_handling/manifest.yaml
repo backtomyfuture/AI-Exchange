@@ -1,0 +1,12 @@
+id: "skill_vip_handling"
+name: "VIP Leadership Handling"
+description: "Detects emails from high-level executives and ensures P0 priority."
+version: "1.0.0"
+execution_mode: "modifier"
+
+triggers:
+  priority: 100
+  conditions:
+    - type: "sender_match"
+      operator: "in"
+      value: ["lanjuan@tianjin-air.com", "xt_zong@tianjin-air.com"]

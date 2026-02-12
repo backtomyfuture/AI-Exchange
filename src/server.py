@@ -1,18 +1,113 @@
-import logging
-import os
+import hashlib
+import hmac
 import html
+import json
+import logging
 import re
-from fastapi import FastAPI, HTTPException
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
-from src.init_app import get_app_context
+from src.config import get_settings
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
 
 app = FastAPI()
+
+
+def _get_app_context():
+    """
+    Lazy import to avoid loading heavy graph dependencies during lightweight API tests.
+    """
+    from src.init_app import get_app_context
+
+    return get_app_context()
+
+
+async def enqueue_exchange_webhook(
+    payload: Dict[str, Any],
+    header_event: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Forward webhook payload into exchange worker queue.
+    """
+    from src import exchange_service
+
+    return await exchange_service.enqueue_webhook_event(payload, header_event=header_event)
+
+
+@app.get("/health")
+async def health_check():
+    """
+    服务健康检查 endpoint，用于 Docker healthcheck 和外部监控。
+    """
+    try:
+        ctx = _get_app_context()
+        
+        checks = {
+            "db_pool": ctx.pool is not None and not getattr(ctx.pool, 'closed', True),
+            "graph": ctx.graph is not None,
+            "lark_client": lark_app.lark_api_client is not None
+        }
+        
+        healthy = all(checks.values())
+        
+        return JSONResponse(
+            status_code=200 if healthy else 503,
+            content={
+                "status": "healthy" if healthy else "degraded",
+                "checks": checks
+            }
+        )
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.post("/webhooks/exchange")
+async def exchange_webhook(request: Request):
+    """
+    Exchange NewMail Webhook endpoint with HMAC-SHA256 signature verification.
+    """
+    signature = request.headers.get("X-Exchange-Signature")
+    header_event = request.headers.get("X-Exchange-Event")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
+    settings = get_settings()
+    webhook_secret = settings.EXCHANGE_WEBHOOK_SECRET
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+
+    body_bytes = await request.body()
+    expected_signature = hmac.new(
+        webhook_secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    try:
+        result = await enqueue_exchange_webhook(payload, header_event=header_event)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to process Exchange webhook: {e}")
+        raise HTTPException(status_code=502, detail="Failed to process webhook event")
+
+    return {"status": "ok", **result}
+
 
 def _format_address_str(raw_str: str) -> str:
     """Format address string like 'name=..., email=...' to 'Name <email>'"""
@@ -30,8 +125,6 @@ def _format_address_str(raw_str: str) -> str:
         if m2:
             return f"{html.escape(m2.group(1).strip())} &lt;{html.escape(m2.group(2).strip())}&gt;"
 
-        return html.escape(str(raw_str))
-    except Exception:
         return html.escape(str(raw_str))
     except Exception:
         return html.escape(str(raw_str))
@@ -79,7 +172,7 @@ async def view_email(email_id: str):
     """
     Serve the email content as Outlook-style HTML.
     """
-    app_ctx = get_app_context()
+    app_ctx = _get_app_context()
     
     # 1. Try to get state from Graph
     if not app_ctx.graph:

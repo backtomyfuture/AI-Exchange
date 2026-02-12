@@ -1,7 +1,7 @@
 import httpx
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -324,7 +324,7 @@ class ExchangeClient:
                 print(f"Failed to delete email {email_id}: {e}")
                 return False
 
-    async def get_email(self, email_id: str) -> Dict[str, Any]:
+    async def get_email(self, email_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Fetch full details for a specific email by ID.
         """
@@ -332,12 +332,13 @@ class ExchangeClient:
         headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         encoded_id = quote(email_id, safe='')
         endpoint = f"{self.api_url}/{encoded_id}"
+        target_account_id = account_id if account_id is not None else self.account_id
         
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
             try:
                 response = await client.get(
                     endpoint, 
-                    params={"account_id": self.account_id}, 
+                    params={"account_id": target_account_id},
                     headers=headers, 
                     timeout=20.0
                 )
@@ -379,6 +380,50 @@ class ExchangeClient:
             except Exception as e:
                 print(f"Reply exception: {e}")
                 return False
+
+    async def resolve_contact(self, query: str) -> Optional[str]:
+        """
+        通过 Exchange 通讯录查询联系人名称。
+        优先搜索个人通讯录，未找到则回退到全局地址列表 (GAL)。
+        
+        Args:
+            query: 查询关键词（邮箱地址、姓名或别名）
+            
+        Returns:
+            联系人显示名称，未找到则返回 None
+        """
+        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
+        
+        # Derive contacts endpoint from emails endpoint
+        # e.g. https://host/api/v1/exchange/emails -> https://host/api/v1/exchange/contacts/resolve
+        import re as _re
+        base_url = _re.sub(r'/emails/?$', '', self.api_url)
+        endpoint = f"{base_url}/contacts/resolve"
+        
+        params = {
+            "q": query,
+            "account_id": self.account_id
+        }
+
+        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
+            try:
+                response = await client.get(
+                    endpoint,
+                    params=params,
+                    headers=headers,
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("success") and data.get("data"):
+                        # Return the first match's name
+                        return data["data"][0].get("name")
+                else:
+                    print(f"Contact resolve failed for '{query}': {response.status_code}")
+            except Exception as e:
+                print(f"Contact resolve exception for '{query}': {e}")
+        
+        return None
 
     async def forward_email(self, email_id: str, to: List[str], body: str) -> bool:
         """

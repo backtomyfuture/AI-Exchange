@@ -37,6 +37,7 @@ services:
       - EXTERNAL_URL=http://localhost:8000
     ports:
       - "8000:8000"
+      - "15000:8000"
     depends_on:
       qdrant:
         condition: service_started
@@ -45,5 +46,18 @@ services:
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
+      - ./skills_registry:/app/skills_registry
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G

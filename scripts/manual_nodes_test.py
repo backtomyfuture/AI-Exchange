@@ -12,7 +12,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def test_nodes():
+import asyncio
+
+async def test_nodes():
     # Mock state
     state = {
         "email": {
@@ -29,18 +31,21 @@ def test_nodes():
 
     print("Testing Categorizer...")
     try:
-        new_state = categorize_email(state)
+        new_state = await categorize_email(state)
         print("Categorization Result:", new_state.get("classification"))
     except Exception as e:
         print(f"Categorizer failed: {e}")
+        new_state = state # Fallback for next step
 
     print("\nTesting Drafter...")
     try:
         # Drafter needs context from retrieval usually, but we'll test basic generation
-        new_state = generate_draft(new_state)
+        new_state = await generate_draft(new_state)
         print("Draft Result:", new_state.get("draft")[:200] + "...")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Drafter failed: {e}")
 
 if __name__ == "__main__":
-    test_nodes()
+    asyncio.run(test_nodes())

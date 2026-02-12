@@ -85,41 +85,58 @@ def html_to_lark_md(html_str: str) -> str:
 
 def extract_email_address(raw: str) -> Optional[str]:
     """从各种格式中提取邮箱地址"""
-    m = re.search(r"email_address='(.*?)'", str(raw))
+    raw_str = str(raw).strip()
+    
+    # Format 1: name='张霞', email_address='zhang-xia@tianjin-air.com'
+    m = re.search(r"email_address='(.*?)'", raw_str)
     if m:
         return m.group(1)
-    m2 = re.search(r"<([^>]+)>", str(raw))
+    
+    # Format 2: 张霞 <zhang-xia@tianjin-air.com>
+    m2 = re.search(r"<([^>]+)>", raw_str)
     if m2:
         return m2.group(1)
+    
+    # Format 3: Pure email (zhang-xia@tianjin-air.com)
+    if '@' in raw_str and ' ' not in raw_str:
+        return raw_str
+    
     return None
 
 
 class LarkCardBuilder:
     """飞书卡片构建器"""
 
-    def __init__(self, lark_api_client=None):
+    def __init__(self, lark_api_client=None, exchange_client=None):
         self.lark_api_client = lark_api_client
+        self.exchange_client = exchange_client
         self._user_cache: Dict[str, Dict[str, str]] = {}
 
     def lookup_lark_users(self, emails: List[str]) -> Dict[str, Dict[str, str]]:
         """
         Lookup Lark User IDs by email prefix strategy.
-        Returns map: {email -> {'open_id': xxx, 'name': xxx}}
+        Falls back to Exchange contact resolution for unresolved emails.
+        Returns map: {email -> {'open_id': xxx, 'name': xxx}} or {email -> {'name': xxx}} for Exchange-only.
         """
-        if not emails or not self.lark_api_client:
+        if not emails:
             return {}
 
-        from lark_oapi.api.contact.v3 import GetUserRequest
-
         email_map = {}
+        unresolved_emails = []
         logger.info(f"Looking up Lark users for: {emails}")
 
+        # Phase 1: Lark lookup
         for email in emails:
             if email in self._user_cache:
                 email_map[email] = self._user_cache[email]
                 continue
 
+            if not self.lark_api_client:
+                unresolved_emails.append(email)
+                continue
+
             try:
+                from lark_oapi.api.contact.v3 import GetUserRequest
                 user_id_input = email.split("@")[0]
                 req = GetUserRequest.builder() \
                     .user_id(user_id_input) \
@@ -129,7 +146,8 @@ class LarkCardBuilder:
                 resp = self.lark_api_client.contact.v3.user.get(req)
 
                 if not resp.success():
-                    logger.warning(f"Lookup failed for user_id='{user_id_input}': {resp.code}")
+                    logger.warning(f"Lookup failed for user_id='{user_id_input}' (email={email}): code={resp.code}, msg={resp.msg}")
+                    unresolved_emails.append(email)
                     continue
 
                 if resp.data and resp.data.user:
@@ -140,9 +158,42 @@ class LarkCardBuilder:
                         user_info = {'open_id': found_open_id, 'name': found_name}
                         email_map[email] = user_info
                         self._user_cache[email] = user_info
+                    else:
+                        unresolved_emails.append(email)
+                else:
+                    unresolved_emails.append(email)
 
             except Exception as e:
                 logger.error(f"Error resolving user {email}: {e}")
+                unresolved_emails.append(email)
+
+        # Phase 2: Exchange contact resolution fallback
+        if unresolved_emails and self.exchange_client:
+            import asyncio
+            logger.info(f"Falling back to Exchange contact resolve for: {unresolved_emails}")
+            for email in unresolved_emails:
+                try:
+                    # Run async resolve_contact in sync context
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            name = pool.submit(
+                                asyncio.run,
+                                self.exchange_client.resolve_contact(email)
+                            ).result(timeout=10)
+                    else:
+                        name = asyncio.run(self.exchange_client.resolve_contact(email))
+                    
+                    if name:
+                        logger.info(f"Exchange resolved {email} -> {name}")
+                        user_info = {'name': name}  # No open_id
+                        email_map[email] = user_info
+                        self._user_cache[email] = user_info
+                    else:
+                        logger.info(f"Exchange could not resolve {email}")
+                except Exception as e:
+                    logger.error(f"Exchange contact resolve error for {email}: {e}")
 
         return email_map
 
@@ -173,11 +224,15 @@ class LarkCardBuilder:
 
             if email and email in user_map:
                 u_info = user_map[email]
-                lark_id = u_info['open_id']
-                real_name = u_info['name']
-                formatted_items.append(
-                    f"[{real_name}](feishu://applink.feishu.cn/client/contact/open?openId={lark_id})"
-                )
+                if u_info.get('open_id'):
+                    lark_id = u_info['open_id']
+                    real_name = u_info['name']
+                    formatted_items.append(
+                        f"[{real_name}](feishu://applink.feishu.cn/client/contact/open?openId={lark_id})"
+                    )
+                else:
+                    # Exchange-resolved: show name only
+                    formatted_items.append(u_info.get('name', name))
             elif show_email and email:
                 formatted_items.append(f"{name} ({email})")
             else:
@@ -209,7 +264,12 @@ class LarkCardBuilder:
                 name = e.split("@")[0]
 
             if e and e in user_map:
-                matched_ids.append(user_map[e]['open_id'])
+                u_info = user_map[e]
+                if u_info.get('open_id'):
+                    matched_ids.append(u_info['open_id'])
+                else:
+                    # Exchange-resolved: use the resolved name
+                    leftover_text.append(u_info.get('name', name))
             else:
                 leftover_text.append(name)
 
@@ -354,11 +414,21 @@ class LarkCardBuilder:
         })
         elements.append({"tag": "hr"})
 
+        logger.info(f"Build Card Debug: Sender={raw_sender}, To={email_data.get('to')}, Cc={cc_list}, PDF={pdf_url}")
+
         # Original email summary
         header_text = "**📄 原始邮件摘要:**"
         if pdf_url:
             header_text = f"**📄 原始邮件摘要:** ([📄 查看完整原文 (PDF)]({pdf_url}))"
-        elements.append({"tag": "markdown", "content": header_text})
+        
+        # Use div+lark_md instead of bare markdown tag for better link support
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": header_text
+            }
+        })
         
         # Optimize summary: Priority 1 - LLM Summary, Priority 2 - Body, Priority 3 - Context
         llm_summary = classification.get("summary")
@@ -391,18 +461,24 @@ class LarkCardBuilder:
             "text": {"tag": "lark_md", "content": summary_content}
         })
 
+        # Attachments - Filter out inline images (content_id indicates embedded image in body)
         attachments = email_data.get("attachments", [])
-        if attachments:
+        real_attachments = [att for att in attachments if not att.get('content_id')]
+        
+        if real_attachments:
             att_lines = []
-            for att in attachments[:5]:
+            for att in real_attachments[:5]:
                 name = att.get('name', 'Unknown File')
                 if att.get('lark_file_url'):
                     att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
                 else:
-                    att_lines.append(f"📎 {name}")
+                    # Skip attachments without URL (not uploaded)
+                    logger.debug(f"Skipping attachment without URL: {name}")
+                    continue
             
-            att_text = "\n".join(att_lines)
-            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": att_text}})
+            if att_lines:
+                att_text = "\n".join(att_lines)
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": att_text}})
 
         # Web view link hidden by request
         # settings = get_settings()
@@ -466,6 +542,158 @@ class LarkCardBuilder:
 
         return {"header": header, "elements": elements}
 
+    def build_read_only_card(
+        self,
+        email_id: str,
+        context: List[dict],
+        email_data: dict,
+        classification: dict,
+        pdf_url: str = None
+    ) -> dict:
+        """
+        构建只读卡片 - 用于重要但不需要回复的邮件。
+        
+        与审批卡片相比：
+        - 保留: 邮件信息展示、附件链接、PDF原文链接
+        - 移除: 回复草稿区域、收件人编辑、批准/拒绝按钮
+        - 新增: 已阅按钮
+        """
+        subject = email_data.get("subject", "No Subject")
+        subject = re.sub(r"^(Subject|主题)[:：]\s*", "", subject, flags=re.IGNORECASE).strip()
+        raw_sender = email_data.get("sender", "Unknown")
+
+        reason = classification.get("reasoning", "智能生成")
+        cc_list = email_data.get("cc", [])
+        if isinstance(cc_list, str):
+            cc_list = [cc_list]
+
+        # Collect all emails for user lookup
+        all_emails = []
+        sender_email = extract_email_address(raw_sender)
+        if sender_email:
+            all_emails.append(sender_email)
+        for r in email_data.get("to", []):
+            e = extract_email_address(r)
+            if e:
+                all_emails.append(e)
+        for c in cc_list:
+            e = extract_email_address(c)
+            if e:
+                all_emails.append(e)
+
+        user_map = self.lookup_lark_users(list(set(all_emails)))
+
+        elements = []
+
+        # Header - 使用紫色区分只读卡片
+        priority = classification.get("priority", "P1")
+        priority_emoji = {"P0": "🔴", "P1": "🟠", "P2": "🟡", "P3": "⚪"}.get(priority, "📧")
+        header = {
+            "template": "purple",
+            "title": {
+                "content": f"{priority_emoji} 重要邮件: {subject}",
+                "tag": "plain_text"
+            }
+        }
+
+        # AI Note
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": f"💡 AI 处理说明: {reason}（无需回复）"}]
+        })
+
+        # Sender/Recipient compact row
+        compact_columns = self._build_compact_header_row(raw_sender, email_data, user_map)
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "horizontal_spacing": "small",
+            "columns": compact_columns
+        })
+        elements.append({"tag": "hr"})
+
+        # Debug logging for recipients
+        logger.info(f"Build Read-Only Card: Sender={raw_sender}, To={email_data.get('to')}, Subject={subject}, PDF={pdf_url}")
+
+        # Original email summary
+        header_text = "**📄 邮件内容摘要:**"
+        if pdf_url:
+            header_text = f"**📄 邮件内容摘要:** ([📄 查看完整原文 (PDF)]({pdf_url}))"
+        
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": header_text
+            }
+        })
+        
+        # Summary content
+        llm_summary = classification.get("summary")
+        if llm_summary:
+            original_snippet = llm_summary
+        else:
+            raw_body = email_data.get("body", "")
+            if raw_body:
+                try:
+                    soup = BeautifulSoup(raw_body, "html.parser")
+                    text = soup.get_text(separator=" ", strip=True)
+                    original_snippet = text[:300] + "..." if len(text) > 300 else text
+                except Exception:
+                    original_snippet = raw_body[:300]
+            elif context:
+                text = context[0].get('chunk_text') or context[0].get('body') or ""
+                text = text.strip()
+                clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
+                text = " ".join(clean_lines)
+                original_snippet = text[:300] + "..." if len(text) > 300 else text
+            else:
+                original_snippet = "无内容摘要"
+
+        summary_content = f"*{original_snippet}*"
+        
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": summary_content}
+        })
+
+        # Attachments - Filter out inline images (content_id indicates embedded image in body)
+        attachments = email_data.get("attachments", [])
+        real_attachments = [att for att in attachments if not att.get('content_id')]
+        
+        if real_attachments:
+            att_lines = []
+            for att in real_attachments[:5]:
+                name = att.get('name', 'Unknown File')
+                if att.get('lark_file_url'):
+                    att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
+                else:
+                    # Skip attachments without URL (not uploaded)
+                    logger.debug(f"Skipping attachment without URL: {name}")
+                    continue
+            
+            if att_lines:
+                att_text = "\n".join(att_lines)
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": att_text}})
+        
+        # Log filtered attachments for debugging
+        if len(attachments) != len(real_attachments):
+            logger.info(f"Filtered {len(attachments) - len(real_attachments)} inline images from attachments")
+
+        elements.append({"tag": "hr"})
+
+        # Action button - 只有"已阅"按钮
+        elements.append({
+            "tag": "action",
+            "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 已阅"},
+                 "type": "primary", "value": {"action": "mark_read", "id": email_id}}
+            ]
+        })
+
+        return {"header": header, "elements": elements}
+
     def _build_compact_header_row(
         self,
         raw_sender: str,
@@ -479,6 +707,11 @@ class LarkCardBuilder:
         settings = get_settings()
         my_email = settings.EXCHANGE_ACCOUNT_EMAIL or ""
         
+        # Debug Logging for Missing Recipients
+        to_list = email_data.get("to", [])
+        cc_list = email_data.get("cc", [])
+        logger.info(f"Compact Header Debug: Sender={raw_sender}, To={to_list} (len={len(to_list)}), Cc={cc_list} (len={len(cc_list)})")
+
         columns = []
         
         # Helper to get ONE representative
@@ -498,15 +731,27 @@ class LarkCardBuilder:
                         break
             
             return selected, total - 1
+
+        # Separator element
+        def make_separator():
+             return {
+                "tag": "column", "width": "auto", "vertical_align": "center",
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;|&nbsp;</font>"}}]
+            }
             
-        # --- 1. Sender ---
-        columns.append({
-            "tag": "column", "width": "auto", "vertical_align": "center",
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👤 发件人:**"}}]
-        })
-        
+        # --- 1. Sender Section (Always Present) ---
         sender_email = extract_email_address(raw_sender)
         sender_uid = user_map.get(sender_email, {}).get('open_id') if sender_email else None
+        
+        label_content = "**👤 发件人:**"
+        # Check if sender is Me
+        if my_email and sender_email and my_email.lower() in sender_email.lower():
+             label_content = "**👤 发件人 (我):**"
+
+        columns.append({
+            "tag": "column", "width": "auto", "vertical_align": "center",
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": label_content}}]
+        })
         
         if sender_uid:
             columns.append({
@@ -514,24 +759,22 @@ class LarkCardBuilder:
                 "elements": [{"tag": "person", "user_id": sender_uid, "style": "normal"}]
             })
         else:
-             # Just show name (Full Email as fallback)
-            s_name = sender_email if sender_email else "Unknown"
+            # Try Exchange-resolved name, then fall back to email
+            s_name = user_map.get(sender_email, {}).get('name') if sender_email else None
+            if not s_name:
+                s_name = sender_email if sender_email else "Unknown"
             columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
                 "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": s_name}}]
             })
 
-        # Separator
-        columns.append({
-            "tag": "column", "width": "auto", "vertical_align": "center",
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;|&nbsp;</font>"}}]
-        })
-
-        # --- 2. To ---
-        to_list = email_data.get("to", [])
+        # --- 2. To Section ---
         to_person, to_count = get_one_person_and_count(to_list)
         
         if to_person:
+            # Add separator only if we have a To section
+            columns.append(make_separator())
+            
             columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
                 "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👥 收件人:**"}}]
@@ -546,7 +789,10 @@ class LarkCardBuilder:
                     "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
                 })
             else:
-                name = e if e else "Unknown"
+                # Try Exchange-resolved name, then fall back to email
+                name = user_map.get(e, {}).get('name') if e else None
+                if not name:
+                    name = e if e else "Unknown"
                 columns.append({
                     "tag": "column", "width": "auto", "vertical_align": "center",
                     "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": name}}]
@@ -558,16 +804,12 @@ class LarkCardBuilder:
                     "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f" +{to_count}"}}]
                 })
 
-        # --- 3. Cc (Optional) ---
-        cc_list = email_data.get("cc", [])
-        if cc_list:
-            # Separator
-            columns.append({
-                "tag": "column", "width": "auto", "vertical_align": "center",
-                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "<font color='lightgrey'>&nbsp;|&nbsp;</font>"}}]
-            })
-            
-            cc_person, cc_count = get_one_person_and_count(cc_list)
+        # --- 3. Cc Section ---
+        cc_person, cc_count = get_one_person_and_count(cc_list)
+        
+        if cc_person:
+            # Add separator only if we have a Cc section (works even if To is missing, though unusual)
+            columns.append(make_separator())
             
             columns.append({
                 "tag": "column", "width": "auto", "vertical_align": "center",
@@ -583,7 +825,10 @@ class LarkCardBuilder:
                     "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
                 })
             else:
-                name = e if e else "Unknown"
+                # Try Exchange-resolved name, then fall back to email
+                name = user_map.get(e, {}).get('name') if e else None
+                if not name:
+                    name = e if e else "Unknown"
                 columns.append({
                     "tag": "column", "width": "auto", "vertical_align": "center",
                     "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": name}}]
@@ -595,7 +840,7 @@ class LarkCardBuilder:
                     "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f" +{cc_count}"}}]
                 })
 
-        # Filler
+        # Filler to align left
         columns.append({"tag": "column", "width": "weighted", "weight": 1, "elements": []})
 
         return columns

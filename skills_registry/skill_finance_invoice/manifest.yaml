@@ -1,0 +1,12 @@
+id: "skill_finance_invoice"
+name: "Finance & Invoice Processor"
+description: "Handles emails related to payments, invoices, and financial approvals."
+version: "1.0.0"
+execution_mode: "modifier"
+
+triggers:
+  priority: 85
+  conditions:
+    - type: "subject_match"
+      operator: "regex"
+      value: "发票|报销|支付|合同|审批|Invoice|Payment|Contract|Order|Approval"

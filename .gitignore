@@ -22,6 +22,7 @@ processed_emails.json
 .claude/
 .vscode/
 .idea/
+.worktrees/
 
 # Docker logs
 *.log

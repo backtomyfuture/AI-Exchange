@@ -1,5 +1,4 @@
 
-import os
 import hashlib
 import logging
 import uuid
@@ -13,6 +12,8 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 class EmailProcessor:
@@ -24,17 +25,19 @@ class EmailProcessor:
         embedding_model: Optional[str] = None,
         collection_name: str = "emails"
     ):
-        self.qdrant_client = QdrantClient(url=qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333"))
+        settings = get_settings()
+        self.qdrant_client = QdrantClient(url=qdrant_url or settings.QDRANT_URL)
         
-        # Priority: explicit arg > ENV > default
-        api_base = embedding_base_url or os.getenv("EMBEDDING_BASE_URL") or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        api_key = embedding_api_key or os.getenv("EMBEDDING_API_KEY", "ollama")
+        # Priority: explicit arg > Settings
+        api_base = embedding_base_url or settings.EMBEDDING_BASE_URL
+        api_key = embedding_api_key or settings.EMBEDDING_API_KEY
         
         self.openai_client = OpenAI(
             base_url=api_base,
-            api_key=api_key
+            api_key=api_key,
+            timeout=5.0
         )
-        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
+        self.embedding_model = embedding_model or settings.EMBEDDING_MODEL
         
         self.collection_name = collection_name
         
@@ -133,7 +136,7 @@ class EmailProcessor:
             logger.error(f"Image analysis API error: {e}")
             return "[图片解析失败]"
 
-    @retry(stop=stop_after_attempt(5), wait=wait_random_exponential(multiplier=1, max=60))
+    @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=1, max=10))
     def process_batch(self, batch_emails: List[Dict[str, Any]]) -> int:
         """
         Embed and upsert a batch of emails. Returns number of points upserted.
@@ -146,10 +149,10 @@ class EmailProcessor:
 
         points = []
         for email in batch_emails:
-            # --- 1. Process Attachments Metadata & Images ---
+            # --- 1. Process Attachments Metadata (Lazy Image Analysis) ---
             attachments = email.get("attachments", [])
             attachment_summaries = []
-            image_descriptions = []
+            image_attachments = []  # 暂存图片数据，延迟到拟稿阶段分析
             valid_attachments_metadata = []
 
             for att in attachments:
@@ -169,33 +172,31 @@ class EmailProcessor:
                     "size": size
                 })
 
-                # Image Analysis (if content is present)
+                # Collect image attachments for deferred analysis (no Vision API call here)
                 if content_b64 and ftype.startswith("image/"):
-                    logger.info(f"Analyzing image attachment: {name} (type: {ftype})")
-                    description = self._describe_image(content_b64, ftype)
-                    summary = f"--- 图片附件 '{name}' 的内容描述 ---\n{description}\n-----------------------------------"
-                    image_descriptions.append(summary)
-                    logger.info(f"Analysis completed for {name}: {description[:50]}...")
+                    image_attachments.append({
+                        "name": name,
+                        "content": content_b64,
+                        "mime_type": ftype
+                    })
+                    logger.info(f"Collected image attachment for deferred analysis: {name} ({ftype})")
 
             # --- 2. Construct Full Text ---
-            # Structure: Subject + Attachment Metadata + Image Descriptions + Body
+            # Structure: Subject + Attachment Metadata + Body (no image descriptions at this stage)
             
             parts = [f"Subject: {email.get('subject', '')}"]
             
             if attachment_summaries:
                 parts.append("【包含的附件列表】:\n" + "\n".join(attachment_summaries))
                 
-            if image_descriptions:
-                parts.append("【图片附件内容解析】:\n" + "\n".join(image_descriptions))
-                
             parts.append("【邮件正文】:\n" + email.get('body', ''))
             
             full_text = "\n\n".join(parts)
             
-            # Store image descriptions in the email object so further nodes (like categorizer) can see it
-            if image_descriptions:
-                email["image_analysis"] = "\n".join(image_descriptions)
-                logger.info("Stored image analysis results in email object for classification use.")
+            # Store image attachment data for deferred analysis by retriever_node
+            if image_attachments:
+                email["_image_attachments"] = image_attachments
+                logger.info(f"Stored {len(image_attachments)} image(s) for deferred analysis.")
             
             chunks = self.text_splitter.split_text(full_text)
             

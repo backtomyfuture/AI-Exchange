@@ -5,6 +5,8 @@ import asyncio
 import re
 import html
 import io
+import hashlib
+import hmac
 from typing import Dict, Any, List, Optional
 import lark_oapi
 from lark_oapi.api.im.v1 import *
@@ -28,6 +30,34 @@ graph = None
 exchange_client = None
 worker_loop = None
 _mock_store = {} # Store for test card states
+
+
+def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str) -> bool:
+    """
+    验证飞书事件签名，确保请求来源合法。
+    
+    Args:
+        timestamp: 请求头中的 X-Lark-Request-Timestamp
+        nonce: 请求头中的 X-Lark-Request-Nonce
+        body: 请求体原始字符串
+        signature: 请求头中的 X-Lark-Signature
+    
+    Returns:
+        bool: 签名验证是否通过
+    """
+    settings = get_settings()
+    encrypt_key = settings.LARK_ENCRYPT_KEY
+    
+    if not encrypt_key:
+        logger.warning("LARK_ENCRYPT_KEY not configured, skipping signature verification.")
+        return True  # 未配置时跳过验证（开发环境）
+    
+    # 拼接待签名字符串: timestamp + nonce + encrypt_key + body
+    content = f"{timestamp}{nonce}{encrypt_key}{body}"
+    expected_signature = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    
+    # 使用恒时比较防止时序攻击
+    return hmac.compare_digest(expected_signature, signature)
 
 def _format_address_str(raw_str: str) -> str:
     """Format address string like 'name=..., email=...' to 'Name <email>'"""
@@ -153,10 +183,10 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
         if settings.LARK_CHAT_ID:
             _resolve_current_user_email(settings.LARK_CHAT_ID)
             
-        card_builder = LarkCardBuilder(lark_api_client)
+        card_builder = LarkCardBuilder(lark_api_client, exchange_client=exchange_client)
         logger.info("Lark API Client initialized.")
     else:
-        card_builder = LarkCardBuilder(None)
+        card_builder = LarkCardBuilder(None, exchange_client=exchange_client)
         logger.warning("Lark App ID or Secret missing. Lark features disabled.")
 
 def _resolve_current_user_email(chat_id: str):
@@ -248,11 +278,91 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
     else:
         logger.info(f"Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
 
+def send_system_notification(title: str, content: str, template: str = "red"):
+    """
+    Send a system notification card (e.g. for Circuit Breaker alerts).
+    """
+    if not lark_api_client:
+        logger.error("Lark Client not initialized. Cannot send system notification.")
+        return
+    
+    settings = get_settings()
+    chat_id = settings.LARK_CHAT_ID
+    if not chat_id:
+        logger.error("LARK_CHAT_ID not configured.")
+        return
+
+    card_content = {
+        "header": {
+            "template": template,
+            "title": {
+                "content": title,
+                "tag": "plain_text"
+            }
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": content
+                }
+            }
+        ]
+    }
+    
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(json.dumps(card_content))
+            .build()) \
+        .build()
+
+    response = lark_api_client.im.v1.message.create(request)
+    if not response.success():
+        logger.error(f"Failed to send system notification: {response.code} - {response.msg}")
+    else:
+        logger.info(f"System notification sent: {title}")
 
 
 
 
 # Event Handlers
+
+def send_read_only_card(email_id: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
+    """
+    Send a read-only interactive card for important emails that don't require a reply.
+    This card shows email info but has no draft/reply section.
+    """
+    if not lark_api_client:
+        logger.error("Lark Client not initialized. Cannot send card.")
+        return
+    
+    settings = get_settings()
+    chat_id = settings.LARK_CHAT_ID
+    if not chat_id:
+        logger.error("LARK_CHAT_ID not configured.")
+        return
+
+    card_content = card_builder.build_read_only_card(email_id, context, email_data, classification, pdf_url=pdf_url)
+    
+    request = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(json.dumps(card_content))
+            .build()) \
+        .build()
+
+    response = lark_api_client.im.v1.message.create(request)
+    if not response.success():
+        logger.error(f"Failed to send read-only Lark card: {response.code} - {response.msg}")
+    else:
+        logger.info(f"Read-only Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
+
 
 def update_card_ui(message_id, card_content):
     """
@@ -455,6 +565,38 @@ def handle_card_action(event):
                 "toast": {
                     "type": "info",
                     "content": "已拒绝该拟稿"
+                },
+                "card": {
+                    "type": "raw",
+                    "data": new_card
+                }
+            }
+            
+        # 只读卡片 - 标记已阅
+        elif action_type == "mark_read":
+            logger.info(f"Mark as read for email {email_id} by {user_id}")
+            safe_async_wait(db_manager.update_status(email_id, "read"))
+            
+            # Remove attachments (PDF + Originals)
+            att_tokens = state.values.get("attachment_tokens", [])
+            # Make a copy to avoid modifying state in place if it is a reference
+            att_tokens = list(att_tokens)
+            
+            # Always try to include PDF token if it exists
+            pdf_token = state.values.get("pdf_token")
+            if pdf_token and pdf_token not in att_tokens:
+                att_tokens.append(pdf_token)
+                
+            if att_tokens:
+                logger.info(f"Cleaning up {len(att_tokens)} attachments (mark_read)...")
+                for tok in att_tokens:
+                     safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
+
+            new_card = LarkCardBuilder.get_processed_card("已阅", subject)
+            return {
+                "toast": {
+                    "type": "success",
+                    "content": "已标记为已阅"
                 },
                 "card": {
                     "type": "raw",
@@ -696,12 +838,18 @@ def process_approval(email_id, user_id):
     safe_async_wait(db_manager.update_status(email_id, "approved"))
     logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
     # Execute graph
-    # Remove attachment if exists
+    # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
-    pdf_token = state.values.get("pdf_token")
-    if pdf_token:
-        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
-        safe_async_run(asyncio.to_thread(delete_file_from_drive, pdf_token))
+    att_tokens = state.values.get("attachment_tokens", [])
+    
+    # Legacy fallback
+    if not att_tokens and state.values.get("pdf_token"):
+        att_tokens.append(state.values.get("pdf_token"))
+        
+    if att_tokens:
+        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
+        for tok in att_tokens:
+             safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
 
     safe_async_run(graph.ainvoke(None, config=config))
 
@@ -710,12 +858,18 @@ def process_rejection(email_id, user_id):
     safe_async_wait(graph.aupdate_state(config, {"approval_status": "rejected"}))
     safe_async_wait(db_manager.update_status(email_id, "rejected"))
     logger.info(f"Rejection processed for {email_id} by {user_id}. Executing graph...")
-    # Remove attachment if exists
+    # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
-    pdf_token = state.values.get("pdf_token")
-    if pdf_token:
-        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
-        safe_async_run(asyncio.to_thread(delete_file_from_drive, pdf_token))
+    att_tokens = state.values.get("attachment_tokens", [])
+    
+    # Legacy fallback
+    if not att_tokens and state.values.get("pdf_token"):
+        att_tokens.append(state.values.get("pdf_token"))
+
+    if att_tokens:
+        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
+        for tok in att_tokens:
+             safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
 
     safe_async_run(graph.ainvoke(None, config=config))
     
@@ -738,13 +892,17 @@ async def process_save_draft(email_id, state):
          await exchange_client.create_draft(str(to), subject, body)
     await db_manager.update_status(email_id, "draft_saved")
 
-    # Remove attachment if exists
-    pdf_token = state.values.get("pdf_token")
-    if pdf_token:
-        logger.info(f"Cleaning up PDF attachment: {pdf_token}")
-        # Running in async context, but delete is sync (using client), wrapping in thread or simple call if safe
-        # delete_file_from_drive uses lark_api_client which is thread safe for HTTP calls
-        delete_file_from_drive(pdf_token)
+    # Remove attachments (PDF + Originals)
+    att_tokens = state.values.get("attachment_tokens", [])
+    
+    # Legacy fallback
+    if not att_tokens and state.values.get("pdf_token"):
+        att_tokens.append(state.values.get("pdf_token"))
+
+    if att_tokens:
+        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
+        for tok in att_tokens:
+             delete_file_from_drive(tok)
 
 async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[str]:
     """
@@ -756,6 +914,10 @@ async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[s
         # 1. Render HTML (CPU bound)
         loop = asyncio.get_running_loop()
         html_content = await loop.run_in_executor(None, render_email_html, email_data)
+        
+        if html_content:
+            logger.info(f"HTML Content generated for PDF. Size: {len(html_content)} bytes")
+
         
         # 2. Convert to PDF (CPU/IO bound)
         pdf_bytes = await loop.run_in_executor(None, convert_html_to_pdf, html_content)

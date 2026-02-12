@@ -1,8 +1,8 @@
-import os
+import logging
 from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
+from src.config import get_settings
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
 class LLMFactory:
     @staticmethod
@@ -10,21 +10,21 @@ class LLMFactory:
         """
         Create a configured ChatOpenAI instance.
         """
-        model = model_name or os.getenv("LLM_MODEL", "gemini-3-flash")
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_API_BASE")
+        settings = get_settings()
+        model = model_name or settings.LLM_MODEL
+        api_key = settings.OPENAI_API_KEY
+        base_url = settings.OPENAI_API_BASE
         
         # Optional: Validate credentials
         if not api_key:
-            import logging
-            logging.getLogger(__name__).warning("OPENAI_API_KEY is not set.")
+            logger.warning("OPENAI_API_KEY is not set.")
 
         kwargs = {
             "model": model,
             "temperature": temperature,
             "base_url": base_url,
             "api_key": api_key,
-            "max_retries": 5,
+            "max_retries": 2,
             "timeout": 60
         }
 
@@ -35,3 +35,4 @@ class LLMFactory:
              pass
 
         return ChatOpenAI(**kwargs)
+
