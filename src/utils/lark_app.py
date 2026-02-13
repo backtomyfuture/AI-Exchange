@@ -18,6 +18,16 @@ from src.utils.card_builder import LarkCardBuilder, html_to_lark_md
 from src.config import get_settings
 from src.utils.email_renderer import render_email_html
 from src.utils.pdf_generator import convert_html_to_pdf
+from src.commands.router import CommandRouter
+from src.commands.handlers import (
+    init_commands,
+    handle_help,
+    handle_stats,
+    handle_queue,
+    handle_pending,
+    handle_search,
+    handle_health,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +40,30 @@ graph = None
 exchange_client = None
 worker_loop = None
 _mock_store = {} # Store for test card states
+_command_router: Optional[CommandRouter] = None
+
+
+def _register_builtin_commands():
+    global _command_router
+    _command_router = CommandRouter()
+    _command_router.register("/help", handle_help)
+    _command_router.register("/stats", handle_stats)
+    _command_router.register("/queue", handle_queue)
+    _command_router.register("/pending", handle_pending)
+    _command_router.register("/search", handle_search)
+    _command_router.register("/health", handle_health)
+
+
+def _read_nested(obj: Any, *path: str) -> Any:
+    current = obj
+    for part in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            current = getattr(current, part, None)
+    return current
 
 
 def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str) -> bool:
@@ -120,6 +154,9 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     else:
         card_builder = LarkCardBuilder(None, exchange_client=exchange_client)
         logger.warning("Lark App ID or Secret missing. Lark features disabled.")
+
+    init_commands(db_mgr)
+    _register_builtin_commands()
 
 def _resolve_current_user_email(chat_id: str):
     """
@@ -626,6 +663,63 @@ def handle_card_action(event):
         err_resp.toast = toast
         return err_resp
 
+
+def _handle_p2_im_message_receive(event):
+    """Handle incoming private text messages and dispatch slash commands."""
+    try:
+        message = _read_nested(event, "event", "message")
+        if message is None:
+            return
+
+        message_type = _read_nested(message, "message_type")
+        chat_type = _read_nested(message, "chat_type")
+        sender_open_id = _read_nested(event, "event", "sender", "sender_id", "open_id")
+        raw_content = _read_nested(message, "content") or ""
+
+        if message_type != "text" or chat_type != "p2p" or not sender_open_id:
+            return
+
+        try:
+            content = json.loads(raw_content).get("text", "")
+        except Exception:
+            content = str(raw_content)
+
+        async def _dispatch():
+            if _command_router is None:
+                logger.warning("Command router not initialized.")
+                return
+            reply = await _command_router.dispatch(content)
+            if reply is None:
+                return
+            if not lark_api_client:
+                logger.warning("Lark API client not initialized for command response.")
+                return
+
+            if isinstance(reply, dict):
+                msg_type = "interactive"
+                content_str = json.dumps(reply, ensure_ascii=False)
+            else:
+                msg_type = "text"
+                content_str = json.dumps({"text": str(reply)}, ensure_ascii=False)
+
+            req = CreateMessageRequest.builder() \
+                .receive_id_type("open_id") \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(sender_open_id)
+                    .msg_type(msg_type)
+                    .content(content_str)
+                    .build()
+                ) \
+                .build()
+            resp = lark_api_client.im.v1.message.create(req)
+            if not resp.success():
+                logger.error("Command reply send failed: %s - %s", resp.code, resp.msg)
+
+        safe_async_run(_dispatch())
+    except Exception as e:
+        logger.error("Error handling message event: %s", e)
+
 def build_final_response(text):
     """
     Returns a simple card update to show final status
@@ -890,9 +984,13 @@ def start_lark_ws():
 
     global lark_ws_client
 
-    event_handler = lark_oapi.EventDispatcherHandler.builder("", "") \
-        .register_p2_card_action_trigger(handle_card_action) \
-        .build()
+    builder = lark_oapi.EventDispatcherHandler.builder("", "") \
+        .register_p2_card_action_trigger(handle_card_action)
+    if hasattr(builder, "register_p2_im_message_receive_v1"):
+        builder = builder.register_p2_im_message_receive_v1(_handle_p2_im_message_receive)
+    else:
+        logger.warning("Lark SDK does not support im.message.receive_v1 registration.")
+    event_handler = builder.build()
 
     lark_ws_client = lark_oapi.ws.Client(
         app_id, 
