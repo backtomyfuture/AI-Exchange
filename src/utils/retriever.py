@@ -1,10 +1,8 @@
-import os
 import logging
 from typing import List, Optional, Any
 from openai import OpenAI, APIError, APIConnectionError
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,21 +22,21 @@ class EmailRetriever:
         embedding_base_url: Optional[str] = None,
         embedding_model: Optional[str] = None
     ):
-        self._qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
+        settings = get_settings()
+        self._qdrant_url = qdrant_url or settings.QDRANT_URL
         self.client: Optional[Any] = None
         # Capture patchable class at construction time for test compatibility.
         self._qdrant_client_cls = QdrantClient
         self.collection_name = collection_name
 
-        # Priority: explicit arg > ENV > default
-        api_base = embedding_base_url or os.getenv("EMBEDDING_BASE_URL") or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-        api_key = embedding_api_key or os.getenv("EMBEDDING_API_KEY", "ollama")
+        api_base = embedding_base_url or settings.EMBEDDING_BASE_URL or "http://localhost:11434/v1"
+        api_key = embedding_api_key or settings.EMBEDDING_API_KEY or "ollama"
 
         self.openai_client = OpenAI(
             base_url=api_base,
             api_key=api_key
         )
-        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
+        self.embedding_model = embedding_model or settings.EMBEDDING_MODEL
 
     def _get_client(self):
         if self.client is None:
