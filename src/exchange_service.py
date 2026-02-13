@@ -147,10 +147,14 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
     else:
         await _upload_attachments_to_lark(email_data)
         await _ingest_to_qdrant(thread_id, email_data, ctx)
-        pipeline_result = await _run_ai_pipeline(thread_id, email_data, ctx, config)
-        if pipeline_result is not None:
-            await _dispatch_notification(thread_id, pipeline_result, ctx, config)
-        await _mark_email_read(thread_id, ctx)
+        try:
+            pipeline_result = await _run_ai_pipeline(thread_id, email_data, ctx, config)
+            if pipeline_result is not None:
+                await _dispatch_notification(thread_id, pipeline_result, ctx, config)
+            await _mark_email_read(thread_id, ctx)
+        except Exception as e:
+            logger.error("Pipeline failed for %s, leaving unread for retry: %s", thread_id, e)
+            await ctx.db_manager.update_status(thread_id, "error")
 
 async def _worker_loop():
     """Webhook-driven background worker. No polling/sync logic."""
