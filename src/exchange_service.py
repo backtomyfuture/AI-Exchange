@@ -11,9 +11,11 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("ExchangeService")
+WORKER_CONCURRENCY = 3
 _webhook_queue: asyncio.Queue | None = None
 _worker_task: asyncio.Task | None = None
 _worker_ctx = None
+_worker_semaphore: asyncio.Semaphore | None = None
 
 async def _upload_attachments_to_lark(email_data: dict) -> None:
     """Upload attachments to Lark Drive and append tokens/urls."""
@@ -157,35 +159,35 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
             await ctx.db_manager.update_status(thread_id, "error")
 
 async def _worker_loop():
-    """Webhook-driven background worker. No polling/sync logic."""
-    global _webhook_queue, _worker_ctx
-    logger.info("Exchange webhook worker started.")
+    """Webhook-driven background worker with concurrency control."""
+    global _webhook_queue, _worker_ctx, _worker_semaphore
+    _worker_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    logger.info("Exchange webhook worker started (concurrency=%d).", WORKER_CONCURRENCY)
+
+    async def _process_one(email_data, skip_analysis):
+        async with _worker_semaphore:
+            try:
+                if "body" not in email_data:
+                    email_id = email_data.get("id")
+                    logger.info(f"Fetching details for {email_id}...")
+                    full_details = await _worker_ctx.exchange_client.get_email(email_id)
+                    if full_details:
+                        email_data.update(full_details)
+                    else:
+                        logger.warning(
+                            "Skip webhook event because detail fetch failed (id=%s, event=%s).",
+                            email_id,
+                            email_data.get("_event_type", "unknown"),
+                        )
+                        return
+                await process_and_archive_email(email_data, _worker_ctx, skip_analysis)
+            except Exception as e:
+                logger.error(f"Worker processing error: {e}")
+
     while True:
         email_data, skip_analysis = await _webhook_queue.get()
-        try:
-            # Fetch full details if body missing
-            if "body" not in email_data:
-                email_id = email_data.get("id")
-                logger.info(f"Fetching details for {email_id}...")
-                full_details = await _worker_ctx.exchange_client.get_email(email_id)
-                if full_details:
-                    email_data.update(full_details)
-                else:
-                    # If detail fetch fails (404/stale/malformed id), skip processing to
-                    # avoid generating drafts/cards and avoid malformed mark-as-read calls.
-                    logger.warning(
-                        "Skip webhook event because detail fetch failed (id=%s, event=%s).",
-                        email_id,
-                        email_data.get("_event_type", "unknown"),
-                    )
-                    continue
-
-            await process_and_archive_email(email_data, _worker_ctx, skip_analysis)
-        except Exception as e:
-            logger.error(f"Worker processing error: {e}")
-        finally:
-            _webhook_queue.task_done()
-            await asyncio.sleep(1)
+        asyncio.create_task(_process_one(email_data, skip_analysis))
+        _webhook_queue.task_done()
 
 
 async def start_worker(ctx=None):
