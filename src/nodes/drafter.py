@@ -61,11 +61,13 @@ async def generate_draft(state: AgentState) -> AgentState:
         ("user", """【历史背景】:
 {context}
 
+<email_content>
 【当前待回复邮件】:
 发件人: {sender}
 主题: {subject}
 正文:
-{body}""")
+{body}
+</email_content>""")
     ])
     chain = prompt | llm
     
