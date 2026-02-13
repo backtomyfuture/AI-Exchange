@@ -398,6 +398,68 @@ def handle_card_action(event):
                     seen.add(uid)
             return deduped
 
+        def _merge_unique(values: List[str]) -> List[str]:
+            merged = []
+            seen = set()
+            for v in values:
+                s = str(v).strip()
+                if s and s not in seen:
+                    merged.append(s)
+                    seen.add(s)
+            return merged
+
+        def _normalize_email_list(raw_value) -> List[str]:
+            """Normalize free-text emails (supports comma/semicolon/newline separators)."""
+            if raw_value is None:
+                return []
+
+            if isinstance(raw_value, (list, tuple, set)):
+                raw_text = ",".join([str(x) for x in raw_value if str(x).strip()])
+            else:
+                raw_text = str(raw_value or "")
+
+            # Prefer extracting emails from arbitrary text, including "Name <email@domain>".
+            matches = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", raw_text)
+            if matches:
+                return _merge_unique(matches)
+
+            tokens = re.split(r"[,;；，\s]+", raw_text.strip())
+            email_pattern = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+            valid = [t.strip() for t in tokens if t.strip() and email_pattern.match(t.strip())]
+            return _merge_unique(valid)
+
+        def _extract_external_emails_from_recipients(recipients) -> List[str]:
+            values = recipients or []
+            if isinstance(values, str):
+                values = [values]
+            extracted = []
+            for item in values:
+                text = str(item).strip()
+                if not text or text.startswith("open_id="):
+                    continue
+                m = re.search(r"email_address='(.*?)'", text)
+                if m:
+                    extracted.append(m.group(1).strip())
+                    continue
+                m2 = re.search(r"<([^>]+)>", text)
+                if m2:
+                    extracted.append(m2.group(1).strip())
+                    continue
+                if "@" in text and " " not in text:
+                    extracted.append(text)
+                    continue
+                extracted.extend(_normalize_email_list(text))
+            return _merge_unique(extracted)
+
+        def _clear_recipient_edit_temp(email_payload: Dict[str, Any], field_type: str):
+            for key in (
+                f"draft_{field_type}_options",
+                f"draft_{field_type}_search_hint",
+                f"draft_{field_type}_new_selected",
+                f"draft_{field_type}_external_input",
+            ):
+                email_payload.pop(key, None)
+
         # Prepare Base Response (ACK)
         response = P2CardActionTriggerResponse()
         
@@ -635,6 +697,10 @@ def handle_card_action(event):
             logger.info(f"save_to action data: value={action_data.value}, form_value={form_values}")
             keep_uids = _normalize_uid_list(form_values.get("to_existing"))
             add_uids = _normalize_uid_list(form_values.get("to_new"))
+            external_raw = form_values.get("to_external_input", None)
+            external_emails = _normalize_email_list(external_raw)
+            if external_raw is None:
+                external_emails = _extract_external_emails_from_recipients(email_data.get("draft_to"))
             merged_uids = []
             seen = set()
             for uid in keep_uids + add_uids:
@@ -642,27 +708,34 @@ def handle_card_action(event):
                     merged_uids.append(uid)
                     seen.add(uid)
 
-            if not merged_uids:
+            new_to = [f"open_id={uid}" for uid in merged_uids]
+            for email in external_emails:
+                if email not in new_to:
+                    new_to.append(email)
+
+            if not new_to:
                 draft = state.values.get("draft", "")
                 edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="to")
                 return {
-                    "toast": {"type": "warning", "content": "收件人至少保留 1 人"},
+                    "toast": {"type": "warning", "content": "收件人至少保留 1 人（飞书人员或外部邮箱）"},
                     "card": {"type": "raw", "data": edit_card}
                 }
 
-            new_to = [f"open_id={uid}" for uid in merged_uids]
             email_data["draft_to"] = new_to
+            _clear_recipient_edit_temp(email_data, "to")
             if str(email_id).startswith("test_push_"):
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_to" not in mock_email:
                     mock_email["original_to"] = list(mock_email.get("to", []))
                 mock_email["draft_to"] = new_to
+                _clear_recipient_edit_temp(mock_email, "to")
             else:
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
                 if "original_to" not in current_email:
                     current_email["original_to"] = list(current_email.get("to", []))
                 current_email["draft_to"] = new_to
+                _clear_recipient_edit_temp(current_email, "to")
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
@@ -671,6 +744,115 @@ def handle_card_action(event):
                 "toast": {"type": "success", "content": f"收件人已保存（{len(new_to)}人）"},
                 "card": {"type": "raw", "data": view_card}
             }
+
+        # 搜索收件人候选
+        elif action_type in ("search_to", "search_cc"):
+            field_type = "to" if action_type == "search_to" else "cc"
+            action_data = event.event.action
+            form_values = getattr(action_data, "form_value", None) or {}
+            keyword = str(form_values.get(f"{field_type}_search_keyword", "")).strip()
+            logger.info("search_%s form_value=%s", field_type, form_values)
+
+            if not keyword:
+                draft = state.values.get("draft", "")
+                edit_card = card_builder.build_approval_card(
+                    email_id, draft, [], email_data, classification, edit_field=field_type
+                )
+                return {
+                    "toast": {"type": "warning", "content": "请输入关键词后再搜索"},
+                    "card": {"type": "raw", "data": edit_card}
+                }
+
+            if not message_id:
+                return {"toast": {"type": "error", "content": "无法定位消息，请重新打开卡片后重试"}}
+
+            async def _search_and_patch_recipients():
+                try:
+                    matched_uids = await asyncio.to_thread(
+                        card_builder.search_person_picker_candidates,
+                        keyword,
+                    )
+                    options_key = f"draft_{field_type}_options"
+                    hint_key = f"draft_{field_type}_search_hint"
+                    selected_key = f"draft_{field_type}_new_selected"
+                    external_key = f"draft_{field_type}_external_input"
+
+                    def _next_hint(total_candidates: int) -> str:
+                        if matched_uids:
+                            return f"本次命中 {len(matched_uids)} 人，累计候选 {total_candidates} 人。可继续搜索并勾选后保存。"
+                        return f"未找到“{keyword}”匹配人员，累计候选 {total_candidates} 人。仅支持邮箱前缀精确搜索（@前部分）。"
+
+                    if str(email_id).startswith("test_push_"):
+                        mock_state = _mock_store.get(email_id)
+                        if not mock_state:
+                            return
+                        current_email = mock_state.values.get("email", {}).copy()
+                        selected_raw = form_values.get(f"{field_type}_new", None)
+                        if selected_raw is None:
+                            selected_new = _normalize_uid_list(current_email.get(selected_key))
+                        else:
+                            selected_new = _normalize_uid_list(selected_raw)
+                        current_options = _normalize_uid_list(current_email.get(options_key))
+                        merged_options = _merge_unique(current_options + matched_uids + selected_new)
+                        external_raw = form_values.get(f"{field_type}_external_input", None)
+                        if external_raw is None:
+                            external_input = str(current_email.get(external_key, "") or "")
+                        else:
+                            external_input = str(external_raw or "").strip()
+                        current_email[options_key] = merged_options
+                        current_email[selected_key] = selected_new
+                        current_email[external_key] = external_input
+                        current_email[hint_key] = _next_hint(len(merged_options))
+                        mock_state.values["email"] = current_email
+                        latest_email = current_email
+                        latest_classification = mock_state.values.get("classification", classification)
+                        latest_draft = mock_state.values.get("draft", "")
+                    else:
+                        config = {"configurable": {"thread_id": email_id}}
+                        latest_state = await graph.aget_state(config)
+                        current_email = latest_state.values.get("email", {}).copy()
+                        selected_raw = form_values.get(f"{field_type}_new", None)
+                        if selected_raw is None:
+                            selected_new = _normalize_uid_list(current_email.get(selected_key))
+                        else:
+                            selected_new = _normalize_uid_list(selected_raw)
+                        current_options = _normalize_uid_list(current_email.get(options_key))
+                        merged_options = _merge_unique(current_options + matched_uids + selected_new)
+                        external_raw = form_values.get(f"{field_type}_external_input", None)
+                        if external_raw is None:
+                            external_input = str(current_email.get(external_key, "") or "")
+                        else:
+                            external_input = str(external_raw or "").strip()
+                        current_email[options_key] = merged_options
+                        current_email[selected_key] = selected_new
+                        current_email[external_key] = external_input
+                        current_email[hint_key] = _next_hint(len(merged_options))
+                        await graph.aupdate_state(config, {"email": current_email})
+                        latest_state = await graph.aget_state(config)
+                        latest_email = latest_state.values.get("email", current_email)
+                        latest_classification = latest_state.values.get("classification", classification)
+                        latest_draft = latest_state.values.get("draft", "")
+
+                    edit_card = card_builder.build_approval_card(
+                        email_id,
+                        latest_draft,
+                        [],
+                        latest_email,
+                        latest_classification,
+                        edit_field=field_type,
+                    )
+                    update_card_ui(message_id, edit_card)
+                    logger.info(
+                        "Recipient search finished: field=%s, keyword=%s, matches=%s",
+                        field_type,
+                        keyword,
+                        len(matched_uids),
+                    )
+                except Exception as e:
+                    logger.error("Recipient search failed: field=%s, err=%s", field_type, e, exc_info=True)
+
+            safe_async_run(_search_and_patch_recipients())
+            return {"toast": {"type": "info", "content": f"正在搜索“{keyword}”，稍后自动更新候选人..."}}
         
         # 保存抄送人
         elif action_type == "save_cc":
@@ -679,6 +861,10 @@ def handle_card_action(event):
             logger.info(f"save_cc action data: value={action_data.value}, form_value={form_values}")
             keep_uids = _normalize_uid_list(form_values.get("cc_existing"))
             add_uids = _normalize_uid_list(form_values.get("cc_new"))
+            external_raw = form_values.get("cc_external_input", None)
+            external_emails = _normalize_email_list(external_raw)
+            if external_raw is None:
+                external_emails = _extract_external_emails_from_recipients(email_data.get("draft_cc"))
             merged_uids = []
             seen = set()
             for uid in keep_uids + add_uids:
@@ -687,18 +873,24 @@ def handle_card_action(event):
                     seen.add(uid)
 
             new_cc = [f"open_id={uid}" for uid in merged_uids]
+            for email in external_emails:
+                if email not in new_cc:
+                    new_cc.append(email)
             email_data["draft_cc"] = new_cc
+            _clear_recipient_edit_temp(email_data, "cc")
             if str(email_id).startswith("test_push_"):
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_cc" not in mock_email:
                     mock_email["original_cc"] = list(mock_email.get("cc", []))
                 mock_email["draft_cc"] = new_cc
+                _clear_recipient_edit_temp(mock_email, "cc")
             else:
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
                 if "original_cc" not in current_email:
                     current_email["original_cc"] = list(current_email.get("cc", []))
                 current_email["draft_cc"] = new_cc
+                _clear_recipient_edit_temp(current_email, "cc")
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")

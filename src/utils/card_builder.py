@@ -210,6 +210,84 @@ class LarkCardBuilder:
 
         return email_map
 
+    def search_person_picker_candidates(self, keyword: str) -> List[str]:
+        """
+        Search selectable open_ids by exact mailbox prefix (user_id) only.
+        No org-wide name matching or cache in v1.
+        """
+        raw_keyword = (keyword or "").strip().lower()
+        if not raw_keyword or not self.lark_api_client:
+            return []
+
+        from lark_oapi.api.contact.v3 import GetUserRequest
+
+        # Accept both full email and direct prefix input.
+        user_prefix = raw_keyword.split("@", 1)[0].strip()
+        if not user_prefix:
+            return []
+
+        results: List[str] = []
+        try:
+            req = GetUserRequest.builder() \
+                .user_id_type("user_id") \
+                .department_id_type("department_id") \
+                .user_id(user_prefix) \
+                .build()
+            resp = self.lark_api_client.contact.v3.user.get(req)
+            if resp.success():
+                body = getattr(resp, "data", None)
+                user = getattr(body, "user", None) if body else None
+                open_id = str(getattr(user, "open_id", "") or "").strip()
+                if open_id:
+                    results.append(open_id)
+        except Exception as e:
+            logger.warning("Prefix lookup failed: prefix=%s, err=%s", user_prefix, e)
+
+        logger.info(
+            "Recipient search stats: mode=prefix_only, keyword=%s, prefix=%s, hits=%s",
+            raw_keyword,
+            user_prefix,
+            len(results),
+        )
+        return results
+
+    @staticmethod
+    def _collect_open_ids_from_recipients(
+        recipients: List,
+        user_map: Dict[str, Dict[str, str]]
+    ) -> List[str]:
+        """Extract open_id list from mixed recipient formats."""
+        collected: List[str] = []
+        seen = set()
+        for r in recipients or []:
+            uid = None
+            r_str = str(r).strip()
+            if r_str.startswith("open_id="):
+                uid = r_str.split("=", 1)[1].strip()
+            else:
+                email = extract_email_address(r)
+                if email:
+                    uid = user_map.get(email, {}).get("open_id")
+            if uid and uid not in seen:
+                collected.append(uid)
+                seen.add(uid)
+        return collected
+
+    @staticmethod
+    def _collect_external_emails_from_recipients(recipients: List) -> List[str]:
+        """Extract non-open_id emails from recipients for external-input defaults."""
+        emails: List[str] = []
+        seen = set()
+        for r in recipients or []:
+            r_str = str(r).strip()
+            if not r_str or r_str.startswith("open_id="):
+                continue
+            email = extract_email_address(r_str)
+            if email and email not in seen:
+                emails.append(email)
+                seen.add(email)
+        return emails
+
     def _format_recipients(
         self,
         recipient_list: List,
@@ -424,6 +502,32 @@ class LarkCardBuilder:
                 all_emails.append(e)
 
         user_map = self.lookup_lark_users(list(set(all_emails)))
+        to_picker_candidates = email_data.get("draft_to_options", []) or []
+        cc_picker_candidates = email_data.get("draft_cc_options", []) or []
+        to_search_hint = email_data.get("draft_to_search_hint", "")
+        cc_search_hint = email_data.get("draft_cc_search_hint", "")
+        to_new_selected = email_data.get("draft_to_new_selected", []) or []
+        cc_new_selected = email_data.get("draft_cc_new_selected", []) or []
+        to_external_input = str(email_data.get("draft_to_external_input", "") or "")
+        cc_external_input = str(email_data.get("draft_cc_external_input", "") or "")
+        if not to_external_input:
+            to_external_input = "; ".join(self._collect_external_emails_from_recipients(draft_to_list))
+        if not cc_external_input:
+            cc_external_input = "; ".join(self._collect_external_emails_from_recipients(draft_cc_list))
+
+        to_existing_candidates = self._collect_open_ids_from_recipients(draft_to_list, user_map)
+        for uid in self._collect_open_ids_from_recipients(original_to_list, user_map):
+            if uid not in to_existing_candidates:
+                to_existing_candidates.append(uid)
+            if len(to_existing_candidates) >= 5:
+                break
+
+        cc_existing_candidates = self._collect_open_ids_from_recipients(draft_cc_list, user_map)
+        for uid in self._collect_open_ids_from_recipients(original_cc_list, user_map):
+            if uid not in cc_existing_candidates:
+                cc_existing_candidates.append(uid)
+            if len(cc_existing_candidates) >= 5:
+                break
 
         elements = []
 
@@ -553,13 +657,23 @@ class LarkCardBuilder:
         elements.append({"tag": "markdown", "content": "**✍️ 拟定回复:**"})
 
         elements.extend(self._build_recipient_section(
-            email_id, "to", "📥 收件人 (To):", draft_to_list, user_map, 
+            email_id, "to", "📥 收件人 (To):", draft_to_list, user_map,
+            existing_candidates=to_existing_candidates,
+            picker_candidates=to_picker_candidates,
+            new_selected=to_new_selected,
+            search_hint=to_search_hint,
+            external_input=to_external_input,
             is_editing=(edit_field == "to")
         ))
 
         # 抄送人部分
         elements.extend(self._build_recipient_section(
             email_id, "cc", "👀 抄送人 (Cc):", draft_cc_list, user_map,
+            existing_candidates=cc_existing_candidates,
+            picker_candidates=cc_picker_candidates,
+            new_selected=cc_new_selected,
+            search_hint=cc_search_hint,
+            external_input=cc_external_input,
             is_editing=(edit_field == "cc")
         ))
 
@@ -912,26 +1026,27 @@ class LarkCardBuilder:
         label: str,
         recipients: List,
         user_map: Dict[str, Dict[str, str]],
+        existing_candidates: Optional[List[str]] = None,
+        picker_candidates: Optional[List[str]] = None,
+        new_selected: Optional[List[str]] = None,
+        search_hint: str = "",
+        external_input: str = "",
         is_editing: bool = False
     ) -> List[dict]:
         """Build recipient section with inline edit button"""
         elements = []
         
         if is_editing:
-            selected_open_ids = []
-            seen = set()
-            for r in recipients or []:
-                uid = None
-                r_str = str(r).strip()
-                if r_str.startswith("open_id="):
-                    uid = r_str.split("=", 1)[1].strip()
-                else:
-                    email = extract_email_address(r)
-                    if email:
-                        uid = user_map.get(email, {}).get("open_id")
-                if uid and uid not in seen:
-                    selected_open_ids.append(uid)
-                    seen.add(uid)
+            selected_open_ids = self._collect_open_ids_from_recipients(recipients, user_map)
+            selected_set = set(selected_open_ids)
+            existing_pool = []
+            existing_seen = set()
+            for uid in selected_open_ids + list(existing_candidates or []):
+                if uid and uid not in existing_seen:
+                    existing_pool.append(uid)
+                    existing_seen.add(uid)
+            max_existing = max(5, len(selected_open_ids))
+            existing_options = existing_pool[:max_existing]
 
             # 编辑模式：使用 form + 显式保存
             elements.append({
@@ -940,20 +1055,81 @@ class LarkCardBuilder:
             })
 
             form_elements = []
-            if selected_open_ids:
-                form_elements.append({
+            if existing_options:
+                existing_picker = {
                     "tag": "multi_select_person",
                     "name": f"{field_type}_existing",
                     "placeholder": {"tag": "plain_text", "content": "原有人员（可取消勾选移除）"},
-                    "options": [{"value": uid} for uid in selected_open_ids],
-                    "selected_values": selected_open_ids
-                })
+                    "options": [{"value": uid} for uid in existing_options],
+                }
+                if selected_open_ids:
+                    existing_picker["selected_values"] = selected_open_ids
+                form_elements.append(existing_picker)
 
             form_elements.append({
+                "tag": "input",
+                "name": f"{field_type}_search_keyword",
+                "input_type": "text",
+                "placeholder": {"tag": "plain_text", "content": "输入邮箱前缀（@前部分）后点击搜索"},
+                "label": {"tag": "plain_text", "content": "🔎 新增人员搜索"},
+                "label_position": "top",
+                "width": "fill"
+            })
+
+            # Keep button in column_set to avoid unsupported "action" container inside form.
+            form_elements.append({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "default",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "top",
+                        "elements": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "搜索匹配人员"},
+                                "type": "default",
+                                "action_type": "form_submit",
+                                "name": f"Button_search_{field_type}",
+                                "value": {"action": f"search_{field_type}", "id": email_id}
+                            }
+                        ]
+                    },
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": []}
+                ]
+            })
+
+            form_elements.append({
+                "tag": "input",
+                "name": f"{field_type}_external_input",
+                "input_type": "text",
+                "placeholder": {"tag": "plain_text", "content": "外部邮箱/群组，多个用逗号或分号分隔"},
+                "label": {"tag": "plain_text", "content": "🌐 外部邮箱（非飞书用户）"},
+                "label_position": "top",
+                "width": "fill",
+                "default_value": str(external_input or "")
+            })
+
+            new_picker = {
                 "tag": "multi_select_person",
                 "name": f"{field_type}_new",
-                "placeholder": {"tag": "plain_text", "content": "新增人员（从可见成员中选择）"}
-            })
+                "placeholder": {"tag": "plain_text", "content": "新增人员（先搜索，再从结果中选择）"},
+            }
+            option_values = []
+            option_seen = set()
+            for uid in list(picker_candidates or []) + list(new_selected or []):
+                if not uid or uid in selected_set or uid in option_seen:
+                    continue
+                option_values.append(uid)
+                option_seen.add(uid)
+            if option_values:
+                new_picker["options"] = [{"value": uid} for uid in option_values]
+                selected_values = [uid for uid in (new_selected or []) if uid in option_seen]
+                if selected_values:
+                    new_picker["selected_values"] = selected_values
+            form_elements.append(new_picker)
 
             form_elements.append({
                 "tag": "column_set",
@@ -1003,7 +1179,7 @@ class LarkCardBuilder:
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": "提示：上方可删减原人员并新增人员，点击保存生效。"
+                        "content": search_hint or "提示：支持累计搜索结果；外部邮箱可直接填写，保存后生效。"
                     }
                 ]
             })
@@ -1013,37 +1189,69 @@ class LarkCardBuilder:
                 {"tag": "column", "width": "auto", "vertical_align": "center",
                  "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": f"**{label}**"}}]}
             ]
-            
-            # 显示收件人
-            for r in recipients[:3]:
-                # 支持 open_id=xxx 格式（选择后的格式）
-                if str(r).startswith("open_id="):
-                    uid = str(r).replace("open_id=", "")
-                    columns.append({
-                        "tag": "column", "width": "auto", "vertical_align": "center",
-                        "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
-                    })
+            rendered_count = 0
+            display_limit = 5
+            hidden_external_count = 0
+
+            def _render_recipient_item(recipient: Any):
+                """Return ('person', uid, is_external) or ('text', content, is_external)."""
+                r_str = str(recipient).strip()
+                if not r_str:
+                    return ("text", "Unknown", False)
+
+                if r_str.startswith("open_id="):
+                    uid = r_str.replace("open_id=", "").strip()
+                    if uid:
+                        return ("person", uid, False)
+                    return ("text", "Unknown", False)
+
+                email = extract_email_address(recipient)
+                if email:
+                    uid = user_map.get(email, {}).get("open_id")
+                    if uid:
+                        return ("person", uid, False)
+                    # Keep original display logic: prefer resolved Exchange name, else raw email text.
+                    display_text = user_map.get(email, {}).get("name") or email
+                    return ("text", display_text, True)
+
+                m_name = re.search(r"name='(.*?)'", r_str)
+                if m_name:
+                    return ("text", m_name.group(1).strip()[:32], False)
+                return ("text", r_str[:32], False)
+
+            for idx, r in enumerate(recipients or []):
+                item_type, value, is_external = _render_recipient_item(r)
+                if idx >= display_limit:
+                    if is_external:
+                        hidden_external_count += 1
                     continue
-                
-                email = extract_email_address(r)
-                uid = user_map.get(email, {}).get('open_id') if email else None
-                if uid:
+
+                if item_type == "person":
                     columns.append({
                         "tag": "column", "width": "auto", "vertical_align": "center",
-                        "elements": [{"tag": "person", "user_id": uid, "style": "normal"}]
+                        "elements": [{"tag": "person", "user_id": value, "style": "normal"}]
                     })
-                elif email:
-                    name = email.split("@")[0]
+                else:
                     columns.append({
                         "tag": "column", "width": "auto", "vertical_align": "center",
-                        "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": name}}]
+                        "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": str(value)[:32]}}]
                     })
-            
-            # 显示更多数量
-            if len(recipients) > 3:
+                rendered_count += 1
+
+            hidden_count = max(0, len(recipients or []) - display_limit)
+            if hidden_count > 0:
+                overflow_text = f"+{hidden_count}"
+                if hidden_external_count > 0:
+                    overflow_text += f"（含外部{hidden_external_count}）"
                 columns.append({
                     "tag": "column", "width": "auto", "vertical_align": "center",
-                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": f"+{len(recipients)-3}"}}]
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": overflow_text}}]
+                })
+
+            if rendered_count == 0:
+                columns.append({
+                    "tag": "column", "width": "auto", "vertical_align": "center",
+                    "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": "（未设置）"}}]
                 })
             
             # 占位
