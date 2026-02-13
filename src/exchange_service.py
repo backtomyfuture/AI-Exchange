@@ -41,9 +41,9 @@ async def _upload_attachments_to_lark(email_data: dict) -> None:
 
 
 async def _ingest_to_qdrant(email_id: str, email_data: dict, ctx) -> None:
-    """Ingest email into Qdrant vector store."""
+    """Ingest email into Qdrant vector store (sync call wrapped in thread)."""
     try:
-        ctx.email_processor.process_email(email_data)
+        await asyncio.to_thread(ctx.email_processor.process_email, email_data)
         logger.info(f"Email {email_id} ingested to Qdrant.")
         await ctx.db_manager.update_status(email_id, "ingested")
     except Exception as e:
