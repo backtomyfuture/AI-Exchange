@@ -6,6 +6,11 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
+from src.config import get_settings
+from src.utils.logging_setup import setup_logging
+
+setup_logging(get_settings().LOG_LEVEL)
+
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.exchange_service import start_worker as exchange_start_worker
@@ -14,11 +19,6 @@ from src.utils.self_healing import SelfHealer
 from src.scheduler.daily_summary import init_scheduler, run_scheduler
 from src.server import app
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger("MainService")
 
 @asynccontextmanager

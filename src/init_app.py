@@ -12,11 +12,6 @@ from src.utils.email_processor import EmailProcessor
 from src.utils.db_async import AsyncDatabaseManager
 from src.config import get_settings
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 load_dotenv()

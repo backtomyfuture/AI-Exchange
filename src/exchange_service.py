@@ -5,11 +5,6 @@ import re
 from src.init_app import get_app_context
 from src.utils import lark_app
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
 _webhook_queue: asyncio.Queue | None = None
