@@ -54,7 +54,8 @@ def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
     
     mock_instance.im.v1.message.create.return_value = mock_resp
     
-    with patch("src.utils.lark_app.get_settings", return_value=fake_settings):
+    with patch("src.utils.lark_app.get_settings", return_value=fake_settings), \
+         patch("src.utils.lark_messaging.get_settings", return_value=fake_settings):
         lark_app.send_approval_card(
             email_id="123",
             draft="Hi",

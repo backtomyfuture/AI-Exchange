@@ -19,9 +19,13 @@ def mock_settings():
 @pytest.fixture
 def mock_env(monkeypatch):
     """Set environment variables for testing."""
+    from src.config import get_settings
+    get_settings.cache_clear()
     monkeypatch.setenv("EXCHANGE_API_URL", "http://mock-api")
     monkeypatch.setenv("EXCHANGE_API_KEY", "test-key")
-    monkeypatch.setenv("EXCHANGE_ACCOUNT_ID", "test-account-id")
+    monkeypatch.setenv("EXCHANGE_ACCOUNT_ID", "8")
     monkeypatch.setenv("LARK_APP_ID", "test-lark-id")
     monkeypatch.setenv("LARK_APP_SECRET", "test-lark-secret")
     monkeypatch.setenv("LARK_CHAT_ID", "test-chat-id")
+    yield
+    get_settings.cache_clear()

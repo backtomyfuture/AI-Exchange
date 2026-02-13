@@ -80,82 +80,14 @@ def _format_address_str(raw_str: str) -> str:
         return html.escape(str(raw_str))
 
 def upload_file_to_drive(name: str, content: bytes, size: int) -> Optional[dict]:
-    """
-    Upload file to Lark Drive. Returns dict with 'file_token' and 'url'.
-    Requires LARK_DRIVE_FOLDER_TOKEN in env.
-    """
-    if not lark_api_client:
-        logger.warning("Lark Client not initialized.")
-        return None
-        
-    settings = get_settings()
-    folder_token = settings.LARK_DRIVE_FOLDER_TOKEN
-    if not folder_token:
-        logger.warning("Lark Drive Folder Token not configured (LARK_DRIVE_FOLDER_TOKEN). Skipping upload.")
-        return None
-
-    try:
-        from lark_oapi.api.drive.v1 import UploadAllFileRequest, UploadAllFileRequestBody
-        
-        request = UploadAllFileRequest.builder() \
-            .request_body(UploadAllFileRequestBody.builder()
-                .file_name(name)
-                .parent_type("explorer")
-                .parent_node(folder_token)
-                .size(size)
-                .file(io.BytesIO(content))
-                .build()) \
-            .build()
-            
-        response = lark_api_client.drive.v1.file.upload_all(request)
-        if not response.success():
-            logger.error(f"Failed to upload file {name}: {response.code} - {response.msg}")
-            return None
-            
-        data = response.data
-        file_token = data.file_token
-        # Construct URL manually as API doesn't return it
-        # Format: https://www.feishu.cn/file/{file_token}
-        url = getattr(data, "url", "")
-        if not url and file_token:
-            url = f"https://www.feishu.cn/file/{file_token}"
-            
-        logger.info(f"File uploaded. Token: {file_token}, Constructed URL: {url}")
-            
-        return {
-            "file_token": file_token,
-            "url": url
-        }
-    except Exception as e:
-        logger.error(f"Exception uploading file {name}: {e}")
-        return None
+    """Upload file to Lark Drive. Delegates to lark_file_ops."""
+    from src.utils.lark_file_ops import upload_file_to_drive as _impl
+    return _impl(name, content, size, lark_api_client=lark_api_client)
 
 def delete_file_from_drive(file_token: str) -> bool:
-    """
-    Delete a file from Lark Drive (trash).
-    """
-    if not lark_api_client or not file_token:
-        return False
-        
-    try:
-        from lark_oapi.api.drive.v1 import DeleteFileRequest
-        
-        # Note: Drive v1 Delete puts file in trash
-        request = DeleteFileRequest.builder() \
-            .file_token(file_token) \
-            .type("file") \
-            .build()
-            
-        response = lark_api_client.drive.v1.file.delete(request)
-        if not response.success():
-            logger.warning(f"Failed to delete file {file_token}: {response.code} - {response.msg}")
-            return False
-            
-        logger.info(f"File deleted (moved to trash): {file_token}")
-        return True
-    except Exception as e:
-        logger.error(f"Exception deleting file {file_token}: {e}")
-        return False
+    """Delete a file from Lark Drive. Delegates to lark_file_ops."""
+    from src.utils.lark_file_ops import delete_file_from_drive as _impl
+    return _impl(file_token, lark_api_client=lark_api_client)
 
 def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     """
@@ -248,83 +180,15 @@ def _resolve_current_user_email(chat_id: str):
         logger.error(f"Error resolving identity: {e}")
 
 def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
-    """
-    Send an interactive card to the configured Lark group/user.
-    """
-    if not lark_api_client:
-        logger.error("Lark Client not initialized. Cannot send card.")
-        return
-    
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
-    if not chat_id:
-        logger.error("LARK_CHAT_ID not configured.")
-        return
-
-    card_content = card_builder.build_approval_card(email_id, draft, context, email_data, classification, pdf_url=pdf_url)
-    
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card_content))
-            .build()) \
-        .build()
-
-    response = lark_api_client.im.v1.message.create(request)
-    if not response.success():
-        logger.error(f"Failed to send Lark card: {response.code} - {response.msg}")
-    else:
-        logger.info(f"Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
+    """Send an interactive approval card. Delegates to lark_messaging."""
+    from src.utils.lark_messaging import send_approval_card as _impl
+    return _impl(email_id, draft, context, email_data, classification, pdf_url=pdf_url,
+                 lark_api_client=lark_api_client, card_builder=card_builder)
 
 def send_system_notification(title: str, content: str, template: str = "red"):
-    """
-    Send a system notification card (e.g. for Circuit Breaker alerts).
-    """
-    if not lark_api_client:
-        logger.error("Lark Client not initialized. Cannot send system notification.")
-        return
-    
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
-    if not chat_id:
-        logger.error("LARK_CHAT_ID not configured.")
-        return
-
-    card_content = {
-        "header": {
-            "template": template,
-            "title": {
-                "content": title,
-                "tag": "plain_text"
-            }
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": content
-                }
-            }
-        ]
-    }
-    
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card_content))
-            .build()) \
-        .build()
-
-    response = lark_api_client.im.v1.message.create(request)
-    if not response.success():
-        logger.error(f"Failed to send system notification: {response.code} - {response.msg}")
-    else:
-        logger.info(f"System notification sent: {title}")
+    """Send a system notification card. Delegates to lark_messaging."""
+    from src.utils.lark_messaging import send_system_notification as _impl
+    return _impl(title, content, template, lark_api_client=lark_api_client)
 
 
 
@@ -332,36 +196,10 @@ def send_system_notification(title: str, content: str, template: str = "red"):
 # Event Handlers
 
 def send_read_only_card(email_id: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
-    """
-    Send a read-only interactive card for important emails that don't require a reply.
-    This card shows email info but has no draft/reply section.
-    """
-    if not lark_api_client:
-        logger.error("Lark Client not initialized. Cannot send card.")
-        return
-    
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
-    if not chat_id:
-        logger.error("LARK_CHAT_ID not configured.")
-        return
-
-    card_content = card_builder.build_read_only_card(email_id, context, email_data, classification, pdf_url=pdf_url)
-    
-    request = CreateMessageRequest.builder() \
-        .receive_id_type("chat_id") \
-        .request_body(CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card_content))
-            .build()) \
-        .build()
-
-    response = lark_api_client.im.v1.message.create(request)
-    if not response.success():
-        logger.error(f"Failed to send read-only Lark card: {response.code} - {response.msg}")
-    else:
-        logger.info(f"Read-only Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
+    """Send a read-only card. Delegates to lark_messaging."""
+    from src.utils.lark_messaging import send_read_only_card as _impl
+    return _impl(email_id, context, email_data, classification, pdf_url=pdf_url,
+                 lark_api_client=lark_api_client, card_builder=card_builder)
 
 
 def update_card_ui(message_id, card_content):
