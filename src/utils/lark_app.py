@@ -366,6 +366,38 @@ def handle_card_action(event):
                     seen.add(uid)
             return deduped
 
+        def _normalize_uid_list(raw_value) -> List[str]:
+            """Normalize form field values to open_id list."""
+            if raw_value is None:
+                return []
+
+            values = []
+            if isinstance(raw_value, (list, tuple, set)):
+                values = [str(x).strip() for x in raw_value]
+            elif isinstance(raw_value, str):
+                raw = raw_value.strip()
+                if not raw:
+                    values = []
+                elif raw.startswith("[") and raw.endswith("]"):
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, list):
+                            values = [str(x).strip() for x in parsed]
+                    except Exception:
+                        values = [v.strip() for v in raw.split(",")]
+                else:
+                    values = [v.strip() for v in raw.split(",")]
+            else:
+                values = [str(raw_value).strip()]
+
+            deduped = []
+            seen = set()
+            for uid in values:
+                if uid and uid not in seen:
+                    deduped.append(uid)
+                    seen.add(uid)
+            return deduped
+
         # Prepare Base Response (ACK)
         response = P2CardActionTriggerResponse()
         
@@ -541,17 +573,22 @@ def handle_card_action(event):
                 }
 
             new_to = [f"open_id={uid}" for uid in selected_uids]
-            email_data["to"] = new_to
+            email_data["draft_to"] = new_to
 
             # PERSISTENCE
             if str(email_id).startswith("test_push_"):
                 # Update Mock Store
-                _mock_store[email_id].values["email"]["to"] = new_to
+                mock_email = _mock_store[email_id].values["email"]
+                if "original_to" not in mock_email:
+                    mock_email["original_to"] = list(mock_email.get("to", []))
+                mock_email["draft_to"] = new_to
             else:
                 # Update Graph State
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
-                current_email["to"] = new_to
+                if "original_to" not in current_email:
+                    current_email["original_to"] = list(current_email.get("to", []))
+                current_email["draft_to"] = new_to
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
@@ -566,17 +603,22 @@ def handle_card_action(event):
             selected_uids = _read_selected_open_ids(action_data)
             logger.info(f"select_cc: selected={selected_uids}")
             new_cc = [f"open_id={uid}" for uid in selected_uids]
-            email_data["cc"] = new_cc
+            email_data["draft_cc"] = new_cc
 
             # PERSISTENCE
             if str(email_id).startswith("test_push_"):
                 # Update Mock Store
-                _mock_store[email_id].values["email"]["cc"] = new_cc
+                mock_email = _mock_store[email_id].values["email"]
+                if "original_cc" not in mock_email:
+                    mock_email["original_cc"] = list(mock_email.get("cc", []))
+                mock_email["draft_cc"] = new_cc
             else:
                 # Update Graph State
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
-                current_email["cc"] = new_cc
+                if "original_cc" not in current_email:
+                    current_email["original_cc"] = list(current_email.get("cc", []))
+                current_email["draft_cc"] = new_cc
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
@@ -589,25 +631,80 @@ def handle_card_action(event):
         # 保存收件人
         elif action_type == "save_to":
             action_data = event.event.action
-            logger.info(f"save_to action data: value={action_data.value}, option={getattr(action_data, 'option', None)}, form_value={action_data.form_value}")
-            # 目前无法持久化，仅返回原卡片
+            form_values = getattr(action_data, "form_value", None) or {}
+            logger.info(f"save_to action data: value={action_data.value}, form_value={form_values}")
+            keep_uids = _normalize_uid_list(form_values.get("to_existing"))
+            add_uids = _normalize_uid_list(form_values.get("to_new"))
+            merged_uids = []
+            seen = set()
+            for uid in keep_uids + add_uids:
+                if uid and uid not in seen:
+                    merged_uids.append(uid)
+                    seen.add(uid)
+
+            if not merged_uids:
+                draft = state.values.get("draft", "")
+                edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="to")
+                return {
+                    "toast": {"type": "warning", "content": "收件人至少保留 1 人"},
+                    "card": {"type": "raw", "data": edit_card}
+                }
+
+            new_to = [f"open_id={uid}" for uid in merged_uids]
+            email_data["draft_to"] = new_to
+            if str(email_id).startswith("test_push_"):
+                mock_email = _mock_store[email_id].values["email"]
+                if "original_to" not in mock_email:
+                    mock_email["original_to"] = list(mock_email.get("to", []))
+                mock_email["draft_to"] = new_to
+            else:
+                config = {"configurable": {"thread_id": email_id}}
+                current_email = state.values.get("email", {}).copy()
+                if "original_to" not in current_email:
+                    current_email["original_to"] = list(current_email.get("to", []))
+                current_email["draft_to"] = new_to
+                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+
             draft = state.values.get("draft", "")
             view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
             return {
-                "toast": {"type": "info", "content": "暂不支持修改收件人（测试模式）"},
+                "toast": {"type": "success", "content": f"收件人已保存（{len(new_to)}人）"},
                 "card": {"type": "raw", "data": view_card}
             }
         
         # 保存抄送人
         elif action_type == "save_cc":
-            # 人员选择器的值可能在 option 或 form_value 中
             action_data = event.event.action
-            logger.info(f"save_cc action data: value={action_data.value}, option={getattr(action_data, 'option', None)}, form_value={action_data.form_value}")
-            # 目前无法持久化，仅返回原卡片
+            form_values = getattr(action_data, "form_value", None) or {}
+            logger.info(f"save_cc action data: value={action_data.value}, form_value={form_values}")
+            keep_uids = _normalize_uid_list(form_values.get("cc_existing"))
+            add_uids = _normalize_uid_list(form_values.get("cc_new"))
+            merged_uids = []
+            seen = set()
+            for uid in keep_uids + add_uids:
+                if uid and uid not in seen:
+                    merged_uids.append(uid)
+                    seen.add(uid)
+
+            new_cc = [f"open_id={uid}" for uid in merged_uids]
+            email_data["draft_cc"] = new_cc
+            if str(email_id).startswith("test_push_"):
+                mock_email = _mock_store[email_id].values["email"]
+                if "original_cc" not in mock_email:
+                    mock_email["original_cc"] = list(mock_email.get("cc", []))
+                mock_email["draft_cc"] = new_cc
+            else:
+                config = {"configurable": {"thread_id": email_id}}
+                current_email = state.values.get("email", {}).copy()
+                if "original_cc" not in current_email:
+                    current_email["original_cc"] = list(current_email.get("cc", []))
+                current_email["draft_cc"] = new_cc
+                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+
             draft = state.values.get("draft", "")
             view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
             return {
-                "toast": {"type": "info", "content": "暂不支持修改抄送人（测试模式）"},
+                "toast": {"type": "success", "content": f"抄送人已保存（{len(new_cc)}人）"},
                 "card": {"type": "raw", "data": view_card}
             }
         

@@ -379,20 +379,46 @@ class LarkCardBuilder:
             original_snippet = text[:150] + "..." if len(text) > 150 else text
 
         reason = classification.get("reasoning", "智能生成")
-        cc_list = email_data.get("cc", [])
-        if isinstance(cc_list, str):
-            cc_list = [cc_list]
+
+        original_to_list = email_data.get("original_to", email_data.get("to", []))
+        if isinstance(original_to_list, str):
+            original_to_list = [original_to_list]
+
+        original_cc_list = email_data.get("original_cc", email_data.get("cc", []))
+        if isinstance(original_cc_list, str):
+            original_cc_list = [original_cc_list]
+
+        draft_to_list = email_data.get("draft_to")
+        if isinstance(draft_to_list, str):
+            draft_to_list = [draft_to_list]
+        if not draft_to_list:
+            draft_to_list = [raw_sender]
+
+        # draft_cc supports explicit empty list; when absent, fallback to original cc
+        draft_cc_list = email_data.get("draft_cc")
+        if draft_cc_list is None:
+            draft_cc_list = list(original_cc_list)
+        elif isinstance(draft_cc_list, str):
+            draft_cc_list = [draft_cc_list]
 
         # Collect all emails for user lookup
         all_emails = []
         sender_email = extract_email_address(raw_sender)
         if sender_email:
             all_emails.append(sender_email)
-        for r in email_data.get("to", []):
+        for r in original_to_list:
             e = extract_email_address(r)
             if e:
                 all_emails.append(e)
-        for c in cc_list:
+        for c in original_cc_list:
+            e = extract_email_address(c)
+            if e:
+                all_emails.append(e)
+        for r in draft_to_list:
+            e = extract_email_address(r)
+            if e:
+                all_emails.append(e)
+        for c in draft_cc_list:
             e = extract_email_address(c)
             if e:
                 all_emails.append(e)
@@ -417,7 +443,11 @@ class LarkCardBuilder:
         })
 
         # Sender/Recipient compact row
-        compact_columns = self._build_compact_header_row(raw_sender, email_data, user_map)
+        compact_columns = self._build_compact_header_row(
+            raw_sender,
+            {"to": original_to_list, "cc": original_cc_list},
+            user_map
+        )
         elements.append({
             "tag": "column_set",
             "flex_mode": "none",
@@ -427,7 +457,15 @@ class LarkCardBuilder:
         })
         elements.append({"tag": "hr"})
 
-        logger.info(f"Build Card Debug: Sender={raw_sender}, To={email_data.get('to')}, Cc={cc_list}, PDF={pdf_url}")
+        logger.info(
+            "Build Card Debug: Sender=%s, OriginalTo=%s, OriginalCc=%s, DraftTo=%s, DraftCc=%s, PDF=%s",
+            raw_sender,
+            original_to_list,
+            original_cc_list,
+            draft_to_list,
+            draft_cc_list,
+            pdf_url,
+        )
         resolved_pdf_url = self._normalize_pdf_url(pdf_url)
 
         # Original email summary
@@ -514,12 +552,6 @@ class LarkCardBuilder:
         # Draft section
         elements.append({"tag": "markdown", "content": "**✍️ 拟定回复:**"})
 
-        # 收件人部分: 默认回复给发件人，但如果用户修改了(含有open_id)，则使用修改后的列表
-        draft_to_list = [raw_sender]
-        current_to = email_data.get("to", [])
-        if current_to and any(str(x).startswith("open_id=") for x in current_to):
-            draft_to_list = current_to
-
         elements.extend(self._build_recipient_section(
             email_id, "to", "📥 收件人 (To):", draft_to_list, user_map, 
             is_editing=(edit_field == "to")
@@ -527,7 +559,7 @@ class LarkCardBuilder:
 
         # 抄送人部分
         elements.extend(self._build_recipient_section(
-            email_id, "cc", "👀 抄送人 (Cc):", cc_list, user_map,
+            email_id, "cc", "👀 抄送人 (Cc):", draft_cc_list, user_map,
             is_editing=(edit_field == "cc")
         ))
 
@@ -796,8 +828,14 @@ class LarkCardBuilder:
                 "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👥 收件人:**"}}]
             })
             
-            e = extract_email_address(to_person)
-            uid = user_map.get(e, {}).get('open_id') if e else None
+            to_person_str = str(to_person).strip()
+            uid = None
+            e = None
+            if to_person_str.startswith("open_id="):
+                uid = to_person_str.split("=", 1)[1].strip()
+            else:
+                e = extract_email_address(to_person)
+                uid = user_map.get(e, {}).get('open_id') if e else None
             
             if uid:
                 columns.append({
@@ -832,8 +870,14 @@ class LarkCardBuilder:
                 "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "**👀 抄送:**"}}]
             })
             
-            e = extract_email_address(cc_person)
-            uid = user_map.get(e, {}).get('open_id') if e else None
+            cc_person_str = str(cc_person).strip()
+            uid = None
+            e = None
+            if cc_person_str.startswith("open_id="):
+                uid = cc_person_str.split("=", 1)[1].strip()
+            else:
+                e = extract_email_address(cc_person)
+                uid = user_map.get(e, {}).get('open_id') if e else None
             
             if uid:
                 columns.append({
@@ -874,26 +918,92 @@ class LarkCardBuilder:
         elements = []
         
         if is_editing:
-            person_picker = {
-                "tag": "multi_select_person",
-                "placeholder": {"tag": "plain_text", "content": "从可见成员中多选"},
-                "value": {"action": f"select_{field_type}", "id": email_id}
-            }
+            selected_open_ids = []
+            seen = set()
+            for r in recipients or []:
+                uid = None
+                r_str = str(r).strip()
+                if r_str.startswith("open_id="):
+                    uid = r_str.split("=", 1)[1].strip()
+                else:
+                    email = extract_email_address(r)
+                    if email:
+                        uid = user_map.get(email, {}).get("open_id")
+                if uid and uid not in seen:
+                    selected_open_ids.append(uid)
+                    seen.add(uid)
 
-            # 编辑模式：显示人员选择器，选择后立即更新
+            # 编辑模式：使用 form + 显式保存
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**{label}** *(选择后自动保存)*"}
+                "text": {"tag": "lark_md", "content": f"**{label}**"}
             })
-            elements.append({
-                "tag": "action",
-                "actions": [
-                    person_picker,
+
+            form_elements = []
+            if selected_open_ids:
+                form_elements.append({
+                    "tag": "multi_select_person",
+                    "name": f"{field_type}_existing",
+                    "placeholder": {"tag": "plain_text", "content": "原有人员（可取消勾选移除）"},
+                    "options": [{"value": uid} for uid in selected_open_ids],
+                    "selected_values": selected_open_ids
+                })
+
+            form_elements.append({
+                "tag": "multi_select_person",
+                "name": f"{field_type}_new",
+                "placeholder": {"tag": "plain_text", "content": "新增人员（从可见成员中选择）"}
+            })
+
+            form_elements.append({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "default",
+                "columns": [
                     {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "✕ 取消"},
-                        "type": "default",
-                        "value": {"action": "cancel_edit", "id": email_id}
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "top",
+                        "elements": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "✓ 保存"},
+                                "type": "primary",
+                                "action_type": "form_submit",
+                                "name": f"Button_submit_{field_type}",
+                                "value": {"action": f"save_{field_type}", "id": email_id}
+                            }
+                        ]
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "vertical_align": "top",
+                        "elements": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "✕ 取消"},
+                                "type": "default",
+                                "value": {"action": "cancel_edit", "id": email_id},
+                                "name": f"Button_cancel_{field_type}"
+                            }
+                        ]
+                    }
+                ]
+            })
+
+            elements.append({
+                "tag": "form",
+                "name": f"Form_{field_type}",
+                "elements": form_elements
+            })
+
+            elements.append({
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": "提示：上方可删减原人员并新增人员，点击保存生效。"
                     }
                 ]
             })

@@ -56,15 +56,20 @@ async def send_final_email(state: AgentState, config: RunnableConfig | None = No
             return str(recipient_str)
 
         # Resolve To/Cc lists
+        # Reply recipients are editable in card and stored separately from original email recipients.
         final_to = []
-        raw_to = email_data.get("to", [])
+        raw_to = email_data.get("draft_to")
+        if raw_to is None:
+            raw_to = email_data.get("to", [])
         if isinstance(raw_to, str): raw_to = [raw_to]
         for r in raw_to:
             resolved = resolve_recipient(r)
             if resolved: final_to.append(resolved)
 
         final_cc = []
-        raw_cc = email_data.get("cc", [])
+        raw_cc = email_data.get("draft_cc")
+        if raw_cc is None:
+            raw_cc = email_data.get("cc", [])
         if isinstance(raw_cc, str): raw_cc = [raw_cc]
         for r in raw_cc:
             resolved = resolve_recipient(r)
