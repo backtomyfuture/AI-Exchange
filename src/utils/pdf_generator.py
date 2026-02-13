@@ -6,6 +6,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Suppress verbose fontTools logs
+logging.getLogger("fontTools").setLevel(logging.WARNING)
+
 # Optional import for WeasyPrint (requires system libraries like pango)
 try:
     from weasyprint import HTML, CSS

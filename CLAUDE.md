@@ -814,4 +814,98 @@ process_batch[仅元数据] → categorizer(纯文本) → need_reply?
 
 ---
 
-**Last Updated**: 2026-02-12 (Webhook-Only Migration + QDRANT_URL Startup Fix)
+## 13. Full-upgrade 全面升级纪要 (2026-02-13)
+
+> [!IMPORTANT]
+> 本节记录 `docs/plans/2026-02-12-full-upgrade-plan.md` 的实际落地。共 21 个 Task，分 4 个 Phase 完成，将系统从"可用"提升到"生产级"。
+
+### 13.1 执行概览
+
+| Phase | 目标 | 状态 |
+|:------|:----|:-----|
+| Phase 1 | P0 正确性与安全 | ✅ |
+| Phase 2 | P1 可靠性与可维护性 | ✅ |
+| Phase 3 | P2 工程成熟度 | ✅ |
+| Phase 4 | 新功能 (Ideas 1-5) | ✅ |
+
+### 13.2 Phase 1: P0 - 正确性与安全
+
+| Task | 内容 | 核心文件 |
+|:-----|:----|:--------|
+| 1 | 路由引擎集成到 LangGraph | `categorizer.py` 开头调用 `get_routing_engine().execute_router(state)` |
+| 2 | `/debug/inject_email` 保护 | `config.py` 新增 `DEBUG`，`server.py` 非 DEBUG 时返回 403 |
+| 3 | drafter 消费 `system_prompt_modifier` | `drafter.py` 在 system prompt 后追加 modifier |
+| 4 | 熔断器滑动窗口 | `circuit_breaker.py` 重写：`failure_threshold`、`window_seconds`、`_failure_timestamps` |
+
+### 13.3 Phase 2: P1 - 可靠性与可维护性
+
+| Task | 内容 | 核心文件 |
+|:-----|:----|:--------|
+| 5 | 启动 SelfHealer + DailySummary | `main.py` lifespan，`self_healing.py` 用 `get_connection()`，`db_async.py` 新增 `get_records_by_date` |
+| 6 | 失败时不标记已读 | `exchange_service.py` 仅成功时调用 `_mark_email_read` |
+| 7 | Worker 并发消费 | `exchange_service.py` 使用 `Semaphore(3)` 限制并发 |
+| 8 | 拆分 lark_app | `lark_messaging.py`、`lark_file_ops.py`、`lark_ws.py`（WS 入口 facade） |
+| 9 | Qdrant 调用异步包装 | `_ingest_to_qdrant` 用 `asyncio.to_thread` 包装 `process_email` |
+
+### 13.4 Phase 3: P2 - 工程成熟度
+
+| Task | 内容 | 核心文件 |
+|:-----|:----|:--------|
+| 10 | 结构化日志 | `logging_setup.py`、`structlog`、`main.py`/`init_app.py` |
+| 11 | Prompt 注入防御 | `categorizer.py`、`drafter.py` 用 `<email_content>` 包裹用户内容 |
+| 12 | retriever 配置统一 | `retriever.py` 改用 `get_settings()` |
+| 13 | 删除 db.py | 移除 `src/utils/db.py` |
+| 14 | AgentState reducer | `state.py` 使用 `Annotated[List, operator.add]` |
+| 15 | 健康检查增强 | `server.py` `/health` 增加 DB ping、queue_depth、circuit_breaker |
+| 16 | update_status 列名白名单 | `db_async.py` 仅允许 `ALLOWED_COLUMNS` 更新 |
+
+### 13.5 Phase 4: 新功能
+
+| Task | 内容 | 核心文件 |
+|:-----|:----|:--------|
+| 17 | 分类置信度 | `categorizer.py` 输出 `confidence` 字段 |
+| 18 | 线程感知检索 | `retriever_node.py` 优先 `search_by_thread`，再语义检索 |
+| 19 | 草稿自评 reviewer | `reviewer.py`、`builder.py` 图内 drafter→reviewer→条件边 |
+| 20 | 飞书私聊指令中心 | `src/commands/`、`lark_app.py` 注册 `im.message.receive_v1` |
+| 21 | `/stats` 富卡片回复 | `handlers.py` 的 `handle_stats` 返回 dict 时发 interactive 卡片 |
+
+### 13.6 飞书指令中心 (Task 20/21) 详解
+
+**可用指令**（私聊 p2p 发送）：
+- `/help` - 显示帮助
+- `/stats [today 或 week]` - 邮件统计（富卡片）
+- `/queue` - 队列深度与熔断器状态
+- `/pending` - 待审批邮件
+- `/search <关键词>` - 搜索历史邮件
+- `/health` - 系统健康状态
+
+**关键代码位置**：
+- `src/commands/router.py` - 指令路由
+- `src/commands/handlers.py` - 各指令实现、`init_commands(db_manager)`
+- `src/utils/lark_app.py` - `_handle_p2_im_message_receive`、`register_p2_im_message_receive_v1`
+- `src/utils/lark_ws.py` - WS 入口 facade（兼容 `lark_app`）
+
+**回复类型**：`str` 发文本，`dict` 发 interactive 卡片。`/stats` 有数据时返回 dict 富卡片。
+
+### 13.7 影响文件总览
+
+- **新增**：`src/commands/`、`src/nodes/reviewer.py`、`src/utils/lark_ws.py`、`src/utils/lark_messaging.py`、`src/utils/lark_file_ops.py`、`src/utils/logging_setup.py`
+- **删除**：`src/utils/db.py`
+- **重点修改**：`categorizer.py`、`drafter.py`、`retriever_node.py`、`exchange_service.py`、`lark_app.py`、`graph/builder.py`、`graph/state.py`、`server.py`、`db_async.py`、`circuit_breaker.py`、`main.py`、`config.py`
+
+### 13.8 验证清单
+
+```bash
+# 全量测试
+.venv/bin/python -m pytest -q
+
+# 健康检查
+curl http://localhost:8000/health
+
+# 指令中心（需飞书私聊机器人）
+# 在飞书私聊中发送 /help 或 /stats
+```
+
+---
+
+**Last Updated**: 2026-02-13 (Full-upgrade 21 Tasks + Lark Command Center)

@@ -79,6 +79,9 @@ async def _run_ai_pipeline(email_id: str, email_data: dict, ctx, config: dict):
 async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, config: dict) -> None:
     """Send Lark card based on classification result."""
     classification = pipeline_result.get("classification", {})
+    priority = classification.get("priority", "P3")
+    intent = classification.get("intent", "Unknown")
+
     if classification.get("need_reply"):
         logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
         pdf_url = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
@@ -91,6 +94,17 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             pdf_url=pdf_url,
         )
         await ctx.db_manager.update_status(email_id, "waiting_approval")
+    elif priority == "P1" or intent == "通知":
+        logger.info(f"Email is important ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
+        pdf_url = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
+        lark_app.send_read_only_card(
+            email_id=email_id,
+            context=pipeline_result.get("context", []),
+            email_data=pipeline_result.get("email", {}),
+            classification=classification,
+            pdf_url=pdf_url,
+        )
+        await ctx.db_manager.update_status(email_id, "notified_readonly")
     else:
         logger.info(f"No reply needed for email: {email_id}")
         await ctx.db_manager.update_status(email_id, "skipped")
@@ -108,28 +122,30 @@ async def _mark_email_read(email_id: str, ctx) -> None:
         logger.error(f"Exception marking email {email_id} as read: {e}")
 
 
-async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False):
+async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False, force_reprocess: bool = False):
     """
     Process a single email based on route decision.
 
     - skip_analysis=False: upload -> ingest -> AI -> notify -> mark_read
     - skip_analysis=True: ingest only -> mark archived (no upload/AI/notify/mark_read)
+    - force_reprocess=True: proceed even if email already exists in DB
     """
     thread_id = email_data.get("id", str(time.time()))
     config = {"configurable": {"thread_id": thread_id}}
     event_type = email_data.get("_event_type", "unknown")
     folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(
-        "Starting processing for email: %s - %s (event=%s, folder=%s, skip_analysis=%s)",
+        "Starting processing for email: %s - %s (event=%s, folder=%s, skip_analysis=%s, force=%s)",
         thread_id,
         email_data.get("subject"),
         event_type,
         folder_name,
         skip_analysis,
+        force_reprocess,
     )
 
     is_new = await ctx.db_manager.log_initial_email(email_data)
-    if not is_new:
+    if not is_new and not force_reprocess:
         logger.info("Email %s already exists in DB.", thread_id)
         if not skip_analysis:
             await _mark_email_read(thread_id, ctx)
