@@ -10,6 +10,8 @@ from src.init_app import get_app_context
 from src.utils import lark_app
 from src.exchange_service import start_worker as exchange_start_worker
 from src.exchange_service import stop_worker as exchange_stop_worker
+from src.utils.self_healing import SelfHealer
+from src.scheduler.daily_summary import init_scheduler, run_scheduler
 from src.server import app
 
 # Configure logging
@@ -42,7 +44,15 @@ async def lifespan(app: FastAPI):
     
     # 3. Start webhook-driven Exchange worker
     await exchange_start_worker(ctx)
-    
+
+    # 4. Start Self-Healing worker
+    self_healer = SelfHealer(ctx=ctx, interval_seconds=900)
+    healing_task = asyncio.create_task(self_healer.start())
+
+    # 5. Start Daily Summary scheduler
+    init_scheduler(ctx.db_manager, lark_app)
+    summary_task = asyncio.create_task(run_scheduler())
+
     logger.info("Service is fully operational (Web Server running).")
     
     yield # Server runs here
@@ -50,6 +60,13 @@ async def lifespan(app: FastAPI):
     logger.info("Stopping services...")
     
     # Shutdown logic
+    self_healer.stop()
+    healing_task.cancel()
+    summary_task.cancel()
+    try:
+        await asyncio.gather(healing_task, summary_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        pass
     await exchange_stop_worker()
     await ctx.close()
     logger.info("Shutdown complete.")

@@ -192,6 +192,20 @@ class AsyncDatabaseManager:
         """Quick shortcut for dedup, sets status to 'ingested'."""
         await self.update_status(email_id, "ingested")
 
+    async def get_records_by_date(self, target_date) -> list:
+        """Query email records processed on a specific date."""
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT * FROM emails_log WHERE DATE(processed_at) = %s ORDER BY processed_at DESC",
+                        (target_date,)
+                    )
+                    return await cur.fetchall()
+        except Exception as e:
+            logger.error(f"Failed to get records by date: {e}")
+            return []
+
     async def close(self):
         if self._pool:
             await self._pool.close()

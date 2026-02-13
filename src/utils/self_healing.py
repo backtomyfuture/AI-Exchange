@@ -21,27 +21,23 @@ class SelfHealer:
         """
         Find emails that are either in 'error' state or stuck in intermediate states for too long.
         """
-        stuck_emails = []
         try:
-            conn = await self.ctx.db_manager.get_connection()
-            async with conn.cursor() as cur:
-                # 1. Select emails in 'error' status
-                # 2. Select emails in intermediate statuses that haven't been updated for 30 minutes
-                query = f"""
-                    SELECT id, status, subject, updated_at 
-                    FROM emails_log 
-                    WHERE status = 'error' 
-                       OR (status IN ('ingested', 'analyzed', 'pending') 
-                           AND updated_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes')
-                    ORDER BY updated_at ASC
-                    LIMIT 20
-                """
-                await cur.execute(query)
-                stuck_emails = await cur.fetchall()
+            async with self.ctx.db_manager.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    query = """
+                        SELECT id, status, subject, updated_at
+                        FROM emails_log
+                        WHERE status = 'error'
+                           OR (status IN ('ingested', 'analyzed', 'pending')
+                               AND updated_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes')
+                        ORDER BY updated_at ASC
+                        LIMIT 20
+                    """
+                    await cur.execute(query)
+                    return await cur.fetchall()
         except Exception as e:
             logger.error(f"Failed to query stuck emails for self-healing: {e}")
-        
-        return stuck_emails
+            return []
 
     async def reprocess_single(self, email_id: str) -> bool:
         """
@@ -61,9 +57,9 @@ class SelfHealer:
             email_data['id'] = email_id
             
             # Step 2: Delete old DB record to reset state machine
-            conn = await self.ctx.db_manager.get_connection()
-            async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM emails_log WHERE id = %s", (email_id,))
+            async with self.ctx.db_manager.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("DELETE FROM emails_log WHERE id = %s", (email_id,))
             
             # Step 3: Run full processing pipeline
             # This uses the new fixed process_and_archive_email
