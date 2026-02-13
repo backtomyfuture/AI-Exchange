@@ -18,6 +18,7 @@ async def test_categorize_email_success(mock_env):
                     "intent": "咨询",
                     "summary": "Test Summary",
                     "reasoning": "Test Reason",
+                    "confidence": 0.9,
                 }
 
             return _wrapped

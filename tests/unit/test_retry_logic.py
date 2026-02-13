@@ -24,7 +24,8 @@ async def test_categorize_email_retry_logic():
         "need_reply": True,
         "intent": "咨询",
         "summary": "Test retry email",
-        "reasoning": "Retry success"
+        "reasoning": "Retry success",
+        "confidence": 0.8,
     }
 
     with patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create_llm, \

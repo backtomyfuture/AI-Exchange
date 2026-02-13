@@ -17,6 +17,7 @@ class EmailClassification(BaseModel):
     intent: Literal["咨询", "审批", "通知", "垃圾邮件"] = Field(description="邮件的主要意图")
     summary: str = Field(description="根据邮件的标题和内容，生成一个简短的总结")
     reasoning: str = Field(description="简短的分类理由")
+    confidence: float = Field(description="分类置信度，0.0 到 1.0 之间", ge=0.0, le=1.0)
 
 async def categorize_email(state: AgentState) -> AgentState:
     """
@@ -65,7 +66,8 @@ async def categorize_email(state: AgentState) -> AgentState:
             need_reply=False, 
             intent="通知", 
             summary=subject or "分类失败，已降级处理",
-            reasoning=f"Auto-fallback due to error: {str(e)[:50]}"
+            reasoning=f"Auto-fallback due to error: {str(e)[:50]}",
+            confidence=0.0,
         )
 
     # 更新状态
