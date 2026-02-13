@@ -346,6 +346,26 @@ def handle_card_action(event):
 
         logger.info(f"State fetched for {email_id}. Action: {action_type}")
 
+        def _read_selected_open_ids(action_data) -> List[str]:
+            """Read selected open_ids from person picker callbacks."""
+            selected = []
+
+            options = getattr(action_data, "options", None)
+            if isinstance(options, list):
+                selected.extend([str(uid).strip() for uid in options if str(uid).strip()])
+
+            option = getattr(action_data, "option", None)
+            if option:
+                selected.append(str(option).strip())
+
+            deduped = []
+            seen = set()
+            for uid in selected:
+                if uid and uid not in seen:
+                    deduped.append(uid)
+                    seen.add(uid)
+            return deduped
+
         # Prepare Base Response (ACK)
         response = P2CardActionTriggerResponse()
         
@@ -507,61 +527,62 @@ def handle_card_action(event):
                 "card": {"type": "raw", "data": edit_card}
             }
         
-        # 选择人员时的回调 - 直接更新卡片显示选中的人
+        # 选择人员时的回调 - 支持多选并直接更新卡片
         elif action_type == "select_to":
             action_data = event.event.action
-            selected_uid = getattr(action_data, 'option', None)
-            logger.info(f"select_to: selected={selected_uid}")
-            if selected_uid:
-                # 更新email_data中的to
-                new_to = [f"open_id={selected_uid}"]
-                email_data["to"] = new_to
-                
-                # PERSISTENCE
-                if str(email_id).startswith("test_push_"):
-                    # Update Mock Store
-                    _mock_store[email_id].values["email"]["to"] = new_to
-                else:
-                    # Update Graph State
-                    config = {"configurable": {"thread_id": email_id}}
-                    # Merge deep update manually or just update whole email object
-                    # Graph update usually merges top-level keys. We need to be careful.
-                    # Assuming we can update 'email' key.
-                    # Retrieve current email data first to avoid overwriting other fields (already done in 'state')
-                    current_email = state.values.get("email", {}).copy()
-                    current_email["to"] = new_to
-                    safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
-                
+            selected_uids = _read_selected_open_ids(action_data)
+            logger.info(f"select_to: selected={selected_uids}")
+            if not selected_uids:
+                draft = state.values.get("draft", "")
+                view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+                return {
+                    "toast": {"type": "warning", "content": "收件人至少保留 1 人"},
+                    "card": {"type": "raw", "data": view_card}
+                }
+
+            new_to = [f"open_id={uid}" for uid in selected_uids]
+            email_data["to"] = new_to
+
+            # PERSISTENCE
+            if str(email_id).startswith("test_push_"):
+                # Update Mock Store
+                _mock_store[email_id].values["email"]["to"] = new_to
+            else:
+                # Update Graph State
+                config = {"configurable": {"thread_id": email_id}}
+                current_email = state.values.get("email", {}).copy()
+                current_email["to"] = new_to
+                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+
             draft = state.values.get("draft", "")
             view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
             return {
-                "toast": {"type": "success", "content": "收件人已更新"},
+                "toast": {"type": "success", "content": f"收件人已更新（{len(new_to)}人）"},
                 "card": {"type": "raw", "data": view_card}
             }
         
         elif action_type == "select_cc":
             action_data = event.event.action
-            selected_uid = getattr(action_data, 'option', None)
-            logger.info(f"select_cc: selected={selected_uid}")
-            if selected_uid:
-                new_cc = [f"open_id={selected_uid}"]
-                email_data["cc"] = new_cc
-                
-                 # PERSISTENCE
-                if str(email_id).startswith("test_push_"):
-                    # Update Mock Store
-                    _mock_store[email_id].values["email"]["cc"] = new_cc
-                else:
-                    # Update Graph State
-                    config = {"configurable": {"thread_id": email_id}}
-                    current_email = state.values.get("email", {}).copy()
-                    current_email["cc"] = new_cc
-                    safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+            selected_uids = _read_selected_open_ids(action_data)
+            logger.info(f"select_cc: selected={selected_uids}")
+            new_cc = [f"open_id={uid}" for uid in selected_uids]
+            email_data["cc"] = new_cc
+
+            # PERSISTENCE
+            if str(email_id).startswith("test_push_"):
+                # Update Mock Store
+                _mock_store[email_id].values["email"]["cc"] = new_cc
+            else:
+                # Update Graph State
+                config = {"configurable": {"thread_id": email_id}}
+                current_email = state.values.get("email", {}).copy()
+                current_email["cc"] = new_cc
+                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
             view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
             return {
-                "toast": {"type": "success", "content": "抄送人已更新"},
+                "toast": {"type": "success", "content": f"抄送人已更新（{len(new_cc)}人）"},
                 "card": {"type": "raw", "data": view_card}
             }
         
@@ -579,7 +600,7 @@ def handle_card_action(event):
         
         # 保存抄送人
         elif action_type == "save_cc":
-            # select_person 的值可能在 option 或 form_value 中
+            # 人员选择器的值可能在 option 或 form_value 中
             action_data = event.event.action
             logger.info(f"save_cc action data: value={action_data.value}, option={getattr(action_data, 'option', None)}, form_value={action_data.form_value}")
             # 目前无法持久化，仅返回原卡片

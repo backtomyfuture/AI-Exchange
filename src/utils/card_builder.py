@@ -874,6 +874,12 @@ class LarkCardBuilder:
         elements = []
         
         if is_editing:
+            person_picker = {
+                "tag": "multi_select_person",
+                "placeholder": {"tag": "plain_text", "content": "从可见成员中多选"},
+                "value": {"action": f"select_{field_type}", "id": email_id}
+            }
+
             # 编辑模式：显示人员选择器，选择后立即更新
             elements.append({
                 "tag": "div",
@@ -882,11 +888,7 @@ class LarkCardBuilder:
             elements.append({
                 "tag": "action",
                 "actions": [
-                    {
-                        "tag": "select_person",
-                        "placeholder": {"tag": "plain_text", "content": "从群成员中选择"},
-                        "value": {"action": f"select_{field_type}", "id": email_id}
-                    },
+                    person_picker,
                     {
                         "tag": "button",
                         "text": {"tag": "plain_text", "content": "✕ 取消"},
