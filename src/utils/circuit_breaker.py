@@ -1,8 +1,10 @@
 import time
 import logging
 import threading
+from typing import List
 
 logger = logging.getLogger(__name__)
+
 
 class CircuitBreaker:
     _instance = None
@@ -17,58 +19,57 @@ class CircuitBreaker:
 
     def _init(self):
         self._is_open = False
-        self.last_failure_time = 0
+        self.failure_threshold = 3
+        self.window_seconds = 120
+        self.recovery_timeout = 300
+        self._failure_timestamps: List[float] = []
         self.failure_count = 0
-        # Recovery timeout in seconds (default 5 minutes)
-        self.recovery_timeout = 300 
+        self.last_failure_time = 0
         self.last_error = None
+
+    def _prune_expired(self):
+        """Remove failure timestamps outside the sliding window."""
+        cutoff = time.time() - self.window_seconds
+        self._failure_timestamps = [t for t in self._failure_timestamps if t > cutoff]
 
     @property
     def is_open(self):
         return self._is_open
 
     def report_failure(self, error: Exception):
-        """
-        Report a failure. Transitions state to OPEN if closed.
-        """
-        current_time = time.time()
-        self.failure_count += 1
-        self.last_failure_time = current_time
+        now = time.time()
+        self._failure_timestamps.append(now)
+        self._prune_expired()
+        self.failure_count = len(self._failure_timestamps)
+        self.last_failure_time = now
         self.last_error = str(error)
-        
-        if not self._is_open:
+
+        if not self._is_open and self.failure_count >= self.failure_threshold:
             self._is_open = True
-            logger.critical(f"Circuit Breaker OPENED due to error: {error}")
-            return True # Indicates state changed to OPEN
+            logger.critical(
+                "Circuit Breaker OPENED: %d failures in %ds window (error: %s)",
+                self.failure_count, self.window_seconds, error,
+            )
+            return True
         return False
 
     def report_success(self):
-        """
-        Report a success. Transitions state to CLOSED if open.
-        """
-        if self._is_open:
-            self._is_open = False
-            self.failure_count = 0
-            self.last_error = None
+        was_open = self._is_open
+        self._is_open = False
+        self.failure_count = 0
+        self._failure_timestamps.clear()
+        self.last_error = None
+        if was_open:
             logger.info("Circuit Breaker CLOSED (System recovered)")
-            return True # Indicates state changed to CLOSED
-        else:
-            self.failure_count = 0
-            return False
+        return was_open
 
     def can_proceed(self) -> bool:
-        """
-        Returns True if the circuit is CLOSED (system healthy).
-        """
         return not self._is_open
 
     def should_attempt_recovery(self) -> bool:
-        """
-        Returns True if enough time has passed since failure to attempt recovery.
-        """
         if not self._is_open:
             return False
         return (time.time() - self.last_failure_time) > self.recovery_timeout
 
-# Global instance
+
 circuit_breaker = CircuitBreaker()
