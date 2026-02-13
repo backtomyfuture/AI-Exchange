@@ -49,20 +49,39 @@ async def health_check():
     """
     try:
         ctx = get_app_context()
-        
+
+        # DB ping
+        db_ok = False
+        try:
+            async with ctx.db_manager.get_connection() as conn:
+                await conn.execute("SELECT 1")
+                db_ok = True
+        except Exception:
+            pass
+
+        # Queue depth
+        from src.exchange_service import _webhook_queue
+        queue_depth = _webhook_queue.qsize() if _webhook_queue else 0
+
+        # Circuit breaker
+        from src.utils.circuit_breaker import circuit_breaker
+        cb_open = circuit_breaker.is_open
+
         checks = {
-            "db_pool": ctx.pool is not None and not getattr(ctx.pool, 'closed', True),
+            "db_ping": db_ok,
             "graph": ctx.graph is not None,
-            "lark_client": lark_app.lark_api_client is not None
+            "lark_client": lark_app.lark_api_client is not None,
+            "circuit_breaker_open": cb_open,
         }
-        
-        healthy = all(checks.values())
-        
+
+        healthy = db_ok and ctx.graph is not None and not cb_open
+
         return JSONResponse(
             status_code=200 if healthy else 503,
             content={
                 "status": "healthy" if healthy else "degraded",
-                "checks": checks
+                "checks": checks,
+                "queue_depth": queue_depth,
             }
         )
     except Exception as e:
