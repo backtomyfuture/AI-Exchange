@@ -145,12 +145,20 @@ class AsyncDatabaseManager:
 
     async def update_status(self, email_id: str, status: str, **kwargs):
         """Update the status and optional fields of an email log."""
+        ALLOWED_COLUMNS = {
+            "classification", "summary", "priority", "need_reply",
+            "card_type", "draft", "message_id", "intent", "reasoning",
+            "error_message",
+        }
         try:
             async with self.get_connection() as conn:
                 update_fields = ["status = %s", "updated_at = CURRENT_TIMESTAMP"]
                 params = [status]
 
                 for key, value in kwargs.items():
+                    if key not in ALLOWED_COLUMNS:
+                        logger.warning(f"Rejected update_status column: {key}")
+                        continue
                     if key == "classification":
                         update_fields.append(f"{key} = %s")
                         params.append(json.dumps(value))
