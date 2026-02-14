@@ -290,25 +290,17 @@ class ExchangeClient:
         """
         return await self._send_payload(to, subject, body, is_draft=False)
 
-    async def create_draft(self, to: str, subject: str, body: str) -> bool:
+    async def create_draft(self, to: List[str], subject: str, body: str, cc: List[str] = None) -> bool:
         """
         调用接口创建草稿。
-        Ref: User provided specific implementation for /emails/drafts
         """
-        # Clean the 'to' address
-        clean_to = to
-        if "email_address=" in to:
-            match = re.search(r"email_address='([^']*)'", to)
-            if match:
-                clean_to = match.group(1)
-
         headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        # Assuming api_url is .../exchange/emails, and new endpoint is .../exchange/emails/drafts
         endpoint = f"{self.api_url}/drafts"
         
         payload = {
             "account_id": self.account_id,
-            "to": [clean_to],
+            "to": to,
+            "cc": cc or [],
             "subject": subject,
             "body": body,
             "body_type": "html",

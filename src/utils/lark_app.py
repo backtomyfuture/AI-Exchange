@@ -158,7 +158,35 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     init_commands(db_mgr)
     _register_builtin_commands()
 
+def _collect_cleanup_tokens(state) -> List[str]:
+    """
+    Collect all file tokens that need to be cleaned up from the state.
+    Includes:
+    1. 'attachment_tokens' (legacy/explicit list)
+    2. 'pdf_token' (generated PDF)
+    3. 'email.attachments[].lark_file_token' (original attachments)
+    """
+    tokens = set()
+    
+    # 1. Explicit tokens
+    if state.values.get("attachment_tokens"):
+        tokens.update(state.values["attachment_tokens"])
+        
+    # 2. PDF Token
+    if state.values.get("pdf_token"):
+        tokens.add(state.values["pdf_token"])
+        
+    # 3. Email Attachments
+    email_data = state.values.get("email", {})
+    attachments = email_data.get("attachments", [])
+    for att in attachments:
+        if att.get("lark_file_token"):
+            tokens.add(att["lark_file_token"])
+            
+    return list(tokens)
+
 def _resolve_current_user_email(chat_id: str):
+
     """
     Dynamically resolve the current user's email based on LARK_CHAT_ID.
     Logic: GetChat -> OwnerID (OpenID) -> GetUser -> Email/Username
@@ -567,15 +595,8 @@ def handle_card_action(event):
             safe_async_wait(db_manager.update_status(email_id, "read"))
             
             # Remove attachments (PDF + Originals)
-            att_tokens = state.values.get("attachment_tokens", [])
-            # Make a copy to avoid modifying state in place if it is a reference
-            att_tokens = list(att_tokens)
+            att_tokens = _collect_cleanup_tokens(state)
             
-            # Always try to include PDF token if it exists
-            pdf_token = state.values.get("pdf_token")
-            if pdf_token and pdf_token not in att_tokens:
-                att_tokens.append(pdf_token)
-                
             if att_tokens:
                 logger.info(f"Cleaning up {len(att_tokens)} attachments (mark_read)...")
                 for tok in att_tokens:
@@ -1079,15 +1100,12 @@ def process_approval(email_id, user_id):
     safe_async_wait(graph.aupdate_state(config, {"approval_status": "approved"}))
     safe_async_wait(db_manager.update_status(email_id, "approved"))
     logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
-    # Execute graph
+    # Execution graph
     # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
-    att_tokens = state.values.get("attachment_tokens", [])
     
-    # Legacy fallback
-    if not att_tokens and state.values.get("pdf_token"):
-        att_tokens.append(state.values.get("pdf_token"))
-        
+    att_tokens = _collect_cleanup_tokens(state)
+
     if att_tokens:
         logger.info(f"Cleaning up {len(att_tokens)} attachments...")
         for tok in att_tokens:
@@ -1102,11 +1120,8 @@ def process_rejection(email_id, user_id):
     logger.info(f"Rejection processed for {email_id} by {user_id}. Executing graph...")
     # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
-    att_tokens = state.values.get("attachment_tokens", [])
     
-    # Legacy fallback
-    if not att_tokens and state.values.get("pdf_token"):
-        att_tokens.append(state.values.get("pdf_token"))
+    att_tokens = _collect_cleanup_tokens(state)
 
     if att_tokens:
         logger.info(f"Cleaning up {len(att_tokens)} attachments...")
@@ -1125,26 +1140,72 @@ def process_modification(email_id, new_draft):
     logger.info(f"Modification saved for {email_id}. New draft length: {len(new_draft)}")
 
 async def process_save_draft(email_id, state):
-    draft = state.values.get("draft", "")
-    email_data = state.values.get("email", {})
-    to = email_data.get("sender")
-    subject = "Re: " + email_data.get("subject", "")
-    body = draft + "<br><br>--<br>AI Generated Draft"
-    if exchange_client:
-         await exchange_client.create_draft(str(to), subject, body)
-    await db_manager.update_status(email_id, "draft_saved")
-
-    # Remove attachments (PDF + Originals)
-    att_tokens = state.values.get("attachment_tokens", [])
+    try:
+        draft = state.values.get("draft", "")
+        email_data = state.values.get("email", {})
+        
+        # 1. Resolve Recipients (Copy logic from sender.py)
+        from lark_oapi.api.contact.v3 import GetUserRequest
+        
+        def resolve_recipient(recipient_str):
+            # Check for open_id=xxx
+            if "open_id=" in str(recipient_str):
+                open_id = str(recipient_str).replace("open_id=", "").strip()
+                if not lark_api_client:
+                    return None
+                try:
+                    req = GetUserRequest.builder().user_id(open_id).user_id_type("open_id").build()
+                    resp = lark_api_client.contact.v3.user.get(req)
+                    if resp.success() and resp.data and resp.data.user:
+                            # Prioritize enterprise_email, then email
+                            email = resp.data.user.enterprise_email or resp.data.user.email
+                            if email:
+                                return email
+                    return None
+                except Exception as e:
+                    logger.error(f"Error resolving open_id {open_id}: {e}")
+                    return None
+            
+            # Extract from legacy format "name='...', email_address='...'" or just return string
+            if "email_address='" in str(recipient_str):
+                m = re.search(r"email_address='(.*?)'", str(recipient_str))
+                if m: return m.group(1)
+            
+            return str(recipient_str)
     
-    # Legacy fallback
-    if not att_tokens and state.values.get("pdf_token"):
-        att_tokens.append(state.values.get("pdf_token"))
+        final_to = []
+        raw_to = email_data.get("draft_to", [])
+        if isinstance(raw_to, str): raw_to = [raw_to]
+        for r in raw_to:
+            resolved = resolve_recipient(r)
+            if resolved: final_to.append(resolved)
 
-    if att_tokens:
-        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
-        for tok in att_tokens:
-             delete_file_from_drive(tok)
+        final_cc = []
+        raw_cc = email_data.get("draft_cc", [])
+        if isinstance(raw_cc, str): raw_cc = [raw_cc]
+        for r in raw_cc:
+            resolved = resolve_recipient(r)
+            if resolved: final_cc.append(resolved)
+
+        subject = "Re: " + email_data.get("subject", "")
+        body = draft + "<br><br>--<br>AI Generated Draft"
+        
+        if exchange_client:
+             logger.info(f"Saving draft for {email_id}. To: {final_to}, Cc: {final_cc}")
+             await exchange_client.create_draft(final_to, subject, body, cc=final_cc)
+        
+        await db_manager.update_status(email_id, "draft_saved")
+
+        # Remove attachments (PDF + Originals)
+        att_tokens = _collect_cleanup_tokens(state)
+
+        if att_tokens:
+            logger.info(f"Cleaning up {len(att_tokens)} attachments (async)...")
+            for tok in att_tokens:
+                 await asyncio.to_thread(delete_file_from_drive, tok)
+
+    except Exception as e:
+        logger.error(f"Error in process_save_draft: {e}", exc_info=True)
 
 async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[str]:
     """
@@ -1159,25 +1220,40 @@ async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[s
         
         if html_content:
             logger.info(f"HTML Content generated for PDF. Size: {len(html_content)} bytes")
+        else:
+            logger.warning("HTML Content is empty or None.")
 
-        
         # 2. Convert to PDF (CPU/IO bound)
-        pdf_bytes = await loop.run_in_executor(None, convert_html_to_pdf, html_content)
+        logger.info(f"Calling convert_html_to_pdf with content length: {len(html_content) if html_content else 0}")
+        try:
+             pdf_bytes = await loop.run_in_executor(None, convert_html_to_pdf, html_content)
+        except Exception as pdf_err:
+             logger.error(f"convert_html_to_pdf failed: {pdf_err}", exc_info=True)
+             return None
         
         if not pdf_bytes:
             logger.error("PDF generation returned empty bytes.")
             return None
+        
+        logger.info(f"PDF Generated. Size: {len(pdf_bytes)} bytes")
 
         # 3. Upload to Drive (Network bound)
         filename = f"Email_Export_{email_id}.pdf"
-        upload_resp = await loop.run_in_executor(None, upload_file_to_drive, filename, pdf_bytes, len(pdf_bytes))
+        logger.info(f"Uploading PDF: {filename}")
         
+        try:
+            upload_resp = await loop.run_in_executor(None, upload_file_to_drive, filename, pdf_bytes, len(pdf_bytes))
+        except Exception as up_err:
+            logger.error(f"upload_file_to_drive failed: {up_err}", exc_info=True)
+            return None
+        
+        logger.info(f"Upload Response Type: {type(upload_resp)}")
         if not upload_resp:
-            logger.error("PDF Upload failed.")
+            logger.error("PDF Upload failed (response is empty/None).")
             return None
 
-        file_url = upload_resp["url"]
-        file_token = upload_resp["file_token"]
+        file_url = upload_resp.get("url")
+        file_token = upload_resp.get("file_token")
         logger.info(f"PDF Uploaded: {file_url} (Token: {file_token})")
         return {"url": file_url, "file_token": file_token}
         

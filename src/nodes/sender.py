@@ -75,24 +75,45 @@ async def send_final_email(state: AgentState, config: RunnableConfig | None = No
             resolved = resolve_recipient(r)
             if resolved: final_cc.append(resolved)
 
-        logger.info(f"Sending reply. To: {final_to}, Cc: {final_cc}")
+        if state.get("classification", {}).get("action") == "forward":
+            # Forward Actions
+            # Note: Exchange forward API might not support CC field directly in this wrapper,
+            # so we merge CC into To for now to ensuring delivery, or just ignore if API follows strict forward semantics.
+            # Looking at exchange_api.py, forward_email only takes 'to'.
+            # We will merge final_cc into final_to.
+            forward_recipients = list(set(final_to + final_cc))
+            
+            logger.info(f"Executing Forward. Recipients: {forward_recipients}")
+            
+            success = await ctx.exchange_client.forward_email(
+                email_id=email_data.get("id"),
+                to=forward_recipients,
+                body=draft
+            )
+            action_type = "forwarded"
+        else:
+            # Reply Action
+            logger.info(f"Sending reply. To: {final_to}, Cc: {final_cc}")
 
-        success = await ctx.exchange_client.reply_email(
-            email_id=email_data.get("id"),
-            body=draft,
-            to=final_to,
-            cc=final_cc
-        )
+            success = await ctx.exchange_client.reply_email(
+                email_id=email_data.get("id"),
+                body=draft,
+                to=final_to,
+                cc=final_cc
+            )
+            action_type = "sent"
 
         if success:
-            await ctx.db_manager.update_status(email_data.get("id"), "sent")
+            await ctx.db_manager.update_status(email_data.get("id"), action_type)
+            # Only index reply/forward content if needed. currently process_sent_email indexes it.
+            # We can reuse process_sent_email for forwarding too, it just logs "me" -> "recipient"
             ctx.email_processor.process_sent_email(
                 original_email_data=email_data,
                 reply_content=draft
             )
-            logger.info(f"邮件已成功发送并存入向量库。邮件 ID: {email_data.get('id')}")
+            logger.info(f"邮件已成功{action_type}并存入向量库。邮件 ID: {email_data.get('id')}")
         else:
             await ctx.db_manager.update_status(email_data.get('id'), "failed_sending")
-            logger.error(f"邮件发送失败。邮件 ID: {email_data.get('id')}")
+            logger.error(f"邮件发送/转发失败。邮件 ID: {email_data.get('id')}")
 
     return state

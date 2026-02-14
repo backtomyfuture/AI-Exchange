@@ -49,6 +49,7 @@ async def generate_draft(state: AgentState) -> AgentState:
 2. 模仿用户的稳重、专业且礼貌的写作风格。
 3. 直接输出最终的邮件回复正文。
 4. 不要输出 <thought> 或 <draft> 标签，也不要包含任何解释性文字。
+5. 【重要】绝对不要包含原邮件内容、发件人信息或引用历史。系统会自动追加，如果你输出了会导致重复。只输出你的回复部分即可。
 
 请使用中文回复。"""
 
@@ -74,6 +75,12 @@ async def generate_draft(state: AgentState) -> AgentState:
     @with_llm_retry(max_attempts=3)
     async def invoke_with_retry(payload):
         return await chain.ainvoke(payload)
+
+    # Check for Forwarding action - Skip LLM
+    classification = state.get("classification", {})
+    if classification.get("action") == "forward":
+        logger.info("Action is 'forward'. Skipping LLM draft generation. Using existing draft.")
+        return state
 
     try:
         logger.info("Generating draft with LLM and retrieved context.")

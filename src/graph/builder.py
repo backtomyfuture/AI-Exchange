@@ -37,21 +37,16 @@ def build_graph(checkpointer=None):
     def route_after_review(state: AgentState):
         if state.get("next_step") == "drafter":
             return "drafter"
-        return "continue"
-
-    def route_after_approval(state: AgentState):
-        status = state.get("approval_status", "pending")
-        if status == "approved":
+        # If approved (updated via human action), go to sender
+        if state.get("approval_status") == "approved":
             return "sender"
-        elif status == "modify":
-            return "drafter"
-        else:
-            return END
+        # Otherwise finish (wait for approval)
+        return "continue"
 
     workflow.add_conditional_edges(
         "reviewer",
         route_after_review,
-        {"drafter": "drafter", "continue": END}
+        {"drafter": "drafter", "continue": END, "sender": "sender"}
     )
 
     workflow.add_edge("sender", END)

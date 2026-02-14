@@ -466,17 +466,12 @@ class LarkCardBuilder:
         if isinstance(original_cc_list, str):
             original_cc_list = [original_cc_list]
 
-        draft_to_list = email_data.get("draft_to")
+        draft_to_list = email_data.get("draft_to", [])
         if isinstance(draft_to_list, str):
             draft_to_list = [draft_to_list]
-        if not draft_to_list:
-            draft_to_list = [raw_sender]
 
-        # draft_cc supports explicit empty list; when absent, fallback to original cc
-        draft_cc_list = email_data.get("draft_cc")
-        if draft_cc_list is None:
-            draft_cc_list = list(original_cc_list)
-        elif isinstance(draft_cc_list, str):
+        draft_cc_list = email_data.get("draft_cc", [])
+        if isinstance(draft_cc_list, str):
             draft_cc_list = [draft_cc_list]
 
         # Collect all emails for user lookup
@@ -532,10 +527,13 @@ class LarkCardBuilder:
         elements = []
 
         # Header
+        is_forward = classification.get("action") == "forward"
+        header_title = f"📬 拟定转发: {subject}" if is_forward else f"📬 拟稿审批: {subject}"
+        
         header = {
             "template": "blue",
             "title": {
-                "content": f"📬 拟稿审批: {subject}",
+                "content": header_title,
                 "tag": "plain_text"
             }
         }
@@ -654,10 +652,13 @@ class LarkCardBuilder:
         elements.append({"tag": "hr"})
 
         # Draft section
-        elements.append({"tag": "markdown", "content": "**✍️ 拟定回复:**"})
+        # Draft section
+        draft_section_title = "**✍️ 拟定转发语:**" if is_forward else "**✍️ 拟定回复:**"
+        elements.append({"tag": "markdown", "content": draft_section_title})
 
+        to_label = "📥 转发给 (To):" if is_forward else "📥 收件人 (To):"
         elements.extend(self._build_recipient_section(
-            email_id, "to", "📥 收件人 (To):", draft_to_list, user_map,
+            email_id, "to", to_label, draft_to_list, user_map,
             existing_candidates=to_existing_candidates,
             picker_candidates=to_picker_candidates,
             new_selected=to_new_selected,
@@ -691,7 +692,7 @@ class LarkCardBuilder:
         elements.append({
             "tag": "action",
             "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 批准发送"},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 批准转发" if is_forward else "✅ 批准发送"},
                  "type": "primary", "value": {"action": "approve", "id": email_id}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "💾 存为草稿"},
                  "type": "default", "value": {"action": "save_draft_only", "id": email_id}},

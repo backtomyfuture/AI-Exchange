@@ -84,7 +84,15 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
 
     if classification.get("need_reply"):
         logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
-        pdf_url = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
+        pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
+        pdf_url = pdf_result.get("url") if pdf_result else None
+        pdf_token = pdf_result.get("file_token") if pdf_result else None
+        
+        if pdf_token:
+            # Persist PDF token for cleanup
+            config = {"configurable": {"thread_id": email_id}}
+            await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
+
         lark_app.send_approval_card(
             email_id=email_id,
             draft=pipeline_result.get("draft", ""),
@@ -96,7 +104,15 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         await ctx.db_manager.update_status(email_id, "waiting_approval")
     elif priority == "P1" or intent == "通知":
         logger.info(f"Email is important ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
-        pdf_url = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
+        pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
+        pdf_url = pdf_result.get("url") if pdf_result else None
+        pdf_token = pdf_result.get("file_token") if pdf_result else None
+        
+        if pdf_token:
+            # Persist PDF token for cleanup
+            config = {"configurable": {"thread_id": email_id}}
+            await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
+
         lark_app.send_read_only_card(
             email_id=email_id,
             context=pipeline_result.get("context", []),
@@ -143,6 +159,14 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
         skip_analysis,
         force_reprocess,
     )
+
+    # Initialize Draft Recipients (Reply Logic)
+    # This ensures "Reply to Sender" and "Reply All (CC)" is the default behavior
+    if "draft_to" not in email_data:
+        email_data["draft_to"] = [email_data.get("sender")] if email_data.get("sender") else []
+    
+    if "draft_cc" not in email_data:
+        email_data["draft_cc"] = email_data.get("cc", [])
 
     is_new = await ctx.db_manager.log_initial_email(email_data)
     if not is_new and not force_reprocess:

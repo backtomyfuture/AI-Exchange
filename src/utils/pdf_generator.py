@@ -7,7 +7,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Suppress verbose fontTools logs
-logging.getLogger("fontTools").setLevel(logging.WARNING)
+# Suppress verbose fontTools and WeasyPrint logs
+# Suppress verbose fontTools and WeasyPrint logs
+logging.getLogger("fontTools").setLevel(logging.ERROR)
+logging.getLogger("weasyprint").setLevel(logging.ERROR)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # Optional import for WeasyPrint (requires system libraries like pango)
 try:
@@ -65,7 +70,26 @@ def convert_html_to_pdf(html_content: str) -> bytes:
         if html_content:
             html_content = html_content.replace('windowtext', 'black')
 
+        # Configure Fonts
         font_config = FontConfiguration()
+        
+        # Explicitly check if any fonts were loaded to avoid "NoneType" error later
+        if not font_config.font_map:
+             logger.warning("WeasyPrint FontConfiguration found no fonts. Checking system paths...")
+             # Check for common custom font paths
+             custom_font_dirs = ["/usr/share/fonts", "/usr/local/share/fonts", "/root/.local/share/fonts"]
+             found_fonts = []
+             for d in custom_font_dirs:
+                 if os.path.exists(d):
+                     for root, _, files in os.walk(d):
+                         for f in files:
+                             if f.lower().endswith((".ttf", ".otf")):
+                                 found_fonts.append(os.path.join(root, f))
+             
+             if not found_fonts:
+                 logger.error("No fonts found in system! PDF generation may crash or look wrong.")
+             else:
+                 logger.info(f"Found {len(found_fonts)} fonts in system directories.")
         
         css_string = """
             body {

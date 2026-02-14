@@ -29,8 +29,11 @@ class AppContext:
         Initialize all shared components.
         """
         logger.info("Initializing Application Context...")
-        
         settings = get_settings()
+
+        # Suppress verbose logs from third-party libraries globally
+        logging.getLogger("fontTools").setLevel(logging.ERROR)
+        logging.getLogger("weasyprint").setLevel(logging.ERROR)
 
         # 1. Core Components
         self.exchange_client = ExchangeClient(settings)
