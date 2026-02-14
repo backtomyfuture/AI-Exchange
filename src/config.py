@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     LLM_RATE_LIMIT_DELAY: int = 10
     LLM_MAX_RPM: float = 15.0
 
+    # Polling (Hybrid Mode)
+    POLLING_INTERVAL: int = 3600  # Default 1 hour
+
     # Embedding
     QDRANT_URL: str = "http://localhost:6333"
     EMBEDDING_API_KEY: str = ""

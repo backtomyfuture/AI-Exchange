@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import signal
@@ -17,6 +18,7 @@ from src.exchange_service import start_worker as exchange_start_worker
 from src.exchange_service import stop_worker as exchange_stop_worker
 from src.utils.self_healing import SelfHealer
 from src.scheduler.daily_summary import init_scheduler, run_scheduler
+from src.scheduler.polling import run_polling_loop
 from src.server import app
 
 logger = logging.getLogger("MainService")
@@ -53,6 +55,12 @@ async def lifespan(app: FastAPI):
     init_scheduler(ctx.db_manager, lark_app)
     summary_task = asyncio.create_task(run_scheduler())
 
+    # 6. Start Hybrid Polling scheduler (Catch-up)
+    polling_interval = get_settings().POLLING_INTERVAL
+    polling_task = asyncio.create_task(
+        run_polling_loop(ctx, interval=polling_interval, startup_delay=polling_interval)
+    )
+
     logger.info("Service is fully operational (Web Server running).")
     
     yield # Server runs here
@@ -63,8 +71,9 @@ async def lifespan(app: FastAPI):
     self_healer.stop()
     healing_task.cancel()
     summary_task.cancel()
+    polling_task.cancel()
     try:
-        await asyncio.gather(healing_task, summary_task, return_exceptions=True)
+        await asyncio.gather(healing_task, summary_task, polling_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     await exchange_stop_worker()
@@ -96,4 +105,3 @@ def run_server():
 
 if __name__ == "__main__":
     run_server()
-
