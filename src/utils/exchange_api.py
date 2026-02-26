@@ -7,6 +7,7 @@ logger = logging.getLogger("ExchangeClient")
 class ExchangeClient:
     """
     Exchange 接口客户端，封装 HTTP 调用逻辑。
+    Uses a shared httpx.AsyncClient with connection pooling for performance.
     """
     def __init__(self, settings=None):
         if settings is None:
@@ -22,6 +23,8 @@ class ExchangeClient:
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
 
+        self._http_client: httpx.AsyncClient | None = None
+
         # --- Folder cache for webhook routing ---
         self._folder_cache: dict | None = None
         self._folder_tree: dict | None = None
@@ -30,6 +33,24 @@ class ExchangeClient:
         self.drafts_folder_id: str | None = None
         self._sentitems_name = getattr(settings, "EXCHANGE_FOLDER_SENTITEMS", "已发送邮件")
         self._drafts_name = getattr(settings, "EXCHANGE_FOLDER_DRAFTS", "草稿")
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Lazy-initialized shared HTTP client with connection pooling."""
+        if self._http_client is None or self._http_client.is_closed:
+            headers = {"X-API-KEY": self.api_key} if self.api_key else {}
+            self._http_client = httpx.AsyncClient(
+                verify=self.ssl_verify,
+                headers=headers,
+                timeout=httpx.Timeout(20.0, connect=10.0),
+            )
+        return self._http_client
+
+    async def close(self):
+        """Close the shared HTTP client."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.close()
+            self._http_client = None
 
     async def get_all_folders(self, force_refresh: bool = False) -> dict:
         """
@@ -41,7 +62,6 @@ class ExchangeClient:
         if self._folder_cache is not None and not force_refresh:
             return self._folder_cache
 
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         base_url = re.sub(r"/emails/?$", "", self.api_url)
         endpoints = [
             f"{self.api_url}/folders/all",
@@ -49,37 +69,36 @@ class ExchangeClient:
         ]
         params = {"account_id": self.account_id}
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                for endpoint in dict.fromkeys(endpoints):
-                    response = await client.get(
-                        endpoint,
-                        params=params,
-                        headers=headers,
-                        timeout=15.0,
-                    )
-                    if response.status_code == 200:
-                        folders = response.json().get("data", {}).get("folders", [])
-                        self._build_folder_cache(folders)
-                        logger.info(
-                            "Folder cache loaded from %s: %s folders. sentitems=%s, drafts=%s",
-                            endpoint,
-                            len(self._folder_cache),
-                            self.sentitems_folder_id,
-                            self.drafts_folder_id,
-                        )
-                        return self._folder_cache
-                    logger.warning(
-                        "Folder endpoint returned %s: %s",
-                        response.status_code,
-                        endpoint,
-                    )
-                logger.warning(
-                    "Failed to get folders from all candidate endpoints. "
-                    "Routing will use safe fallback mode."
+        client = self.http_client
+        try:
+            for endpoint in dict.fromkeys(endpoints):
+                response = await client.get(
+                    endpoint,
+                    params=params,
+                    timeout=15.0,
                 )
-            except Exception as e:
-                logger.error("Exception getting folders: %s", e)
+                if response.status_code == 200:
+                    folders = response.json().get("data", {}).get("folders", [])
+                    self._build_folder_cache(folders)
+                    logger.info(
+                        "Folder cache loaded from %s: %s folders. sentitems=%s, drafts=%s",
+                        endpoint,
+                        len(self._folder_cache),
+                        self.sentitems_folder_id,
+                        self.drafts_folder_id,
+                    )
+                    return self._folder_cache
+                logger.warning(
+                    "Folder endpoint returned %s: %s",
+                    response.status_code,
+                    endpoint,
+                )
+            logger.warning(
+                "Failed to get folders from all candidate endpoints. "
+                "Routing will use safe fallback mode."
+            )
+        except Exception as e:
+            logger.error("Exception getting folders: %s", e)
 
         self._folder_cache = {}
         self._folder_tree = {}
@@ -195,8 +214,6 @@ class ExchangeClient:
         """
         if exclude_ids is None:
             exclude_ids = []
-            
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
 
         # 严格对齐示例代码的参数设置
         params = {
@@ -206,84 +223,82 @@ class ExchangeClient:
             "unread_only": "True"  # 尝试字符串 "True" 以匹配 requests 的行为
         }
 
-        # Use configured SSL verification
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                # 1. 获取列表
-                list_url = f"{self.api_url}/list"
-                logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
+        client = self.http_client
+        try:
+            # 1. 获取列表
+            list_url = f"{self.api_url}/list"
+            logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
 
-                response = await client.get(list_url, params=params, headers=headers, timeout=10.0)
-                if response.status_code != 200:
-                    logger.error("列表获取失败: %s - %s", response.status_code, response.text)
-                    return []
-
-                data = response.json()
-                # 打印原始数据结构以供调试
-                logger.info(
-                    "列表接口返回数据状态: %s, 消息: %s",
-                    data.get("code"),
-                    data.get("message"),
-                )
-
-                items = data.get("data", {}).get("items", [])
-                if not items:
-                    logger.info("目前没有未读邮件。")
-
-                full_emails = []
-                from urllib.parse import quote
-                # 2. 获取每封邮件的详情
-                for item in items:
-                    email_id = item.get("id")
-                    
-                    if email_id in exclude_ids:
-                        # Skip if already processed in this session
-                        continue
-                    
-                    # 优化：如果列表接口已经返回了 body，则直接使用，不再请求详情
-                    # FIX: 列表返回的 body 可能不完整，强制获取详情
-                    # if item.get("body"):
-                    #      print(f"列表已包含邮件内容，跳过详情请求 (ID: {email_id})")
-                    #      full_emails.append(item)
-                    #      continue
-
-                    # URL encode the ID to handle special characters like '/'
-                    encoded_id = quote(email_id, safe='')
-                    detail_url = f"{self.api_url}/{encoded_id}"
-
-                    try:
-                        logger.info("正在请求详情: %s", detail_url)
-                        detail_resp = await client.get(
-                            detail_url,
-                            params={"account_id": self.account_id},
-                            headers=headers,
-                            timeout=10.0
-                        )
-                        if detail_resp.status_code == 200:
-                            detail_data = detail_resp.json().get("data", {})
-                            if detail_data:
-                                # 确保包含 ID，以便后续跟踪
-                                if "id" not in detail_data:
-                                    detail_data["id"] = email_id
-                                full_emails.append(detail_data)
-                            else:
-                                logger.warning("邮件详情为空 (ID: %s)", email_id)
-                        else:
-                            logger.error(
-                                "详情获取失败 (ID: %s): %s - %s",
-                                email_id,
-                                detail_resp.status_code,
-                                detail_resp.text,
-                            )
-                    except Exception as detail_err:
-                        logger.error("请求详情异常 (ID: %s): %s", email_id, detail_err)
-
-                if full_emails:
-                    logger.info("成功获取 %s 封邮件的完整详情", len(full_emails))
-                return full_emails
-            except Exception as e:
-                logger.error("获取邮件异常: %s", e)
+            response = await client.get(list_url, params=params, timeout=10.0)
+            if response.status_code != 200:
+                logger.error("列表获取失败: %s - %s", response.status_code, response.text)
                 return []
+
+            data = response.json()
+            # 打印原始数据结构以供调试
+            logger.info(
+                "列表接口返回数据状态: %s, 消息: %s",
+                data.get("code"),
+                data.get("message"),
+            )
+
+            items = data.get("data", {}).get("items", [])
+            if not items:
+                logger.info("目前没有未读邮件。")
+
+            full_emails = []
+            from urllib.parse import quote
+            # 2. 获取每封邮件的详情
+            for item in items:
+                email_id = item.get("id")
+
+                if email_id in exclude_ids:
+                    # Skip if already processed in this session
+                    continue
+
+                # 优化：如果列表接口已经返回了 body，则直接使用，不再请求详情
+                # FIX: 列表返回的 body 可能不完整，强制获取详情
+                # if item.get("body"):
+                #      print(f"列表已包含邮件内容，跳过详情请求 (ID: {email_id})")
+                #      full_emails.append(item)
+                #      continue
+
+                # URL encode the ID to handle special characters like '/'
+                encoded_id = quote(email_id, safe='')
+                detail_url = f"{self.api_url}/{encoded_id}"
+
+                try:
+                    logger.info("正在请求详情: %s", detail_url)
+                    detail_resp = await client.get(
+                        detail_url,
+                        params={"account_id": self.account_id},
+                        timeout=10.0
+                    )
+                    if detail_resp.status_code == 200:
+                        detail_data = detail_resp.json().get("data", {})
+                        if detail_data:
+                            # 确保包含 ID，以便后续跟踪
+                            if "id" not in detail_data:
+                                detail_data["id"] = email_id
+                            full_emails.append(detail_data)
+                        else:
+                            logger.warning("邮件详情为空 (ID: %s)", email_id)
+                    else:
+                        logger.error(
+                            "详情获取失败 (ID: %s): %s - %s",
+                            email_id,
+                            detail_resp.status_code,
+                            detail_resp.text,
+                        )
+                except Exception as detail_err:
+                    logger.error("请求详情异常 (ID: %s): %s", email_id, detail_err)
+
+            if full_emails:
+                logger.info("成功获取 %s 封邮件的完整详情", len(full_emails))
+            return full_emails
+        except Exception as e:
+            logger.error("获取邮件异常: %s", e)
+            return []
 
     async def send_email(self, to: str, subject: str, body: str) -> bool:
         """
@@ -295,7 +310,6 @@ class ExchangeClient:
         """
         调用接口创建草稿。
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/drafts"
         
         payload = {
@@ -308,24 +322,21 @@ class ExchangeClient:
             "folder": "Drafts"
         }
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                logger.info("正在请求保存草稿接口: %s", endpoint)
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=10.0
-                )
-                response.raise_for_status()
-                # Optional: log result
-                # print(f"Draft saved response: {response.json()}")
-                return True
-            except Exception as e:
-                logger.error("保存草稿失败: %s", e)
-                if hasattr(e, 'response') and e.response:
-                    logger.error("Server response: %s", e.response.text)
-                return False
+        client = self.http_client
+        try:
+            logger.info("正在请求保存草稿接口: %s", endpoint)
+            response = await client.post(
+                endpoint,
+                json=payload,
+                timeout=10.0
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error("保存草稿失败: %s", e)
+            if hasattr(e, 'response') and e.response:
+                logger.error("Server response: %s", e.response.text)
+            return False
 
     async def _send_payload(self, to: str, subject: str, body: str, is_draft: bool = False) -> bool:
         """
@@ -340,7 +351,6 @@ class ExchangeClient:
             if match:
                 clean_to = match.group(1)
         
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         payload = {
             "account_id": self.account_id,
             "to": [clean_to],
@@ -350,140 +360,120 @@ class ExchangeClient:
 
         # Select endpoint based on action
         if is_draft:
-            # Assuming a CREATE endpoint for drafts exists or using a query param on send.
-            # Let's try a standard REST pattern for creating resources in a 'drafts' collection if possible,
-            # OR just assuming the server has a create_draft capability.
-            # Given the user context provided no API docs, I'll try generating a request to `/drafts` 
-            # If that 404s, we might need to adjust.
             endpoint = f"{self.api_url}/drafts"
         else:
             endpoint = f"{self.api_url}/send"
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                action = "保存草稿" if is_draft else "发送邮件"
-                logger.info("正在请求%s接口: %s", action, endpoint)
-                response = await client.post(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=10.0
-                )
-                if response.status_code == 404 and is_draft:
-                    # Fallback: maybe specific param on send?
-                    # For now, let's just log and fail gracefully or try 'save=true' on send endpoint if known.
-                    # But distinct endpoint is cleaner design to assume first.
-                    logger.warning("Draft endpoint 404. %s", response.text)
-                    return False
-                    
-                response.raise_for_status()
-                return True
-            except Exception as e:
-                logger.error("%s失败: %s", action, e)
+        client = self.http_client
+        try:
+            action = "保存草稿" if is_draft else "发送邮件"
+            logger.info("正在请求%s接口: %s", action, endpoint)
+            response = await client.post(
+                endpoint,
+                json=payload,
+                timeout=10.0
+            )
+            if response.status_code == 404 and is_draft:
+                logger.warning("Draft endpoint 404. %s", response.text)
                 return False
+
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error("%s失败: %s", action, e)
+            return False
 
     async def mark_as_read(self, email_id: str, is_read: bool = True) -> bool:
         """
         Mark an email as read/unread using the new API.
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        # Make sure to URL encode the ID if needed, though requests/httpx usually handle params well,
-        # but the ID is in the path here.
         from urllib.parse import quote
         encoded_id = quote(email_id, safe='')
         endpoint = f"{self.api_url}/{encoded_id}/read"
         
-        # Based on test_prod_sync.py, it uses PUT with query params
         params = {
             "account_id": self.account_id,
             "is_read": is_read
         }
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                response = await client.put(endpoint, params=params, headers=headers, timeout=10.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get('code') == 200
-                else:
-                    # Log as warning rather than error to avoid panic if object ID is stale
-                    logger.warning(
-                        "Mark as read failed (ID: %s): %s - %s",
-                        email_id,
-                        response.status_code,
-                        response.text,
-                    )
-                    return False
-            except Exception as e:
-                logger.error("Failed to mark email %s as read: %s", email_id, e)
+        client = self.http_client
+        try:
+            response = await client.put(endpoint, params=params, timeout=10.0)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('code') == 200
+            else:
+                logger.warning(
+                    "Mark as read failed (ID: %s): %s - %s",
+                    email_id,
+                    response.status_code,
+                    response.text,
+                )
                 return False
+        except Exception as e:
+            logger.error("Failed to mark email %s as read: %s", email_id, e)
+            return False
 
     async def move_email(self, email_id: str, folder_id: str) -> bool:
         """
         Move an email to a specific folder.
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/{email_id}/move"
         payload = {"folder_id": folder_id}
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                response = await client.post(endpoint, json=payload, headers=headers, timeout=5.0)
-                return response.status_code == 200
-            except Exception as e:
-                logger.error("Failed to move email %s to %s: %s", email_id, folder_id, e)
-                return False
+        client = self.http_client
+        try:
+            response = await client.post(endpoint, json=payload, timeout=5.0)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error("Failed to move email %s to %s: %s", email_id, folder_id, e)
+            return False
 
     async def delete_email(self, email_id: str) -> bool:
         """
         Delete an email involved in freeing up quota.
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/{email_id}"
-        
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                response = await client.delete(endpoint, headers=headers, timeout=5.0)
-                return response.status_code == 200
-            except Exception as e:
-                logger.error("Failed to delete email %s: %s", email_id, e)
-                return False
+
+        client = self.http_client
+        try:
+            response = await client.delete(endpoint, timeout=5.0)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error("Failed to delete email %s: %s", email_id, e)
+            return False
 
     async def get_email(self, email_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Fetch full details for a specific email by ID.
         """
         from urllib.parse import quote
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         encoded_id = quote(email_id, safe='')
         endpoint = f"{self.api_url}/{encoded_id}"
         target_account_id = account_id if account_id is not None else self.account_id
-        
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                response = await client.get(
-                    endpoint, 
-                    params={"account_id": target_account_id},
-                    headers=headers, 
-                    timeout=20.0
+
+        client = self.http_client
+        try:
+            response = await client.get(
+                endpoint,
+                params={"account_id": target_account_id},
+            )
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            else:
+                logger.error(
+                    "Failed to get email details for %s: %s",
+                    email_id,
+                    response.status_code,
                 )
-                if response.status_code == 200:
-                    return response.json().get("data", {})
-                else:
-                    logger.error(
-                        "Failed to get email details for %s: %s",
-                        email_id,
-                        response.status_code,
-                    )
-            except Exception as e:
-                logger.error("Exception getting email %s: %s", email_id, e)
+        except Exception as e:
+            logger.error("Exception getting email %s: %s", email_id, e)
         return {}
 
     async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
         """
         New Interface: Reply to an existing email.
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/reply"
         
         payload = {
@@ -497,18 +487,18 @@ class ExchangeClient:
         if cc:
             payload["cc"] = cc
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                logger.info("正在请求回复接口: %s", endpoint)
-                response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
-                if response.status_code == 200:
-                    return response.json().get("code") == 200
-                else:
-                    logger.error("Reply failed: %s - %s", response.status_code, response.text)
-                    return False
-            except Exception as e:
-                logger.error("Reply exception: %s", e)
+        client = self.http_client
+        try:
+            logger.info("正在请求回复接口: %s", endpoint)
+            response = await client.post(endpoint, json=payload, timeout=15.0)
+            if response.status_code == 200:
+                return response.json().get("code") == 200
+            else:
+                logger.error("Reply failed: %s - %s", response.status_code, response.text)
                 return False
+        except Exception as e:
+            logger.error("Reply exception: %s", e)
+            return False
 
     async def resolve_contact(self, query: str) -> Optional[str]:
         """
@@ -521,8 +511,6 @@ class ExchangeClient:
         Returns:
             联系人显示名称，未找到则返回 None
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        
         # Derive contacts endpoint from emails endpoint
         # e.g. https://host/api/v1/exchange/emails -> https://host/api/v1/exchange/contacts/resolve
         import re as _re
@@ -534,27 +522,25 @@ class ExchangeClient:
             "account_id": self.account_id
         }
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                response = await client.get(
-                    endpoint,
-                    params=params,
-                    headers=headers,
-                    timeout=10.0
+        client = self.http_client
+        try:
+            response = await client.get(
+                endpoint,
+                params=params,
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success") and data.get("data"):
+                    return data["data"][0].get("name")
+            else:
+                logger.warning(
+                    "Contact resolve failed for '%s': %s",
+                    query,
+                    response.status_code,
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("success") and data.get("data"):
-                        # Return the first match's name
-                        return data["data"][0].get("name")
-                else:
-                    logger.warning(
-                        "Contact resolve failed for '%s': %s",
-                        query,
-                        response.status_code,
-                    )
-            except Exception as e:
-                logger.error("Contact resolve exception for '%s': %s", query, e)
+        except Exception as e:
+            logger.error("Contact resolve exception for '%s': %s", query, e)
         
         return None
 
@@ -562,7 +548,6 @@ class ExchangeClient:
         """
         New Interface: Forward an existing email.
         """
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
         endpoint = f"{self.api_url}/forward"
         
         payload = {
@@ -573,15 +558,15 @@ class ExchangeClient:
             "body_type": "html"
         }
 
-        async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            try:
-                logger.info("正在请求转发接口: %s", endpoint)
-                response = await client.post(endpoint, json=payload, headers=headers, timeout=15.0)
-                if response.status_code == 200:
-                    return response.json().get("code") == 200
-                else:
-                    logger.error("Forward failed: %s - %s", response.status_code, response.text)
-                    return False
-            except Exception as e:
-                logger.error("Forward exception: %s", e)
+        client = self.http_client
+        try:
+            logger.info("正在请求转发接口: %s", endpoint)
+            response = await client.post(endpoint, json=payload, timeout=15.0)
+            if response.status_code == 200:
+                return response.json().get("code") == 200
+            else:
+                logger.error("Forward failed: %s - %s", response.status_code, response.text)
                 return False
+        except Exception as e:
+            logger.error("Forward exception: %s", e)
+            return False
