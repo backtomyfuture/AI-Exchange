@@ -33,11 +33,10 @@ async def generate_draft(state: AgentState) -> AgentState:
         # 弹窗输入 (feedback) 就是拟稿的全文正文。
         # 直接使用用户的版本作为新草稿，跳过 LLM 处理以确保 100% 忠于用户的编辑并提高响应速度。
         return {
-             **state,
-             "draft": feedback.strip(),
-             "feedback": None,
-             "approval_status": "pending",
-             "next_step": "approval"
+            "draft": feedback.strip(),
+            "feedback": None,
+            "approval_status": "pending",
+            "next_step": "approval",
         }
     
     # --- 初始拟稿逻辑 (仅在没有 feedback 时执行) ---
@@ -105,9 +104,8 @@ async def generate_draft(state: AgentState) -> AgentState:
     cleaned_draft = cleaned_draft.strip()
 
     return {
-        **state,
         "draft": cleaned_draft,
         "feedback": None,
         "approval_status": "pending",
-        "next_step": "approval"
+        "next_step": "approval",
     }

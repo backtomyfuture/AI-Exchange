@@ -61,7 +61,6 @@ async def review_draft(state: AgentState) -> AgentState:
             metadata["review_count"] = review_count + 1
             metadata["review_issues"] = result.get("issues", "")
             return {
-                **state,
                 "metadata": metadata,
                 "next_step": "drafter",
             }

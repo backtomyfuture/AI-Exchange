@@ -1,23 +1,36 @@
-
-from pydantic_settings import BaseSettings
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
-from typing import Optional
+
+
+def resolve_secret(value) -> str:
+    """Extract plain string from SecretStr or return string as-is (mock-safe)."""
+    if hasattr(value, "get_secret_value"):
+        return value.get_secret_value()
+    return str(value) if value is not None else ""
+
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     # Database
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "email_agent"
     POSTGRES_USER: str = "user"
-    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_PASSWORD: SecretStr = SecretStr("password")
 
     # Exchange
     EXCHANGE_API_URL: str = ""
-    EXCHANGE_API_KEY: str = ""
+    EXCHANGE_API_KEY: SecretStr = SecretStr("")
     EXCHANGE_ACCOUNT_ID: int = 8
-    EXCHANGE_ACCOUNT_EMAIL: str = "" # Identify "Me"
+    EXCHANGE_ACCOUNT_EMAIL: str = ""
     EXCHANGE_SSL_VERIFY: bool = False
-    EXCHANGE_WEBHOOK_SECRET: str = ""
+    EXCHANGE_WEBHOOK_SECRET: SecretStr = SecretStr("")
     EXCHANGE_FOLDERS_FULL: str = "收件箱"
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
     EXCHANGE_FOLDER_SENTITEMS: str = "已发送邮件"
@@ -25,9 +38,9 @@ class Settings(BaseSettings):
 
     # Lark
     LARK_APP_ID: str = ""
-    LARK_APP_SECRET: str = ""
+    LARK_APP_SECRET: SecretStr = SecretStr("")
     LARK_VERIFICATION_TOKEN: str = ""
-    LARK_ENCRYPT_KEY: str = ""
+    LARK_ENCRYPT_KEY: SecretStr = SecretStr("")
     LARK_CHAT_ID: str = ""
     LARK_DRIVE_FOLDER_TOKEN: str = ""
 
@@ -40,18 +53,18 @@ class Settings(BaseSettings):
     SLACK_CHANNEL_ID: str = ""
 
     # LLM
-    OPENAI_API_KEY: str = ""
-    OPENAI_API_BASE: str = ""  # 与 .env 保持一致
+    OPENAI_API_KEY: SecretStr = SecretStr("")
+    OPENAI_API_BASE: str = ""
     LLM_MODEL: str = "gemini-3-flash"
     LLM_RATE_LIMIT_DELAY: int = 10
     LLM_MAX_RPM: float = 15.0
 
     # Polling (Hybrid Mode)
-    POLLING_INTERVAL: int = 3600  # Default 1 hour
+    POLLING_INTERVAL: int = 3600
 
     # Embedding
     QDRANT_URL: str = "http://localhost:6333"
-    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_API_KEY: SecretStr = SecretStr("")
     EMBEDDING_BASE_URL: str = ""
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"
 
@@ -59,11 +72,15 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = 'utf-8'
-        extra = "ignore"
+    @property
+    def database_url(self) -> str:
+        """Compute PostgreSQL DSN from individual fields."""
+        return (
+            f"postgresql://{self.POSTGRES_USER}:{resolve_secret(self.POSTGRES_PASSWORD)}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
 
 @lru_cache()
-def get_settings():
+def get_settings() -> Settings:
     return Settings()

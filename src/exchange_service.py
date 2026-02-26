@@ -7,10 +7,7 @@ from src.utils import lark_app
 
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
-_webhook_queue: asyncio.Queue | None = None
-_worker_task: asyncio.Task | None = None
-_worker_ctx = None
-_worker_semaphore: asyncio.Semaphore | None = None
+
 
 async def _upload_attachments_to_lark(email_data: dict) -> None:
     """Upload attachments to Lark Drive and append tokens/urls."""
@@ -89,7 +86,6 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         pdf_token = pdf_result.get("file_token") if pdf_result else None
         
         if pdf_token:
-            # Persist PDF token for cleanup
             config = {"configurable": {"thread_id": email_id}}
             await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
 
@@ -109,7 +105,6 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         pdf_token = pdf_result.get("file_token") if pdf_result else None
         
         if pdf_token:
-            # Persist PDF token for cleanup
             config = {"configurable": {"thread_id": email_id}}
             await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
 
@@ -161,7 +156,6 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
     )
 
     # Initialize Draft Recipients (Reply Logic)
-    # This ensures "Reply to Sender" and "Reply All (CC)" is the default behavior
     if "draft_to" not in email_data:
         email_data["draft_to"] = [email_data.get("sender")] if email_data.get("sender") else []
     
@@ -193,61 +187,6 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
             logger.error("Pipeline failed for %s, leaving unread for retry: %s", thread_id, e)
             await ctx.db_manager.update_status(thread_id, "error")
 
-async def _worker_loop():
-    """Webhook-driven background worker with concurrency control."""
-    global _webhook_queue, _worker_ctx, _worker_semaphore
-    _worker_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
-    logger.info("Exchange webhook worker started (concurrency=%d).", WORKER_CONCURRENCY)
-
-    async def _process_one(email_data, skip_analysis):
-        async with _worker_semaphore:
-            try:
-                if "body" not in email_data:
-                    email_id = email_data.get("id")
-                    logger.info(f"Fetching details for {email_id}...")
-                    full_details = await _worker_ctx.exchange_client.get_email(email_id)
-                    if full_details:
-                        email_data.update(full_details)
-                    else:
-                        logger.warning(
-                            "Skip webhook event because detail fetch failed (id=%s, event=%s).",
-                            email_id,
-                            email_data.get("_event_type", "unknown"),
-                        )
-                        return
-                await process_and_archive_email(email_data, _worker_ctx, skip_analysis)
-            except Exception as e:
-                logger.error(f"Worker processing error: {e}")
-
-    while True:
-        email_data, skip_analysis = await _webhook_queue.get()
-        asyncio.create_task(_process_one(email_data, skip_analysis))
-        _webhook_queue.task_done()
-
-
-async def start_worker(ctx=None):
-    """Start webhook worker once."""
-    global _webhook_queue, _worker_task, _worker_ctx
-    if _worker_task and not _worker_task.done():
-        return
-    _worker_ctx = ctx or get_app_context()
-    _webhook_queue = asyncio.Queue()
-    _worker_task = asyncio.create_task(_worker_loop())
-
-
-async def stop_worker():
-    """Stop webhook worker and cleanup task."""
-    global _worker_task, _webhook_queue
-    if _worker_task is None:
-        return
-    _worker_task.cancel()
-    try:
-        await _worker_task
-    except asyncio.CancelledError:
-        logger.info("Exchange webhook worker cancelled.")
-    _worker_task = None
-    _webhook_queue = None
-
 
 def _extract_id(raw) -> str | None:
     """Safely extract ID from nested EWS objects or plain strings."""
@@ -257,8 +196,6 @@ def _extract_id(raw) -> str | None:
         raw_str = raw.strip()
         if not raw_str:
             return None
-        # Handle object-like string repr:
-        # ItemId(id='xxx', changekey='...') / ParentFolderId(id='xxx', ...)
         match = re.search(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", raw_str)
         if match:
             return match.group(1)
@@ -266,11 +203,13 @@ def _extract_id(raw) -> str | None:
     return None
 
 
-async def enqueue_webhook_event(payload: dict, header_event: str | None = None) -> dict:
-    """
-    Route webhook event by event type + folder policy and enqueue.
-    """
-    if _webhook_queue is None:
+# ---------------------------------------------------------------------------
+# Shared enqueue implementation (used by both WebhookWorker and legacy API)
+# ---------------------------------------------------------------------------
+
+async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_event: str | None = None) -> dict:
+    """Core routing + enqueue logic, parameterised on *queue* and *ctx*."""
+    if queue is None:
         raise RuntimeError("Exchange worker is not running")
 
     event_type = header_event or payload.get("event_type") or payload.get("event")
@@ -283,7 +222,7 @@ async def enqueue_webhook_event(payload: dict, header_event: str | None = None) 
         logger.debug("Ignoring event %s: no item_id", event_type)
         return {"queued": False, "reason": "no_item_id", "event_type": event_type}
 
-    exchange_client = _worker_ctx.exchange_client if _worker_ctx else None
+    exchange_client = ctx.exchange_client if ctx else None
     folder_name = exchange_client.get_folder_name(parent_folder_id) if exchange_client else None
 
     route = None
@@ -331,7 +270,7 @@ async def enqueue_webhook_event(payload: dict, header_event: str | None = None) 
     email_data["_parent_folder_name"] = folder_name
     email_data["_event_type"] = event_type
 
-    await _webhook_queue.put((email_data, skip_analysis))
+    await queue.put((email_data, skip_analysis))
     logger.info(
         "Enqueued %s [%s]: %s (folder=%s, skip_analysis=%s)",
         event_type,
@@ -345,5 +284,116 @@ async def enqueue_webhook_event(payload: dict, header_event: str | None = None) 
         "email_id": email_id,
         "route": route,
         "folder": folder_name,
-        "queue_size": _webhook_queue.qsize(),
+        "queue_size": queue.qsize(),
     }
+
+
+# ---------------------------------------------------------------------------
+# WebhookWorker class
+# ---------------------------------------------------------------------------
+
+class WebhookWorker:
+    """Encapsulates webhook worker state: queue, task, context, semaphore."""
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+
+    @property
+    def queue(self) -> asyncio.Queue:
+        return self._queue
+
+    async def start(self):
+        """Start the background worker loop."""
+        if self._task and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._worker_loop())
+
+    async def stop(self):
+        """Cancel the worker task and clean up."""
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            logger.info("Exchange webhook worker cancelled.")
+        self._task = None
+
+    async def enqueue_event(self, payload: dict, header_event: str | None = None) -> dict:
+        """Route and enqueue a webhook event."""
+        return await _enqueue_event_impl(self._queue, self._ctx, payload, header_event)
+
+    async def _worker_loop(self):
+        """Background loop: dequeue and process with concurrency control."""
+        logger.info("Exchange webhook worker started (concurrency=%d).", WORKER_CONCURRENCY)
+        while True:
+            email_data, skip_analysis = await self._queue.get()
+            asyncio.create_task(self._process_one(email_data, skip_analysis))
+            self._queue.task_done()
+
+    async def _process_one(self, email_data, skip_analysis):
+        """Process a single webhook event with semaphore-based concurrency."""
+        async with self._semaphore:
+            try:
+                if "body" not in email_data:
+                    email_id = email_data.get("id")
+                    logger.info(f"Fetching details for {email_id}...")
+                    full_details = await self._ctx.exchange_client.get_email(email_id)
+                    if full_details:
+                        email_data.update(full_details)
+                    else:
+                        logger.warning(
+                            "Skip webhook event because detail fetch failed (id=%s, event=%s).",
+                            email_id,
+                            email_data.get("_event_type", "unknown"),
+                        )
+                        return
+                await process_and_archive_email(email_data, self._ctx, skip_analysis)
+            except Exception as e:
+                logger.error(f"Worker processing error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton and backward-compatible globals / functions
+# ---------------------------------------------------------------------------
+
+_worker: WebhookWorker | None = None
+_webhook_queue: asyncio.Queue | None = None
+_worker_ctx = None
+_worker_semaphore: asyncio.Semaphore | None = None
+
+
+async def start_worker(ctx=None):
+    """Start webhook worker (backward-compatible module-level function)."""
+    global _worker, _webhook_queue, _worker_ctx, _worker_semaphore
+    if _worker is not None and _worker._task and not _worker._task.done():
+        return
+    ctx = ctx or get_app_context()
+    _worker = WebhookWorker(ctx)
+    _webhook_queue = _worker.queue
+    _worker_ctx = ctx
+    _worker_semaphore = _worker._semaphore
+    await _worker.start()
+
+
+async def stop_worker():
+    """Stop webhook worker (backward-compatible module-level function)."""
+    global _worker, _webhook_queue, _worker_ctx, _worker_semaphore
+    if _worker is None:
+        return
+    await _worker.stop()
+    _worker = None
+    _webhook_queue = None
+    _worker_ctx = None
+    _worker_semaphore = None
+
+
+async def enqueue_webhook_event(payload: dict, header_event: str | None = None) -> dict:
+    """Enqueue a webhook event (backward-compatible module-level function)."""
+    if _worker is not None:
+        return await _worker.enqueue_event(payload, header_event)
+    # Legacy fallback: tests may patch _webhook_queue and _worker_ctx directly
+    return await _enqueue_event_impl(_webhook_queue, _worker_ctx, payload, header_event)

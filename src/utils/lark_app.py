@@ -15,7 +15,7 @@ from lark_oapi.ws import Client as WsClient
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse, CallBackCard, CallBackToast
 
 from src.utils.card_builder import LarkCardBuilder, html_to_lark_md
-from src.config import get_settings
+from src.config import get_settings, resolve_secret
 from src.utils.email_renderer import render_email_html
 from src.utils.pdf_generator import convert_html_to_pdf
 from src.commands.router import CommandRouter
@@ -80,13 +80,12 @@ def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str)
         bool: 签名验证是否通过
     """
     settings = get_settings()
-    encrypt_key = settings.LARK_ENCRYPT_KEY
+    encrypt_key = resolve_secret(settings.LARK_ENCRYPT_KEY)
     
     if not encrypt_key:
         logger.warning("LARK_ENCRYPT_KEY not configured, skipping signature verification.")
-        return True  # 未配置时跳过验证（开发环境）
+        return True
     
-    # 拼接待签名字符串: timestamp + nonce + encrypt_key + body
     content = f"{timestamp}{nonce}{encrypt_key}{body}"
     expected_signature = hashlib.sha256(content.encode('utf-8')).hexdigest()
     
@@ -136,7 +135,7 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     
     settings = get_settings()
     app_id = settings.LARK_APP_ID
-    app_secret = settings.LARK_APP_SECRET
+    app_secret = resolve_secret(settings.LARK_APP_SECRET)
     
     if app_id and app_secret:
         lark_api_client = lark_oapi.Client.builder() \
@@ -145,7 +144,6 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
             .log_level(lark_oapi.LogLevel.INFO) \
             .build()
             
-        # Optimize Identity Logic: Resolve "Me" from Chat ID
         if settings.LARK_CHAT_ID:
             _resolve_current_user_email(settings.LARK_CHAT_ID)
             
@@ -1362,7 +1360,7 @@ def start_lark_ws():
     """
     settings = get_settings()
     app_id = settings.LARK_APP_ID
-    app_secret = settings.LARK_APP_SECRET
+    app_secret = resolve_secret(settings.LARK_APP_SECRET)
     
     if not (app_id and app_secret):
         logger.warning("Lark App ID/Secret missing. WS Client not started.")

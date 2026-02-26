@@ -30,7 +30,8 @@ class EmailProcessor:
         
         # Priority: explicit arg > Settings
         api_base = embedding_base_url or settings.EMBEDDING_BASE_URL
-        api_key = embedding_api_key or settings.EMBEDDING_API_KEY
+        from src.config import resolve_secret
+        api_key = embedding_api_key or resolve_secret(settings.EMBEDDING_API_KEY)
         
         self.openai_client = OpenAI(
             base_url=api_base,

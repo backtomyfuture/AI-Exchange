@@ -42,7 +42,7 @@ class AppContext:
         self.db_manager = AsyncDatabaseManager(settings)
         
         # 2. Postgres Connection Pool for LangGraph Checkpointer
-        dsn = f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
+        dsn = settings.database_url
         
         # 3. Setup Checkpointer and Graph
         # We skip sync setup logic here assuming DB is initialized or will be by AsyncDatabaseManager
@@ -92,11 +92,12 @@ class AppContext:
             logger.info("Graph initialized with AsyncPostgresSaver.")
 
     async def close(self):
+        if self.exchange_client:
+            await self.exchange_client.close()
         if self.db_manager:
             await self.db_manager.close()
-        # Async pool close
         if self.pool:
-             await self.pool.close()
+            await self.pool.close()
 
 # Singleton instance
 app_context = AppContext()

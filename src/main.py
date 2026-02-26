@@ -10,8 +10,6 @@ from fastapi import FastAPI
 from src.config import get_settings
 from src.utils.logging_setup import setup_logging
 
-setup_logging(get_settings().LOG_LEVEL)
-
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.exchange_service import start_worker as exchange_start_worker
@@ -30,6 +28,7 @@ async def lifespan(app: FastAPI):
     Startup: Initialize Context, Start Lark WS, Start Exchange Loop.
     Shutdown: Stop Exchange Loop, Cleanup Context.
     """
+    setup_logging(get_settings().LOG_LEVEL)
     logger.info("Starting AI Assistant Unified Service (Web + Worker)...")
 
     # 1. Initialize Shared Context
@@ -101,6 +100,7 @@ async def main():
 
 def run_server():
     """Entrypoint for CLI runtime."""
+    setup_logging(get_settings().LOG_LEVEL)
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
