@@ -14,7 +14,8 @@ class ExchangeClient:
             settings = get_settings()
             
         self.api_url = settings.EXCHANGE_API_URL.rstrip("/")
-        self.api_key = settings.EXCHANGE_API_KEY
+        from src.config import resolve_secret
+        self.api_key = resolve_secret(settings.EXCHANGE_API_KEY)
         self.account_id = settings.EXCHANGE_ACCOUNT_ID
         self.ssl_verify = settings.EXCHANGE_SSL_VERIFY
 

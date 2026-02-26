@@ -30,7 +30,8 @@ class EmailRetriever:
         self.collection_name = collection_name
 
         api_base = embedding_base_url or settings.EMBEDDING_BASE_URL or "http://localhost:11434/v1"
-        api_key = embedding_api_key or settings.EMBEDDING_API_KEY or "ollama"
+        from src.config import resolve_secret
+        api_key = embedding_api_key or resolve_secret(settings.EMBEDDING_API_KEY) or "ollama"
 
         self.openai_client = OpenAI(
             base_url=api_base,

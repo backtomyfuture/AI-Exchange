@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
-from src.config import get_settings
+from src.config import get_settings, resolve_secret
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
@@ -103,7 +103,7 @@ async def exchange_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing signature")
 
     settings = get_settings()
-    webhook_secret = settings.EXCHANGE_WEBHOOK_SECRET
+    webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
     if not webhook_secret:
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
 

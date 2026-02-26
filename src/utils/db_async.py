@@ -30,10 +30,7 @@ class AsyncDatabaseManager:
     """
 
     def __init__(self, settings):
-        self._dsn = (
-            f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}"
-            f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
-        )
+        self._dsn = settings.database_url
         self._pool: Optional[AsyncConnectionPool] = None
         self._initialized = False
 

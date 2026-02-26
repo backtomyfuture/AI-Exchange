@@ -42,7 +42,7 @@ class AppContext:
         self.db_manager = AsyncDatabaseManager(settings)
         
         # 2. Postgres Connection Pool for LangGraph Checkpointer
-        dsn = f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
+        dsn = settings.database_url
         
         # 3. Setup Checkpointer and Graph
         # We skip sync setup logic here assuming DB is initialized or will be by AsyncDatabaseManager

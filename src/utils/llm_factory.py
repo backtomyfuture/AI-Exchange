@@ -1,6 +1,6 @@
 import logging
 from langchain_openai import ChatOpenAI
-from src.config import get_settings
+from src.config import get_settings, resolve_secret
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ class LLMFactory:
         """
         settings = get_settings()
         model = model_name or settings.LLM_MODEL
-        api_key = settings.OPENAI_API_KEY
+        api_key = resolve_secret(settings.OPENAI_API_KEY)
         base_url = settings.OPENAI_API_BASE
         
         # Optional: Validate credentials
