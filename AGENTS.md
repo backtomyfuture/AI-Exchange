@@ -64,3 +64,6 @@ Copy `.env.example` to `.env`. The only mandatory fix for tests: set `EXCHANGE_A
 - Lark WS will fail to connect with placeholder credentials — this is expected and does not block the health check or webhook processing.
 - Exchange API calls will fail without valid `EXCHANGE_API_URL`/`EXCHANGE_API_KEY` — also expected in dev; the folder-cache init is wrapped in a try/except.
 - Tests are heavily mocked and do **not** require running Docker services.
+- `Settings` uses `SecretStr` for sensitive fields; access via `resolve_secret()` helper for mock compatibility.
+- `ExchangeClient` uses a shared `httpx.AsyncClient` with connection pooling — call `close()` on shutdown.
+- `rate_limiter.py` defers `get_settings()` to first `acquire()` — no module-level side effects.
