@@ -92,11 +92,12 @@ class AppContext:
             logger.info("Graph initialized with AsyncPostgresSaver.")
 
     async def close(self):
+        if self.exchange_client:
+            await self.exchange_client.close()
         if self.db_manager:
             await self.db_manager.close()
-        # Async pool close
         if self.pool:
-             await self.pool.close()
+            await self.pool.close()
 
 # Singleton instance
 app_context = AppContext()
