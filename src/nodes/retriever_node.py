@@ -36,7 +36,6 @@ async def retrieve_context(state: AgentState) -> AgentState:
                 results.append(r)
 
     return {
-        **state,
         "context": results,
-        "next_step": "drafter"
+        "next_step": "drafter",
     }

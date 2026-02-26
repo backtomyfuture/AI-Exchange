@@ -27,14 +27,14 @@ async def categorize_email(state: AgentState) -> AgentState:
     engine = get_routing_engine()
     state = await engine.execute_router(state)
 
-    # Check if a Skill has already determined the action (Tier 1/2 hit)
     current_classification = state.get("classification", {})
     if current_classification.get("action") in ["forward", "transfer"]:
         logger.info(f"Skipping LLM Categorization due to existing action: {current_classification.get('action')}")
-        return {
-            **state,
-            "next_step": "drafter" # Forwarding always needs drafting/review
-        }
+        updates = {"next_step": "drafter"}
+        for key in ("routing_log", "active_skills", "system_prompt_modifier", "classification"):
+            if key in state:
+                updates[key] = state[key]
+        return updates
 
     email = state.get("email", {})
     subject = email.get("subject", "")
@@ -79,9 +79,11 @@ async def categorize_email(state: AgentState) -> AgentState:
             confidence=0.0,
         )
 
-    # 更新状态
-    return {
-        **state,
+    updates = {
         "classification": classification_result.model_dump(),
-        "next_step": "rag_search" if classification_result.need_reply else "end"
+        "next_step": "rag_search" if classification_result.need_reply else "end",
     }
+    for key in ("routing_log", "active_skills", "system_prompt_modifier"):
+        if key in state:
+            updates[key] = state[key]
+    return updates
