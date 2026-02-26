@@ -3,11 +3,9 @@ import pytest
 
 
 def _make_fresh_cb():
-    """Create a fresh CircuitBreaker instance bypassing singleton."""
+    """Create a fresh CircuitBreaker instance."""
     from src.utils.circuit_breaker import CircuitBreaker
-    cb = CircuitBreaker.__new__(CircuitBreaker)
-    cb._init()
-    return cb
+    return CircuitBreaker()
 
 
 def test_circuit_breaker_stays_closed_on_single_failure():
@@ -37,7 +35,7 @@ def test_circuit_breaker_old_failures_expire():
     cb.failure_threshold = 3
     cb.window_seconds = 10
 
-    now = time.time()
+    now = time.monotonic()
     cb._failure_timestamps = [now - 20, now - 15]  # expired
     cb.report_failure(Exception("recent"))
     assert cb.can_proceed() is True  # only 1 recent failure
