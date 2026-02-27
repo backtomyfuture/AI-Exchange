@@ -102,8 +102,8 @@ class EmailProcessor:
         Use an LLM to generate a text description for an image.
         """
         try:
-            from src.utils.llm_factory import LLMFactory
-            llm = LLMFactory.create_llm(temperature=0.3)
+            from src.providers.factory import get_llm
+            llm = get_llm(temperature=0.3)
             
             message = HumanMessage(
                 content=[

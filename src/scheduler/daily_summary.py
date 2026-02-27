@@ -10,7 +10,7 @@ from datetime import datetime, time, timedelta
 from typing import Optional
 
 from src.config import get_settings
-from src.utils.llm_factory import LLMFactory
+from src.providers.factory import get_llm_for_role
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ async def generate_daily_summary() -> Optional[str]:
             subjects.append(record.get("subject", "无主题"))
         
         # 使用 LLM 生成摘要
-        llm = LLMFactory.create_llm(temperature=0.5)
+        llm = get_llm_for_role("summary", temperature=0.5)
         
         prompt = f"""请用简洁的中文总结今日邮件处理情况：
 

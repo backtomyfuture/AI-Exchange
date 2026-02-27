@@ -52,12 +52,31 @@ class Settings(BaseSettings):
     SLACK_APP_TOKEN: str = ""
     SLACK_CHANNEL_ID: str = ""
 
-    # LLM
+    # LLM (global defaults)
     OPENAI_API_KEY: SecretStr = SecretStr("")
     OPENAI_API_BASE: str = ""
     LLM_MODEL: str = "gemini-3-flash"
     LLM_RATE_LIMIT_DELAY: int = 10
     LLM_MAX_RPM: float = 15.0
+
+    # Per-role model overrides (leave empty to use LLM_MODEL)
+    LLM_CATEGORIZER_MODEL: str = ""
+    LLM_DRAFTER_MODEL: str = ""
+    LLM_REVIEWER_MODEL: str = ""
+    LLM_ROUTER_MODEL: str = ""
+    LLM_SUMMARY_MODEL: str = ""
+    LLM_CONSOLIDATOR_MODEL: str = ""
+
+    # Additional provider API keys (auto-detected by model name)
+    ANTHROPIC_API_KEY: SecretStr = SecretStr("")
+    GOOGLE_API_KEY: SecretStr = SecretStr("")
+    DEEPSEEK_API_KEY: SecretStr = SecretStr("")
+    DASHSCOPE_API_KEY: SecretStr = SecretStr("")
+    MOONSHOT_API_KEY: SecretStr = SecretStr("")
+    ZHIPUAI_API_KEY: SecretStr = SecretStr("")
+    XAI_API_KEY: SecretStr = SecretStr("")
+    GROQ_API_KEY: SecretStr = SecretStr("")
+    MISTRAL_API_KEY: SecretStr = SecretStr("")
 
     # Polling (Hybrid Mode)
     POLLING_INTERVAL: int = 3600

@@ -16,8 +16,8 @@ async def review_draft(state: AgentState) -> AgentState:
     if not draft or review_count >= 1:
         return state
 
-    from src.utils.llm_factory import LLMFactory
-    llm = LLMFactory.create_llm(temperature=0)
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("reviewer", temperature=0)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一个邮件质量审核员。请评估以下回复草稿的质量。

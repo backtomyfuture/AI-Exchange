@@ -65,7 +65,7 @@ class RoutingEngine:
         根据邮件内容，让 LLM 从可用 Skill 中选择最合适的技能。
         """
         try:
-            from src.utils.llm_factory import LLMFactory
+            from src.providers.factory import get_llm_for_role
             
             if skills is None:
                 skills = self.skill_manager.get_all_skills()
@@ -92,7 +92,7 @@ class RoutingEngine:
 请只输出技能 ID，例如: skill_vip_handling, skill_project_tracker
 如果没有合适的技能，请返回: NONE"""
 
-            llm = LLMFactory.create_llm(temperature=0)
+            llm = get_llm_for_role("router", temperature=0)
             response = await llm.ainvoke(prompt)
             
             content = response.content.strip()

@@ -149,8 +149,8 @@ async def analyze_images(image_attachments: List[Dict]) -> str:
     message = HumanMessage(content=content_parts)
 
     # Step 3: 调用 Vision API（带重试）
-    from src.utils.llm_factory import LLMFactory
-    llm = LLMFactory.create_llm(temperature=0.3)
+    from src.providers.factory import get_llm
+    llm = get_llm(temperature=0.3)
 
     @retry(
         wait=wait_random_exponential(multiplier=2, max=60),

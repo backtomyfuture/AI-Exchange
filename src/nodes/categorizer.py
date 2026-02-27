@@ -40,9 +40,8 @@ async def categorize_email(state: AgentState) -> AgentState:
     subject = email.get("subject", "")
     body = email.get("body", "")
 
-    # 初始化 LLM
-    from src.utils.llm_factory import LLMFactory
-    llm = LLMFactory.create_llm(temperature=0)
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("categorizer", temperature=0)
     
     # Use JsonOutputParser for robust parsing of LLM output
     parser = JsonOutputParser(pydantic_object=EmailClassification)
