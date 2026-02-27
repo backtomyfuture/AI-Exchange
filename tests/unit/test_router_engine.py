@@ -119,17 +119,14 @@ class TestRoutingEngineTier3:
         with patch.object(engine.skill_manager, 'get_all_skills', return_value={
             'skill_project_tracker': mock_skill
         }):
-            # Mock LLM返回skill_project_tracker  
-            with patch('src.utils.llm_factory.LLMFactory') as mock_llm_factory:
-                mock_llm = AsyncMock()
-                mock_response = Mock()
-                mock_response.content = "skill_project_tracker"
-                mock_llm.ainvoke.return_value = mock_response
-                mock_llm_factory.create_llm.return_value = mock_llm
-                
+            mock_llm = AsyncMock()
+            mock_response = Mock()
+            mock_response.content = "skill_project_tracker"
+            mock_llm.ainvoke.return_value = mock_response
+
+            with patch('src.providers.factory.get_llm_for_role', return_value=mock_llm):
                 result = await engine._tier3_llm_route(sample_state)
                 
-                # 验证返回正确的skill
                 assert 'skill_project_tracker' in result
                 assert len(result) == 1
 
@@ -140,16 +137,13 @@ class TestRoutingEngineTier3:
         engine = RoutingEngine()
         
         with patch.object(engine.skill_manager, 'get_all_skills', return_value={}):
-            with patch('src.utils.llm_factory.LLMFactory') as mock_llm_factory:
-                mock_llm = AsyncMock()
-                mock_response = Mock()
-                mock_response.content = "NONE"
-                mock_llm.ainvoke.return_value = mock_response
-                mock_llm_factory.create_llm.return_value = mock_llm
-                
+            mock_llm = AsyncMock()
+            mock_response = Mock()
+            mock_response.content = "NONE"
+            mock_llm.ainvoke.return_value = mock_response
+
+            with patch('src.providers.factory.get_llm_for_role', return_value=mock_llm):
                 result = await engine._tier3_llm_route(sample_state)
-                
-                # 应返回空列表
                 assert result == []
 
 
@@ -167,17 +161,14 @@ class TestRoutingEngineTier3:
             'skill_vip_handling': mock_skill1,
             'skill_project_tracker': mock_skill2
         }):
-            with patch('src.utils.llm_factory.LLMFactory') as mock_llm_factory:
-                mock_llm = AsyncMock()
-                mock_response = Mock()
-                # LLM返回逗号分隔的多个skill
-                mock_response.content = "skill_vip_handling, skill_project_tracker"
-                mock_llm.ainvoke.return_value = mock_response
-                mock_llm_factory.create_llm.return_value = mock_llm
-                
+            mock_llm = AsyncMock()
+            mock_response = Mock()
+            mock_response.content = "skill_vip_handling, skill_project_tracker"
+            mock_llm.ainvoke.return_value = mock_response
+
+            with patch('src.providers.factory.get_llm_for_role', return_value=mock_llm):
                 result = await engine._tier3_llm_route(sample_state)
                 
-                # 验证返回两个skills
                 assert len(result) == 2
                 assert 'skill_vip_handling' in result
                 assert 'skill_project_tracker' in result
@@ -196,17 +187,14 @@ class TestRoutingEngineTier3:
         with patch.object(engine.skill_manager, 'get_all_skills', return_value={
             'skill_valid': mock_skill
         }):
-            with patch('src.utils.llm_factory.LLMFactory') as mock_llm_factory:
-                mock_llm = AsyncMock()
-                mock_response = Mock()
-                # LLM返回有效和无效的skill ID
-                mock_response.content = "skill_valid, skill_invalid, skill_nonexistent"
-                mock_llm.ainvoke.return_value = mock_response
-                mock_llm_factory.create_llm.return_value = mock_llm
-                
+            mock_llm = AsyncMock()
+            mock_response = Mock()
+            mock_response.content = "skill_valid, skill_invalid, skill_nonexistent"
+            mock_llm.ainvoke.return_value = mock_response
+
+            with patch('src.providers.factory.get_llm_for_role', return_value=mock_llm):
                 result = await engine._tier3_llm_route(sample_state)
                 
-                # 只返回有效的skill
                 assert 'skill_valid' in result
                 assert len(result) == 1
 

@@ -20,9 +20,8 @@ async def generate_draft(state: AgentState) -> AgentState:
         context_str += f"主题: {ctx.get('subject', '无主题')}\n"
         context_str += f"内容: {ctx.get('body', '')[:300]}...\n\n"
 
-    # 初始化 LLM
-    from src.utils.llm_factory import LLMFactory
-    llm = LLMFactory.create_llm(temperature=0.7)
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("drafter", temperature=0.7)
 
     feedback = state.get("feedback")
     prev_draft = state.get("draft")
