@@ -54,6 +54,27 @@ async def lifespan(app: FastAPI):
     init_scheduler(ctx.db_manager, lark_app)
     summary_task = asyncio.create_task(run_scheduler())
 
+    # 5b. Start Memory Consolidation (runs alongside daily summary)
+    from src.memory.consolidator import MemoryConsolidator
+    consolidator = MemoryConsolidator(
+        db_manager=ctx.db_manager,
+        email_processor=ctx.email_processor,
+    )
+
+    async def _consolidation_loop():
+        await asyncio.sleep(7200)
+        while True:
+            try:
+                result = await consolidator.consolidate(days=7, min_records=10)
+                logger.info("Memory consolidation result: %s", result)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Memory consolidation failed: %s", e)
+            await asyncio.sleep(86400)
+
+    consolidation_task = asyncio.create_task(_consolidation_loop())
+
     # 6. Start Hybrid Polling scheduler (Catch-up)
     polling_interval = get_settings().POLLING_INTERVAL
     polling_task = asyncio.create_task(
@@ -70,9 +91,10 @@ async def lifespan(app: FastAPI):
     self_healer.stop()
     healing_task.cancel()
     summary_task.cancel()
+    consolidation_task.cancel()
     polling_task.cancel()
     try:
-        await asyncio.gather(healing_task, summary_task, polling_task, return_exceptions=True)
+        await asyncio.gather(healing_task, summary_task, consolidation_task, polling_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     await exchange_stop_worker()

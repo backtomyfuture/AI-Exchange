@@ -90,6 +90,17 @@ class EmailProcessor:
         hash_object = hashlib.md5(content.encode('utf-8'))
         return str(uuid.UUID(hash_object.hexdigest()))
 
+    def _get_embedding_safe(self, text: str) -> List[float]:
+        """Get embedding vector, returning empty list on failure."""
+        try:
+            response = self.openai_client.embeddings.create(
+                input=text, model=self.embedding_model,
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error("Embedding failed: %s", e)
+            return []
+
     def process_email(self, email: Dict[str, Any]) -> bool:
         """
         Process a single email. Returns True on success.
