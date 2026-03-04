@@ -97,10 +97,17 @@ async def exchange_webhook(request: Request):
     """
     Exchange NewMail Webhook endpoint with HMAC-SHA256 signature verification.
     """
-    signature = request.headers.get("X-Exchange-Signature")
+    signature = request.headers.get("X-Webhook-Signature") or request.headers.get("X-Exchange-Signature")
     header_event = request.headers.get("X-Exchange-Event")
+    logger.info(f"Received webhook request: method={request.method} headers={dict(request.headers)}")
+
     if not signature:
+        logger.warning("Missing X-Webhook-Signature in webhook request")
         raise HTTPException(status_code=400, detail="Missing signature")
+
+    # Strip the 'sha256=' prefix if present (sent by Exchange server)
+    if signature.startswith("sha256="):
+        signature = signature[len("sha256="):]
 
     settings = get_settings()
     webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
@@ -119,7 +126,8 @@ async def exchange_webhook(request: Request):
 
     try:
         payload = json.loads(body_bytes.decode("utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON payload: {body_bytes.decode('utf-8')} ({e})")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     try:

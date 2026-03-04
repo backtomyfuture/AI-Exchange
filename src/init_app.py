@@ -47,7 +47,8 @@ class AppContext:
         # 3. Setup Checkpointer and Graph
         # We skip sync setup logic here assuming DB is initialized or will be by AsyncDatabaseManager
         
-        self.pool = AsyncConnectionPool(conninfo=dsn, max_size=20, open=False)
+        connection_kwargs = {"autocommit": True, "prepare_threshold": 0}
+        self.pool = AsyncConnectionPool(conninfo=dsn, max_size=20, kwargs=connection_kwargs, open=False)
         # checkpointer and graph will be initialized in setup_async() to ensure loop exists.
         logger.info("Application Context Initialized (Pool created, Graph deferred).")
 
