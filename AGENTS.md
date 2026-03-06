@@ -8,7 +8,9 @@ AI Email Assistant — a FastAPI service orchestrated by LangGraph that classifi
 
 - Python 3.12 venv at `.venv/`
 - System libs for WeasyPrint (`libpango`, `libpangoft2`, `libjpeg-dev`, `libopenjp2-7-dev`, `fonts-noto-cjk`)
+- `libpq-dev` (required for `psycopg` pure-python implementation; without it, tests importing `psycopg` fail with `no pq wrapper available`)
 - Docker with `fuse-overlayfs` storage driver and `iptables-legacy`
+- `ruff` is installed inside `.venv/` (not in `requirements.txt`; the update script installs it)
 
 ### Running infrastructure services
 
