@@ -431,6 +431,36 @@ class LarkCardBuilder:
             "columns": columns
         }
 
+    def _build_email_info_section(
+        self,
+        raw_sender: str,
+        to_list: list,
+        cc_list: list,
+        user_map: Dict[str, Dict[str, str]]
+    ) -> List[dict]:
+        """
+        Build email info rows: Sender, To, Cc displayed on separate lines
+        using _build_user_row for full person component rendering.
+        """
+        elements = []
+        settings = get_settings()
+        my_email = (settings.EXCHANGE_ACCOUNT_EMAIL or "").strip().lower()
+
+        sender_email = extract_email_address(raw_sender)
+        sender_label = "👤 发件人:"
+        if my_email and sender_email and my_email in sender_email.lower():
+            sender_label = "👤 发件人 (我):"
+        if raw_sender and raw_sender != "Unknown":
+            elements.append(self._build_user_row(sender_label, [raw_sender], user_map))
+
+        if to_list:
+            elements.append(self._build_user_row("👥 收件人:", to_list, user_map))
+
+        if cc_list:
+            elements.append(self._build_user_row("👀 抄送:", cc_list, user_map))
+
+        return elements
+
     def build_approval_card(
         self,
         email_id: str,
@@ -544,19 +574,10 @@ class LarkCardBuilder:
             "elements": [{"tag": "plain_text", "content": f"💡 AI 处理说明: {reason}"}]
         })
 
-        # Sender/Recipient compact row
-        compact_columns = self._build_compact_header_row(
-            raw_sender,
-            {"to": original_to_list, "cc": original_cc_list},
-            user_map
-        )
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "default",
-            "horizontal_spacing": "small",
-            "columns": compact_columns
-        })
+        # Email info section: Sender / To / Cc on separate rows
+        elements.extend(self._build_email_info_section(
+            raw_sender, original_to_list, original_cc_list, user_map
+        ))
         elements.append({"tag": "hr"})
 
         logger.info(
@@ -724,6 +745,11 @@ class LarkCardBuilder:
         raw_sender = email_data.get("sender", "Unknown")
 
         reason = classification.get("reasoning", "智能生成")
+
+        to_list = email_data.get("to", [])
+        if isinstance(to_list, str):
+            to_list = [to_list]
+
         cc_list = email_data.get("cc", [])
         if isinstance(cc_list, str):
             cc_list = [cc_list]
@@ -733,7 +759,7 @@ class LarkCardBuilder:
         sender_email = extract_email_address(raw_sender)
         if sender_email:
             all_emails.append(sender_email)
-        for r in email_data.get("to", []):
+        for r in to_list:
             e = extract_email_address(r)
             if e:
                 all_emails.append(e)
@@ -763,15 +789,10 @@ class LarkCardBuilder:
             "elements": [{"tag": "plain_text", "content": f"💡 AI 处理说明: {reason}（无需回复）"}]
         })
 
-        # Sender/Recipient compact row
-        compact_columns = self._build_compact_header_row(raw_sender, email_data, user_map)
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "default",
-            "horizontal_spacing": "small",
-            "columns": compact_columns
-        })
+        # Email info section: Sender / To / Cc on separate rows
+        elements.extend(self._build_email_info_section(
+            raw_sender, to_list, cc_list, user_map
+        ))
         elements.append({"tag": "hr"})
 
         # Debug logging for recipients

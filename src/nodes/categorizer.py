@@ -30,8 +30,25 @@ async def categorize_email(state: AgentState) -> AgentState:
     current_classification = state.get("classification", {})
     if current_classification.get("action") in ["forward", "transfer"]:
         logger.info(f"Skipping LLM Categorization due to existing action: {current_classification.get('action')}")
-        updates = {"next_step": "drafter"}
-        for key in ("routing_log", "active_skills", "system_prompt_modifier", "classification"):
+
+        # Fill in missing classification fields that LLM would normally produce
+        email = state.get("email", {})
+        if not current_classification.get("summary"):
+            subject = email.get("subject", "")
+            sender = email.get("sender", "")
+            sender_name = sender.split("@")[0] if "@" in str(sender) else str(sender)
+            current_classification["summary"] = (
+                f"来自 {sender_name} 的邮件「{subject}」需要转发处理"
+                if subject else "转发邮件"
+            )
+        if "confidence" not in current_classification:
+            current_classification["confidence"] = 1.0
+        reasoning = current_classification.get("reasoning", "")
+        if reasoning.startswith("Triggered by skill"):
+            current_classification["reasoning"] = "系统规则自动触发转发"
+
+        updates = {"next_step": "drafter", "classification": current_classification}
+        for key in ("routing_log", "active_skills", "system_prompt_modifier"):
             if key in state:
                 updates[key] = state[key]
         return updates
