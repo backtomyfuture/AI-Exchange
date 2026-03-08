@@ -67,6 +67,8 @@ async def _run_ai_pipeline(email_id: str, email_data: dict, ctx, config: dict):
             "draft": state.values.get("draft", ""),
             "context": state.values.get("context", []),
             "email": state.values.get("email", {}),
+            "routing_log": state.values.get("routing_log", []),
+            "active_skills": state.values.get("active_skills", []),
         }
     except Exception as e:
         logger.exception(f"Error executing graph for {email_id}: {e}")
@@ -78,6 +80,15 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
     classification = pipeline_result.get("classification", {})
     priority = classification.get("priority", "P3")
     intent = classification.get("intent", "Unknown")
+    routing_log = pipeline_result.get("routing_log", [])
+    active_skills = pipeline_result.get("active_skills", [])
+
+    await ctx.db_manager.update_status(
+        email_id, None,
+        routing_log=routing_log,
+        active_skills=active_skills,
+        original_draft=pipeline_result.get("draft", ""),
+    )
 
     if classification.get("need_reply"):
         logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
@@ -96,6 +107,8 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             email_data=pipeline_result.get("email", {}),
             classification=classification,
             pdf_url=pdf_url,
+            routing_log=routing_log,
+            active_skills=active_skills,
         )
         await ctx.db_manager.update_status(email_id, "waiting_approval")
     elif priority == "P1" or intent == "通知":
@@ -114,6 +127,8 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             email_data=pipeline_result.get("email", {}),
             classification=classification,
             pdf_url=pdf_url,
+            routing_log=routing_log,
+            active_skills=active_skills,
         )
         await ctx.db_manager.update_status(email_id, "notified_readonly")
     else:

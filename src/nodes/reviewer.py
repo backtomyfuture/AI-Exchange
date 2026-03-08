@@ -8,13 +8,14 @@ logger = logging.getLogger(__name__)
 
 
 async def review_draft(state: AgentState) -> AgentState:
-    """Review draft quality before human approval. Auto-rewrite once if poor."""
+    """Review draft quality before human approval. Auto-rewrite once if poor.
+    Also runs ContentGuard checks (hallucination + sensitive info)."""
     draft = state.get("draft", "")
     email = state.get("email", {})
     review_count = (state.get("metadata") or {}).get("review_count", 0)
 
     if not draft or review_count >= 1:
-        return state
+        return await _run_content_guard(state, draft, email)
 
     from src.providers.factory import get_llm_for_role
     llm = get_llm_for_role("reviewer", temperature=0)
@@ -54,7 +55,7 @@ async def review_draft(state: AgentState) -> AgentState:
 
         if result.get("pass", True):
             logger.info("Draft review: PASS")
-            return state
+            return await _run_content_guard(state, draft, email)
         else:
             logger.info("Draft review: FAIL - %s. Requesting rewrite.", result.get("issues"))
             metadata = dict(state.get("metadata") or {})
@@ -66,4 +67,27 @@ async def review_draft(state: AgentState) -> AgentState:
             }
     except Exception as e:
         logger.warning("Draft review failed, passing through: %s", e)
+        return await _run_content_guard(state, draft, email)
+
+
+async def _run_content_guard(state: AgentState, draft: str, email: dict) -> AgentState:
+    """Run ContentGuard checks and store warnings in metadata."""
+    if not draft:
         return state
+    try:
+        from src.utils.content_guard import ContentGuard
+        guard = ContentGuard()
+        result = await guard.run_all_checks(draft, email)
+        if not result["passed"]:
+            metadata = dict(state.get("metadata") or {})
+            metadata["content_guard"] = {
+                "passed": False,
+                "summary": result["summary"],
+                "sensitive_issues": result["sensitive_issues"][:5],
+                "hallucination_issues": result["hallucination_issues"][:5],
+            }
+            logger.info("ContentGuard: %s", result["summary"])
+            return {**state, "metadata": metadata}
+    except Exception as e:
+        logger.debug("ContentGuard skipped: %s", e)
+    return state

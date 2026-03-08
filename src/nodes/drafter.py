@@ -55,10 +55,31 @@ async def generate_draft(state: AgentState) -> AgentState:
     if modifier:
         base_system_prompt = base_system_prompt + "\n\n" + modifier.strip()
 
+    metadata = state.get("metadata") or {}
+
+    style_guidance = metadata.get("style_guidance", "")
+    if style_guidance:
+        base_system_prompt += "\n\n【写作风格参考】:\n" + style_guidance
+
+    pref_hints = metadata.get("preference_hints") or []
+    if pref_hints:
+        pref_lines = []
+        for p in pref_hints[:5]:
+            pattern = p.get("pattern", "")
+            if pattern:
+                pref_lines.append(f"- {pattern}")
+        if pref_lines:
+            base_system_prompt += "\n\n【用户偏好（基于历史修改学习）】:\n" + "\n".join(pref_lines)
+
+    thread_summary = metadata.get("thread_summary", "")
+    extra_context = ""
+    if thread_summary:
+        extra_context = f"\n\n【会话进展摘要】:\n{thread_summary}"
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", base_system_prompt),
         ("user", """【历史背景】:
-{context}
+{context}{extra_context}
 
 <email_content>
 【当前待回复邮件】:
@@ -84,6 +105,7 @@ async def generate_draft(state: AgentState) -> AgentState:
         logger.info("Generating draft with LLM and retrieved context.")
         response = await invoke_with_retry({
             "context": context_str if context_str else "无相关历史背景",
+            "extra_context": extra_context,
             "sender": email.get("sender", ""),
             "subject": email.get("subject", ""),
             "body": email.get("body", "")

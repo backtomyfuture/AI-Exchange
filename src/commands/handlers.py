@@ -146,3 +146,117 @@ async def handle_health(args: str) -> str:
         f"  熔断器: {cb_status}\n"
         f"  队列深度: {queue_size}"
     )
+
+
+async def handle_routing(args: str) -> str:
+    """Query routing decision for an email by ID."""
+    email_id = (args or "").strip()
+    if not email_id:
+        return "用法: /routing <email_id>"
+    if not _db_manager:
+        return "数据库未初始化"
+    try:
+        async with _db_manager.get_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT routing_log, active_skills, classification FROM emails_log WHERE id = %s",
+                    (email_id,),
+                )
+                row = await cur.fetchone()
+        if not row:
+            return f"未找到邮件: {email_id}"
+        import json as _json
+
+        routing_log = row.get("routing_log") or []
+        if isinstance(routing_log, str):
+            routing_log = _json.loads(routing_log)
+        active_skills = row.get("active_skills") or []
+        if isinstance(active_skills, str):
+            active_skills = _json.loads(active_skills)
+        cls = row.get("classification") or {}
+        if isinstance(cls, str):
+            cls = _json.loads(cls)
+
+        lines = [f"🔀 路由详情 [{email_id[:20]}...]:\n"]
+        lines.append(f"  Skills: {', '.join(active_skills) if active_skills else '无'}")
+        lines.append(f"  路由链: {' → '.join(routing_log) if routing_log else '无记录'}")
+        lines.append(f"  Priority: {cls.get('priority', '?')}")
+        lines.append(f"  Intent: {cls.get('intent', '?')}")
+        lines.append(f"  Confidence: {cls.get('confidence', '?')}")
+        lines.append(f"  Need Reply: {cls.get('need_reply', '?')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("handle_routing failed: %s", e)
+        return f"查询失败: {e}"
+
+
+async def handle_test_rule(args: str) -> str:
+    """Dry-run routing rules against a given subject/sender."""
+    parts = (args or "").strip()
+    if not parts:
+        return "用法: /test_rule 发件人邮箱 邮件主题\n示例: /test_rule ceo@corp.com 紧急会议通知"
+    tokens = parts.split(maxsplit=1)
+    sender = tokens[0]
+    subject = tokens[1] if len(tokens) > 1 else ""
+
+    try:
+        from src.router.engine import get_routing_engine
+        engine = get_routing_engine()
+        report = engine.dry_run(subject=subject, sender=sender)
+    except Exception as e:
+        return f"规则引擎错误: {e}"
+
+    lines = ["🧪 规则沙盒测试结果:\n"]
+    lines.append(f"  发件人: {sender}")
+    lines.append(f"  主题: {subject or '(空)'}")
+    lines.append("")
+    t1 = report.get("tier1", [])
+    lines.append(f"  Tier 1 匹配: {', '.join(t1) if t1 else '无匹配 → 将进入 Tier 3 LLM'}")
+    lines.append(f"  已注册 Skills ({len(report.get('skills_available', []))}):")
+    for s in report.get("skills_available", [])[:10]:
+        lines.append(f"    · {s}")
+    return "\n".join(lines)
+
+
+async def handle_ai_report(args: str) -> str:
+    """Weekly AI performance report."""
+    if not _db_manager:
+        return "数据库未初始化"
+    try:
+        async with _db_manager.get_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status IN ('approved','sent','forwarded')) AS approved,
+                        COUNT(*) FILTER (WHERE status = 'rejected') AS rejected,
+                        COUNT(*) FILTER (WHERE status = 'modified') AS modified,
+                        COUNT(*) FILTER (WHERE original_draft IS NOT NULL AND final_draft IS NOT NULL
+                                         AND original_draft = final_draft) AS no_edit,
+                        COUNT(*) FILTER (WHERE original_draft IS NOT NULL AND final_draft IS NOT NULL
+                                         AND original_draft != final_draft) AS edited,
+                        COUNT(*) FILTER (WHERE rejection_reason IS NOT NULL) AS has_reason,
+                        COUNT(*) AS total
+                    FROM emails_log
+                    WHERE processed_at >= CURRENT_DATE - INTERVAL '7 days'
+                """)
+                row = await cur.fetchone()
+
+        total = row["total"] or 0
+        approved = row["approved"] or 0
+        rejected = row["rejected"] or 0
+        no_edit = row["no_edit"] or 0
+        edited = row["edited"] or 0
+        drafts_total = no_edit + edited
+        pass_rate = f"{no_edit / drafts_total * 100:.0f}%" if drafts_total > 0 else "N/A"
+
+        lines = [
+            "📊 本周 AI 表现报告:\n",
+            f"  总处理: {total} 封",
+            f"  已批准: {approved}  |  已拒绝: {rejected}",
+            f"  草稿一次通过率: {pass_rate} ({no_edit}/{drafts_total})",
+            f"  用户编辑后批准: {edited} 封",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error("handle_ai_report failed: %s", e)
+        return f"查询失败: {e}"

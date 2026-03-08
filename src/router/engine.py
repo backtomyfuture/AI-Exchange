@@ -147,6 +147,22 @@ class RoutingEngine:
         return new_state
 
 
+    def dry_run(self, subject: str, sender: str, body: str = "") -> Dict[str, Any]:
+        """Simulate routing without executing skills. Returns the decision report."""
+        email = {"subject": subject, "sender": sender, "body": body}
+        report: Dict[str, Any] = {"tier1": [], "tier3_candidates": [], "skills_available": []}
+
+        t1_matches = self.t1_router.route(email)
+        report["tier1"] = t1_matches or []
+
+        skills = self.skill_manager.get_all_skills()
+        for sid, skill in skills.items():
+            desc = getattr(skill.manifest, "description", sid)
+            report["skills_available"].append(f"{sid}: {desc}")
+
+        return report
+
+
 # 全局单例 - 避免每封邮件都重新加载 Skills 和初始化路由器
 _routing_engine = None
 

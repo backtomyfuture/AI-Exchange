@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
                        classification: dict, pdf_url: str = None,
+                       routing_log: List = None, active_skills: List = None,
                        *, lark_api_client=None, card_builder=None):
     if lark_api_client is None:
         from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
@@ -32,7 +33,8 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
         return
 
     card_content = card_builder.build_approval_card(
-        email_id, draft, context, email_data, classification, pdf_url=pdf_url
+        email_id, draft, context, email_data, classification, pdf_url=pdf_url,
+        routing_log=routing_log, active_skills=active_skills,
     )
 
     request = CreateMessageRequest.builder() \
@@ -53,6 +55,7 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
 
 def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
                         classification: dict, pdf_url: str = None,
+                        routing_log: List = None, active_skills: List = None,
                         *, lark_api_client=None, card_builder=None):
     if lark_api_client is None:
         from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
@@ -70,7 +73,8 @@ def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
         return
 
     card_content = card_builder.build_read_only_card(
-        email_id, context, email_data, classification, pdf_url=pdf_url
+        email_id, context, email_data, classification, pdf_url=pdf_url,
+        routing_log=routing_log, active_skills=active_skills,
     )
 
     request = CreateMessageRequest.builder() \
