@@ -159,11 +159,15 @@ class TestApprovalCardForward:
             classification={"action": "forward"},
         )
         actions = [e for e in card["elements"] if e.get("tag") == "action"]
-        button_texts = []
+        action_items = []
         for a in actions:
-            for btn in a.get("actions", []):
-                button_texts.append(btn["text"]["content"])
-        assert any("批准转发" in t for t in button_texts)
+            for item in a.get("actions", []):
+                if item.get("tag") == "button":
+                    action_items.append(item["text"]["content"])
+                elif item.get("tag") == "select_static":
+                    action_items.append(item["placeholder"]["content"])
+        assert any("批准转发" in t for t in action_items)
+        assert any("拒绝" in t for t in action_items)
 
     def test_forward_card_shows_original_recipients(self):
         builder = _make_builder()

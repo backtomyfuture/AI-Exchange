@@ -140,28 +140,45 @@ class AsyncDatabaseManager:
             logger.error(f"Failed to log initial email {email_data.get('id')}: {e}")
             return False
 
-    async def update_status(self, email_id: str, status: str, **kwargs):
-        """Update the status and optional fields of an email log."""
+    async def update_status(self, email_id: str, status: Optional[str], **kwargs):
+        """Update the status and optional fields of an email log.
+
+        Args:
+            email_id: The email ID.
+            status: New status string, or None to skip status change (metadata-only update).
+            **kwargs: Additional columns to update.
+        """
         ALLOWED_COLUMNS = {
             "classification", "summary", "priority", "need_reply",
-            "card_type", "draft", "message_id", "intent", "reasoning",
-            "error_message",
+            "card_type", "draft", "draft_content", "message_id", "intent",
+            "reasoning", "error_message",
+            "routing_log", "active_skills",
+            "original_draft", "final_draft", "draft_diff",
+            "approver_user_id", "rejection_reason",
         }
+        JSONB_COLUMNS = {"classification", "routing_log", "active_skills"}
         try:
             async with self.get_connection() as conn:
-                update_fields = ["status = %s", "updated_at = CURRENT_TIMESTAMP"]
-                params = [status]
+                update_fields = ["updated_at = CURRENT_TIMESTAMP"]
+                params: list = []
+
+                if status is not None:
+                    update_fields.insert(0, "status = %s")
+                    params.append(status)
 
                 for key, value in kwargs.items():
                     if key not in ALLOWED_COLUMNS:
                         logger.warning(f"Rejected update_status column: {key}")
                         continue
-                    if key == "classification":
+                    if key in JSONB_COLUMNS:
                         update_fields.append(f"{key} = %s")
-                        params.append(json.dumps(value))
+                        params.append(json.dumps(value) if not isinstance(value, str) else value)
                     else:
                         update_fields.append(f"{key} = %s")
                         params.append(value)
+
+                if not update_fields:
+                    return
 
                 params.append(email_id)
                 query = f"UPDATE emails_log SET {', '.join(update_fields)} WHERE id = %s"

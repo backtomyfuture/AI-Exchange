@@ -431,6 +431,40 @@ class LarkCardBuilder:
             "columns": columns
         }
 
+    @staticmethod
+    def _build_routing_note(
+        routing_log: Optional[List[str]] = None,
+        active_skills: Optional[List[str]] = None,
+        classification: Optional[dict] = None,
+    ) -> List[dict]:
+        """Build a compact routing-info note for observability."""
+        parts = []
+        if active_skills:
+            parts.append(f"Skills: {', '.join(active_skills)}")
+        if routing_log:
+            parts.append(" → ".join(routing_log[:4]))
+        conf = (classification or {}).get("confidence")
+        if conf is not None:
+            parts.append(f"Conf: {conf:.0%}")
+        if not parts:
+            return []
+        return [{
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": f"🔀 路由: {' | '.join(parts)}"}]
+        }]
+
+    @staticmethod
+    def _build_content_guard_warning(classification: Optional[dict] = None) -> List[dict]:
+        """Build a warning note if ContentGuard found issues."""
+        guard_data = (classification or {}).get("_content_guard")
+        if not guard_data or guard_data.get("passed", True):
+            return []
+        summary = guard_data.get("summary", "")
+        return [{
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": f"⚠️ 质量检查: {summary}"}]
+        }]
+
     def _build_email_info_section(
         self,
         raw_sender: str,
@@ -470,7 +504,9 @@ class LarkCardBuilder:
         classification: dict,
         edit_field: str = None,  # None=普通模式, "to"/"cc"/"draft"=编辑对应字段
         feedback_value: str = "",
-        pdf_url: str = None
+        pdf_url: str = None,
+        routing_log: Optional[List[str]] = None,
+        active_skills: Optional[List[str]] = None,
     ) -> dict:
         """
         Constructs the Lark Card JSON for approval workflow.
@@ -709,7 +745,7 @@ class LarkCardBuilder:
 
         elements.append({"tag": "hr"})
 
-        # Action buttons - 简化为3个主要按钮
+        # Action buttons
         elements.append({
             "tag": "action",
             "actions": [
@@ -717,10 +753,21 @@ class LarkCardBuilder:
                  "type": "primary", "value": {"action": "approve", "id": email_id}},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "💾 存为草稿"},
                  "type": "default", "value": {"action": "save_draft_only", "id": email_id}},
-                {"tag": "button", "text": {"tag": "plain_text", "content": "🛑 拒绝"},
-                 "type": "danger", "value": {"action": "reject", "id": email_id}}
+                {
+                    "tag": "select_static",
+                    "placeholder": {"tag": "plain_text", "content": "🛑 拒绝..."},
+                    "options": [
+                        {"text": {"tag": "plain_text", "content": "语气不当"}, "value": "tone_wrong"},
+                        {"text": {"tag": "plain_text", "content": "内容有误"}, "value": "content_error"},
+                        {"text": {"tag": "plain_text", "content": "无需回复"}, "value": "no_reply_needed"},
+                        {"text": {"tag": "plain_text", "content": "其他原因"}, "value": "other"},
+                    ],
+                    "value": {"action": "reject_with_reason", "id": email_id},
+                },
             ]
         })
+
+        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
 
         return {"header": header, "elements": elements}
 
@@ -730,7 +777,9 @@ class LarkCardBuilder:
         context: List[dict],
         email_data: dict,
         classification: dict,
-        pdf_url: str = None
+        pdf_url: str = None,
+        routing_log: Optional[List[str]] = None,
+        active_skills: Optional[List[str]] = None
     ) -> dict:
         """
         构建只读卡片 - 用于重要但不需要回复的邮件。
@@ -875,6 +924,8 @@ class LarkCardBuilder:
                  "type": "primary", "value": {"action": "mark_read", "id": email_id}}
             ]
         })
+
+        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
 
         return {"header": header, "elements": elements}
 

@@ -27,6 +27,9 @@ from src.commands.handlers import (
     handle_pending,
     handle_search,
     handle_health,
+    handle_routing,
+    handle_test_rule,
+    handle_ai_report,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,9 @@ def _register_builtin_commands():
     _command_router.register("/pending", handle_pending)
     _command_router.register("/search", handle_search)
     _command_router.register("/health", handle_health)
+    _command_router.register("/routing", handle_routing)
+    _command_router.register("/test_rule", handle_test_rule)
+    _command_router.register("/ai_report", handle_ai_report)
 
 
 def _read_nested(obj: Any, *path: str) -> Any:
@@ -242,10 +248,13 @@ def _resolve_current_user_email(chat_id: str):
     except Exception as e:
         logger.error(f"Error resolving identity: {e}")
 
-def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
+def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
+                       classification: dict, pdf_url: str = None,
+                       routing_log: List = None, active_skills: List = None):
     """Send an interactive approval card. Delegates to lark_messaging."""
     from src.utils.lark_messaging import send_approval_card as _impl
     return _impl(email_id, draft, context, email_data, classification, pdf_url=pdf_url,
+                 routing_log=routing_log, active_skills=active_skills,
                  lark_api_client=lark_api_client, card_builder=card_builder)
 
 def send_system_notification(title: str, content: str, template: str = "red"):
@@ -258,10 +267,13 @@ def send_system_notification(title: str, content: str, template: str = "red"):
 
 # Event Handlers
 
-def send_read_only_card(email_id: str, context: List[dict], email_data: dict, classification: dict, pdf_url: str = None):
+def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
+                        classification: dict, pdf_url: str = None,
+                        routing_log: List = None, active_skills: List = None):
     """Send a read-only card. Delegates to lark_messaging."""
     from src.utils.lark_messaging import send_read_only_card as _impl
     return _impl(email_id, context, email_data, classification, pdf_url=pdf_url,
+                 routing_log=routing_log, active_skills=active_skills,
                  lark_api_client=lark_api_client, card_builder=card_builder)
 
 
@@ -574,17 +586,25 @@ def handle_card_action(event):
         elif action_type == "reject":
             process_rejection(email_id, user_id)
             new_card = LarkCardBuilder.get_processed_card("已拒绝", subject)
-            
-            # 关键：直接在响应中返回新卡片，实现实时更新
             return {
-                "toast": {
-                    "type": "info",
-                    "content": "已拒绝该拟稿"
-                },
-                "card": {
-                    "type": "raw",
-                    "data": new_card
-                }
+                "toast": {"type": "info", "content": "已拒绝该拟稿"},
+                "card": {"type": "raw", "data": new_card}
+            }
+
+        elif action_type == "reject_with_reason":
+            option = getattr(event.event.action, "option", None) or ""
+            reason_map = {
+                "tone_wrong": "语气不当",
+                "content_error": "内容有误",
+                "no_reply_needed": "无需回复",
+                "other": "其他原因",
+            }
+            reason_text = reason_map.get(option, option or "未指定")
+            process_rejection(email_id, user_id, reason=reason_text)
+            new_card = LarkCardBuilder.get_processed_card(f"已拒绝 ({reason_text})", subject)
+            return {
+                "toast": {"type": "info", "content": f"已拒绝: {reason_text}"},
+                "card": {"type": "raw", "data": new_card}
             }
             
         # 只读卡片 - 标记已阅
@@ -1095,12 +1115,17 @@ def safe_async_wait(coro):
 
 def process_approval(email_id, user_id):
     config = {"configurable": {"thread_id": email_id}}
-    safe_async_wait(graph.aupdate_state(config, {"approval_status": "approved"}))
-    safe_async_wait(db_manager.update_status(email_id, "approved"))
-    logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
-    # Execution graph
-    # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
+
+    final_draft = state.values.get("draft", "") if state and state.values else ""
+    safe_async_wait(db_manager.update_status(
+        email_id, "approved",
+        approver_user_id=user_id,
+        final_draft=final_draft,
+    ))
+
+    safe_async_wait(graph.aupdate_state(config, {"approval_status": "approved"}))
+    logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
     
     att_tokens = _collect_cleanup_tokens(state)
 
@@ -1111,11 +1136,14 @@ def process_approval(email_id, user_id):
 
     safe_async_run(graph.ainvoke(None, config=config))
 
-def process_rejection(email_id, user_id):
+def process_rejection(email_id, user_id, reason: str = ""):
     config = {"configurable": {"thread_id": email_id}}
     safe_async_wait(graph.aupdate_state(config, {"approval_status": "rejected"}))
-    safe_async_wait(db_manager.update_status(email_id, "rejected"))
-    logger.info(f"Rejection processed for {email_id} by {user_id}. Executing graph...")
+    kwargs = {"approver_user_id": user_id}
+    if reason:
+        kwargs["rejection_reason"] = reason
+    safe_async_wait(db_manager.update_status(email_id, "rejected", **kwargs))
+    logger.info(f"Rejection processed for {email_id} by {user_id} reason={reason}. Executing graph...")
     # Remove attachments (PDF + Originals)
     state = safe_async_wait(graph.aget_state(config))
     
