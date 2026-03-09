@@ -1,0 +1,12 @@
+id: "skill_hnair_marketing"
+name: "HNAir Marketing Auto-Archive"
+description: "Auto-archives marketing emails from the HNA airline commerce platform."
+version: "1.0.0"
+execution_mode: "modifier"
+
+triggers:
+  priority: 95
+  conditions:
+    - type: "sender_match"
+      operator: "eq"
+      value: "hhsc@hnair.com"

@@ -1,0 +1,12 @@
+id: "skill_safety_platform_archive"
+name: "Safety Platform Auto-Archive"
+description: "Auto-archives system emails from the HNA digital safety management platform."
+version: "1.0.0"
+execution_mode: "modifier"
+
+triggers:
+  priority: 95
+  conditions:
+    - type: "sender_match"
+      operator: "eq"
+      value: "hnasafety@hnaaviation.com"

@@ -1,0 +1,15 @@
+id: "skill_zhangxia_forward"
+name: "Zhang Xia Forward Read-Only"
+description: "Marks forwarded informational emails from Zhang Xia as read-only P3 notifications."
+version: "1.0.0"
+execution_mode: "modifier"
+
+triggers:
+  priority: 85
+  conditions:
+    - type: "sender_match"
+      operator: "eq"
+      value: "zhang-xia@tianjin-air.com"
+    - type: "subject_match"
+      operator: "regex"
+      value: "转发|Fw:|FW:"
