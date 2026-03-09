@@ -19,6 +19,7 @@ from scripts.import_pst import (
     iter_from_eml,
     iter_from_eml_dir,
     iter_from_mbox,
+    iter_from_pst,
     parse_email_message,
     run_import,
 )
@@ -245,6 +246,87 @@ class TestRunImport:
         (tmp_path / "empty.eml").write_text(eml)
         stats = run_import(tmp_path, dry_run=True)
         assert stats.skipped >= 1
+
+
+class TestPypffParser:
+    """Tests for the pypff-based PST parsing path."""
+
+    def test_pypff_message_to_email_basic(self):
+        """Test converting a mock pypff message to ParsedEmail."""
+        from scripts.import_pst import _pypff_message_to_email
+
+        msg = MagicMock()
+        msg.subject = "Test Subject"
+        msg.sender_name = "Alice"
+        msg.sender_email_address = "alice@corp.com"
+        msg.plain_text_body = "Hello world"
+        msg.html_body = None
+        msg.delivery_time = None
+        msg.client_submit_time = None
+        msg.transport_headers = (
+            "To: bob@corp.com\r\n"
+            "Cc: carol@corp.com\r\n"
+            "In-Reply-To: <original@corp.com>\r\n"
+        )
+        msg.number_of_attachments = 0
+
+        result = _pypff_message_to_email(msg, "Inbox", "received")
+        assert result is not None
+        assert result.subject == "Test Subject"
+        assert "alice@corp.com" in result.sender
+        assert result.to == ["bob@corp.com"]
+        assert result.cc == ["carol@corp.com"]
+        assert result.in_reply_to == "<original@corp.com>"
+        assert result.message_type == "received"
+
+    def test_pypff_message_to_email_with_attachments(self):
+        from scripts.import_pst import _pypff_message_to_email
+
+        att = MagicMock()
+        att.name = "report.pdf"
+        att.size = 12345
+
+        msg = MagicMock()
+        msg.subject = "With Attachment"
+        msg.sender_name = "Bob"
+        msg.sender_email_address = "bob@corp.com"
+        msg.plain_text_body = "See attached"
+        msg.html_body = None
+        msg.delivery_time = None
+        msg.client_submit_time = None
+        msg.transport_headers = ""
+        msg.number_of_attachments = 1
+        msg.get_attachment.return_value = att
+
+        result = _pypff_message_to_email(msg, "Inbox", "received")
+        assert result is not None
+        assert len(result.attachments_metadata) == 1
+        assert result.attachments_metadata[0]["name"] == "report.pdf"
+
+    def test_pypff_message_bytes_body(self):
+        from scripts.import_pst import _pypff_message_to_email
+
+        msg = MagicMock()
+        msg.subject = "Bytes Body"
+        msg.sender_name = ""
+        msg.sender_email_address = "test@corp.com"
+        msg.plain_text_body = b"\xe4\xbd\xa0\xe5\xa5\xbd"  # "你好" in UTF-8
+        msg.html_body = None
+        msg.delivery_time = None
+        msg.client_submit_time = None
+        msg.transport_headers = None
+        msg.number_of_attachments = 0
+
+        result = _pypff_message_to_email(msg, "Inbox", "received")
+        assert result is not None
+        assert "你好" in result.body
+
+    def test_iter_from_pst_uses_pypff_when_available(self):
+        """Verify iter_from_pst prefers pypff over readpst."""
+        with patch("scripts.import_pst._iter_from_pst_pypff") as mock_pypff:
+            mock_pypff.return_value = iter([])
+            list(iter_from_pst(Path("/fake.pst")))
+            mock_pypff.assert_called_once()
 
 
 class TestImportStats:

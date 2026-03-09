@@ -3,7 +3,7 @@
 PST 历史邮件导入工具 —— 将 .pst 文件中的邮件批量解析并存入 Qdrant 向量数据库。
 
 支持格式:
-  - .pst  (需要系统安装 readpst: sudo apt install pst-utils)
+  - .pst  (纯 Python 解析，pip install libpff-python)
   - .mbox (Python 标准库直接解析)
   - .eml  (单封邮件) 或包含 .eml 文件的目录
 
@@ -24,8 +24,8 @@ PST 历史邮件导入工具 —— 将 .pst 文件中的邮件批量解析并�
     python scripts/import_pst.py /path/to/archive.pst --batch-size 100
 
 环境准备:
-    # PST 文件需要 readpst 工具
-    sudo apt install pst-utils
+    # PST 文件需要 pypff:
+    pip install libpff-python
 
     # 确保 .env 配置了 Qdrant 和 Embedding 服务
     # QDRANT_URL=http://localhost:6333
@@ -267,6 +267,133 @@ def iter_from_eml_dir(dir_path: Path) -> Iterator[ParsedEmail]:
         yield from iter_from_eml(eml_file, folder=folder)
 
 
+def _iter_from_pst_pypff(pst_path: Path) -> Iterator[ParsedEmail]:
+    """Parse PST using pypff (libpff-python) — pure pip, no system deps."""
+    import pypff
+
+    pst = pypff.file()
+    pst.open(str(pst_path))
+
+    try:
+        root = pst.get_root_folder()
+        yield from _walk_pypff_folder(root, "")
+    finally:
+        pst.close()
+
+
+def _walk_pypff_folder(folder, parent_path: str) -> Iterator[ParsedEmail]:
+    """Recursively walk pypff folders and yield emails."""
+    folder_name = folder.name or ""
+    current_path = (
+        f"{parent_path}/{folder_name}" if parent_path else folder_name
+    )
+    display_folder = folder_name or "Root"
+    message_type = _infer_folder_type(current_path)
+
+    for i in range(folder.number_of_sub_messages):
+        try:
+            msg = folder.get_sub_message(i)
+            parsed = _pypff_message_to_email(msg, display_folder, message_type)
+            if parsed:
+                yield parsed
+        except Exception as e:
+            logger.debug("Skipping message %d in %s: %s", i, display_folder, e)
+
+    for i in range(folder.number_of_sub_folders):
+        try:
+            sub = folder.get_sub_folder(i)
+            yield from _walk_pypff_folder(sub, current_path)
+        except Exception as e:
+            logger.debug("Skipping subfolder %d in %s: %s", i, display_folder, e)
+
+
+def _pypff_message_to_email(
+    msg, folder: str, message_type: str,
+) -> Optional[ParsedEmail]:
+    """Convert a pypff message object to ParsedEmail."""
+    try:
+        subject = msg.subject or "(无主题)"
+        sender = msg.sender_name or ""
+        if not sender:
+            sender = msg.sender_email_address or "unknown"
+        elif msg.sender_email_address:
+            sender = f"{sender} <{msg.sender_email_address}>"
+
+        body = msg.plain_text_body or ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        html_body = msg.html_body or ""
+        if isinstance(html_body, bytes):
+            html_body = html_body.decode("utf-8", errors="replace")
+        best_body = html_body or body
+
+        received_at = ""
+        if msg.delivery_time:
+            received_at = msg.delivery_time.isoformat()
+        elif msg.client_submit_time:
+            received_at = msg.client_submit_time.isoformat()
+        if not received_at:
+            received_at = datetime.now().isoformat()
+
+        # Build transport headers for reply detection
+        headers = msg.transport_headers or ""
+        if isinstance(headers, bytes):
+            headers = headers.decode("utf-8", errors="replace")
+
+        in_reply_to = ""
+        conversation_id = ""
+        to_list: list[str] = []
+        cc_list: list[str] = []
+
+        if headers:
+            hdr_msg = email_lib.message_from_string(headers)
+            in_reply_to = hdr_msg.get("In-Reply-To", "") or ""
+            refs = hdr_msg.get("References", "") or ""
+            conversation_id = (
+                in_reply_to.split()[0] if in_reply_to
+                else (refs.split()[0] if refs else "")
+            )
+            to_list = _parse_address_list(hdr_msg.get("To"))
+            cc_list = _parse_address_list(hdr_msg.get("Cc"))
+
+        # Attachment metadata
+        attachments_meta: list[dict] = []
+        try:
+            for j in range(msg.number_of_attachments):
+                att = msg.get_attachment(j)
+                name = att.name or f"attachment_{j}"
+                size = att.size if hasattr(att, "size") else 0
+                attachments_meta.append({
+                    "name": name,
+                    "content_type": "application/octet-stream",
+                    "size": size,
+                })
+        except Exception:
+            pass
+
+        eid = _generate_email_id(
+            f"{subject}|{sender}|{received_at}|{folder}"
+        )
+
+        return ParsedEmail(
+            id=eid,
+            subject=subject,
+            sender=sender,
+            to=to_list,
+            cc=cc_list,
+            body=best_body,
+            received_at=received_at,
+            source_folder=folder,
+            message_type=message_type,
+            in_reply_to=in_reply_to,
+            conversation_id=conversation_id,
+            attachments_metadata=attachments_meta,
+        )
+    except Exception as e:
+        logger.debug("Failed to convert pypff message: %s", e)
+        return None
+
+
 def _discover_mbox_files(directory: Path) -> list[Path]:
     """Find all mbox-like files in a readpst output directory."""
     results = []
@@ -277,8 +404,8 @@ def _discover_mbox_files(directory: Path) -> list[Path]:
     return results
 
 
-def iter_from_pst(pst_path: Path) -> Iterator[ParsedEmail]:
-    """Extract a .pst file using readpst, then iterate over the result."""
+def _iter_from_pst_readpst(pst_path: Path) -> Iterator[ParsedEmail]:
+    """Fallback: extract PST via readpst CLI, then parse mbox/eml output."""
     if shutil.which("readpst") is None:
         logger.error(
             "readpst 未安装。请运行: sudo apt install pst-utils"
@@ -287,41 +414,43 @@ def iter_from_pst(pst_path: Path) -> Iterator[ParsedEmail]:
 
     with tempfile.TemporaryDirectory(prefix="pst_import_") as tmpdir:
         tmpdir_path = Path(tmpdir)
-        logger.info("正在解压 PST 文件到临时目录: %s", tmpdir_path)
+        logger.info("readpst: 解压到 %s", tmpdir_path)
 
         result = subprocess.run(
             ["readpst", "-r", "-8", "-o", str(tmpdir_path), str(pst_path)],
-            capture_output=True,
-            text=True,
+            capture_output=True, text=True,
         )
-
         if result.returncode != 0:
-            logger.error("readpst 执行失败: %s", result.stderr.strip())
+            logger.error("readpst 失败: %s", result.stderr.strip())
             sys.exit(1)
 
-        if result.stderr:
-            for line in result.stderr.strip().split("\n"):
-                if line.strip():
-                    logger.debug("readpst: %s", line.strip())
-
         mbox_files = _discover_mbox_files(tmpdir_path)
-        if not mbox_files:
-            eml_files = list(tmpdir_path.rglob("*.eml"))
-            if eml_files:
-                logger.info("找到 %d 个 EML 文件", len(eml_files))
-                for eml_file in sorted(eml_files):
-                    folder = eml_file.parent.name
-                    yield from iter_from_eml(eml_file, folder=folder)
-                return
-
-            logger.warning("readpst 解压后未找到可识别的邮件文件")
+        if mbox_files:
+            for mbox_file in mbox_files:
+                folder = mbox_file.parent.name or mbox_file.stem
+                yield from iter_from_mbox(mbox_file, folder=folder)
             return
 
-        logger.info("找到 %d 个 mbox 文件", len(mbox_files))
-        for mbox_file in mbox_files:
-            folder = mbox_file.parent.name or mbox_file.stem
-            logger.info("  读取: %s (folder=%s)", mbox_file.name, folder)
-            yield from iter_from_mbox(mbox_file, folder=folder)
+        eml_files = list(tmpdir_path.rglob("*.eml"))
+        if eml_files:
+            for eml_file in sorted(eml_files):
+                folder = eml_file.parent.name
+                yield from iter_from_eml(eml_file, folder=folder)
+            return
+
+        logger.warning("readpst 解压后未找到邮件文件")
+
+
+def iter_from_pst(pst_path: Path) -> Iterator[ParsedEmail]:
+    """Parse a .pst file. Uses pypff (pip) first, readpst as fallback."""
+    try:
+        import pypff  # noqa: F401
+        logger.info("使用 pypff 解析 PST 文件 (纯 Python)")
+        yield from _iter_from_pst_pypff(pst_path)
+    except ImportError:
+        logger.info("pypff 未安装，尝试 readpst 后备方案")
+        logger.info("提示: pip install libpff-python 可避免系统依赖")
+        yield from _iter_from_pst_readpst(pst_path)
 
 
 # ---------------------------------------------------------------------------
