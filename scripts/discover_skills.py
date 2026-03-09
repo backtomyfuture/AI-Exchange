@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "python-dotenv",
+#   "pyyaml",
+# ]
+# ///
 """
-Skill 自动发现工具 —— 分析历史邮件，挖掘处理模式，生成可复用的 Skill。
+Skill 自动发现工具 —— 分析历史邮件，发现处理模式，自动生成 Skill。
 
-工作流:
-  1. 从 Qdrant 读取历史邮件数据（含 PST 导入的邮件）
-  2. 统计发件人、主题、回复率等维度
-  3. 用 LLM 深度分析模式（如无 LLM 则使用启发式算法）
-  4. 以链路图形式展示发现的模式
-  5. 用户多选确认后，自动生成 Skill 文件
+快速开始 (使用 uv，无需手动建虚拟环境):
+    uv run scripts/discover_skills.py --source eml --pst-path ./emails/ --no-llm
 
-使用方法:
-    # 基于 Qdrant 中的邮件进行分析
-    python scripts/discover_skills.py
-
-    # 直接分析 PST 文件（不需要先导入）
-    python scripts/discover_skills.py --source pst --pst-path archive.pst
-
-    # 使用启发式分析（不调用 LLM）
-    python scripts/discover_skills.py --no-llm
-
-    # 限制分析的邮件数
-    python scripts/discover_skills.py --limit 1000
+完整说明见 docs/history-import-and-skill-discovery.md
 """
 
 from __future__ import annotations

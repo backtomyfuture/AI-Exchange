@@ -1,36 +1,19 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "libpff-python",
+#   "python-dotenv",
+# ]
+# ///
 """
-PST 历史邮件导入工具 —— 将 .pst 文件中的邮件批量解析并存入 Qdrant 向量数据库。
+PST 历史邮件导入工具 —— 将 .pst / .mbox / .eml 邮件批量解析并存入 Qdrant。
 
-支持格式:
-  - .pst  (纯 Python 解析，pip install libpff-python)
-  - .mbox (Python 标准库直接解析)
-  - .eml  (单封邮件) 或包含 .eml 文件的目录
+快速开始 (使用 uv，无需手动建虚拟环境):
+    uv run scripts/import_pst.py archive.pst --dry-run
+    uv run scripts/import_pst.py archive.pst
 
-使用方法:
-    # 导入 PST 文件
-    python scripts/import_pst.py /path/to/archive.pst
-
-    # 导入 mbox 文件
-    python scripts/import_pst.py /path/to/mail.mbox
-
-    # 导入 eml 文件目录
-    python scripts/import_pst.py /path/to/eml_dir/
-
-    # 先预览不实际导入
-    python scripts/import_pst.py /path/to/archive.pst --dry-run
-
-    # 指定批次大小
-    python scripts/import_pst.py /path/to/archive.pst --batch-size 100
-
-环境准备:
-    # PST 文件需要 pypff:
-    pip install libpff-python
-
-    # 确保 .env 配置了 Qdrant 和 Embedding 服务
-    # QDRANT_URL=http://localhost:6333
-    # EMBEDDING_BASE_URL=...
-    # EMBEDDING_API_KEY=...
+完整说明见 docs/history-import-and-skill-discovery.md
 """
 
 from __future__ import annotations
@@ -482,9 +465,6 @@ def run_import(
     dry_run: bool = False,
 ) -> ImportStats:
     """Main import logic — detect source type, parse, and batch-ingest."""
-
-    from src.utils.email_processor import EmailProcessor
-
     stats = ImportStats()
 
     suffix = source.suffix.lower()
@@ -513,6 +493,8 @@ def run_import(
     processor = None
     if not dry_run:
         try:
+            from src.utils.email_processor import EmailProcessor
+
             processor = EmailProcessor()
             processor.init_collection()
             logger.info("Qdrant 连接成功，集合已就绪")
