@@ -2,7 +2,7 @@
 
 本文档包含两个独立工具的使用说明：
 
-1. **`import_pst.py`** — 将历史邮件（PST / Mbox / EML）导入到 Qdrant 向量数据库
+1. **`import_pst.py`** — 将历史邮件（PST / Mbox / EML）或 Exchange 服务器当前邮件导入到 Qdrant 向量数据库
 2. **`discover_skills.py`** — 分析历史邮件，自动发现处理模式并生成 Skill
 
 ---
@@ -69,6 +69,7 @@ python scripts/import_pst.py archive.pst --dry-run
 | **Mbox** | `mail.mbox` | 无（Python 标准库） | Linux/Thunderbird 常见格式 |
 | **EML** | `email.eml` | 无（Python 标准库） | 单封邮件文件 |
 | **EML 目录** | `./emails/` | 无（Python 标准库） | 递归扫描所有 `.eml` 文件 |
+| **Exchange** | `--source exchange` | 无（使用项目已有 API 客户端） | 从 Exchange 服务器直接拉取当前邮件 |
 
 ### 基本用法
 
@@ -125,13 +126,19 @@ uv run scripts/import_pst.py archive.pst --batch-size 100
 
 ### 完整参数
 
-```
-用法: import_pst.py [-h] [--batch-size N] [--dry-run] SOURCE
+```text
+用法: import_pst.py [-h] [--source {file,exchange}] [--folder FOLDER]
+                     [--limit N] [--all-mail] [--batch-size N] [--dry-run]
+                     [SOURCE]
 
 位置参数:
-  SOURCE              PST/Mbox/EML 文件路径，或 EML 目录路径
+  SOURCE              PST/Mbox/EML 文件路径，或 EML 目录路径 (--source file 时必填)
 
 可选参数:
+  --source {file,exchange}  数据来源: file=本地文件 (默认), exchange=Exchange 服务器
+  --folder FOLDER     Exchange 文件夹: ALL=全部邮件文件夹 (默认), 或指定如 inbox/sent/drafts
+  --limit N           从 Exchange 拉取的最大邮件数 (默认: 0=全部)
+  --all-mail          拉取全部邮件（含已读），默认只拉未读
   --batch-size N      每批次处理的邮件数 (默认: 50)
   --dry-run           仅预览，不写入 Qdrant
 ```
@@ -142,7 +149,7 @@ uv run scripts/import_pst.py archive.pst --batch-size 100
 
 | 字段 | 说明 |
 |------|------|
-| `id` | 基于内容哈希的唯一 ID（`pst_` 前缀） |
+| `id` | 唯一 ID（本地文件为 `pst_` + 哈希；Exchange 为 `exc_` + Base64） |
 | `subject` | 邮件主题 |
 | `sender` | 发件人 |
 | `to` / `cc` | 收件人 / 抄送人 |
@@ -152,7 +159,7 @@ uv run scripts/import_pst.py archive.pst --batch-size 100
 | `type` | 邮件类型：`received` / `sent` / `draft` |
 | `in_reply_to` | 回复的原始邮件 ID（用于线程追踪） |
 | `thread_id` | 会话 ID（从 In-Reply-To / References 推断） |
-| `_import_source` | 固定为 `pst_import`，用于区分数据来源 |
+| `_import_source` | 用于区分数据来源：`pst_import`（本地文件）或 `exchange_import`（服务器） |
 
 ### PST 解析策略
 
@@ -364,6 +371,25 @@ Thunderbird 的邮件已经以 mbox 格式存储在本地，通常在：
 ```bash
 uv run scripts/import_pst.py ~/.thunderbird/xxx/Mail/Local\ Folders/ --dry-run
 ```
+
+### 场景五：「我想导入 Exchange 服务器上的当前邮件」
+
+```bash
+# 预览服务器上所有文件夹的未读邮件
+uv run scripts/import_pst.py --source exchange --dry-run
+
+# 拉取全部文件夹的全部邮件（含已读），自动分页获取
+uv run scripts/import_pst.py --source exchange --all-mail
+
+# 只拉取指定文件夹的邮件（如收件箱，限制获取前 50 封做测试）
+uv run scripts/import_pst.py --source exchange --folder inbox --limit 50 --dry-run
+
+# 只拉取已发送邮件
+uv run scripts/import_pst.py --source exchange --folder sent --all-mail --dry-run
+```
+
+> **前提**：`.env` 中需要配置好 `EXCHANGE_API_URL`、`EXCHANGE_API_KEY`、`EXCHANGE_ACCOUNT_ID`。
+> Exchange 导入模式会自动通过 API 获取服务器全部有邮件的文件夹，过滤掉日历、联系人等系统内部目录，并采用分页防超时机制直接同步大批量邮件。
 
 ---
 

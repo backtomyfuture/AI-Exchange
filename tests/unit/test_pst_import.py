@@ -337,3 +337,131 @@ class TestImportStats:
         assert "10" in output
         assert "8" in output
         assert "24" in output
+
+
+# ---------------------------------------------------------------------------
+# Exchange import
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeImport:
+    """Tests for Exchange server email import."""
+
+    def test_exchange_item_to_parsed_email_basic(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {
+            "id": "AAMkAGQ3YzEwNDM=",
+            "subject": "Q4 报表审批",
+            "sender": "finance@corp.com",
+            "to": ["boss@corp.com"],
+            "cc": ["cfo@corp.com"],
+            "body": "<html><body>请审批</body></html>",
+            "received_at": "2024-06-15T10:30:00+08:00",
+            "in_reply_to": "",
+        }
+
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        assert result is not None
+        assert result.subject == "Q4 报表审批"
+        assert result.sender == "finance@corp.com"
+        assert result.to == ["boss@corp.com"]
+        assert result.cc == ["cfo@corp.com"]
+        assert result.message_type == "received"
+        assert result.id.startswith("exc_")
+        assert result.import_source == "exchange_import"
+
+    def test_exchange_item_to_parsed_email_sent_folder(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {
+            "id": "AAMkSent123",
+            "subject": "Re: 项目进度",
+            "sender": "me@corp.com",
+            "to": ["pm@corp.com"],
+            "body": "已完成",
+            "received_at": "2024-06-15T11:00:00+08:00",
+        }
+
+        result = _exchange_item_to_parsed_email(item, folder="Sent Items")
+        assert result is not None
+        assert result.message_type == "sent"
+
+    def test_exchange_item_to_parsed_email_string_addresses(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {
+            "id": "AAMkStr123",
+            "subject": "Test",
+            "sender": "a@b.com",
+            "to": "x@y.com, z@w.com",
+            "cc": "",
+            "body": "Hello",
+        }
+
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        assert result is not None
+        assert result.to == ["x@y.com", "z@w.com"]
+        assert result.cc == []
+
+    def test_exchange_item_to_parsed_email_with_attachments(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {
+            "id": "AAMkAtt123",
+            "subject": "附件测试",
+            "sender": "a@b.com",
+            "to": ["c@d.com"],
+            "body": "请查收",
+            "attachments": [
+                {"name": "report.xlsx", "content_type": "application/vnd.ms-excel", "size": 54321},
+            ],
+        }
+
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        assert result is not None
+        assert len(result.attachments_metadata) == 1
+        assert result.attachments_metadata[0]["name"] == "report.xlsx"
+
+    def test_exchange_item_to_parsed_email_missing_fields(self):
+        """Minimal item with only id and body should still parse."""
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {"id": "MinimalID", "body": "Just body"}
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        assert result is not None
+        assert result.subject == "(无主题)"
+        assert result.sender == "unknown"
+
+    def test_exchange_item_to_dict_import_source(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {"id": "TestSource", "subject": "Source Test", "body": "body"}
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        d = result.to_dict()
+        assert d["_import_source"] == "exchange_import"
+
+    def test_exchange_dry_run(self, tmp_path: Path):
+        """Verify dry-run with exchange source via mocked iter_from_exchange."""
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        # Simulate what iter_from_exchange would produce
+        items = [
+            {"id": f"ID_{i}", "subject": f"Mail {i}", "sender": "s@c.com",
+             "to": ["r@c.com"], "body": f"Body {i}"}
+            for i in range(3)
+        ]
+        parsed = [_exchange_item_to_parsed_email(it, folder="INBOX") for it in items]
+
+        with patch("scripts.import_pst.iter_from_exchange", return_value=iter(parsed)):
+            stats = run_import(
+                source=None,
+                dry_run=True,
+                source_type="exchange",
+                exchange_folder="INBOX",
+                exchange_limit=10,
+            )
+            assert stats.total == 3
+            assert stats.imported == 3
+            assert stats.points_created == 0
+

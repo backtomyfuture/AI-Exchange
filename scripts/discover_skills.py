@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "python-dotenv",
-#   "pyyaml",
-# ]
-# ///
 """
 Skill 自动发现工具 —— 分析历史邮件，发现处理模式，自动生成 Skill。
 

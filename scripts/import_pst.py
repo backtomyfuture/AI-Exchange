@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "libpff-python",
-#   "python-dotenv",
-# ]
-# ///
 """
-PST 历史邮件导入工具 —— 将 .pst / .mbox / .eml 邮件批量解析并存入 Qdrant。
+邮件导入工具 —— 将 .pst / .mbox / .eml / Exchange 服务器邮件批量解析并存入 Qdrant。
 
 快速开始 (使用 uv，无需手动建虚拟环境):
     uv run scripts/import_pst.py archive.pst --dry-run
     uv run scripts/import_pst.py archive.pst
+    uv run scripts/import_pst.py --source exchange --dry-run
 
 完整说明见 docs/history-import-and-skill-discovery.md
 """
@@ -19,6 +13,7 @@ PST 历史邮件导入工具 —— 将 .pst / .mbox / .eml 邮件批量解析�
 from __future__ import annotations
 
 import argparse
+import asyncio
 import email as email_lib
 import email.policy
 import email.utils
@@ -68,6 +63,7 @@ class ParsedEmail:
     in_reply_to: str = ""
     conversation_id: str = ""
     attachments_metadata: list[dict] = field(default_factory=list)
+    import_source: str = "pst_import"
 
     def to_dict(self) -> dict:
         return {
@@ -84,7 +80,7 @@ class ParsedEmail:
             "thread_id": self.conversation_id,
             "attachments": [],
             "attachments_metadata": self.attachments_metadata,
-            "_import_source": "pst_import",
+            "_import_source": self.import_source,
         }
 
 
@@ -296,11 +292,12 @@ def _pypff_message_to_email(
     """Convert a pypff message object to ParsedEmail."""
     try:
         subject = msg.subject or "(无主题)"
-        sender = msg.sender_name or ""
+        sender = getattr(msg, "sender_name", "") or ""
+        sender_email = getattr(msg, "sender_email_address", "")
         if not sender:
-            sender = msg.sender_email_address or "unknown"
-        elif msg.sender_email_address:
-            sender = f"{sender} <{msg.sender_email_address}>"
+            sender = sender_email or "unknown"
+        elif sender_email:
+            sender = f"{sender} <{sender_email}>"
 
         body = msg.plain_text_body or ""
         if isinstance(body, bytes):
@@ -437,6 +434,364 @@ def iter_from_pst(pst_path: Path) -> Iterator[ParsedEmail]:
 
 
 # ---------------------------------------------------------------------------
+# Exchange server source
+# ---------------------------------------------------------------------------
+
+def _exchange_item_to_parsed_email(
+    item: dict, folder: str = "",
+) -> Optional[ParsedEmail]:
+    """Convert an Exchange API email dict to ParsedEmail."""
+    try:
+        subject = item.get("subject", "(无主题)") or "(无主题)"
+        sender = _parse_exchange_sender(
+            item.get("sender") or item.get("from")
+        )
+        to_raw = item.get("to", [])
+        cc_raw = item.get("cc", [])
+
+        # Handle both list and string formats
+        if isinstance(to_raw, str):
+            to_list = _parse_address_list(to_raw)
+        else:
+            to_list = [str(a) for a in to_raw] if to_raw else []
+        if isinstance(cc_raw, str):
+            cc_list = _parse_address_list(cc_raw)
+        else:
+            cc_list = [str(a) for a in cc_raw] if cc_raw else []
+
+        body = item.get("body", "") or ""
+        received_at = (
+            item.get("received_at")
+            or item.get("received_time")
+            or item.get("date", "")
+            or ""
+        )
+        if not received_at:
+            received_at = datetime.now().isoformat()
+
+        message_type = _infer_folder_type(folder)
+        in_reply_to = item.get("in_reply_to", "") or ""
+        conversation_id = item.get("conversation_id") or item.get("thread_id", "") or ""
+        if not conversation_id and in_reply_to:
+            conversation_id = in_reply_to.split()[0]
+
+        # Attachment metadata
+        attachments_meta: list[dict] = []
+        for att in item.get("attachments", []) or []:
+            if isinstance(att, dict):
+                attachments_meta.append({
+                    "name": att.get("name", "unknown"),
+                    "content_type": att.get("content_type", "application/octet-stream"),
+                    "size": att.get("size", 0),
+                })
+
+        # Build deterministic ID from Exchange email ID or content
+        exchange_id = item.get("id", "")
+        if exchange_id:
+            eid = f"exc_{hashlib.sha256(exchange_id.encode()).hexdigest()[:20]}"
+        else:
+            eid = f"exc_{hashlib.sha256(f'{subject}|{sender}|{received_at}'.encode()).hexdigest()[:20]}"
+
+        return ParsedEmail(
+            id=eid,
+            subject=subject,
+            sender=sender,
+            to=to_list,
+            cc=cc_list,
+            body=body,
+            received_at=received_at,
+            source_folder=folder,
+            message_type=message_type,
+            in_reply_to=in_reply_to,
+            conversation_id=conversation_id,
+            attachments_metadata=attachments_meta,
+            import_source="exchange_import",
+        )
+    except Exception as e:
+        logger.warning("Failed to convert Exchange email: %s", e)
+        return None
+
+
+def _parse_exchange_sender(raw_sender: str | None) -> str:
+    """Parse Exchange sender which may be Mailbox(...) format or plain string."""
+    if not raw_sender:
+        return "unknown"
+    # Handle Mailbox(name='...', email_address='...', ...) format
+    import re
+    email_match = re.search(r"email_address='([^']*)'", str(raw_sender))
+    name_match = re.search(r"name='([^']*)'", str(raw_sender))
+    if email_match:
+        email_addr = email_match.group(1)
+        name = name_match.group(1) if name_match else ""
+        if name:
+            return f"{name} <{email_addr}>"
+        return email_addr
+    return str(raw_sender)
+
+
+def _fetch_exchange_emails(
+    folder: str = "INBOX",
+    limit: int = 0,
+    all_mail: bool = False,
+) -> list[ParsedEmail]:
+    """Fetch emails from Exchange server via synchronous HTTP calls.
+
+    Uses offset-based pagination (small page size) to avoid Exchange gateway
+    504 timeouts.  ``limit=0`` means fetch all available emails.
+    """
+    from src.config import get_settings, resolve_secret
+    import httpx
+
+    PAGE_SIZE = 5  # Exchange gateway times out on larger requests
+
+    settings = get_settings()
+    api_url = settings.EXCHANGE_API_URL.rstrip("/")
+    api_key = resolve_secret(settings.EXCHANGE_API_KEY)
+    account_id = settings.EXCHANGE_ACCOUNT_ID
+    ssl_verify = settings.EXCHANGE_SSL_VERIFY
+
+    headers = {"X-API-KEY": api_key} if api_key else {}
+
+    base_params: dict = {
+        "account_id": account_id,
+        "folder": folder,
+    }
+    if not all_mail:
+        base_params["unread_only"] = "True"
+
+    results: list[ParsedEmail] = []
+    fetch_all = (limit == 0)
+    max_fetch = limit if limit > 0 else 999_999  # effectively unlimited
+
+    with httpx.Client(
+        verify=ssl_verify,
+        headers=headers,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    ) as http:
+        list_url = f"{api_url}/list"
+        offset = 0
+        page = 0
+        total_on_server: int | None = None
+
+        while len(results) < max_fetch:
+            page_size = min(PAGE_SIZE, max_fetch - len(results))
+            params = {**base_params, "limit": page_size, "offset": offset}
+
+            page += 1
+            target_desc = "全部" if fetch_all else str(limit)
+            logger.info(
+                "正在拉取 Exchange 邮件 (第 %d 页, offset=%d, 已获取 %d/%s)...",
+                page, offset, len(results), target_desc,
+            )
+
+            try:
+                response = http.get(list_url, params=params)
+            except Exception as e:
+                logger.warning("Exchange 列表请求失败 [%s]: %s", type(e).__name__, e)
+                break
+
+            if response.status_code != 200:
+                logger.warning(
+                    "列表获取失败: %s - %s", response.status_code, response.text[:200],
+                )
+                break
+
+            data = response.json().get("data", {})
+            items = data.get("items", [])
+
+            if total_on_server is None:
+                total_on_server = data.get("total", 0)
+                logger.info("Exchange 服务器共有 %d 封邮件", total_on_server)
+
+            if not items:
+                logger.info("没有更多邮件了")
+                break
+
+            from urllib.parse import quote
+            page_success = 0
+
+            for item in items:
+                email_id = item.get("id", "")
+                if not email_id:
+                    continue
+
+                # Fetch full detail
+                encoded_id = quote(email_id, safe="")
+                detail_url = f"{api_url}/{encoded_id}"
+                try:
+                    detail_resp = http.get(
+                        detail_url,
+                        params={"account_id": account_id},
+                        timeout=30.0,
+                    )
+                    if detail_resp.status_code == 200:
+                        detail_data = detail_resp.json().get("data", {})
+                        if detail_data:
+                            if "id" not in detail_data:
+                                detail_data["id"] = email_id
+                            parsed = _exchange_item_to_parsed_email(
+                                detail_data, folder=folder,
+                            )
+                            if parsed:
+                                results.append(parsed)
+                                page_success += 1
+                    else:
+                        logger.warning(
+                            "详情获取失败 (ID: %s): %s",
+                            email_id, detail_resp.status_code,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "获取详情异常 [%s] (ID: %s): %s",
+                        type(e).__name__, email_id, e,
+                    )
+
+            offset += len(items)
+            logger.info("本页获取 %d 封, 累计 %d/%s", page_success, len(results), target_desc)
+
+            # Stop if server returned fewer items than requested (end of list)
+            if len(items) < page_size:
+                logger.info("已到达邮件列表末尾")
+                break
+
+    return results
+
+
+# Well-known EWS folder name mapping: display name -> API name
+# This is standard Exchange/EWS protocol mapping, not hardcoded business logic.
+_EWS_FOLDER_MAP: dict[str, str] = {
+    "收件箱": "inbox",
+    "已发送邮件": "sent",
+    "草稿": "drafts",
+    "已删除邮件": "deleteditems",
+    "垃圾邮件": "junkemail",
+    "发件箱": "outbox",
+    # English display names
+    "Inbox": "inbox",
+    "Sent Items": "sent",
+    "Drafts": "drafts",
+    "Deleted Items": "deleteditems",
+    "Junk Email": "junkemail",
+    "Outbox": "outbox",
+}
+
+# Non-mail folder classes to exclude (IPF.Note = mail; others are not mail)
+_NON_MAIL_CLASSES = {"IPF.Contact", "IPF.Appointment", "IPF.Task",
+                     "IPF.Journal", "IPF.StickyNote", "IPF.Activity"}
+
+
+def _get_exchange_mail_folders() -> list[tuple[str, str]]:
+    """Return list of (api_folder_name, display_name) for folders likely containing mail.
+
+    Dynamically discovers folders via the folders/all API and filters by:
+    1. folder_class (only IPF.Note or unset = mail folders)
+    2. item count > 0
+    3. Name not a GUID (system internal folders)
+    """
+    from src.config import get_settings, resolve_secret
+    import httpx, re
+
+    settings = get_settings()
+    api_url = settings.EXCHANGE_API_URL.rstrip("/")
+    api_key = resolve_secret(settings.EXCHANGE_API_KEY)
+    account_id = settings.EXCHANGE_ACCOUNT_ID
+    ssl_verify = settings.EXCHANGE_SSL_VERIFY
+    headers = {"X-API-KEY": api_key} if api_key else {}
+
+    folders_url = f"{api_url}/folders/all"
+    try:
+        r = httpx.get(
+            folders_url,
+            params={"account_id": account_id},
+            headers=headers, verify=ssl_verify, timeout=30.0,
+        )
+        if r.status_code != 200:
+            # Fallback endpoint
+            base_url = re.sub(r"/emails/?$", "", api_url)
+            r = httpx.get(
+                f"{base_url}/folders/all",
+                params={"account_id": account_id},
+                headers=headers, verify=ssl_verify, timeout=30.0,
+            )
+    except Exception as e:
+        logger.error("获取文件夹列表失败: %s", e)
+        return [("inbox", "Inbox")]
+
+    if r.status_code != 200:
+        logger.warning("文件夹列表请求失败 (%s), 仅使用 Inbox", r.status_code)
+        return [("inbox", "Inbox")]
+
+    folders_data = r.json().get("data", {}).get("folders", [])
+    result: list[tuple[str, str]] = []
+
+    for f in folders_data:
+        name = f.get("name", "")
+        total = f.get("total_count", f.get("child_item_count", 0)) or 0
+        folder_class = f.get("folder_class", "")
+
+        # Skip empty folders
+        if total == 0:
+            continue
+
+        # Skip GUID-named folders (internal system folders like {A9E2BC46-...})
+        if re.match(r"^\{[0-9A-Fa-f-]+\}$", name):
+            continue
+
+        # Skip non-mail folders by class
+        if folder_class:
+            # Exact match or prefix match for non-mail classes
+            if any(folder_class == cls or folder_class.startswith(cls + ".")
+                   for cls in _NON_MAIL_CLASSES):
+                continue
+
+        # Map known system folder names to EWS API names
+        if name in _EWS_FOLDER_MAP:
+            api_name = _EWS_FOLDER_MAP[name]
+        else:
+            api_name = name  # custom folders use their display name directly
+
+        # Avoid duplicates (e.g. Chinese and English names mapping to same API name)
+        if not any(api == api_name for api, _ in result):
+            result.append((api_name, name))
+            logger.debug("发现邮件文件夹: %s -> %s (%d 封, class=%s)",
+                         name, api_name, total, folder_class or "未知")
+
+    if not result:
+        result = [("inbox", "Inbox")]
+
+    return result
+
+
+def iter_from_exchange(
+    folder: str = "ALL",
+    limit: int = 0,
+    all_mail: bool = False,
+) -> Iterator[ParsedEmail]:
+    """Fetch emails from Exchange server and yield ParsedEmail.
+
+    When folder is "ALL", iterates over all mail folders.
+    """
+    if folder.upper() == "ALL":
+        mail_folders = _get_exchange_mail_folders()
+        logger.info("将遍历 %d 个邮件文件夹: %s",
+                     len(mail_folders),
+                     ", ".join(f"{d}({a})" for a, d in mail_folders))
+        for api_name, display_name in mail_folders:
+            logger.info("━━━ 开始拉取文件夹: %s ━━━", display_name)
+            emails = _fetch_exchange_emails(
+                folder=api_name, limit=limit, all_mail=all_mail,
+            )
+            for em in emails:
+                em.source_folder = display_name
+            yield from emails
+    else:
+        emails = _fetch_exchange_emails(
+            folder=folder, limit=limit, all_mail=all_mail,
+        )
+        yield from emails
+
+
+# ---------------------------------------------------------------------------
 # Import engine
 # ---------------------------------------------------------------------------
 
@@ -460,29 +815,45 @@ class ImportStats:
 
 
 def run_import(
-    source: Path,
+    source: Path | None = None,
     batch_size: int = 50,
     dry_run: bool = False,
+    *,
+    source_type: str = "file",
+    exchange_folder: str = "INBOX",
+    exchange_limit: int = 100,
+    exchange_all_mail: bool = False,
 ) -> ImportStats:
     """Main import logic — detect source type, parse, and batch-ingest."""
     stats = ImportStats()
 
-    suffix = source.suffix.lower()
-    if source.is_dir():
-        email_iter = iter_from_eml_dir(source)
-        source_desc = f"EML 目录: {source}"
-    elif suffix == ".pst":
-        email_iter = iter_from_pst(source)
-        source_desc = f"PST 文件: {source}"
-    elif suffix == ".mbox":
-        email_iter = iter_from_mbox(source)
-        source_desc = f"Mbox 文件: {source}"
-    elif suffix == ".eml":
-        email_iter = iter_from_eml(source)
-        source_desc = f"EML 文件: {source}"
+    if source_type == "exchange":
+        email_iter = iter_from_exchange(
+            folder=exchange_folder,
+            limit=exchange_limit,
+            all_mail=exchange_all_mail,
+        )
+        mail_scope = "全部邮件" if exchange_all_mail else "未读邮件"
+        limit_desc = f"最多 {exchange_limit} 封" if exchange_limit > 0 else "全部"
+        source_desc = f"Exchange 服务器 [{exchange_folder}] ({mail_scope}, {limit_desc})"
     else:
-        logger.error("不支持的文件格式: %s", suffix)
-        sys.exit(1)
+        assert source is not None
+        suffix = source.suffix.lower()
+        if source.is_dir():
+            email_iter = iter_from_eml_dir(source)
+            source_desc = f"EML 目录: {source}"
+        elif suffix == ".pst":
+            email_iter = iter_from_pst(source)
+            source_desc = f"PST 文件: {source}"
+        elif suffix == ".mbox":
+            email_iter = iter_from_mbox(source)
+            source_desc = f"Mbox 文件: {source}"
+        elif suffix == ".eml":
+            email_iter = iter_from_eml(source)
+            source_desc = f"EML 文件: {source}"
+        else:
+            logger.error("不支持的文件格式: %s", suffix)
+            sys.exit(1)
 
     print("\n📧 邮件导入工具")
     print(f"   来源: {source_desc}")
@@ -557,19 +928,50 @@ def run_import(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PST/Mbox/EML 历史邮件导入 Qdrant 工具",
+        description="PST/Mbox/EML/Exchange 邮件导入 Qdrant 工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 本地文件导入
   python scripts/import_pst.py archive.pst
   python scripts/import_pst.py archive.pst --dry-run
   python scripts/import_pst.py emails.mbox --batch-size 100
   python scripts/import_pst.py ./eml_folder/
+
+  # 从 Exchange 服务器导入
+  python scripts/import_pst.py --source exchange --dry-run
+  python scripts/import_pst.py --source exchange --folder Inbox --limit 50
+  python scripts/import_pst.py --source exchange --all-mail --limit 200
         """,
     )
     parser.add_argument(
         "source",
-        help="PST/Mbox/EML 文件路径或 EML 目录路径",
+        nargs="?",
+        default=None,
+        help="PST/Mbox/EML 文件路径或 EML 目录路径 (--source file 时必填)",
+    )
+    parser.add_argument(
+        "--source",
+        dest="source_type",
+        choices=["file", "exchange"],
+        default="file",
+        help="数据来源: file=本地文件 (默认), exchange=Exchange 服务器",
+    )
+    parser.add_argument(
+        "--folder",
+        default="ALL",
+        help="Exchange 文件夹: ALL=全部文件夹 (默认), 或指定如 inbox/sent/drafts/文件夹名",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="从 Exchange 拉取的最大邮件数 (默认: 0=全部)，仅 --source exchange 时生效",
+    )
+    parser.add_argument(
+        "--all-mail",
+        action="store_true",
+        help="拉取全部邮件（含已读），默认只拉未读。仅 --source exchange 时生效",
     )
     parser.add_argument(
         "--batch-size",
@@ -584,13 +986,25 @@ def main():
     )
 
     args = parser.parse_args()
-    source = Path(args.source)
 
-    if not source.exists():
-        logger.error("文件或目录不存在: %s", source)
-        sys.exit(1)
-
-    run_import(source, batch_size=args.batch_size, dry_run=args.dry_run)
+    if args.source_type == "exchange":
+        run_import(
+            source=None,
+            batch_size=args.batch_size,
+            dry_run=args.dry_run,
+            source_type="exchange",
+            exchange_folder=args.folder,
+            exchange_limit=args.limit,
+            exchange_all_mail=args.all_mail,
+        )
+    else:
+        if not args.source:
+            parser.error("本地文件模式需要指定 SOURCE 路径")
+        source = Path(args.source)
+        if not source.exists():
+            logger.error("文件或目录不存在: %s", source)
+            sys.exit(1)
+        run_import(source, batch_size=args.batch_size, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
