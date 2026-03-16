@@ -138,11 +138,14 @@ class PatternAnalyzer:
         self.sent = [r for r in records if r.message_type == "sent"]
         self._reply_map: dict[str, bool] = {}
         self._build_reply_map()
-        # 如果 my_email 未提供，尝试从 sent 邮件推断
+        # 如果 my_email 未提供，尝试从 sent 邮件推断（使用精确邮箱提取）
         if not self.my_email and self.sent:
-            sender_match = re.search(r'[\w.-]+@[\w.-]+', self.sent[0].sender)
-            if sender_match:
-                self.my_email = sender_match.group().lower()
+            self.my_email = self._extract_email(self.sent[0].sender)
+
+    def _extract_email(self, addr: str) -> str:
+        """从地址字符串中提取邮箱。"""
+        m = re.search(r'[\w.-]+@[\w.-]+', addr.lower())
+        return m.group() if m else addr.lower().strip()
 
     def _build_reply_map(self):
         """Match sent replies to received emails by thread/subject."""
@@ -200,7 +203,12 @@ class PatternAnalyzer:
 
     def _analyze_mailing_lists(self) -> list[dict]:
         """识别邮件组地址及其回复率。"""
-        list_patterns = re.compile(r'(all[-_]|[-_]team@|[-_]group@|[-_]list@|[-_]dept@)', re.IGNORECASE)
+        list_patterns = re.compile(
+            r'(^all[-_@]|[-_]team@|[-_]group@|[-_]list@|[-_]dept@'
+            r'|^noreply@|^no[-_]reply@|^newsletter@|^announce[s]?@'
+            r'|^notifications?@|^info@|^hr@|^finance@|^marketing@)',
+            re.IGNORECASE,
+        )
         addr_counts: Counter = Counter()
         addr_replied: Counter = Counter()
 
@@ -229,8 +237,8 @@ class PatternAnalyzer:
         cc_count, cc_replied = 0, 0
 
         for r in self.received:
-            in_to = any(self.my_email in addr.lower() for addr in r.to) if self.my_email else False
-            in_cc = any(self.my_email in addr.lower() for addr in r.cc) if self.my_email else False
+            in_to = any(self._extract_email(addr) == self.my_email for addr in r.to) if self.my_email else False
+            in_cc = any(self._extract_email(addr) == self.my_email for addr in r.cc) if self.my_email else False
             replied = self._reply_map.get(r.id, False)
 
             if in_to:
@@ -262,8 +270,9 @@ class PatternAnalyzer:
                     clean = email_match.group()
                     if clean != self.my_email:
                         all_recipients.add(clean)
-            if len(all_recipients) >= 2:
-                combo = tuple(sorted(all_recipients)[:4])
+            # 仅处理 2-4 人的收件人集合，超过 4 人直接跳过（避免截断带来的虚假匹配）
+            if 2 <= len(all_recipients) <= 4:
+                combo = tuple(sorted(all_recipients))
                 combo_counts[combo] += 1
                 if self._reply_map.get(r.id):
                     combo_replied[combo] += 1
