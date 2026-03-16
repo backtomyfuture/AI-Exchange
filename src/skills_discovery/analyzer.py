@@ -321,22 +321,67 @@ class PatternAnalyzer:
         return result[:20]
 
     def build_llm_prompt(self, stats: dict) -> str:
-        """Build the LLM prompt for pattern discovery."""
+        """构建多维度 LLM 分析 prompt。"""
+        # --- 1. 发件人统计 ---
         sender_lines = []
         for sender, count in stats["top_senders"]:
             rate = stats["sender_reply_rates"].get(sender, 0)
             reply_label = f"{rate:.0%}" if count >= 2 else "N/A"
             sender_lines.append(f"  - {sender}: {count} 封, 回复率 {reply_label}")
 
+        # --- 2. 收件人/抄送维度 ---
+        recipient_section = ""
+        mailing_lists = stats.get("mailing_lists", [])
+        if mailing_lists:
+            ml_lines = [
+                f"  - {ml['address']}: {ml['count']} 封, 回复率 {ml['reply_rate']:.0%}"
+                for ml in mailing_lists[:10]
+            ]
+            recipient_section += "## 邮件组地址统计\n" + "\n".join(ml_lines) + "\n\n"
+
+        to_vs_cc = stats.get("to_vs_cc_reply_rate", {})
+        if to_vs_cc.get("to_count", 0) > 0 or to_vs_cc.get("cc_count", 0) > 0:
+            recipient_section += (
+                f"## TO vs CC 收件人回复率\n"
+                f"  - 我在 TO 中: {to_vs_cc.get('to_count', 0)} 封, "
+                f"回复率 {to_vs_cc.get('to_reply_rate', 0):.0%}\n"
+                f"  - 我在 CC 中: {to_vs_cc.get('cc_count', 0)} 封, "
+                f"回复率 {to_vs_cc.get('cc_reply_rate', 0):.0%}\n\n"
+            )
+
+        combos = stats.get("frequent_recipient_combos", [])
+        if combos:
+            combo_lines = [
+                f"  - {', '.join(c['recipients'])}: {c['count']} 封, 回复率 {c['reply_rate']:.0%}"
+                for c in combos[:5]
+            ]
+            recipient_section += "## 高频收件人组合\n" + "\n".join(combo_lines) + "\n\n"
+
+        # --- 3. 线程深度统计 ---
+        thread_section = ""
+        thread_stats = stats.get("thread_stats", [])
+        deep_threads = [t for t in thread_stats if t["depth"] >= 2]
+        if deep_threads:
+            thread_lines = [
+                f"  - 线程深度={t['depth']}, 我的回复={t['my_replies']}, "
+                f"参与度={t['participation']:.0%}, 主题=\"{t['subject'][:40]}\""
+                for t in deep_threads[:10]
+            ]
+            thread_section = "## 线程深度分析\n" + "\n".join(thread_lines) + "\n\n"
+
+        # --- 4. 带正文样本的邮件列表 ---
         sample_emails = []
         for r in self.received[:80]:
             replied = "✅" if self._reply_map.get(r.id) else "❌"
+            body_snippet = ""
+            if r.body_preview:
+                body_snippet = f', 正文样本="{r.body_preview[:100]}"'
             sample_emails.append(
                 f"  - [{replied}] sender={r.sender}, subject=\"{r.subject[:50]}\", "
-                f"to={','.join(r.to[:2])}"
+                f"to={','.join(r.to[:2])}{body_snippet}"
             )
 
-        return f"""你是一个邮件路由模式分析专家。请根据以下邮件历史数据，发现可以自动化处理的邮件路由规则。
+        return f"""你是一个邮件路由模式分析专家。请根据以下多维度邮件历史数据，发现可以自动化处理的邮件路由规则。
 
 ## 统计概要
 - 收到邮件: {stats['total_received']} 封
@@ -349,23 +394,24 @@ class PatternAnalyzer:
 ## 高频主题关键词
 {', '.join(f'{w}({c})' for w, c in stats['top_subject_words'][:20])}
 
-## 邮件样本 (✅=已回复, ❌=未回复)
+{recipient_section}{thread_section}## 邮件样本 (✅=已回复, ❌=未回复, 含正文样本)
 {chr(10).join(sample_emails)}
 
 ## 任务
-请识别 3-8 个有意义的邮件路由模式 (pattern)。每个模式应该是一个可以被自动化处理的规则链。
+请识别 3-12 个有意义的邮件路由模式。每个模式应该是可以被自动化处理的规则链。
 
 对每个模式，请提供:
 1. **name**: 简短的模式名称 (中文)
 2. **description**: 对该模式的描述
-3. **trigger_type**: 触发类型，可以是 "sender_match" (发件人匹配), "subject_match" (主题关键词), "combined" (组合条件), "to_match" (收件人匹配)
-4. **conditions**: 触发条件列表，每个条件格式为 {{"type": "sender_match|subject_match|to_match", "operator": "in|contains|regex", "value": "..."}}
-5. **reply_rate**: 该模式对应邮件的回复率 (0.0-1.0)
-6. **sample_count**: 匹配该模式的邮件数量
-7. **suggested_priority**: 建议的优先级 (P0/P1/P2/P3)
-8. **suggested_need_reply**: 是否需要回复 (true/false)
-9. **suggested_tone**: 建议的回复语气 (可选)
-10. **example_subjects**: 2-3 个匹配该模式的示例主题
+3. **trigger_type**: 触发类型，可以是 "sender_match" (发件人), "subject_match" (主题), "combined" (组合), "to_match" (收件人), "cc_match" (抄送), "recipient_role" (收件角色), "body_match" (正文), "thread_depth" (线程深度)
+4. **condition_logic**: 条件组合方式，"and" (所有条件都满足) 或 "or" (任一条件满足)
+5. **conditions**: 触发条件列表，每个条件格式为 {{"type": "sender_match|subject_match|to_match|cc_match|body_match|thread_depth", "operator": "in|contains|regex|gte", "value": "..."}}
+6. **reply_rate**: 该模式对应邮件的回复率 (0.0-1.0)
+7. **sample_count**: 匹配该模式的邮件数量
+8. **suggested_priority**: 建议的优先级 (P0/P1/P2/P3)
+9. **suggested_need_reply**: 是否需要回复 (true/false)
+10. **suggested_tone**: 建议的回复语气 (可选)
+11. **example_subjects**: 2-3 个匹配该模式的示例主题
 
 请以 JSON 数组格式输出，不要包含其他内容。"""
 

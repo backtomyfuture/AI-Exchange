@@ -291,6 +291,54 @@ class TestThreadAnalysis:
 
 
 # ---------------------------------------------------------------------------
+# Enhanced LLM Prompt tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnhancedLLMPrompt:
+    def test_prompt_includes_recipient_data(self):
+        records = _make_records_with_recipients()
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+
+        assert "收件人" in prompt or "邮件组" in prompt or "TO" in prompt or "CC" in prompt
+
+    def test_prompt_includes_thread_data(self):
+        records = _make_records_with_threads()
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+
+        assert "线程" in prompt or "thread" in prompt.lower()
+
+    def test_prompt_includes_body_samples(self):
+        records = [
+            EmailRecord(
+                id=f"r_{i}", subject=f"审批请求 #{i}",
+                sender="finance@corp.com",
+                to=["me@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="received",
+                body_preview="请审核附件中的合同并签字确认。" * 5,
+            )
+            for i in range(5)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+
+        assert "正文样本" in prompt or "邮件内容" in prompt or "body" in prompt.lower()
+
+    def test_prompt_requests_condition_logic(self):
+        records = _make_records(n_received=10, n_sent=3)
+        analyzer = PatternAnalyzer(records)
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+
+        assert "condition_logic" in prompt or "AND" in prompt or "OR" in prompt
+
+
+# ---------------------------------------------------------------------------
 # Analyzer tests
 # ---------------------------------------------------------------------------
 
