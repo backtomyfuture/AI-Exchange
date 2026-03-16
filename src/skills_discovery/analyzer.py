@@ -131,12 +131,18 @@ class EmailHistoryCollector:
 class PatternAnalyzer:
     """Analyzes email history to discover routing patterns."""
 
-    def __init__(self, records: list[EmailRecord]):
+    def __init__(self, records: list[EmailRecord], my_email: str = ""):
         self.records = records
+        self.my_email = my_email.lower().strip()
         self.received = [r for r in records if r.message_type != "sent"]
         self.sent = [r for r in records if r.message_type == "sent"]
         self._reply_map: dict[str, bool] = {}
         self._build_reply_map()
+        # 如果 my_email 未提供，尝试从 sent 邮件推断
+        if not self.my_email and self.sent:
+            sender_match = re.search(r'[\w.-]+@[\w.-]+', self.sent[0].sender)
+            if sender_match:
+                self.my_email = sender_match.group().lower()
 
     def _build_reply_map(self):
         """Match sent replies to received emails by thread/subject."""
@@ -187,7 +193,91 @@ class PatternAnalyzer:
                 for s, c in sender_counts.most_common(20)
             },
             "top_subject_words": subject_words.most_common(30),
+            "mailing_lists": self._analyze_mailing_lists(),
+            "to_vs_cc_reply_rate": self._analyze_to_vs_cc(),
+            "frequent_recipient_combos": self._analyze_recipient_combos(),
         }
+
+    def _analyze_mailing_lists(self) -> list[dict]:
+        """识别邮件组地址及其回复率。"""
+        list_patterns = re.compile(r'(all[-_]|[-_]team@|[-_]group@|[-_]list@|[-_]dept@)', re.IGNORECASE)
+        addr_counts: Counter = Counter()
+        addr_replied: Counter = Counter()
+
+        for r in self.received:
+            for addr_list in (r.to, r.cc):
+                for addr in addr_list:
+                    email_match = re.search(r'[\w.-]+@[\w.-]+', addr.lower())
+                    if not email_match:
+                        continue
+                    clean = email_match.group()
+                    if list_patterns.search(clean):
+                        addr_counts[clean] += 1
+                        if self._reply_map.get(r.id):
+                            addr_replied[clean] += 1
+
+        result = []
+        for addr, count in addr_counts.most_common(20):
+            if count >= 2:
+                rate = addr_replied[addr] / count
+                result.append({"address": addr, "count": count, "reply_rate": rate})
+        return result
+
+    def _analyze_to_vs_cc(self) -> dict:
+        """分析我在 TO vs CC 中的回复率差异。"""
+        to_count, to_replied = 0, 0
+        cc_count, cc_replied = 0, 0
+
+        for r in self.received:
+            in_to = any(self.my_email in addr.lower() for addr in r.to) if self.my_email else False
+            in_cc = any(self.my_email in addr.lower() for addr in r.cc) if self.my_email else False
+            replied = self._reply_map.get(r.id, False)
+
+            if in_to:
+                to_count += 1
+                if replied:
+                    to_replied += 1
+            elif in_cc:
+                cc_count += 1
+                if replied:
+                    cc_replied += 1
+
+        return {
+            "to_count": to_count,
+            "to_reply_rate": to_replied / to_count if to_count > 0 else 0.0,
+            "cc_count": cc_count,
+            "cc_reply_rate": cc_replied / cc_count if cc_count > 0 else 0.0,
+        }
+
+    def _analyze_recipient_combos(self) -> list[dict]:
+        """发现频繁共现的收件人组合。"""
+        combo_counts: Counter = Counter()
+        combo_replied: Counter = Counter()
+
+        for r in self.received:
+            all_recipients: set[str] = set()
+            for addr in r.to + r.cc:
+                email_match = re.search(r'[\w.-]+@[\w.-]+', addr.lower())
+                if email_match:
+                    clean = email_match.group()
+                    if clean != self.my_email:
+                        all_recipients.add(clean)
+            if len(all_recipients) >= 2:
+                combo = tuple(sorted(all_recipients)[:4])
+                combo_counts[combo] += 1
+                if self._reply_map.get(r.id):
+                    combo_replied[combo] += 1
+
+        result = []
+        for combo, count in combo_counts.most_common(10):
+            if count >= 3:
+                rate = combo_replied[combo] / count
+                result.append({
+                    "recipients": list(combo),
+                    "count": count,
+                    "reply_rate": rate,
+                })
+        return result
 
     def build_llm_prompt(self, stats: dict) -> str:
         """Build the LLM prompt for pattern discovery."""

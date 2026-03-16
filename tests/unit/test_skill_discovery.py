@@ -101,6 +101,106 @@ class TestDataModels:
 
 
 # ---------------------------------------------------------------------------
+# Recipient analysis helpers and tests
+# ---------------------------------------------------------------------------
+
+
+def _make_records_with_recipients() -> list[EmailRecord]:
+    """带有收件人/抄送的测试数据。"""
+    records = []
+    mailing_lists = ["all-staff@corp.com", "dev-team@corp.com"]
+    for i in range(15):
+        to_list = [mailing_lists[i % 2]] if i < 10 else ["me@corp.com"]
+        cc_list = ["me@corp.com"] if i < 10 else []
+        records.append(EmailRecord(
+            id=f"recv_{i:04d}",
+            subject=f"项目通知 #{i}",
+            sender=f"user{i % 3}@corp.com",
+            to=to_list, cc=cc_list,
+            received_at=f"2024-01-{(i % 28) + 1:02d}T10:00:00",
+            message_type="received",
+        ))
+    # 一些回复
+    for i in range(3):
+        records.append(EmailRecord(
+            id=f"sent_{i:04d}",
+            subject=f"Re: 项目通知 #{i}",
+            sender="me@corp.com",
+            to=[f"user{i}@corp.com"], cc=[],
+            received_at=f"2024-01-{(i % 28) + 1:02d}T14:00:00",
+            message_type="sent",
+        ))
+    return records
+
+
+class TestRecipientAnalysis:
+    def test_statistics_include_recipient_data(self):
+        records = _make_records_with_recipients()
+        analyzer = PatternAnalyzer(records)
+        stats = analyzer.compute_statistics()
+
+        assert "mailing_lists" in stats
+        assert "to_vs_cc_reply_rate" in stats
+        assert "frequent_recipient_combos" in stats
+
+    def test_mailing_list_detection(self):
+        """邮件组地址（all-@, -team@, -group@）应被识别。"""
+        records = [
+            EmailRecord(
+                id=f"r_{i}", subject=f"通知 #{i}",
+                sender=f"sender{i}@corp.com",
+                to=["all-staff@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="received",
+            )
+            for i in range(5)
+        ] + [
+            EmailRecord(
+                id=f"s_{i}", subject=f"Re: 通知 #{i}",
+                sender="me@corp.com",
+                to=[f"sender{i}@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="sent",
+            )
+            for i in range(1)
+        ]
+        analyzer = PatternAnalyzer(records)
+        stats = analyzer.compute_statistics()
+
+        assert len(stats["mailing_lists"]) > 0
+        ml_addrs = [ml["address"] for ml in stats["mailing_lists"]]
+        assert "all-staff@corp.com" in ml_addrs
+
+    def test_to_vs_cc_reply_rate(self):
+        """我在 TO 里的邮件 vs 我在 CC 里的邮件，回复率应不同。"""
+        records = [
+            # 我在 TO 里 — 5封
+            *[EmailRecord(
+                id=f"to_{i}", subject=f"直接给你 #{i}",
+                sender="boss@corp.com",
+                to=["me@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="received",
+            ) for i in range(5)],
+            # 我在 CC 里 — 5封
+            *[EmailRecord(
+                id=f"cc_{i}", subject=f"抄送通知 #{i}",
+                sender="colleague@corp.com",
+                to=["other@corp.com"], cc=["me@corp.com"],
+                received_at="2024-01-01", message_type="received",
+            ) for i in range(5)],
+            # 对"直接给你"的回复 — 3封
+            *[EmailRecord(
+                id=f"reply_{i}", subject=f"Re: 直接给你 #{i}",
+                sender="me@corp.com",
+                to=["boss@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="sent",
+            ) for i in range(3)],
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+
+        assert stats["to_vs_cc_reply_rate"]["to_reply_rate"] > stats["to_vs_cc_reply_rate"]["cc_reply_rate"]
+
+
+# ---------------------------------------------------------------------------
 # Analyzer tests
 # ---------------------------------------------------------------------------
 
