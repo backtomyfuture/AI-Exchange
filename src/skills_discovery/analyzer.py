@@ -20,6 +20,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def strip_images_from_body(body: str) -> str:
+    """移除 HTML body 中的 <img> 标签（含属性，支持自闭合和非自闭合）。"""
+    return re.sub(r'<img[^>]*?/?>', '', body, flags=re.IGNORECASE)
+
+
 @dataclass
 class DiscoveredPattern:
     """A discovered email routing pattern."""
@@ -103,8 +108,9 @@ class EmailHistoryCollector:
                     cc_raw = [cc_raw]
 
                 body = p.get("body_preview", "") or p.get("body", "")
-                if len(body) > 500:
-                    body = body[:500]
+                body = strip_images_from_body(body)
+                if len(body) > 1000:
+                    body = body[:1000]
 
                 records.append(EmailRecord(
                     id=eid,

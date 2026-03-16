@@ -175,6 +175,14 @@ def interactive_select(patterns: list[DiscoveredPattern]) -> list[DiscoveredPatt
 # Data collection from PST (direct analysis)
 # ---------------------------------------------------------------------------
 
+def _strip_body(body: str) -> str:
+    """截取 body 到 1000 字符并移除图片标签。"""
+    from src.skills_discovery.analyzer import strip_images_from_body
+    if not body:
+        return ""
+    return strip_images_from_body(body)[:1000]
+
+
 def _parsed_to_record(parsed) -> EmailRecord:
     return EmailRecord(
         id=parsed.id,
@@ -185,7 +193,7 @@ def _parsed_to_record(parsed) -> EmailRecord:
         received_at=parsed.received_at,
         message_type=parsed.message_type,
         source_folder=parsed.source_folder,
-        body_preview=parsed.body[:500] if parsed.body else "",
+        body_preview=_strip_body(parsed.body),
         in_reply_to=parsed.in_reply_to,
         thread_id=parsed.conversation_id,
     )

@@ -616,3 +616,102 @@ class TestWriteSkill:
         path1 = write_skill(pattern, registry_path=str(tmp_path))
         path2 = write_skill(pattern, registry_path=str(tmp_path))
         assert path1 == path2
+
+
+# ---------------------------------------------------------------------------
+# Body preview enhancement tests
+# ---------------------------------------------------------------------------
+
+
+class TestBodyPreviewEnhancement:
+    def test_strip_images_from_body(self):
+        """strip_images_from_body 应移除 <img> 标签。"""
+        from src.skills_discovery.analyzer import strip_images_from_body
+        body = '正文开始<img src="logo.png" alt="Logo"/>中间内容<img src="sig.png"/>结尾'
+        cleaned = strip_images_from_body(body)
+        assert "<img" not in cleaned
+        assert "正文开始" in cleaned
+        assert "中间内容" in cleaned
+        assert "结尾" in cleaned
+
+    def test_strip_images_self_closing(self):
+        """应处理自闭合和非自闭合的 img 标签。"""
+        from src.skills_discovery.analyzer import strip_images_from_body
+        body = 'text<img src="a.png">more text<IMG SRC="b.jpg" />end'
+        cleaned = strip_images_from_body(body)
+        assert "<img" not in cleaned.lower()
+        assert "text" in cleaned
+        assert "more text" in cleaned
+        assert "end" in cleaned
+
+    def test_collector_body_truncated_to_1000(self):
+        """EmailHistoryCollector 应将 body 截取到 1000 字符。"""
+        mock_client = MagicMock()
+        point = MagicMock()
+        point.payload = {
+            "id": "email_long_body",
+            "subject": "Test",
+            "sender": "a@b.com",
+            "to": ["c@d.com"],
+            "cc": [],
+            "received_at": "2024-01-01T10:00:00",
+            "type": "received",
+            "body_preview": "x" * 2000,
+        }
+        mock_client.get_collection.return_value = True
+        mock_client.scroll.return_value = ([point], None)
+
+        collector = EmailHistoryCollector(mock_client)
+        records = collector.collect(limit=100)
+
+        assert len(records[0].body_preview) <= 1000
+
+    def test_collector_strips_images_from_body(self):
+        """EmailHistoryCollector 应从 body 中移除 img 标签。"""
+        mock_client = MagicMock()
+        point = MagicMock()
+        point.payload = {
+            "id": "email_with_img",
+            "subject": "Test",
+            "sender": "a@b.com",
+            "to": [],
+            "cc": [],
+            "received_at": "2024-01-01T10:00:00",
+            "type": "received",
+            "body_preview": '正文内容<img src="logo.png"/>更多内容',
+        }
+        mock_client.get_collection.return_value = True
+        mock_client.scroll.return_value = ([point], None)
+
+        collector = EmailHistoryCollector(mock_client)
+        records = collector.collect(limit=100)
+
+        assert "<img" not in records[0].body_preview
+        assert "正文内容" in records[0].body_preview
+
+    def test_parsed_to_record_body_1000(self):
+        """_parsed_to_record 应截取到 1000 字符。"""
+        from scripts.discover_skills import _parsed_to_record
+        from scripts.import_pst import ParsedEmail
+
+        parsed = ParsedEmail(
+            id="test", subject="test", sender="a@b.com",
+            to=[], cc=[], body="x" * 2000,
+            received_at="2024-01-01",
+        )
+        record = _parsed_to_record(parsed)
+        assert len(record.body_preview) <= 1000
+
+    def test_parsed_to_record_strips_img(self):
+        """_parsed_to_record 应移除 img 标签。"""
+        from scripts.discover_skills import _parsed_to_record
+        from scripts.import_pst import ParsedEmail
+
+        parsed = ParsedEmail(
+            id="test", subject="test", sender="a@b.com",
+            to=[], cc=[], body='正文<img src="x.png"/>结尾',
+            received_at="2024-01-01",
+        )
+        record = _parsed_to_record(parsed)
+        assert "<img" not in record.body_preview
+        assert "正文" in record.body_preview
