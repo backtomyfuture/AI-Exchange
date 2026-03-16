@@ -37,6 +37,7 @@ class DiscoveredPattern:
     example_subjects: list[str] = field(default_factory=list)
     example_senders: list[str] = field(default_factory=list)
     confidence: float = 0.0
+    condition_logic: str = "and"  # 顶层条件逻辑: "and" | "or"
 
 
 @dataclass

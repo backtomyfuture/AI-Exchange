@@ -68,6 +68,39 @@ def _make_records(
 
 
 # ---------------------------------------------------------------------------
+# Data model tests
+# ---------------------------------------------------------------------------
+
+
+class TestDataModels:
+    def test_discovered_pattern_has_condition_logic(self):
+        pattern = DiscoveredPattern(
+            id="test",
+            name="test",
+            description="test",
+            trigger_type="combined",
+            condition_logic="and",
+        )
+        assert pattern.condition_logic == "and"
+
+    def test_discovered_pattern_default_logic_is_and(self):
+        pattern = DiscoveredPattern(
+            id="test",
+            name="test",
+            description="test",
+            trigger_type="combined",
+        )
+        assert pattern.condition_logic == "and"
+
+    def test_email_record_body_preview_default_empty(self):
+        record = EmailRecord(
+            id="test", subject="test", sender="a@b.com",
+            to=[], cc=[], received_at="2024-01-01", message_type="received",
+        )
+        assert record.body_preview == ""
+
+
+# ---------------------------------------------------------------------------
 # Analyzer tests
 # ---------------------------------------------------------------------------
 
