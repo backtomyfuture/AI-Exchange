@@ -199,6 +199,7 @@ class PatternAnalyzer:
             "mailing_lists": self._analyze_mailing_lists(),
             "to_vs_cc_reply_rate": self._analyze_to_vs_cc(),
             "frequent_recipient_combos": self._analyze_recipient_combos(),
+            "thread_stats": self._analyze_threads(),
         }
 
     def _analyze_mailing_lists(self) -> list[dict]:
@@ -287,6 +288,37 @@ class PatternAnalyzer:
                     "reply_rate": rate,
                 })
         return result
+
+    def _analyze_threads(self) -> list[dict]:
+        """按 thread_id 聚合，计算线程深度和用户参与度。"""
+        threads: dict[str, list[EmailRecord]] = defaultdict(list)
+
+        for r in self.records:
+            tid = r.thread_id
+            if not tid:
+                continue
+            threads[tid].append(r)
+
+        result = []
+        for tid, emails in threads.items():
+            if len(emails) < 2:
+                continue
+            depth = len(emails)
+            my_replies = sum(1 for e in emails if e.message_type == "sent")
+            participation = my_replies / depth if depth > 0 else 0.0
+
+            result.append({
+                "thread_id": tid,
+                "depth": depth,
+                "my_replies": my_replies,
+                "participation": participation,
+                "subject": emails[0].subject,
+                "senders": list({e.sender for e in emails if e.message_type != "sent"}),
+            })
+
+        # 按深度降序排列
+        result.sort(key=lambda t: t["depth"], reverse=True)
+        return result[:20]
 
     def build_llm_prompt(self, stats: dict) -> str:
         """Build the LLM prompt for pattern discovery."""

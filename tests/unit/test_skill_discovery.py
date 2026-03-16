@@ -201,6 +201,96 @@ class TestRecipientAnalysis:
 
 
 # ---------------------------------------------------------------------------
+# Thread analysis helpers and tests
+# ---------------------------------------------------------------------------
+
+
+def _make_records_with_threads() -> list[EmailRecord]:
+    """带有线程的测试数据。"""
+    records = []
+    # 线程1: 深度4，我回复2次
+    for i in range(4):
+        is_sent = i % 2 == 1
+        records.append(EmailRecord(
+            id=f"thread1_{i}",
+            subject="Re: 重要讨论" if i > 0 else "重要讨论",
+            sender="me@corp.com" if is_sent else "partner@corp.com",
+            to=["partner@corp.com"] if is_sent else ["me@corp.com"],
+            cc=[], received_at=f"2024-01-0{i+1}T10:00:00",
+            message_type="sent" if is_sent else "received",
+            thread_id="thread_A",
+        ))
+    # 线程2: 深度2，我没参与
+    for i in range(2):
+        records.append(EmailRecord(
+            id=f"thread2_{i}",
+            subject="FYI" if i == 0 else "Re: FYI",
+            sender="other@corp.com",
+            to=["me@corp.com"], cc=[],
+            received_at=f"2024-01-0{i+1}T10:00:00",
+            message_type="received",
+            thread_id="thread_B",
+        ))
+    return records
+
+
+class TestThreadAnalysis:
+    def test_statistics_include_thread_data(self):
+        records = _make_records_with_threads()
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+
+        assert "thread_stats" in stats
+        assert len(stats["thread_stats"]) > 0
+
+    def test_thread_depth_and_participation(self):
+        """线程深度和参与度应被正确计算。"""
+        records = [
+            # 线程1：4轮，我发了2封（参与度 2/4=0.5）
+            EmailRecord(id="t1_1", subject="讨论A", sender="a@corp.com",
+                        to=["me@corp.com"], cc=[], received_at="2024-01-01",
+                        message_type="received", thread_id="thread_001"),
+            EmailRecord(id="t1_2", subject="Re: 讨论A", sender="me@corp.com",
+                        to=["a@corp.com"], cc=[], received_at="2024-01-01",
+                        message_type="sent", thread_id="thread_001"),
+            EmailRecord(id="t1_3", subject="Re: 讨论A", sender="a@corp.com",
+                        to=["me@corp.com"], cc=[], received_at="2024-01-02",
+                        message_type="received", thread_id="thread_001"),
+            EmailRecord(id="t1_4", subject="Re: 讨论A", sender="me@corp.com",
+                        to=["a@corp.com"], cc=[], received_at="2024-01-02",
+                        message_type="sent", thread_id="thread_001"),
+            # 线程2：只有1封，不应出现在结果中
+            EmailRecord(id="t2_1", subject="通知B", sender="b@corp.com",
+                        to=["me@corp.com"], cc=[], received_at="2024-01-01",
+                        message_type="received", thread_id="thread_002"),
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+
+        threads = stats["thread_stats"]
+        t1 = next((t for t in threads if t["thread_id"] == "thread_001"), None)
+        assert t1 is not None
+        assert t1["depth"] == 4
+        assert t1["my_replies"] == 2
+        import pytest
+        assert t1["participation"] == pytest.approx(0.5)
+
+    def test_single_email_thread_excluded(self):
+        """只有1封邮件的线程不应出现在 thread_stats 中。"""
+        records = [
+            EmailRecord(
+                id="single", subject="孤立邮件", sender="a@corp.com",
+                to=["me@corp.com"], cc=[], received_at="2024-01-01",
+                message_type="received", thread_id="solo_thread",
+            )
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        stats = analyzer.compute_statistics()
+        solo = [t for t in stats["thread_stats"] if t["thread_id"] == "solo_thread"]
+        assert len(solo) == 0
+
+
+# ---------------------------------------------------------------------------
 # Analyzer tests
 # ---------------------------------------------------------------------------
 
