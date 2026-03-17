@@ -1197,3 +1197,50 @@ class TestRoleBasedHeuristic:
         cc_p = [p for p in patterns if p.trigger_type == "recipient_role"]
         assert len(cc_p) >= 1
         assert cc_p[0].suggested_need_reply is False
+
+
+class TestLLMPromptRoleSection:
+    """build_llm_prompt 中角色分布段落的测试。"""
+
+    def _make_records(self):
+        received_direct = [
+            EmailRecord(
+                id=f"r{i}", subject="工作事项", sender="boss@b.com",
+                to=["me@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(5)
+        ]
+        received_cc = [
+            EmailRecord(
+                id=f"c{i}", subject="会议通知", sender="hr@b.com",
+                to=["team@b.com"], cc=["me@b.com"], received_at="2024-01-01", message_type="received",
+            ) for i in range(3)
+        ]
+        received_group = [
+            EmailRecord(
+                id=f"g{i}", subject="系统通知", sender="sys@b.com",
+                to=["dept@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(4)
+        ]
+        fw = [
+            EmailRecord(
+                id=f"fw{i}", subject=f"FW: 转发事项{i}", sender="a@b.com",
+                to=["me@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(3)
+        ]
+        return received_direct + received_cc + received_group + fw
+
+    def test_prompt_includes_role_distribution(self):
+        records = self._make_records()
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+        assert "我的角色分布" in prompt
+        assert "直接收件" in prompt
+        assert "群组成员" in prompt
+
+    def test_prompt_includes_forward_count(self):
+        records = self._make_records()
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+        assert "转发" in prompt or "呈阅" in prompt

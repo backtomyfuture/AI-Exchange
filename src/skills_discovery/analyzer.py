@@ -440,6 +440,28 @@ class PatternAnalyzer:
             reply_label = f"{rate:.0%}" if count >= 2 else "N/A"
             sender_lines.append(f"  - {sender}: {count} 封, 回复率 {reply_label}")
 
+        # --- 0. 我的角色分布（基于 my_email）---
+        role_section = ""
+        if self.my_email:
+            to_count_r = sum(
+                1 for r in self.received
+                if any(self._extract_email(a) == self.my_email for a in r.to)
+            )
+            cc_count_r = sum(
+                1 for r in self.received
+                if not any(self._extract_email(a) == self.my_email for a in r.to)
+                and any(self._extract_email(a) == self.my_email for a in r.cc)
+            )
+            group_count_r = len(self.received) - to_count_r - cc_count_r
+            fyi_count_r = sum(1 for r in self.received if self._detect_forward_fyi(r))
+            role_section = (
+                f"## 我的角色分布（my_email: {self.my_email}）\n"
+                f"  - 直接收件（TO 含我）：{to_count_r} 封\n"
+                f"  - 仅抄送（CC 含我）：{cc_count_r} 封\n"
+                f"  - 群组成员（TO/CC 均无我）：{group_count_r} 封\n"
+                f"  - 疑似转发/呈阅邮件：{fyi_count_r} 封\n\n"
+            )
+
         # --- 2. 收件人/抄送维度 ---
         recipient_section = ""
         mailing_lists = stats.get("mailing_lists", [])
@@ -505,7 +527,7 @@ class PatternAnalyzer:
 ## 高频主题关键词
 {', '.join(f'{w}({c})' for w, c in stats['top_subject_words'][:20])}
 
-{recipient_section}{thread_section}## 邮件样本 (✅=已回复, ❌=未回复, 含正文样本)
+{role_section}{recipient_section}{thread_section}## 邮件样本 (✅=已回复, ❌=未回复, 含正文样本)
 {chr(10).join(sample_emails)}
 
 ## 任务
