@@ -860,3 +860,91 @@ class TestParseLLMEnhanced:
         }]
         patterns = analyzer._parse_llm_patterns(raw)
         assert patterns[0].condition_logic == "and"
+
+
+# ---------------------------------------------------------------------------
+# Generator 增强测试（condition_logic 字段、新触发类型）
+# ---------------------------------------------------------------------------
+
+
+class TestGeneratorEnhanced:
+    def test_manifest_with_or_condition_logic(self):
+        """condition_logic=or 时，manifest triggers 中应包含该字段。"""
+        pattern = DiscoveredPattern(
+            id="test",
+            name="Combined Skill",
+            description="OR 组合",
+            trigger_type="combined",
+            condition_logic="or",
+            conditions=[
+                {"type": "subject_match", "operator": "contains", "value": "审批"},
+                {"type": "body_match", "operator": "contains", "value": "请审核"},
+            ],
+            confidence=0.9,
+        )
+        manifest = generate_manifest(pattern, "skill_auto_combined")
+        assert manifest["triggers"]["condition_logic"] == "or"
+
+    def test_manifest_and_logic_not_emitted(self):
+        """默认 and 时，triggers 中不应输出 condition_logic 字段。"""
+        pattern = DiscoveredPattern(
+            id="test", name="Simple", description="简单",
+            trigger_type="sender_match",
+            condition_logic="and",
+            conditions=[{"type": "sender_match", "operator": "in", "value": ["a@b.com"]}],
+            confidence=0.9,
+        )
+        manifest = generate_manifest(pattern, "skill_auto_simple")
+        assert "condition_logic" not in manifest["triggers"]
+
+    def test_handler_for_cc_match_pattern(self):
+        """cc_match 触发类型的 handler 应能正常生成。"""
+        pattern = DiscoveredPattern(
+            id="test", name="CC 通知",
+            description="CC 中不需要回复",
+            trigger_type="recipient_role",
+            conditions=[{"type": "cc_match", "operator": "contains", "value": "$ME"}],
+            suggested_priority="P3",
+            suggested_need_reply=False,
+            reply_rate=0.1,
+        )
+        code = generate_handler(pattern)
+        assert "class Skill(BaseSkill):" in code
+        assert '"P3"' in code
+        assert "False" in code
+
+    def test_handler_for_thread_depth_pattern(self):
+        """thread_depth 触发类型的 handler 应能正常生成。"""
+        pattern = DiscoveredPattern(
+            id="test", name="深度讨论",
+            description="高深度线程",
+            trigger_type="thread_depth",
+            conditions=[{"type": "thread_depth", "operator": "gte", "value": "3"}],
+            suggested_priority="P1",
+            suggested_need_reply=True,
+            reply_rate=0.8,
+        )
+        code = generate_handler(pattern)
+        assert "class Skill(BaseSkill):" in code
+        assert '"P1"' in code
+
+    def test_write_skill_with_or_logic(self, tmp_path):
+        """写入的 manifest.yaml 中 condition_logic 字段应正确序列化。"""
+        pattern = DiscoveredPattern(
+            id="test", name="OR Skill",
+            description="OR 条件组合",
+            trigger_type="combined",
+            condition_logic="or",
+            conditions=[
+                {"type": "sender_match", "operator": "contains", "value": "boss@"},
+                {"type": "subject_match", "operator": "regex", "value": "紧急"},
+            ],
+            suggested_priority="P0",
+            suggested_need_reply=True,
+            reply_rate=0.95,
+            sample_count=20,
+            confidence=0.95,
+        )
+        path = write_skill(pattern, registry_path=str(tmp_path))
+        manifest = yaml.safe_load((Path(path) / "manifest.yaml").read_text())
+        assert manifest["triggers"]["condition_logic"] == "or"
