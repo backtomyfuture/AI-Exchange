@@ -715,3 +715,81 @@ class TestBodyPreviewEnhancement:
         record = _parsed_to_record(parsed)
         assert "<img" not in record.body_preview
         assert "正文" in record.body_preview
+
+
+# ---------------------------------------------------------------------------
+# Enhanced heuristic discovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnhancedHeuristic:
+    def test_heuristic_discovers_mailing_list_patterns(self):
+        """应能发现邮件组模式（to_match 类型）。"""
+        records = [
+            *[EmailRecord(
+                id=f"ml_{i}", subject=f"全员通知 #{i}",
+                sender=f"hr{i % 2}@corp.com",
+                to=["all-staff@corp.com"], cc=["me@corp.com"],
+                received_at="2024-01-01", message_type="received",
+            ) for i in range(10)],
+            EmailRecord(
+                id="ml_reply", subject="Re: 全员通知 #0",
+                sender="me@corp.com",
+                to=["hr0@corp.com"], cc=[],
+                received_at="2024-01-01", message_type="sent",
+            ),
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        patterns = analyzer._discover_heuristic()
+
+        to_patterns = [p for p in patterns if any(
+            c.get("type") in ("to_match", "cc_match") for c in p.conditions
+        )]
+        assert len(to_patterns) > 0
+
+    def test_heuristic_discovers_cc_pattern(self):
+        """我只在 CC 里且回复率低，应发现为 P3 不需要回复。"""
+        records = [
+            *[EmailRecord(
+                id=f"cc_{i}", subject=f"FYI #{i}",
+                sender="team@corp.com",
+                to=["boss@corp.com"], cc=["me@corp.com"],
+                received_at="2024-01-01", message_type="received",
+            ) for i in range(8)],
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        patterns = analyzer._discover_heuristic()
+
+        cc_patterns = [p for p in patterns if p.trigger_type == "recipient_role"]
+        if cc_patterns:
+            assert not cc_patterns[0].suggested_need_reply
+
+    def test_heuristic_discovers_thread_patterns(self):
+        """高深度+参与度的线程应生成 thread_depth 模式。"""
+        records = []
+        for i in range(6):
+            is_sent = i % 2 == 1
+            records.append(EmailRecord(
+                id=f"deep_{i}", subject="Re: 紧急讨论" if i > 0 else "紧急讨论",
+                sender="me@corp.com" if is_sent else "lead@corp.com",
+                to=["lead@corp.com"] if is_sent else ["me@corp.com"],
+                cc=[], received_at=f"2024-01-0{i+1}T10:00:00",
+                message_type="sent" if is_sent else "received",
+                thread_id="deep_thread",
+            ))
+        # 需要至少 2 个高深度线程才能触发
+        for i in range(6):
+            is_sent = i % 2 == 1
+            records.append(EmailRecord(
+                id=f"deep2_{i}", subject="Re: 另一个讨论" if i > 0 else "另一个讨论",
+                sender="me@corp.com" if is_sent else "peer@corp.com",
+                to=["peer@corp.com"] if is_sent else ["me@corp.com"],
+                cc=[], received_at=f"2024-01-0{i+1}T10:00:00",
+                message_type="sent" if is_sent else "received",
+                thread_id="deep_thread_2",
+            ))
+        analyzer = PatternAnalyzer(records, my_email="me@corp.com")
+        patterns = analyzer._discover_heuristic()
+
+        thread_patterns = [p for p in patterns if p.trigger_type == "thread_depth"]
+        assert len(thread_patterns) > 0

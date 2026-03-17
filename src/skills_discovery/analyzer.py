@@ -528,4 +528,84 @@ class PatternAnalyzer:
                 confidence=min(1.0, count / 10),
             ))
 
+        # --- 2. 邮件组/收件人模式 ---
+        mailing_lists = self._analyze_mailing_lists()
+        for ml in mailing_lists:
+            if ml["count"] < 3:
+                continue
+            idx += 1
+            rate = ml["reply_rate"]
+            need_reply = rate >= 0.3
+            priority = "P2" if need_reply else "P3"
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name=f"{ml['address'].split('@')[0]} 邮件组",
+                description=f"发送到 {ml['address']} 的邮件 ({ml['count']} 封, 回复率 {rate:.0%})",
+                trigger_type="to_match",
+                conditions=[{
+                    "type": "to_match",
+                    "operator": "contains",
+                    "value": ml["address"],
+                }],
+                reply_rate=rate,
+                sample_count=ml["count"],
+                suggested_priority=priority,
+                suggested_need_reply=need_reply,
+                confidence=min(1.0, ml["count"] / 10),
+            ))
+
+        # --- 3. CC 角色模式 ---
+        to_vs_cc = self._analyze_to_vs_cc()
+        if (to_vs_cc["cc_count"] >= 5
+                and to_vs_cc["cc_reply_rate"] < 0.2
+                and (to_vs_cc["to_reply_rate"] - to_vs_cc["cc_reply_rate"]) > 0.3):
+            idx += 1
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name="CC 抄送通知",
+                description=(
+                    f"我仅在 CC 中的邮件 ({to_vs_cc['cc_count']} 封, "
+                    f"回复率 {to_vs_cc['cc_reply_rate']:.0%}) 通常不需要回复"
+                ),
+                trigger_type="recipient_role",
+                conditions=[{
+                    "type": "cc_match",
+                    "operator": "contains",
+                    "value": self.my_email or "$ME",
+                }],
+                reply_rate=to_vs_cc["cc_reply_rate"],
+                sample_count=to_vs_cc["cc_count"],
+                suggested_priority="P3",
+                suggested_need_reply=False,
+                confidence=min(1.0, to_vs_cc["cc_count"] / 10),
+            ))
+
+        # --- 4. 线程深度模式 ---
+        thread_stats = self._analyze_threads()
+        high_depth = [t for t in thread_stats if t["depth"] >= 3 and t["participation"] >= 0.3]
+        if len(high_depth) >= 2:
+            avg_depth = sum(t["depth"] for t in high_depth) / len(high_depth)
+            avg_participation = sum(t["participation"] for t in high_depth) / len(high_depth)
+            idx += 1
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name="深度讨论线程",
+                description=(
+                    f"检测到 {len(high_depth)} 个高参与度讨论线程 "
+                    f"(平均深度 {avg_depth:.1f}, 平均参与度 {avg_participation:.0%})"
+                ),
+                trigger_type="thread_depth",
+                conditions=[{
+                    "type": "thread_depth",
+                    "operator": "gte",
+                    "value": "3",
+                }],
+                reply_rate=avg_participation,
+                sample_count=len(high_depth),
+                suggested_priority="P1",
+                suggested_need_reply=True,
+                confidence=min(1.0, len(high_depth) / 5),
+                example_subjects=[t["subject"] for t in high_depth[:3]],
+            ))
+
         return patterns
