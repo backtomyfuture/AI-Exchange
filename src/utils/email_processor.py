@@ -201,7 +201,15 @@ class EmailProcessor:
             if attachment_summaries:
                 parts.append("【包含的附件列表】:\n" + "\n".join(attachment_summaries))
                 
-            parts.append("【邮件正文】:\n" + email.get('body', ''))
+            # Clean massive inline base64 images to prevent bloat
+            raw_body = email.get('body', '')
+            import re
+            if isinstance(raw_body, str):
+                raw_body = re.sub(r'data:image/[a-zA-Z0-9+.;=]+', '[Image]', raw_body)
+                if len(raw_body) > 50000:
+                    raw_body = raw_body[:50000] + "\n...[truncated]"
+                    
+            parts.append("【邮件正文】:\n" + raw_body)
             
             full_text = "\n\n".join(parts)
             
@@ -218,21 +226,34 @@ class EmailProcessor:
             base_id = email.get("id") or email.get("message_id") or str(uuid.uuid4())
             
             try:
-                responses = self.openai_client.embeddings.create(input=chunks, model=self.embedding_model)
-                embeddings = [data.embedding for data in responses.data]
+                embeddings = []
+                # Batch request to avoid embedding API timeouts
+                for chunk_idx in range(0, len(chunks), 50):
+                    batch_chunks = chunks[chunk_idx:chunk_idx+50]
+                    responses = self.openai_client.embeddings.create(
+                        input=batch_chunks, 
+                        model=self.embedding_model,
+                        timeout=30.0
+                    )
+                    embeddings.extend([data.embedding for data in responses.data])
                 
                 for i, (chunk, vector) in enumerate(zip(chunks, embeddings)):
                     chunk_id = self.generate_deterministic_uuid(f"{base_id}_{i}_{chunk[:20]}")
                     
                     payload = email.copy()
                     payload["attachments_metadata"] = valid_attachments_metadata
+                    
                     if "attachments" in payload:
                         del payload["attachments"]
+                    if "_image_attachments" in payload:
+                        del payload["_image_attachments"]
                         
                     payload["chunk_index"] = i
                     payload["chunk_text"] = chunk
-                    if len(payload.get("body", "")) > 5000:
+                    
+                    if "body" in payload and isinstance(payload["body"], str) and len(payload["body"]) > 2000:
                         payload["body_preview"] = payload["body"][:2000]
+                        payload["body"] = payload["body"][:2000] + "... [truncated]"
                     
                     points.append(models.PointStruct(
                         id=chunk_id,
@@ -251,13 +272,19 @@ class EmailProcessor:
 
         if points:
             try:
-                self.qdrant_client.upsert(
-                    collection_name=self.collection_name,
-                    points=points,
-                    wait=False
-                )
-                logger.info(f"Successfully upserted {len(points)} points to Qdrant.")
-                return len(points)
+                # Upsert in smaller chunks to avoid payload size limits (33MB limit)
+                chunk_size = 100
+                total_upserted = 0
+                for i in range(0, len(points), chunk_size):
+                    batch_points = points[i:i+chunk_size]
+                    self.qdrant_client.upsert(
+                        collection_name=self.collection_name,
+                        points=batch_points,
+                        wait=False
+                    )
+                    total_upserted += len(batch_points)
+                logger.info(f"Successfully upserted {total_upserted} points to Qdrant.")
+                return total_upserted
             except UnexpectedResponse as e:
                 logger.error(f"Qdrant upsert failed (unexpected response): {e}")
                 return 0

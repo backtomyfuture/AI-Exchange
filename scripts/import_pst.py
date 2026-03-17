@@ -387,9 +387,11 @@ def _discover_mbox_files(directory: Path) -> list[Path]:
 def _iter_from_pst_readpst(pst_path: Path) -> Iterator[ParsedEmail]:
     """Fallback: extract PST via readpst CLI, then parse mbox/eml output."""
     if shutil.which("readpst") is None:
-        logger.error(
-            "readpst 未安装。请运行: sudo apt install pst-utils"
-        )
+        if sys.platform == "darwin":
+            msg = "readpst 未安装。Mac 平台请运行: brew install libpst"
+        else:
+            msg = "readpst 未安装。Linux 平台请运行: sudo apt install pst-utils"
+        logger.error(msg)
         sys.exit(1)
 
     with tempfile.TemporaryDirectory(prefix="pst_import_") as tmpdir:

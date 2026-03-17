@@ -100,16 +100,23 @@ def generate_manifest(pattern: DiscoveredPattern, skill_id: str) -> dict:
     elif pattern.confidence < 0.5:
         trigger_priority = 60
 
+    triggers: dict = {
+        "priority": trigger_priority,
+        "conditions": conditions,
+    }
+
+    # 仅在非默认值（非 and）时输出 condition_logic，保持 manifest 简洁
+    condition_logic = getattr(pattern, "condition_logic", "and")
+    if condition_logic and condition_logic != "and":
+        triggers["condition_logic"] = condition_logic
+
     return {
         "id": skill_id,
         "name": pattern.name,
         "description": pattern.description,
         "version": "1.0.0",
         "execution_mode": "modifier",
-        "triggers": {
-            "priority": trigger_priority,
-            "conditions": conditions,
-        },
+        "triggers": triggers,
     }
 
 
