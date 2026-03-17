@@ -1,0 +1,11 @@
+id: skill_auto_tjhkgh
+name: tjhkgh 邮件处理
+description: 来自 tjhkgh@tianjin-air.com 的邮件 (8 封, 回复率 0%)
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 90
+  conditions:
+  - type: sender_match
+    operator: contains
+    value: tjhkgh@tianjin-air.com

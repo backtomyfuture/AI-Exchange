@@ -1,0 +1,11 @@
+id: skill_auto_m_wu
+name: m.wu 邮件处理
+description: 来自 m.wu@tianjin-air.com 的邮件 (13 封, 回复率 0%)
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 90
+  conditions:
+  - type: sender_match
+    operator: contains
+    value: m.wu@tianjin-air.com

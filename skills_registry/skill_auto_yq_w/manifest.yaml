@@ -1,0 +1,11 @@
+id: skill_auto_yq_w
+name: yq.w 邮件处理
+description: 来自 yq.w@tianjin-air.com 的邮件 (15 封, 回复率 0%)
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 90
+  conditions:
+  - type: sender_match
+    operator: contains
+    value: yq.w@tianjin-air.com

@@ -1,0 +1,11 @@
+id: skill_auto_hyong_wang
+name: hyong-wang 邮件处理
+description: 来自 hyong-wang@tianjin-air.com 的邮件 (7 封, 回复率 14%)
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 80
+  conditions:
+  - type: sender_match
+    operator: contains
+    value: hyong-wang@tianjin-air.com

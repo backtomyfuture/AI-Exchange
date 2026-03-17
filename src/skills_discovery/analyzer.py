@@ -25,6 +25,24 @@ def strip_images_from_body(body: str) -> str:
     return re.sub(r'<img[^>]*?/?>', '', body, flags=re.IGNORECASE)
 
 
+def _normalize_mailbox(raw: str) -> str:
+    """将 Mailbox(name='张霞', email_address='zhang-xia@...') 转为 '张霞 <zhang-xia@...>'。
+    标准 RFC 格式（'Name <email>'）或纯邮箱格式直接返回。"""
+    if not raw or not isinstance(raw, str):
+        return raw or ""
+    # 已经是标准格式
+    if "@" in raw and "Mailbox(" not in raw:
+        return raw
+    # 解析 Mailbox(...) 格式
+    name_m = re.search(r"name='([^']*)'", raw)
+    email_m = re.search(r"email_address='([^']*)'", raw)
+    if email_m:
+        email = email_m.group(1)
+        name = name_m.group(1) if name_m else ""
+        return f"{name} <{email}>" if name else email
+    return raw
+
+
 @dataclass
 class DiscoveredPattern:
     """A discovered email routing pattern."""
@@ -100,12 +118,33 @@ class EmailHistoryCollector:
                     continue
                 seen_ids.add(eid)
 
-                to_raw = p.get("to", [])
-                cc_raw = p.get("cc", [])
+                # 兼容两种数据源：
+                # - Exchange源: to_recipients/cc_recipients (存储 Mailbox(...) 字符串列表)
+                # - PST导入源: to/cc (存储 "Name <email>" 字符串列表)
+                to_raw = p.get("to") or p.get("to_recipients") or []
+                cc_raw = p.get("cc") or p.get("cc_recipients") or []
                 if isinstance(to_raw, str):
                     to_raw = [to_raw]
                 if isinstance(cc_raw, str):
                     cc_raw = [cc_raw]
+                # 将 Mailbox(name='张霞', email_address='...') 转为标准 "Name <email>" 格式
+                to_raw = [_normalize_mailbox(addr) for addr in to_raw]
+                cc_raw = [_normalize_mailbox(addr) for addr in cc_raw]
+
+                # 兼容两种邮件类型字段：
+                # - PST源: type = "sent" / "received"
+                # - Exchange源: 无 type 字段，通过 _parent_folder_name 或 source_folder 判断
+                msg_type = p.get("type") or ""
+                if not msg_type:
+                    folder = p.get("_parent_folder_name", "") or p.get("source_folder", "")
+                    folder_lower = folder.lower()
+                    if any(kw in folder_lower for kw in ("sent", "已发送", "发件")):
+                        msg_type = "sent"
+                    else:
+                        msg_type = "received"
+
+                # sender 字段也可能是 Mailbox(...) 格式
+                sender_raw = _normalize_mailbox(p.get("sender", ""))
 
                 body = p.get("body_preview", "") or p.get("body", "")
                 body = strip_images_from_body(body)
@@ -115,15 +154,15 @@ class EmailHistoryCollector:
                 records.append(EmailRecord(
                     id=eid,
                     subject=p.get("subject", ""),
-                    sender=p.get("sender", ""),
+                    sender=sender_raw,
                     to=to_raw,
                     cc=cc_raw,
                     received_at=p.get("received_at", ""),
-                    message_type=p.get("type", "received"),
-                    source_folder=p.get("source_folder", ""),
+                    message_type=msg_type,
+                    source_folder=p.get("source_folder", "") or p.get("_parent_folder_name", ""),
                     body_preview=body,
                     in_reply_to=p.get("in_reply_to", ""),
-                    thread_id=p.get("thread_id", ""),
+                    thread_id=p.get("thread_id", "") or p.get("conversation_id", ""),
                 ))
 
             offset = next_offset
@@ -159,13 +198,13 @@ class PatternAnalyzer:
         sent_recipients: set[str] = set()
 
         for s in self.sent:
-            normalized = re.sub(r"^(Re:\s*|Fw:\s*|转发:\s*|回复:\s*)+", "", s.subject, flags=re.IGNORECASE).strip().lower()
+            normalized = re.sub(r"^(Re:\s*|Fw:\s*|Fwd:\s*|转发:\s*|回复:\s*|答复:\s*)+", "", s.subject, flags=re.IGNORECASE).strip().lower()
             sent_subjects.add(normalized)
             for addr in s.to:
                 sent_recipients.add(addr.lower().strip())
 
         for r in self.received:
-            normalized = re.sub(r"^(Re:\s*|Fw:\s*|转发:\s*|回复:\s*)+", "", r.subject, flags=re.IGNORECASE).strip().lower()
+            normalized = re.sub(r"^(Re:\s*|Fw:\s*|Fwd:\s*|转发:\s*|回复:\s*|答复:\s*)+", "", r.subject, flags=re.IGNORECASE).strip().lower()
             sender_lower = r.sender.lower().strip()
             email_match = re.search(r'[\w.-]+@[\w.-]+', sender_lower)
             sender_email = email_match.group() if email_match else sender_lower
