@@ -37,6 +37,9 @@ class ProviderSpec:
 
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
+    is_oauth: bool = False
+    is_direct: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -74,6 +77,32 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_base_url="https://aihubmix.com/v1",
         is_gateway=True,
         detect_by_base_keyword="aihubmix",
+        supports_json_mode=True,
+        supports_vision=True,
+    ),
+
+    # === OAuth Providers (use OAuth flow, bypass ChatOpenAI) ================
+    # 必须在 Major Cloud Providers 之前，避免 openai-codex 被 openai 关键字拦截
+
+    ProviderSpec(
+        name="openai_codex",
+        display_name="OpenAI Codex",
+        keywords=("openai-codex",),
+        env_key="",
+        default_base_url="https://chatgpt.com/backend-api/codex/responses",
+        is_oauth=True,
+        is_direct=True,
+        supports_vision=True,
+    ),
+
+    ProviderSpec(
+        name="gemini_cli",
+        display_name="Gemini CLI",
+        keywords=("gemini-cli",),
+        env_key="",
+        default_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        is_oauth=True,
+        is_direct=True,
         supports_json_mode=True,
         supports_vision=True,
     ),
