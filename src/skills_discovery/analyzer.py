@@ -467,6 +467,7 @@ class PatternAnalyzer:
                 name=item.get("name", f"Pattern {i+1}"),
                 description=item.get("description", ""),
                 trigger_type=item.get("trigger_type", "combined"),
+                condition_logic=item.get("condition_logic", "and"),
                 conditions=conditions,
                 reply_rate=float(item.get("reply_rate", 0)),
                 sample_count=int(item.get("sample_count", 0)),

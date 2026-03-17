@@ -793,3 +793,70 @@ class TestEnhancedHeuristic:
 
         thread_patterns = [p for p in patterns if p.trigger_type == "thread_depth"]
         assert len(thread_patterns) > 0
+
+
+# ---------------------------------------------------------------------------
+# LLM 解析增强测试（condition_logic 字段）
+# ---------------------------------------------------------------------------
+
+
+class TestParseLLMEnhanced:
+    def test_parse_condition_logic_and(self):
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "组合模式",
+            "description": "发件人+主题组合",
+            "trigger_type": "combined",
+            "condition_logic": "and",
+            "conditions": [
+                {"type": "sender_match", "operator": "contains", "value": "finance@"},
+                {"type": "subject_match", "operator": "regex", "value": "发票|报销"},
+            ],
+            "reply_rate": 0.9,
+            "sample_count": 20,
+            "suggested_priority": "P1",
+            "suggested_need_reply": True,
+        }]
+        patterns = analyzer._parse_llm_patterns(raw)
+        assert patterns[0].condition_logic == "and"
+
+    def test_parse_condition_logic_or(self):
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "OR 模式",
+            "description": "主题或正文匹配",
+            "trigger_type": "combined",
+            "condition_logic": "or",
+            "conditions": [
+                {"type": "subject_match", "operator": "contains", "value": "urgent"},
+                {"type": "body_match", "operator": "contains", "value": "紧急"},
+            ],
+            "reply_rate": 0.7,
+            "sample_count": 10,
+            "suggested_priority": "P0",
+            "suggested_need_reply": True,
+        }]
+        patterns = analyzer._parse_llm_patterns(raw)
+        assert patterns[0].condition_logic == "or"
+
+    def test_parse_default_condition_logic_is_and(self):
+        """LLM 未返回 condition_logic 时默认为 and。"""
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "无 logic 字段",
+            "description": "测试",
+            "trigger_type": "sender_match",
+            "conditions": [{"type": "sender_match", "operator": "in", "value": ["a@b.com"]}],
+            "reply_rate": 0.5,
+            "sample_count": 5,
+            "suggested_priority": "P2",
+            "suggested_need_reply": True,
+        }]
+        patterns = analyzer._parse_llm_patterns(raw)
+        assert patterns[0].condition_logic == "and"
