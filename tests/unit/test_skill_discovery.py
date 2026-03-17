@@ -1030,6 +1030,12 @@ class TestForwardFyiDetection:
         analyzer = PatternAnalyzer([r])
         assert analyzer._detect_forward_fyi(r) is True
 
+    def test_bracket_chengyue_in_subject_detected(self):
+        """主题以半角方括号 [呈阅 开头应被检测为 FYI。"""
+        r = self._make_record(subject="[呈阅]关于技术部门资产情况报告")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
     def test_normal_email_not_detected(self):
         r = self._make_record(subject="关于项目进展的询问", body="您好，请问项目什么时候完成？")
         analyzer = PatternAnalyzer([r])
@@ -1039,7 +1045,7 @@ class TestForwardFyiDetection:
 class TestGroupReceivedAnalysis:
     """_analyze_group_received 方法测试。"""
 
-    def _make_received(self, sender, to, cc, replied=False, subject="test"):
+    def _make_received(self, sender, to, cc, subject="test"):
         r = EmailRecord(
             id=f"{sender}-{subject}",
             subject=subject,
@@ -1062,6 +1068,8 @@ class TestGroupReceivedAnalysis:
         assert len(result) >= 1
         assert result[0]["group_address"] == "group@b.com"
         assert result[0]["count"] == 4
+        assert result[0]["example_subjects"]  # 应非空
+        assert all(isinstance(s, str) for s in result[0]["example_subjects"])
 
     def test_direct_email_not_group(self):
         """to 中含 my_email 的邮件不应被归入群组。"""

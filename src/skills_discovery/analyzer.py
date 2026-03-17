@@ -367,7 +367,7 @@ class PatternAnalyzer:
 
     # 转发/呈阅检测关键词（类级别编译，避免重复编译）
     _FYI_SUBJECT_PATTERNS = re.compile(
-        r'^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|[(\[]呈阅|呈阅示',
+        r'^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|\[呈阅|呈阅示',
         re.IGNORECASE,
     )
     _FYI_BODY_KEYWORDS = re.compile(
