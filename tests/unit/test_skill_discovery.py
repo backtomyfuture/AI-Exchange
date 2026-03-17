@@ -1034,3 +1034,72 @@ class TestForwardFyiDetection:
         r = self._make_record(subject="关于项目进展的询问", body="您好，请问项目什么时候完成？")
         analyzer = PatternAnalyzer([r])
         assert analyzer._detect_forward_fyi(r) is False
+
+
+class TestGroupReceivedAnalysis:
+    """_analyze_group_received 方法测试。"""
+
+    def _make_received(self, sender, to, cc, replied=False, subject="test"):
+        r = EmailRecord(
+            id=f"{sender}-{subject}",
+            subject=subject,
+            sender=sender,
+            to=to,
+            cc=cc,
+            received_at="2024-01-01",
+            message_type="received",
+        )
+        return r
+
+    def test_identifies_group_emails(self):
+        """to/cc 均不含 my_email 的邮件应被识别为群组收件。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) >= 1
+        assert result[0]["group_address"] == "group@b.com"
+        assert result[0]["count"] == 4
+
+    def test_direct_email_not_group(self):
+        """to 中含 my_email 的邮件不应被归入群组。"""
+        records = [
+            self._make_received("a@b.com", ["me@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_cc_email_not_group(self):
+        """cc 中含 my_email（to 不含）的邮件不应被归入群组。"""
+        records = [
+            self._make_received("a@b.com", ["other@b.com"], ["me@b.com"], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_minimum_count_threshold(self):
+        """少于 3 封的群组地址不应出现在结果中。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(2)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_empty_to_fallback_to_sender(self):
+        """to 和 cc 均为空时，应按发件人分组作为兜底。"""
+        records = [
+            self._make_received("sys@b.com", [], [], subject=f"s{i}")
+            for i in range(3)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 1
+        assert "sys@b.com" in result[0]["group_address"]

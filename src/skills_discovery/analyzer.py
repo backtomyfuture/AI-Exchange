@@ -382,6 +382,55 @@ class PatternAnalyzer:
             return True
         return False
 
+    def _analyze_group_received(self) -> list[dict]:
+        """分析 to/cc 均不含 my_email 的邮件（群组成员收件）。
+
+        返回按群组地址分组的统计，每项包含：
+        - group_address: 群组/部门地址（或发件人，当 to 为空时）
+        - count: 邮件数
+        - reply_rate: 回复率
+        - example_subjects: 示例主题
+        """
+        if not self.my_email:
+            return []
+
+        group_counts: Counter = Counter()
+        group_replied: Counter = Counter()
+        group_subjects: dict[str, list[str]] = defaultdict(list)
+
+        for r in self.received:
+            # 判断是否为群组收件：to 和 cc 中都没有 my_email
+            in_to = any(self._extract_email(addr) == self.my_email for addr in r.to)
+            in_cc = any(self._extract_email(addr) == self.my_email for addr in r.cc)
+            if in_to or in_cc:
+                continue  # 直接收件或 CC，不是群组
+
+            # 确定分组 key：优先用 to 中第一个地址，否则用发件人
+            if r.to:
+                email_m = re.search(r'[\w.-]+@[\w.-]+', r.to[0].lower())
+                group_key = email_m.group() if email_m else r.to[0].lower()
+            else:
+                email_m = re.search(r'[\w.-]+@[\w.-]+', r.sender.lower())
+                group_key = email_m.group() if email_m else r.sender.lower()
+
+            group_counts[group_key] += 1
+            group_subjects[group_key].append(r.subject)
+            if self._reply_map.get(r.id):
+                group_replied[group_key] += 1
+
+        result = []
+        for addr, count in group_counts.most_common(20):
+            if count < 3:
+                continue
+            rate = group_replied[addr] / count
+            result.append({
+                "group_address": addr,
+                "count": count,
+                "reply_rate": rate,
+                "example_subjects": group_subjects[addr][:3],
+            })
+        return result
+
     def build_llm_prompt(self, stats: dict) -> str:
         """构建多维度 LLM 分析 prompt。"""
         # --- 1. 发件人统计 ---
