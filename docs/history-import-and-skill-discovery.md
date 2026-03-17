@@ -168,7 +168,7 @@ uv run scripts/import_pst.py archive.pst --batch-size 100
 | 优先级 | 解析器 | 安装方式 | 说明 |
 |--------|--------|----------|------|
 | **1** | `pypff` | `pip install libpff-python` | 纯 Python，直接读取 PST 内部结构 |
-| **2** | `readpst` | `sudo apt install pst-utils` | 系统命令行工具，仅在 pypff 不可用时使用 |
+| **2** | `readpst` | Ubuntu: `sudo apt install pst-utils`<br>macOS: `brew install libpst` | 系统命令行工具，仅在 pypff 不可用时使用 |
 
 使用 `uv run` 时会自动安装 `libpff-python`，无需手动操作。
 
@@ -406,7 +406,10 @@ sudo apt install python3-dev build-essential
 # macOS
 xcode-select --install
 
-# 如果实在装不上，可以先把 PST 在 Outlook 里导出为 EML/Mbox 格式，
+# 另外，如果 C 依赖报错，macOS 用户还可以直接安装 libpst，提供 readpst 作为纯命令行后备方案：
+# brew install libpst
+
+# 如果以上都不行，可以先把 PST 在 Outlook 里导出为 EML/Mbox 格式，
 # 这两种格式不需要任何额外依赖。
 ```
 
