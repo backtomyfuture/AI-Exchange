@@ -1103,3 +1103,13 @@ class TestGroupReceivedAnalysis:
         result = analyzer._analyze_group_received()
         assert len(result) == 1
         assert "sys@b.com" in result[0]["group_address"]
+
+    def test_no_my_email_returns_empty(self):
+        """未提供 my_email 时应直接返回空列表。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records)  # 不传 my_email
+        result = analyzer._analyze_group_received()
+        assert result == []
