@@ -81,7 +81,8 @@ class SkillManager:
                 triggers.append({
                     "skill_id": sid,
                     "priority": skill.manifest.triggers.priority,
-                    "conditions": skill.manifest.triggers.conditions
+                    "conditions": skill.manifest.triggers.conditions,
+                    "condition_logic": skill.manifest.triggers.condition_logic,
                 })
         # 按优先级排序
         return sorted(triggers, key=lambda x: x['priority'], reverse=True)

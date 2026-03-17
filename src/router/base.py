@@ -5,6 +5,7 @@ from src.graph.state import AgentState
 class SkillTrigger(BaseModel):
     priority: int = 50
     conditions: Optional[List[Dict[str, Any]]] = None
+    condition_logic: str = "and"
 
 class SkillManifest(BaseModel):
     id: str
