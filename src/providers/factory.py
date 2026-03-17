@@ -3,13 +3,17 @@ LLM Factory — creates LangChain chat models with provider auto-detection.
 
 Replaces the old LLMFactory static method with provider-aware creation
 that supports per-role model selection and multi-provider API keys.
+同时支持 API Key provider（通过 ChatOpenAI）和 OAuth provider
+（通过 OAuthChatModel 子类）。
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
 from src.config import get_settings, resolve_secret
@@ -25,6 +29,12 @@ _ROLE_MODEL_FIELDS = {
     "router": "LLM_ROUTER_MODEL",
     "summary": "LLM_SUMMARY_MODEL",
     "consolidator": "LLM_CONSOLIDATOR_MODEL",
+}
+
+# OAuth provider name → (module_path, class_name)
+_OAUTH_PROVIDERS: dict[str, tuple[str, str]] = {
+    "openai_codex": ("src.providers.codex_provider", "CodexChatModel"),
+    "gemini_cli": ("src.providers.gemini_cli_provider", "GeminiCliChatModel"),
 }
 
 
@@ -74,19 +84,40 @@ def _resolve_provider_credentials(
     return api_key, base_url
 
 
+def _create_oauth_model(
+    spec: ProviderSpec,
+    model: str,
+    temperature: float,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """通过延迟导入创建 OAuth-based chat model。"""
+    if spec.name not in _OAUTH_PROVIDERS:
+        raise ValueError(f"未注册 OAuth provider 类: '{spec.name}'")
+
+    module_path, class_name = _OAUTH_PROVIDERS[spec.name]
+    module = importlib.import_module(module_path)
+    cls = getattr(module, class_name)
+
+    logger.info("创建 OAuth LLM: model=%s, provider=%s", model, spec.label)
+    return cls(model_name=model, temperature=temperature, **kwargs)
+
+
 def get_llm(
     model: str | None = None,
     temperature: float = 0.7,
     role: str = "",
     **kwargs: Any,
-) -> ChatOpenAI:
-    """Create a ChatOpenAI instance with provider auto-detection.
+) -> BaseChatModel:
+    """创建 chat model，自动检测 provider。
+
+    API Key provider 返回 ChatOpenAI；OAuth provider（Codex、Gemini CLI）
+    返回对应的 OAuthChatModel 子类。
 
     Args:
-        model: Model name. If None, resolved from role or default.
-        temperature: Sampling temperature.
-        role: Functional role (categorizer, drafter, etc.) for per-role model override.
-        **kwargs: Extra kwargs forwarded to ChatOpenAI.
+        model: 模型名称。None 时从 role 或默认配置解析。
+        temperature: 采样温度。
+        role: 功能角色（categorizer、drafter 等），用于 per-role 模型覆盖。
+        **kwargs: 透传给 ChatOpenAI 或 OAuthChatModel 的额外参数。
     """
     settings = get_settings()
 
@@ -97,6 +128,10 @@ def get_llm(
     base_url = settings.OPENAI_API_BASE
 
     spec = match_provider(model, api_key=api_key, api_base=base_url)
+
+    # OAuth provider 不走 ChatOpenAI
+    if spec and spec.is_oauth:
+        return _create_oauth_model(spec, model, temperature, **kwargs)
 
     resolved_key, resolved_base = _resolve_provider_credentials(spec, model)
 
@@ -137,6 +172,6 @@ def get_llm_for_role(
     role: str,
     temperature: float = 0.7,
     **kwargs: Any,
-) -> ChatOpenAI:
+) -> BaseChatModel:
     """Shorthand: create an LLM for a specific functional role."""
     return get_llm(model=None, temperature=temperature, role=role, **kwargs)
