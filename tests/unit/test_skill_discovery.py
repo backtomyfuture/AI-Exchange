@@ -370,7 +370,8 @@ class TestPatternAnalyzer:
         for p in patterns:
             assert p.sample_count >= 3
             assert p.conditions
-            assert p.trigger_type == "sender_match"
+            # 有 my_email 时步骤4生成 combined（发件人+TO），无 my_email 时生成 sender_match
+            assert p.trigger_type in ("sender_match", "combined", "to_match", "recipient_role", "thread_depth")
 
     def test_heuristic_with_few_records(self):
         records = _make_records(n_received=2, n_sent=0)
@@ -1121,3 +1122,78 @@ class TestGroupReceivedAnalysis:
         analyzer = PatternAnalyzer(records)  # 不传 my_email
         result = analyzer._analyze_group_received()
         assert result == []
+
+
+class TestRoleBasedHeuristic:
+    """重构后的 _discover_heuristic 角色驱动逻辑测试。"""
+
+    def _make_r(self, sender, to, cc, replied_subj_set=None, subject="test", body=""):
+        return EmailRecord(
+            id=f"{sender}-{subject}",
+            subject=subject, sender=sender,
+            to=to, cc=cc,
+            received_at="2024-01-01",
+            message_type="received",
+            body_preview=body,
+        )
+
+    def test_forward_pattern_generated(self):
+        """含转发前缀的邮件应生成 priority=P3 need_reply=False 的规则。"""
+        records = [
+            self._make_r("a@b.com", ["me@b.com"], [], subject=f"FW: 事项{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        fyi = [p for p in patterns if p.trigger_type == "combined"
+               and any(c.get("type") == "subject_match" for c in p.conditions)]
+        assert len(fyi) >= 1
+        assert fyi[0].suggested_need_reply is False
+        assert fyi[0].suggested_priority == "P3"
+
+    def test_group_pattern_generated(self):
+        """群组收件邮件应生成 to_match 类型的 P3 规则。"""
+        records = [
+            self._make_r("a@b.com", ["dept@b.com"], [], subject=f"通知{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        group_p = [p for p in patterns if p.trigger_type == "to_match"]
+        assert len(group_p) >= 1
+        assert group_p[0].suggested_need_reply is False
+        assert group_p[0].suggested_priority == "P3"
+
+    def test_direct_to_high_reply_rate(self):
+        """直接收件且高回复率应生成 P1 need_reply=True 的规则。"""
+        sent = [
+            EmailRecord(
+                id=f"sent-{i}", subject=f"回复: 工作{i}", sender="me@b.com",
+                to=["boss@b.com"], cc=[], received_at="2024-01-01", message_type="sent",
+            )
+            for i in range(7)
+        ]
+        received = [
+            self._make_r("boss@b.com", ["me@b.com"], [], subject=f"工作{i}")
+            for i in range(7)
+        ]
+        analyzer = PatternAnalyzer(received + sent, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        direct_p = [p for p in patterns
+                    if any(c.get("type") == "sender_match" for c in p.conditions)
+                    and any(c.get("type") == "to_match" for c in p.conditions)]
+        assert len(direct_p) >= 1
+        assert direct_p[0].suggested_need_reply is True
+        assert direct_p[0].suggested_priority in ("P1", "P2")
+
+    def test_cc_pattern_generated_when_enough_data(self):
+        """CC 邮件足够多且回复率低时，应生成 CC 已阅规则。"""
+        records = [
+            self._make_r("a@b.com", ["other@b.com"], ["me@b.com"], subject=f"抄送{i}")
+            for i in range(6)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        cc_p = [p for p in patterns if p.trigger_type == "recipient_role"]
+        assert len(cc_p) >= 1
+        assert cc_p[0].suggested_need_reply is False
