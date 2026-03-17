@@ -365,6 +365,72 @@ class PatternAnalyzer:
         result.sort(key=lambda t: t["depth"], reverse=True)
         return result[:20]
 
+    # 转发/呈阅检测关键词（类级别编译，避免重复编译）
+    _FYI_SUBJECT_PATTERNS = re.compile(
+        r'^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|\[呈阅|呈阅示',
+        re.IGNORECASE,
+    )
+    _FYI_BODY_KEYWORDS = re.compile(
+        r'呈阅|请知|请悉|谨呈|敬请知悉|请阅|知悉',
+    )
+
+    def _detect_forward_fyi(self, record: EmailRecord) -> bool:
+        """判断邮件是否为转发或呈阅类（不需要回复）。"""
+        if self._FYI_SUBJECT_PATTERNS.search(record.subject):
+            return True
+        if record.body_preview and self._FYI_BODY_KEYWORDS.search(record.body_preview):
+            return True
+        return False
+
+    def _analyze_group_received(self) -> list[dict]:
+        """分析 to/cc 均不含 my_email 的邮件（群组成员收件）。
+
+        返回按群组地址分组的统计，每项包含：
+        - group_address: 群组/部门地址（或发件人，当 to 为空时）
+        - count: 邮件数
+        - reply_rate: 回复率
+        - example_subjects: 示例主题
+        """
+        if not self.my_email:
+            return []
+
+        group_counts: Counter = Counter()
+        group_replied: Counter = Counter()
+        group_subjects: dict[str, list[str]] = defaultdict(list)
+
+        for r in self.received:
+            # 判断是否为群组收件：to 和 cc 中都没有 my_email
+            in_to = any(self._extract_email(addr) == self.my_email for addr in r.to)
+            in_cc = any(self._extract_email(addr) == self.my_email for addr in r.cc)
+            if in_to or in_cc:
+                continue  # 直接收件或 CC，不是群组
+
+            # 确定分组 key：优先用 to 中第一个地址，否则用发件人
+            if r.to:
+                email_m = re.search(r'[\w.-]+@[\w.-]+', r.to[0].lower())
+                group_key = email_m.group() if email_m else r.to[0].lower()
+            else:
+                email_m = re.search(r'[\w.-]+@[\w.-]+', r.sender.lower())
+                group_key = email_m.group() if email_m else r.sender.lower()
+
+            group_counts[group_key] += 1
+            group_subjects[group_key].append(r.subject)
+            if self._reply_map.get(r.id):
+                group_replied[group_key] += 1
+
+        result = []
+        for addr, count in group_counts.most_common(20):
+            if count < 3:
+                continue
+            rate = group_replied[addr] / count
+            result.append({
+                "group_address": addr,
+                "count": count,
+                "reply_rate": rate,
+                "example_subjects": group_subjects[addr][:3],
+            })
+        return result
+
     def build_llm_prompt(self, stats: dict) -> str:
         """构建多维度 LLM 分析 prompt。"""
         # --- 1. 发件人统计 ---
@@ -373,6 +439,28 @@ class PatternAnalyzer:
             rate = stats["sender_reply_rates"].get(sender, 0)
             reply_label = f"{rate:.0%}" if count >= 2 else "N/A"
             sender_lines.append(f"  - {sender}: {count} 封, 回复率 {reply_label}")
+
+        # --- 0. 我的角色分布（基于 my_email）---
+        role_section = ""
+        if self.my_email:
+            to_count_r = sum(
+                1 for r in self.received
+                if any(self._extract_email(a) == self.my_email for a in r.to)
+            )
+            cc_count_r = sum(
+                1 for r in self.received
+                if not any(self._extract_email(a) == self.my_email for a in r.to)
+                and any(self._extract_email(a) == self.my_email for a in r.cc)
+            )
+            group_count_r = len(self.received) - to_count_r - cc_count_r
+            fyi_count_r = sum(1 for r in self.received if self._detect_forward_fyi(r))
+            role_section = (
+                f"## 我的角色分布（my_email: {self.my_email}）\n"
+                f"  - 直接收件（TO 含我）：{to_count_r} 封\n"
+                f"  - 仅抄送（CC 含我）：{cc_count_r} 封\n"
+                f"  - 群组成员（TO/CC 均无我）：{group_count_r} 封\n"
+                f"  - 疑似转发/呈阅邮件：{fyi_count_r} 封\n\n"
+            )
 
         # --- 2. 收件人/抄送维度 ---
         recipient_section = ""
@@ -439,7 +527,7 @@ class PatternAnalyzer:
 ## 高频主题关键词
 {', '.join(f'{w}({c})' for w, c in stats['top_subject_words'][:20])}
 
-{recipient_section}{thread_section}## 邮件样本 (✅=已回复, ❌=未回复, 含正文样本)
+{role_section}{recipient_section}{thread_section}## 邮件样本 (✅=已回复, ❌=未回复, 含正文样本)
 {chr(10).join(sample_emails)}
 
 ## 任务
@@ -520,58 +608,199 @@ class PatternAnalyzer:
         return patterns
 
     def _discover_heuristic(self) -> list[DiscoveredPattern]:
-        """Fallback: discover patterns using simple heuristics when LLM is unavailable."""
-        patterns = []
-        sender_counts: Counter = Counter()
-        sender_replied: Counter = Counter()
-        sender_subjects: dict[str, list[str]] = defaultdict(list)
+        """基于角色驱动的启发式规则发现。
 
+        步骤优先级：
+        1. 转发/呈阅检测（priority=80）
+        2. 群组收件（to/cc 均无 my_email，priority=60）
+        3. CC 抄送（priority=50）
+        4. 直接收件 TO（发件人+to 组合，priority=40）
+        5. 已知邮件组正则（priority=30）
+        6. 线程深度（priority=20）
+        """
+        patterns = []
+        idx = 0
+
+        # ------------------------------------------------------------------ #
+        # 步骤 1: 转发/呈阅模式                                                #
+        # ------------------------------------------------------------------ #
+        fyi_records = [r for r in self.received if self._detect_forward_fyi(r)]
+        if len(fyi_records) >= 2:
+            idx += 1
+            rate = sum(1 for r in fyi_records if self._reply_map.get(r.id)) / len(fyi_records)
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name="转发与呈阅邮件",
+                description=(
+                    f"主题含转发标记或正文含呈阅/请知关键词的邮件 "
+                    f"({len(fyi_records)} 封, 回复率 {rate:.0%})，通常不需要回复"
+                ),
+                trigger_type="combined",
+                condition_logic="or",
+                conditions=[
+                    {
+                        "type": "subject_match",
+                        "operator": "regex",
+                        "value": r"^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|\[呈阅|呈阅示",
+                    },
+                    {
+                        "type": "body_match",
+                        "operator": "regex",
+                        "value": "呈阅|请知|请悉|谨呈|敬请知悉|请阅|知悉",
+                    },
+                ],
+                reply_rate=rate,
+                sample_count=len(fyi_records),
+                suggested_priority="P3",
+                suggested_need_reply=False,
+                example_subjects=[r.subject for r in fyi_records[:3]],
+                confidence=min(1.0, len(fyi_records) / 10),
+            ))
+
+        # ------------------------------------------------------------------ #
+        # 步骤 2: 群组收件模式（to/cc 均无 my_email）                          #
+        # ------------------------------------------------------------------ #
+        group_data = self._analyze_group_received()
+        for grp in group_data:
+            idx += 1
+            rate = grp["reply_rate"]
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name=f"{grp['group_address'].split('@')[0]} 群组邮件",
+                description=(
+                    f"发送到 {grp['group_address']} 的邮件，我通过群组成员身份收到 "
+                    f"({grp['count']} 封, 回复率 {rate:.0%})"
+                ),
+                trigger_type="to_match",
+                conditions=[{
+                    "type": "to_match",
+                    "operator": "contains",
+                    "value": grp["group_address"],
+                }],
+                reply_rate=rate,
+                sample_count=grp["count"],
+                suggested_priority="P3",
+                suggested_need_reply=False,
+                example_subjects=grp["example_subjects"],
+                confidence=min(1.0, grp["count"] / 10),
+            ))
+
+        # ------------------------------------------------------------------ #
+        # 步骤 3: CC 抄送模式                                                  #
+        # ------------------------------------------------------------------ #
+        to_vs_cc = self._analyze_to_vs_cc()
+        cc_count = to_vs_cc.get("cc_count", 0)
+        cc_rate = to_vs_cc.get("cc_reply_rate", 0.0)
+        to_rate = to_vs_cc.get("to_reply_rate", 0.0)
+        to_count = to_vs_cc.get("to_count", 0)
+        if cc_count >= 3 and cc_rate < 0.3 and (not self.my_email or to_count == 0 or (to_rate - cc_rate) > 0.1):
+            idx += 1
+            patterns.append(DiscoveredPattern(
+                id=f"discovered_{idx:03d}",
+                name="抄送通知（我在 CC）",
+                description=(
+                    f"我仅在 CC 中的邮件 ({cc_count} 封, 回复率 {cc_rate:.0%})，通常不需要回复"
+                ),
+                trigger_type="recipient_role",
+                conditions=[{
+                    "type": "cc_match",
+                    "operator": "contains",
+                    "value": self.my_email or "$ME",
+                }],
+                reply_rate=cc_rate,
+                sample_count=cc_count,
+                suggested_priority="P3",
+                suggested_need_reply=False,
+                confidence=min(1.0, cc_count / 10),
+            ))
+
+        # ------------------------------------------------------------------ #
+        # 步骤 4: 直接收件（TO 含 my_email）按发件人分组                       #
+        # ------------------------------------------------------------------ #
+        # 筛选出直接发给我（to 含 my_email）且不是转发/呈阅的邮件
+        direct_records = []
         for r in self.received:
+            if self._detect_forward_fyi(r):
+                continue
+            if self.my_email:
+                in_to = any(self._extract_email(addr) == self.my_email for addr in r.to)
+                if not in_to:
+                    continue
+            direct_records.append(r)
+
+        direct_sender_counts: Counter = Counter()
+        direct_sender_replied: Counter = Counter()
+        direct_sender_subjects: dict[str, list[str]] = defaultdict(list)
+
+        for r in direct_records:
             email_match = re.search(r'[\w.-]+@[\w.-]+', r.sender)
             sender_key = email_match.group() if email_match else r.sender
-            sender_counts[sender_key] += 1
-            sender_subjects[sender_key].append(r.subject)
+            direct_sender_counts[sender_key] += 1
+            direct_sender_subjects[sender_key].append(r.subject)
             if self._reply_map.get(r.id):
-                sender_replied[sender_key] += 1
+                direct_sender_replied[sender_key] += 1
 
-        idx = 0
-        for sender, count in sender_counts.most_common(10):
+        for sender, count in direct_sender_counts.most_common(10):
             if count < 3:
                 continue
-            rate = sender_replied[sender] / count if count > 0 else 0
-            subjects = sender_subjects[sender][:3]
-
+            rate = direct_sender_replied[sender] / count if count > 0 else 0
             idx += 1
+
             if rate >= 0.6:
                 priority, need_reply = "P1", True
             elif rate >= 0.3:
                 priority, need_reply = "P2", True
             else:
-                priority, need_reply = "P2", False
+                priority, need_reply = "P3", False
+
+            # 有 my_email 时生成"发件人+TO"组合条件，更精准
+            if self.my_email:
+                conditions = [
+                    {"type": "sender_match", "operator": "contains", "value": sender},
+                    {"type": "to_match", "operator": "contains", "value": self.my_email},
+                ]
+                trigger_type = "combined"
+            else:
+                conditions = [{"type": "sender_match", "operator": "contains", "value": sender}]
+                trigger_type = "sender_match"
+
+            name = (f"{sender.split('@')[0]} 直接发给我" if self.my_email
+                    else f"{sender.split('@')[0]} 邮件处理")
+            desc = (f"来自 {sender} 直接发给我的邮件 ({count} 封, 回复率 {rate:.0%})" if self.my_email
+                    else f"来自 {sender} 的邮件 ({count} 封, 回复率 {rate:.0%})")
 
             patterns.append(DiscoveredPattern(
                 id=f"discovered_{idx:03d}",
-                name=f"{sender.split('@')[0]} 邮件处理",
-                description=f"来自 {sender} 的邮件 ({count} 封, 回复率 {rate:.0%})",
-                trigger_type="sender_match",
-                conditions=[{
-                    "type": "sender_match",
-                    "operator": "contains",
-                    "value": sender,
-                }],
+                name=name,
+                description=desc,
+                trigger_type=trigger_type,
+                condition_logic="and",
+                conditions=conditions,
                 reply_rate=rate,
                 sample_count=count,
                 suggested_priority=priority,
                 suggested_need_reply=need_reply,
-                example_subjects=subjects,
+                example_subjects=direct_sender_subjects[sender][:3],
                 example_senders=[sender],
                 confidence=min(1.0, count / 10),
             ))
 
-        # --- 2. 邮件组/收件人模式 ---
+        # ------------------------------------------------------------------ #
+        # 步骤 5: 已知邮件组正则（与步骤2互补，覆盖可见邮件列表地址）           #
+        # ------------------------------------------------------------------ #
         mailing_lists = self._analyze_mailing_lists()
         for ml in mailing_lists:
             if ml["count"] < 3:
+                continue
+            # 避免与步骤2重复：若该地址已在群组规则中，跳过
+            already_covered = any(
+                any(
+                    c.get("type") == "to_match" and c.get("value") == ml["address"]
+                    for c in p.conditions
+                )
+                for p in patterns
+            )
+            if already_covered:
                 continue
             idx += 1
             rate = ml["reply_rate"]
@@ -580,13 +809,9 @@ class PatternAnalyzer:
             patterns.append(DiscoveredPattern(
                 id=f"discovered_{idx:03d}",
                 name=f"{ml['address'].split('@')[0]} 邮件组",
-                description=f"发送到 {ml['address']} 的邮件 ({ml['count']} 封, 回复率 {rate:.0%})",
+                description=f"发送到 {ml['address']} 的系统邮件 ({ml['count']} 封, 回复率 {rate:.0%})",
                 trigger_type="to_match",
-                conditions=[{
-                    "type": "to_match",
-                    "operator": "contains",
-                    "value": ml["address"],
-                }],
+                conditions=[{"type": "to_match", "operator": "contains", "value": ml["address"]}],
                 reply_rate=rate,
                 sample_count=ml["count"],
                 suggested_priority=priority,
@@ -594,33 +819,9 @@ class PatternAnalyzer:
                 confidence=min(1.0, ml["count"] / 10),
             ))
 
-        # --- 3. CC 角色模式 ---
-        to_vs_cc = self._analyze_to_vs_cc()
-        if (to_vs_cc["cc_count"] >= 5
-                and to_vs_cc["cc_reply_rate"] < 0.2
-                and (to_vs_cc["to_reply_rate"] - to_vs_cc["cc_reply_rate"]) > 0.3):
-            idx += 1
-            patterns.append(DiscoveredPattern(
-                id=f"discovered_{idx:03d}",
-                name="CC 抄送通知",
-                description=(
-                    f"我仅在 CC 中的邮件 ({to_vs_cc['cc_count']} 封, "
-                    f"回复率 {to_vs_cc['cc_reply_rate']:.0%}) 通常不需要回复"
-                ),
-                trigger_type="recipient_role",
-                conditions=[{
-                    "type": "cc_match",
-                    "operator": "contains",
-                    "value": self.my_email or "$ME",
-                }],
-                reply_rate=to_vs_cc["cc_reply_rate"],
-                sample_count=to_vs_cc["cc_count"],
-                suggested_priority="P3",
-                suggested_need_reply=False,
-                confidence=min(1.0, to_vs_cc["cc_count"] / 10),
-            ))
-
-        # --- 4. 线程深度模式 ---
+        # ------------------------------------------------------------------ #
+        # 步骤 6: 线程深度模式（需要有效 thread_id）                           #
+        # ------------------------------------------------------------------ #
         thread_stats = self._analyze_threads()
         high_depth = [t for t in thread_stats if t["depth"] >= 3 and t["participation"] >= 0.3]
         if len(high_depth) >= 2:
@@ -635,11 +836,7 @@ class PatternAnalyzer:
                     f"(平均深度 {avg_depth:.1f}, 平均参与度 {avg_participation:.0%})"
                 ),
                 trigger_type="thread_depth",
-                conditions=[{
-                    "type": "thread_depth",
-                    "operator": "gte",
-                    "value": "3",
-                }],
+                conditions=[{"type": "thread_depth", "operator": "gte", "value": "3"}],
                 reply_rate=avg_participation,
                 sample_count=len(high_depth),
                 suggested_priority="P1",

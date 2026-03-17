@@ -1,6 +1,6 @@
 id: skill_auto_lanjuan
 name: lanjuan 邮件处理
-description: 来自 lanjuan@tianjin-air.com 的邮件 (10 封, 回复率 0%)
+description: 来自 lanjuan@tianjin-air.com 的邮件 (10 封, 回复率 60%)
 version: 1.0.0
 execution_mode: modifier
 triggers:

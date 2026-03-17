@@ -370,7 +370,8 @@ class TestPatternAnalyzer:
         for p in patterns:
             assert p.sample_count >= 3
             assert p.conditions
-            assert p.trigger_type == "sender_match"
+            # 有 my_email 时步骤4生成 combined（发件人+TO），无 my_email 时生成 sender_match
+            assert p.trigger_type in ("sender_match", "combined", "to_match", "recipient_role", "thread_depth")
 
     def test_heuristic_with_few_records(self):
         records = _make_records(n_received=2, n_sent=0)
@@ -978,3 +979,268 @@ class TestDiscoverScriptIntegration:
         )
         record = _parsed_to_record(parsed)
         assert "<img" not in record.body_preview
+
+
+class TestForwardFyiDetection:
+    """_detect_forward_fyi 方法测试。"""
+
+    def _make_record(self, subject="", body="", **kwargs):
+        return EmailRecord(
+            id=kwargs.get("id", "test"),
+            subject=subject,
+            sender=kwargs.get("sender", "a@b.com"),
+            to=kwargs.get("to", []),
+            cc=kwargs.get("cc", []),
+            received_at="2024-01-01",
+            message_type="received",
+            body_preview=body,
+        )
+
+    def test_fw_prefix_detected(self):
+        r = self._make_record(subject="FW: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_fw_lowercase_detected(self):
+        r = self._make_record(subject="Fw: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_fwd_prefix_detected(self):
+        r = self._make_record(subject="Fwd: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chinese_forward_prefix_detected(self):
+        r = self._make_record(subject="转发: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chengyue_in_subject_detected(self):
+        r = self._make_record(subject="【呈阅示】关于新需求")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chengyue_in_body_detected(self):
+        r = self._make_record(subject="关于AI项目进展", body="谨呈领导审阅，请知。")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_qingzhi_in_body_detected(self):
+        r = self._make_record(subject="工作汇报", body="敬请知悉，如有疑问请联系。")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_bracket_chengyue_in_subject_detected(self):
+        """主题以半角方括号 [呈阅 开头应被检测为 FYI。"""
+        r = self._make_record(subject="[呈阅]关于技术部门资产情况报告")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_normal_email_not_detected(self):
+        r = self._make_record(subject="关于项目进展的询问", body="您好，请问项目什么时候完成？")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is False
+
+
+class TestGroupReceivedAnalysis:
+    """_analyze_group_received 方法测试。"""
+
+    def _make_received(self, sender, to, cc, subject="test"):
+        r = EmailRecord(
+            id=f"{sender}-{subject}",
+            subject=subject,
+            sender=sender,
+            to=to,
+            cc=cc,
+            received_at="2024-01-01",
+            message_type="received",
+        )
+        return r
+
+    def test_identifies_group_emails(self):
+        """to/cc 均不含 my_email 的邮件应被识别为群组收件。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) >= 1
+        assert result[0]["group_address"] == "group@b.com"
+        assert result[0]["count"] == 4
+        assert result[0]["example_subjects"]  # 应非空
+        assert all(isinstance(s, str) for s in result[0]["example_subjects"])
+
+    def test_direct_email_not_group(self):
+        """to 中含 my_email 的邮件不应被归入群组。"""
+        records = [
+            self._make_received("a@b.com", ["me@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_cc_email_not_group(self):
+        """cc 中含 my_email（to 不含）的邮件不应被归入群组。"""
+        records = [
+            self._make_received("a@b.com", ["other@b.com"], ["me@b.com"], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_minimum_count_threshold(self):
+        """少于 3 封的群组地址不应出现在结果中。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(2)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 0
+
+    def test_empty_to_fallback_to_sender(self):
+        """to 和 cc 均为空时，应按发件人分组作为兜底。"""
+        records = [
+            self._make_received("sys@b.com", [], [], subject=f"s{i}")
+            for i in range(3)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        result = analyzer._analyze_group_received()
+        assert len(result) == 1
+        assert "sys@b.com" in result[0]["group_address"]
+
+    def test_no_my_email_returns_empty(self):
+        """未提供 my_email 时应直接返回空列表。"""
+        records = [
+            self._make_received("a@b.com", ["group@b.com"], [], subject=f"s{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records)  # 不传 my_email
+        result = analyzer._analyze_group_received()
+        assert result == []
+
+
+class TestRoleBasedHeuristic:
+    """重构后的 _discover_heuristic 角色驱动逻辑测试。"""
+
+    def _make_r(self, sender, to, cc, replied_subj_set=None, subject="test", body=""):
+        return EmailRecord(
+            id=f"{sender}-{subject}",
+            subject=subject, sender=sender,
+            to=to, cc=cc,
+            received_at="2024-01-01",
+            message_type="received",
+            body_preview=body,
+        )
+
+    def test_forward_pattern_generated(self):
+        """含转发前缀的邮件应生成 priority=P3 need_reply=False 的规则。"""
+        records = [
+            self._make_r("a@b.com", ["me@b.com"], [], subject=f"FW: 事项{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        fyi = [p for p in patterns if p.trigger_type == "combined"
+               and any(c.get("type") == "subject_match" for c in p.conditions)]
+        assert len(fyi) >= 1
+        assert fyi[0].suggested_need_reply is False
+        assert fyi[0].suggested_priority == "P3"
+
+    def test_group_pattern_generated(self):
+        """群组收件邮件应生成 to_match 类型的 P3 规则。"""
+        records = [
+            self._make_r("a@b.com", ["dept@b.com"], [], subject=f"通知{i}")
+            for i in range(4)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        group_p = [p for p in patterns if p.trigger_type == "to_match"]
+        assert len(group_p) >= 1
+        assert group_p[0].suggested_need_reply is False
+        assert group_p[0].suggested_priority == "P3"
+
+    def test_direct_to_high_reply_rate(self):
+        """直接收件且高回复率应生成 P1 need_reply=True 的规则。"""
+        sent = [
+            EmailRecord(
+                id=f"sent-{i}", subject=f"回复: 工作{i}", sender="me@b.com",
+                to=["boss@b.com"], cc=[], received_at="2024-01-01", message_type="sent",
+            )
+            for i in range(7)
+        ]
+        received = [
+            self._make_r("boss@b.com", ["me@b.com"], [], subject=f"工作{i}")
+            for i in range(7)
+        ]
+        analyzer = PatternAnalyzer(received + sent, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        direct_p = [p for p in patterns
+                    if any(c.get("type") == "sender_match" for c in p.conditions)
+                    and any(c.get("type") == "to_match" for c in p.conditions)]
+        assert len(direct_p) >= 1
+        assert direct_p[0].suggested_need_reply is True
+        assert direct_p[0].suggested_priority == "P1"
+
+    def test_cc_pattern_generated_when_enough_data(self):
+        """CC 邮件足够多且回复率低时，应生成 CC 已阅规则。"""
+        records = [
+            self._make_r("a@b.com", ["other@b.com"], ["me@b.com"], subject=f"抄送{i}")
+            for i in range(6)
+        ]
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        patterns = analyzer._discover_heuristic()
+        cc_p = [p for p in patterns if p.trigger_type == "recipient_role"]
+        assert len(cc_p) >= 1
+        assert cc_p[0].suggested_need_reply is False
+
+
+class TestLLMPromptRoleSection:
+    """build_llm_prompt 中角色分布段落的测试。"""
+
+    def _make_records(self):
+        received_direct = [
+            EmailRecord(
+                id=f"r{i}", subject="工作事项", sender="boss@b.com",
+                to=["me@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(5)
+        ]
+        received_cc = [
+            EmailRecord(
+                id=f"c{i}", subject="会议通知", sender="hr@b.com",
+                to=["team@b.com"], cc=["me@b.com"], received_at="2024-01-01", message_type="received",
+            ) for i in range(3)
+        ]
+        received_group = [
+            EmailRecord(
+                id=f"g{i}", subject="系统通知", sender="sys@b.com",
+                to=["dept@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(4)
+        ]
+        fw = [
+            EmailRecord(
+                id=f"fw{i}", subject=f"FW: 转发事项{i}", sender="a@b.com",
+                to=["me@b.com"], cc=[], received_at="2024-01-01", message_type="received",
+            ) for i in range(3)
+        ]
+        return received_direct + received_cc + received_group + fw
+
+    def test_prompt_includes_role_distribution(self):
+        records = self._make_records()
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+        assert "我的角色分布" in prompt
+        assert "直接收件" in prompt
+        assert "群组成员" in prompt
+
+    def test_prompt_includes_forward_count(self):
+        records = self._make_records()
+        analyzer = PatternAnalyzer(records, my_email="me@b.com")
+        stats = analyzer.compute_statistics()
+        prompt = analyzer.build_llm_prompt(stats)
+        assert "转发" in prompt or "呈阅" in prompt
