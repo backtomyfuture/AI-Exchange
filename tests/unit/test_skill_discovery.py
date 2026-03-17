@@ -978,3 +978,59 @@ class TestDiscoverScriptIntegration:
         )
         record = _parsed_to_record(parsed)
         assert "<img" not in record.body_preview
+
+
+class TestForwardFyiDetection:
+    """_detect_forward_fyi 方法测试。"""
+
+    def _make_record(self, subject="", body="", **kwargs):
+        return EmailRecord(
+            id=kwargs.get("id", "test"),
+            subject=subject,
+            sender=kwargs.get("sender", "a@b.com"),
+            to=kwargs.get("to", []),
+            cc=kwargs.get("cc", []),
+            received_at="2024-01-01",
+            message_type="received",
+            body_preview=body,
+        )
+
+    def test_fw_prefix_detected(self):
+        r = self._make_record(subject="FW: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_fw_lowercase_detected(self):
+        r = self._make_record(subject="Fw: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_fwd_prefix_detected(self):
+        r = self._make_record(subject="Fwd: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chinese_forward_prefix_detected(self):
+        r = self._make_record(subject="转发: 关于项目进展")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chengyue_in_subject_detected(self):
+        r = self._make_record(subject="【呈阅示】关于新需求")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_chengyue_in_body_detected(self):
+        r = self._make_record(subject="关于AI项目进展", body="谨呈领导审阅，请知。")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_qingzhi_in_body_detected(self):
+        r = self._make_record(subject="工作汇报", body="敬请知悉，如有疑问请联系。")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is True
+
+    def test_normal_email_not_detected(self):
+        r = self._make_record(subject="关于项目进展的询问", body="您好，请问项目什么时候完成？")
+        analyzer = PatternAnalyzer([r])
+        assert analyzer._detect_forward_fyi(r) is False

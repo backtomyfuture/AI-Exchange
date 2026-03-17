@@ -365,6 +365,23 @@ class PatternAnalyzer:
         result.sort(key=lambda t: t["depth"], reverse=True)
         return result[:20]
 
+    # 转发/呈阅检测关键词（类级别编译，避免重复编译）
+    _FYI_SUBJECT_PATTERNS = re.compile(
+        r'^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|[(\[]呈阅|呈阅示',
+        re.IGNORECASE,
+    )
+    _FYI_BODY_KEYWORDS = re.compile(
+        r'呈阅|请知|请悉|谨呈|敬请知悉|请阅|知悉',
+    )
+
+    def _detect_forward_fyi(self, record: EmailRecord) -> bool:
+        """判断邮件是否为转发或呈阅类（不需要回复）。"""
+        if self._FYI_SUBJECT_PATTERNS.search(record.subject):
+            return True
+        if record.body_preview and self._FYI_BODY_KEYWORDS.search(record.body_preview):
+            return True
+        return False
+
     def build_llm_prompt(self, stats: dict) -> str:
         """构建多维度 LLM 分析 prompt。"""
         # --- 1. 发件人统计 ---
