@@ -948,3 +948,33 @@ class TestGeneratorEnhanced:
         path = write_skill(pattern, registry_path=str(tmp_path))
         manifest = yaml.safe_load((Path(path) / "manifest.yaml").read_text())
         assert manifest["triggers"]["condition_logic"] == "or"
+
+
+class TestDiscoverScriptIntegration:
+    """discover_skills.py _parsed_to_record 集成测试。"""
+
+    def test_parsed_to_record_body_1000(self):
+        """_parsed_to_record 应截取 1000 字符。"""
+        from scripts.discover_skills import _parsed_to_record
+        from scripts.import_pst import ParsedEmail
+
+        parsed = ParsedEmail(
+            id="test", subject="test", sender="a@b.com",
+            to=[], cc=[], body="x" * 2000,
+            received_at="2024-01-01",
+        )
+        record = _parsed_to_record(parsed)
+        assert len(record.body_preview) <= 1000
+
+    def test_parsed_to_record_strips_img(self):
+        """_parsed_to_record 应移除 <img> 标签。"""
+        from scripts.discover_skills import _parsed_to_record
+        from scripts.import_pst import ParsedEmail
+
+        parsed = ParsedEmail(
+            id="test", subject="test", sender="a@b.com",
+            to=[], cc=[], body='正文<img src="x.png"/>结尾',
+            received_at="2024-01-01",
+        )
+        record = _parsed_to_record(parsed)
+        assert "<img" not in record.body_preview

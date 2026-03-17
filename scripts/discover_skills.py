@@ -75,7 +75,10 @@ def display_pattern(idx: int, pattern: DiscoveredPattern):
             "sender_match": "发件人",
             "subject_match": "主题含",
             "to_match": "收件人",
+            "cc_match": "抄送含",
             "body_match": "正文含",
+            "recipient_role": "收件角色",
+            "thread_depth": "线程深度",
         }
         label = type_labels.get(cond_type, cond_type)
         op_map = {
@@ -246,6 +249,7 @@ async def run_discovery(
     use_llm: bool = True,
     limit: int = 5000,
     auto_confirm: bool = False,
+    my_email: str | None = None,
 ) -> list[str]:
     """Run the full discovery workflow. Returns list of generated skill paths."""
 
@@ -274,7 +278,7 @@ async def run_discovery(
 
     # --- 2. Analyze patterns ---
     print("\n⏳ 正在分析邮件模式...")
-    analyzer = PatternAnalyzer(records)
+    analyzer = PatternAnalyzer(records, my_email=my_email or "")
 
     stats = analyzer.compute_statistics()
     print(f"   发件人: {stats['unique_senders']} 个")
@@ -352,6 +356,10 @@ def main():
         action="store_true",
         help="自动确认所有发现的模式 (跳过交互选择)",
     )
+    parser.add_argument(
+        "--my-email",
+        help="你的邮箱地址 (用于识别 TO/CC 角色，默认从已发送邮件推断)",
+    )
 
     args = parser.parse_args()
 
@@ -364,6 +372,7 @@ def main():
         use_llm=not args.no_llm,
         limit=args.limit,
         auto_confirm=args.auto_confirm,
+        my_email=args.my_email,
     ))
 
 
