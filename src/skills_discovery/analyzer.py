@@ -706,22 +706,22 @@ class PatternAnalyzer:
                     continue
             direct_records.append(r)
 
-        sender_counts: Counter = Counter()
-        sender_replied: Counter = Counter()
-        sender_subjects: dict[str, list[str]] = defaultdict(list)
+        direct_sender_counts: Counter = Counter()
+        direct_sender_replied: Counter = Counter()
+        direct_sender_subjects: dict[str, list[str]] = defaultdict(list)
 
         for r in direct_records:
             email_match = re.search(r'[\w.-]+@[\w.-]+', r.sender)
             sender_key = email_match.group() if email_match else r.sender
-            sender_counts[sender_key] += 1
-            sender_subjects[sender_key].append(r.subject)
+            direct_sender_counts[sender_key] += 1
+            direct_sender_subjects[sender_key].append(r.subject)
             if self._reply_map.get(r.id):
-                sender_replied[sender_key] += 1
+                direct_sender_replied[sender_key] += 1
 
-        for sender, count in sender_counts.most_common(10):
+        for sender, count in direct_sender_counts.most_common(10):
             if count < 3:
                 continue
-            rate = sender_replied[sender] / count if count > 0 else 0
+            rate = direct_sender_replied[sender] / count if count > 0 else 0
             idx += 1
 
             if rate >= 0.6:
@@ -742,10 +742,15 @@ class PatternAnalyzer:
                 conditions = [{"type": "sender_match", "operator": "contains", "value": sender}]
                 trigger_type = "sender_match"
 
+            name = (f"{sender.split('@')[0]} 直接发给我" if self.my_email
+                    else f"{sender.split('@')[0]} 邮件处理")
+            desc = (f"来自 {sender} 直接发给我的邮件 ({count} 封, 回复率 {rate:.0%})" if self.my_email
+                    else f"来自 {sender} 的邮件 ({count} 封, 回复率 {rate:.0%})")
+
             patterns.append(DiscoveredPattern(
                 id=f"discovered_{idx:03d}",
-                name=f"{sender.split('@')[0]} 直接发给我",
-                description=f"来自 {sender} 直接发给我的邮件 ({count} 封, 回复率 {rate:.0%})",
+                name=name,
+                description=desc,
                 trigger_type=trigger_type,
                 condition_logic="and",
                 conditions=conditions,
@@ -753,7 +758,7 @@ class PatternAnalyzer:
                 sample_count=count,
                 suggested_priority=priority,
                 suggested_need_reply=need_reply,
-                example_subjects=sender_subjects[sender][:3],
+                example_subjects=direct_sender_subjects[sender][:3],
                 example_senders=[sender],
                 confidence=min(1.0, count / 10),
             ))
@@ -767,7 +772,10 @@ class PatternAnalyzer:
                 continue
             # 避免与步骤2重复：若该地址已在群组规则中，跳过
             already_covered = any(
-                any(c.get("value") == ml["address"] for c in p.conditions)
+                any(
+                    c.get("type") == "to_match" and c.get("value") == ml["address"]
+                    for c in p.conditions
+                )
                 for p in patterns
             )
             if already_covered:

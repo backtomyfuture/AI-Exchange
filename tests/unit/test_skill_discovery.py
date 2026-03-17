@@ -1184,7 +1184,7 @@ class TestRoleBasedHeuristic:
                     and any(c.get("type") == "to_match" for c in p.conditions)]
         assert len(direct_p) >= 1
         assert direct_p[0].suggested_need_reply is True
-        assert direct_p[0].suggested_priority in ("P1", "P2")
+        assert direct_p[0].suggested_priority == "P1"
 
     def test_cc_pattern_generated_when_enough_data(self):
         """CC 邮件足够多且回复率低时，应生成 CC 已阅规则。"""
