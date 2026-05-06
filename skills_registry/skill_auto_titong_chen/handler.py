@@ -6,22 +6,22 @@ from src.graph.state import AgentState
 class Skill(BaseSkill):
     async def execute(self, state: AgentState) -> Dict[str, Any]:
         """
-        来自 titong-chen@tianjin-air.com 的邮件 (8 封, 回复率 62%)
+        发送到 titong-chen@tianjin-air.com 的邮件，我通过群组成员身份收到 (6 封, 回复率 50%)
         """
         classification = state.get("classification", {})
         classification.update({
-            "priority": "P1",
-            "need_reply": True,
+            "priority": "P3",
+            "need_reply": False,
             "reasoning": (
                 classification.get("reasoning", "")
-                + " [Auto-Skill: titong-chen 邮件处理] 匹配自动发现规则，回复率 62%。"
+                + " [Auto-Skill: titong-chen 群组邮件] 匹配自动发现规则，回复率 50%。"
             ).strip(),
-            "card_type": "approval",
+            "card_type": "none",
         })
 
         updates: Dict[str, Any] = {
             "classification": classification,
-            "priority_level": 8,
+            "priority_level": 2,
         }
 
         return updates

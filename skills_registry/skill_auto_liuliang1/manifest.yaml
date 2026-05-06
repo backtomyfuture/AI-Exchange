@@ -1,11 +1,11 @@
 id: skill_auto_liuliang1
-name: liuliang1 邮件处理
-description: 来自 liuliang1@tianjin-air.com 的邮件 (7 封, 回复率 14%)
+name: liuliang1 群组邮件
+description: 发送到 liuliang1@tianjin-air.com 的邮件，我通过群组成员身份收到 (5 封, 回复率 20%)
 version: 1.0.0
 execution_mode: modifier
 triggers:
   priority: 80
   conditions:
-  - type: sender_match
+  - type: to_match
     operator: contains
     value: liuliang1@tianjin-air.com

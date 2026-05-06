@@ -1,6 +1,7 @@
 services:
   qdrant:
     image: qdrant/qdrant:latest
+    restart: always
     ports:
       - "6333:6333"
     volumes:
@@ -8,6 +9,7 @@ services:
 
   postgres:
     image: postgres:15
+    restart: always
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password

@@ -1,11 +1,11 @@
 id: skill_auto_titong_chen
-name: titong-chen 邮件处理
-description: 来自 titong-chen@tianjin-air.com 的邮件 (8 封, 回复率 62%)
+name: titong-chen 群组邮件
+description: 发送到 titong-chen@tianjin-air.com 的邮件，我通过群组成员身份收到 (6 封, 回复率 50%)
 version: 1.0.0
 execution_mode: modifier
 triggers:
-  priority: 90
+  priority: 80
   conditions:
-  - type: sender_match
+  - type: to_match
     operator: contains
     value: titong-chen@tianjin-air.com

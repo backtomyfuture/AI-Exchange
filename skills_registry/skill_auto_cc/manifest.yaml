@@ -1,0 +1,11 @@
+id: skill_auto_cc
+name: 抄送通知（我在 CC）
+description: 我仅在 CC 中的邮件 (5 封, 回复率 0%)，通常不需要回复
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 80
+  conditions:
+  - type: cc_match
+    operator: contains
+    value: q-fu@tianjin-air.com

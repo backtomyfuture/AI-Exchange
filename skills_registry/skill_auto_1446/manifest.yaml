@@ -1,0 +1,15 @@
+id: skill_auto_1446
+name: 转发与呈阅邮件
+description: 主题含转发标记或正文含呈阅/请知关键词的邮件 (110 封, 回复率 5%)，通常不需要回复
+version: 1.0.0
+execution_mode: modifier
+triggers:
+  priority: 90
+  conditions:
+  - type: subject_match
+    operator: regex
+    value: ^(FW:|Fw:|Fwd:|转发[:：])|【呈阅|\[呈阅|呈阅示
+  - type: body_match
+    operator: regex
+    value: 呈阅|请知|请悉|谨呈|敬请知悉|请阅|知悉
+  condition_logic: or

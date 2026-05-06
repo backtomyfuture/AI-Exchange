@@ -6,7 +6,7 @@ from src.graph.state import AgentState
 class Skill(BaseSkill):
     async def execute(self, state: AgentState) -> Dict[str, Any]:
         """
-        来自 hnasafety@hnaaviation.com 直接发给我的邮件 (12 封, 回复率 0%)
+        主题含转发标记或正文含呈阅/请知关键词的邮件 (110 封, 回复率 5%)，通常不需要回复
         """
         classification = state.get("classification", {})
         classification.update({
@@ -14,7 +14,7 @@ class Skill(BaseSkill):
             "need_reply": False,
             "reasoning": (
                 classification.get("reasoning", "")
-                + " [Auto-Skill: hnasafety 直接发给我] 匹配自动发现规则，回复率 0%。"
+                + " [Auto-Skill: 转发与呈阅邮件] 匹配自动发现规则，回复率 5%。"
             ).strip(),
             "card_type": "none",
         })
