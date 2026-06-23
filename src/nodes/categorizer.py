@@ -48,7 +48,11 @@ async def categorize_email(state: AgentState) -> AgentState:
             current_classification["reasoning"] = "系统规则自动触发转发"
 
         updates = {"next_step": "drafter", "classification": current_classification}
-        for key in ("routing_log", "active_skills", "system_prompt_modifier"):
+        # routing_log / active_skills are reducer-managed (operator.add).
+        # Only echo back non-reducer fields so we don't double-accumulate the lists.
+        if "system_prompt_modifier" in state:
+            updates["system_prompt_modifier"] = state["system_prompt_modifier"]
+        for key in ("routing_log", "active_skills"):
             if key in state:
                 updates[key] = state[key]
         return updates

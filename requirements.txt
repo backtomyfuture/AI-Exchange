@@ -6,7 +6,6 @@ langgraph-checkpoint
 langgraph-checkpoint-postgres
 qdrant-client
 openai
-psycopg2-binary
 psycopg[pool]
 python-dotenv
 

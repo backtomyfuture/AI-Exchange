@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     # Lark
     LARK_APP_ID: str = ""
     LARK_APP_SECRET: SecretStr = SecretStr("")
-    LARK_VERIFICATION_TOKEN: str = ""
     LARK_ENCRYPT_KEY: SecretStr = SecretStr("")
     LARK_CHAT_ID: str = ""
     LARK_DRIVE_FOLDER_TOKEN: str = ""
@@ -47,16 +46,10 @@ class Settings(BaseSettings):
     # Server
     EXTERNAL_URL: str = "http://localhost:8000"
 
-    # Slack
-    SLACK_BOT_TOKEN: str = ""
-    SLACK_APP_TOKEN: str = ""
-    SLACK_CHANNEL_ID: str = ""
-
     # LLM (global defaults)
     OPENAI_API_KEY: SecretStr = SecretStr("")
     OPENAI_API_BASE: str = ""
     LLM_MODEL: str = "gemini-3-flash"
-    LLM_RATE_LIMIT_DELAY: int = 10
     LLM_MAX_RPM: float = 15.0
 
     # Per-role model overrides (leave empty to use LLM_MODEL)

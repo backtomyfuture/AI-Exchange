@@ -1,7 +1,7 @@
 """
 通用 LLM 重试装饰器模块
 
-提供带速率限制的 LLM 调用重试逻辑，减少代码重复。
+提供带速率限制 + 熔断器集成的 LLM 调用重试逻辑，减少代码重复。
 """
 
 from functools import wraps
@@ -11,6 +11,10 @@ from openai import RateLimitError, APIError, APIConnectionError
 from src.utils.rate_limiter import llm_rate_limiter
 
 
+class CircuitOpenError(RuntimeError):
+    """Raised when the LLM circuit breaker is currently open."""
+
+
 def with_llm_retry(
     max_attempts: int = 3,
     max_wait: int = 120,
@@ -18,6 +22,11 @@ def with_llm_retry(
 ):
     """
     通用 LLM 调用重试装饰器。
+
+    行为:
+    1. 调用前检查熔断器，若 OPEN 则直接抛出 ``CircuitOpenError``，避免无谓重试。
+    2. 重试结束后仍失败：上报 ``circuit_breaker.report_failure`` 累计失败次数。
+    3. 自愈/恢复由 SelfHealer 调用 ``report_success`` 关闭熔断器。
     """
 
     def decorator(func):
@@ -28,9 +37,23 @@ def with_llm_retry(
             reraise=True,
         )
         @wraps(func)
-        async def async_wrapper(*args, **kwargs):
+        async def _retried_async(*args, **kwargs):
             await llm_rate_limiter.acquire()
             return await func(*args, **kwargs)
+
+        @wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            from src.utils.circuit_breaker import circuit_breaker
+
+            if not circuit_breaker.can_proceed():
+                raise CircuitOpenError(
+                    "LLM circuit breaker is OPEN; refusing to call until recovery."
+                )
+            try:
+                return await _retried_async(*args, **kwargs)
+            except Exception as exc:
+                circuit_breaker.report_failure(exc)
+                raise
 
         @retry(
             wait=wait_random_exponential(multiplier=base_wait, max=max_wait),

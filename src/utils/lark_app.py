@@ -1344,43 +1344,6 @@ async def process_pdf_generation_and_reply(email_id, state, message_id):
     except Exception as e:
         logger.error(f"Error in PDF generation process: {e}", exc_info=True)
 
-        # 4. Reply with Card
-        card_content = {
-            "header": {
-                "template": "blue",
-                "title": {"content": "📄 PDF 原文已生成", "tag": "plain_text"}
-            },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": f"点击下方按钮查看 PDF 文件：\nFilename: *{filename}*"}
-                },
-                {
-                    "tag": "action",
-                    "actions": [{
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "📂 打开 PDF"},
-                        "type": "primary",
-                        "url": file_url
-                    }]
-                }
-            ]
-        }
-        
-        req_msg = ReplyMessageRequest.builder() \
-            .message_id(message_id) \
-            .request_body(ReplyMessageRequestBody.builder() \
-                .msg_type("interactive") \
-                .content(json.dumps(card_content)) \
-                .build()) \
-            .build()
-        
-        lark_api_client.im.v1.message.reply(req_msg)
-        logger.info("PDF Reply sent successfully.")
-
-    except Exception as e:
-        logger.error(f"Error in PDF generation process: {e}", exc_info=True)
-
 
 def start_lark_ws():
     """

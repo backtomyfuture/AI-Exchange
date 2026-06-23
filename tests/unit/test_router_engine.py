@@ -199,6 +199,49 @@ class TestRoutingEngineTier3:
                 assert len(result) == 1
 
 
+class TestRoutingEngineReducerDelta:
+    """Ensure execute_router returns only the delta for reducer-controlled lists."""
+
+    @pytest.mark.asyncio
+    async def test_execute_router_returns_only_delta_for_routing_log(self, mock_settings):
+        engine = RoutingEngine()
+        state = {
+            "email": {"id": "x", "subject": "s", "body": "b", "sender": "u@x.com"},
+            "classification": {},
+            "active_skills": ["already_active"],
+            "routing_log": ["existing entry"],
+            "metadata": {},
+        }
+
+        with patch.object(engine.t1_router, "route", return_value=["skill_new"]), \
+             patch.object(engine, "_apply_skills", return_value=state):
+            result = await engine.execute_router(state)
+
+        # Delta only - not the merged list
+        assert result["routing_log"] == [
+            "Tier 1 Match: ['skill_new']"
+        ]
+        assert result["active_skills"] == ["skill_new"]
+
+    @pytest.mark.asyncio
+    async def test_execute_router_filters_already_active_skills(self, mock_settings):
+        engine = RoutingEngine()
+        state = {
+            "email": {"id": "x", "subject": "s", "body": "b", "sender": "u@x.com"},
+            "classification": {},
+            "active_skills": ["skill_already"],
+            "routing_log": [],
+            "metadata": {},
+        }
+
+        with patch.object(engine.t1_router, "route", return_value=["skill_already", "skill_fresh"]), \
+             patch.object(engine, "_apply_skills", return_value=state):
+            result = await engine.execute_router(state)
+
+        # Only the new skill is returned in the delta; reducer would merge with existing.
+        assert result["active_skills"] == ["skill_fresh"]
+
+
 class TestRoutingEngineSkillApplication:
     """测试Skill应用和状态合并"""
     

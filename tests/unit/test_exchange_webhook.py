@@ -81,3 +81,39 @@ def test_exchange_webhook_valid_signature_enqueues_event():
     assert response.json()["status"] == "ok"
     assert response.json()["queued"] is True
     mock_enqueue.assert_awaited_once_with(payload, header_event="NewMailEvent")
+
+
+def test_exchange_webhook_queue_full_returns_503():
+    client = TestClient(app)
+    payload = {
+        "event_type": "NewMailEvent",
+        "item_id": {"id": "AAMkAGQ"},
+        "parent_folder_id": {"id": "INBOX"},
+    }
+    body, signature = _build_signed_body(payload, "test-secret")
+
+    with patch("src.server.get_settings") as mock_settings, patch(
+        "src.server.enqueue_exchange_webhook",
+        new_callable=AsyncMock,
+    ) as mock_enqueue:
+        mock_settings.return_value = MagicMock(EXCHANGE_WEBHOOK_SECRET="test-secret")
+        mock_enqueue.return_value = {
+            "queued": False,
+            "reason": "queue_full",
+            "email_id": "AAMkAGQ",
+            "queue_size": 500,
+        }
+
+        response = client.post(
+            "/webhooks/exchange",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Exchange-Event": "NewMailEvent",
+                "X-Exchange-Signature": signature,
+            },
+        )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["reason"] == "queue_full"

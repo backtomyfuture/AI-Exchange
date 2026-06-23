@@ -7,6 +7,7 @@ from src.utils import lark_app
 
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
+WEBHOOK_QUEUE_MAXSIZE = 500
 
 
 async def _upload_attachments_to_lark(email_data: dict) -> None:
@@ -285,7 +286,21 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
     email_data["_parent_folder_name"] = folder_name
     email_data["_event_type"] = event_type
 
-    await queue.put((email_data, skip_analysis))
+    try:
+        queue.put_nowait((email_data, skip_analysis))
+    except asyncio.QueueFull:
+        logger.error(
+            "Webhook queue full (max=%s); rejecting %s id=%s. Sender should retry.",
+            getattr(queue, "maxsize", "?"),
+            event_type,
+            email_id,
+        )
+        return {
+            "queued": False,
+            "reason": "queue_full",
+            "email_id": email_id,
+            "queue_size": queue.qsize(),
+        }
     logger.info(
         "Enqueued %s [%s]: %s (folder=%s, skip_analysis=%s)",
         event_type,
@@ -310,9 +325,9 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
 class WebhookWorker:
     """Encapsulates webhook worker state: queue, task, context, semaphore."""
 
-    def __init__(self, ctx):
+    def __init__(self, ctx, queue_maxsize: int = WEBHOOK_QUEUE_MAXSIZE):
         self._ctx = ctx
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         self._task: asyncio.Task | None = None
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
 
