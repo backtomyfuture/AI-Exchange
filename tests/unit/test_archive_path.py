@@ -62,9 +62,13 @@ async def test_full_pipeline_uploads_attachments():
     ) as mock_ingest, patch(
         "src.exchange_service._run_ai_pipeline",
         return_value={"classification": {"need_reply": False}},
-    ) as mock_ai, patch("src.exchange_service._dispatch_notification") as mock_notify, patch(
+    ) as mock_ai, patch(
+        "src.exchange_service._dispatch_notification",
+        new_callable=AsyncMock,
+    ) as mock_notify, patch(
         "src.exchange_service._mark_email_read"
     ) as mock_read:
+        mock_notify.return_value = {"delivered": True, "kind": "skipped"}
         await process_and_archive_email(email_data, mock_ctx, skip_analysis=False)
 
         mock_upload.assert_called_once()

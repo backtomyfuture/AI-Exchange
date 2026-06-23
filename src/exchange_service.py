@@ -76,8 +76,22 @@ async def _run_ai_pipeline(email_id: str, email_data: dict, ctx, config: dict):
         return None
 
 
-async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, config: dict) -> None:
-    """Send Lark card based on classification result."""
+async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, config: dict) -> dict:
+    """
+    Send Lark card based on classification result.
+
+    Returns a dispatch outcome dict so the caller can decide whether to
+    irreversibly mark the email as read on Exchange. Shape::
+
+        {"delivered": bool, "kind": "approval" | "read_only" | "skipped"}
+
+    - ``delivered=True`` means the email is safe to mark-as-read on the server,
+      because the user has either received an actionable card or the rule
+      explicitly classifies the email as not worth surfacing.
+    - ``delivered=False`` means card delivery failed and the email is still
+      unread on Exchange so the SelfHealer (or the next manual retry) can
+      retry without losing the email.
+    """
     classification = pipeline_result.get("classification", {})
     priority = classification.get("priority", "P3")
     intent = classification.get("intent", "Unknown")
@@ -111,12 +125,12 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
         pdf_url = pdf_result.get("url") if pdf_result else None
         pdf_token = pdf_result.get("file_token") if pdf_result else None
-        
+
         if pdf_token:
             config = {"configurable": {"thread_id": email_id}}
             await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
 
-        lark_app.send_approval_card(
+        delivered = bool(lark_app.send_approval_card(
             email_id=email_id,
             draft=pipeline_result.get("draft", ""),
             context=pipeline_result.get("context", []),
@@ -125,19 +139,28 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             pdf_url=pdf_url,
             routing_log=routing_log,
             active_skills=active_skills,
-        )
-        await ctx.db_manager.update_status(email_id, "waiting_approval")
-    elif priority == "P1" or intent == "通知":
+        ))
+        if delivered:
+            await ctx.db_manager.update_status(email_id, "waiting_approval")
+        else:
+            logger.error("Approval card delivery failed for %s; leaving on Exchange unread.", email_id)
+            await ctx.db_manager.update_status(
+                email_id, "delivery_failed",
+                error_message="Approval card send returned failure",
+            )
+        return {"delivered": delivered, "kind": "approval"}
+
+    if priority == "P1" or intent == "通知":
         logger.info(f"Email is important ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
         pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
         pdf_url = pdf_result.get("url") if pdf_result else None
         pdf_token = pdf_result.get("file_token") if pdf_result else None
-        
+
         if pdf_token:
             config = {"configurable": {"thread_id": email_id}}
             await ctx.graph.aupdate_state(config, {"pdf_token": pdf_token})
 
-        lark_app.send_read_only_card(
+        delivered = bool(lark_app.send_read_only_card(
             email_id=email_id,
             context=pipeline_result.get("context", []),
             email_data=pipeline_result.get("email", {}),
@@ -145,11 +168,21 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             pdf_url=pdf_url,
             routing_log=routing_log,
             active_skills=active_skills,
-        )
-        await ctx.db_manager.update_status(email_id, "notified_readonly")
-    else:
-        logger.info(f"No reply needed for email: {email_id}")
-        await ctx.db_manager.update_status(email_id, "skipped")
+        ))
+        if delivered:
+            await ctx.db_manager.update_status(email_id, "notified_readonly")
+        else:
+            logger.error("Read-only card delivery failed for %s; leaving on Exchange unread.", email_id)
+            await ctx.db_manager.update_status(
+                email_id, "delivery_failed",
+                error_message="Read-only card send returned failure",
+            )
+        return {"delivered": delivered, "kind": "read_only"}
+
+    logger.info(f"No reply needed for email: {email_id}")
+    await ctx.db_manager.update_status(email_id, "skipped")
+    # An intentional skip is a successful "delivery" (user does not need to see it).
+    return {"delivered": True, "kind": "skipped"}
 
 
 async def _mark_email_read(email_id: str, ctx) -> None:
@@ -203,20 +236,47 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
     logger.info("Email %s logged to DB as 'pending'.", thread_id)
 
     if skip_analysis:
-        await _ingest_to_qdrant(thread_id, email_data, ctx)
-        await ctx.db_manager.update_status(thread_id, "archived")
-        logger.info("Email %s archived (Qdrant only, event=%s).", thread_id, event_type)
-    else:
-        await _upload_attachments_to_lark(email_data)
-        await _ingest_to_qdrant(thread_id, email_data, ctx)
-        try:
-            pipeline_result = await _run_ai_pipeline(thread_id, email_data, ctx, config)
-            if pipeline_result is not None:
-                await _dispatch_notification(thread_id, pipeline_result, ctx, config)
-            await _mark_email_read(thread_id, ctx)
-        except Exception as e:
-            logger.error("Pipeline failed for %s, leaving unread for retry: %s", thread_id, e)
+        await _archive_only(thread_id, email_data, ctx, event_type)
+        return
+
+    await _run_ai_path(thread_id, email_data, ctx, config)
+
+
+async def _archive_only(thread_id: str, email_data: dict, ctx, event_type: str) -> None:
+    """Archive-folder route: ingest into Qdrant only; never touch mark_as_read."""
+    await _ingest_to_qdrant(thread_id, email_data, ctx)
+    await ctx.db_manager.update_status(thread_id, "archived")
+    logger.info("Email %s archived (Qdrant only, event=%s).", thread_id, event_type)
+
+
+async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> None:
+    """
+    Inbox route: upload -> ingest -> AI -> notify, with two-phase mark_as_read.
+
+    Mark-as-read is only fired AFTER user-facing delivery (Lark card or explicit
+    skip) is confirmed. On dispatch failure the email stays unread on Exchange
+    so SelfHealer / human can retry without losing visibility.
+    """
+    await _upload_attachments_to_lark(email_data)
+    await _ingest_to_qdrant(thread_id, email_data, ctx)
+    try:
+        pipeline_result = await _run_ai_pipeline(thread_id, email_data, ctx, config)
+        if pipeline_result is None:
             await ctx.db_manager.update_status(thread_id, "error")
+            return
+
+        dispatch_result = await _dispatch_notification(thread_id, pipeline_result, ctx, config)
+        if dispatch_result.get("delivered"):
+            await _mark_email_read(thread_id, ctx)
+        else:
+            logger.warning(
+                "Skipping mark_as_read for %s: delivery_failed (kind=%s).",
+                thread_id,
+                dispatch_result.get("kind"),
+            )
+    except Exception as e:
+        logger.error("Pipeline failed for %s, leaving unread for retry: %s", thread_id, e)
+        await ctx.db_manager.update_status(thread_id, "error")
 
 
 def _extract_id(raw) -> str | None:
