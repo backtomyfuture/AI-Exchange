@@ -18,6 +18,16 @@ from src.utils.card_builder import LarkCardBuilder, html_to_lark_md
 from src.config import get_settings, resolve_secret
 from src.utils.email_renderer import render_email_html
 from src.utils.pdf_generator import convert_html_to_pdf
+from src.utils.lark_recipient_editor import (
+    build_recipient_field,
+    clear_recipient_edit_temp,
+    extract_external_emails_from_recipients,
+    merge_keep_and_add,
+    merge_unique,
+    normalize_email_list,
+    normalize_uid_list,
+    read_selected_open_ids,
+)
 from src.commands.router import CommandRouter
 from src.commands.handlers import (
     init_commands,
@@ -384,120 +394,6 @@ def handle_card_action(event):
 
         logger.info(f"State fetched for {email_id}. Action: {action_type}")
 
-        def _read_selected_open_ids(action_data) -> List[str]:
-            """Read selected open_ids from person picker callbacks."""
-            selected = []
-
-            options = getattr(action_data, "options", None)
-            if isinstance(options, list):
-                selected.extend([str(uid).strip() for uid in options if str(uid).strip()])
-
-            option = getattr(action_data, "option", None)
-            if option:
-                selected.append(str(option).strip())
-
-            deduped = []
-            seen = set()
-            for uid in selected:
-                if uid and uid not in seen:
-                    deduped.append(uid)
-                    seen.add(uid)
-            return deduped
-
-        def _normalize_uid_list(raw_value) -> List[str]:
-            """Normalize form field values to open_id list."""
-            if raw_value is None:
-                return []
-
-            values = []
-            if isinstance(raw_value, (list, tuple, set)):
-                values = [str(x).strip() for x in raw_value]
-            elif isinstance(raw_value, str):
-                raw = raw_value.strip()
-                if not raw:
-                    values = []
-                elif raw.startswith("[") and raw.endswith("]"):
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, list):
-                            values = [str(x).strip() for x in parsed]
-                    except Exception:
-                        values = [v.strip() for v in raw.split(",")]
-                else:
-                    values = [v.strip() for v in raw.split(",")]
-            else:
-                values = [str(raw_value).strip()]
-
-            deduped = []
-            seen = set()
-            for uid in values:
-                if uid and uid not in seen:
-                    deduped.append(uid)
-                    seen.add(uid)
-            return deduped
-
-        def _merge_unique(values: List[str]) -> List[str]:
-            merged = []
-            seen = set()
-            for v in values:
-                s = str(v).strip()
-                if s and s not in seen:
-                    merged.append(s)
-                    seen.add(s)
-            return merged
-
-        def _normalize_email_list(raw_value) -> List[str]:
-            """Normalize free-text emails (supports comma/semicolon/newline separators)."""
-            if raw_value is None:
-                return []
-
-            if isinstance(raw_value, (list, tuple, set)):
-                raw_text = ",".join([str(x) for x in raw_value if str(x).strip()])
-            else:
-                raw_text = str(raw_value or "")
-
-            # Prefer extracting emails from arbitrary text, including "Name <email@domain>".
-            matches = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", raw_text)
-            if matches:
-                return _merge_unique(matches)
-
-            tokens = re.split(r"[,;；，\s]+", raw_text.strip())
-            email_pattern = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-            valid = [t.strip() for t in tokens if t.strip() and email_pattern.match(t.strip())]
-            return _merge_unique(valid)
-
-        def _extract_external_emails_from_recipients(recipients) -> List[str]:
-            values = recipients or []
-            if isinstance(values, str):
-                values = [values]
-            extracted = []
-            for item in values:
-                text = str(item).strip()
-                if not text or text.startswith("open_id="):
-                    continue
-                m = re.search(r"email_address='(.*?)'", text)
-                if m:
-                    extracted.append(m.group(1).strip())
-                    continue
-                m2 = re.search(r"<([^>]+)>", text)
-                if m2:
-                    extracted.append(m2.group(1).strip())
-                    continue
-                if "@" in text and " " not in text:
-                    extracted.append(text)
-                    continue
-                extracted.extend(_normalize_email_list(text))
-            return _merge_unique(extracted)
-
-        def _clear_recipient_edit_temp(email_payload: Dict[str, Any], field_type: str):
-            for key in (
-                f"draft_{field_type}_options",
-                f"draft_{field_type}_search_hint",
-                f"draft_{field_type}_new_selected",
-                f"draft_{field_type}_external_input",
-            ):
-                email_payload.pop(key, None)
-
         # Prepare Base Response (ACK)
         response = P2CardActionTriggerResponse()
         
@@ -663,7 +559,7 @@ def handle_card_action(event):
         # 选择人员时的回调 - 支持多选并直接更新卡片
         elif action_type == "select_to":
             action_data = event.event.action
-            selected_uids = _read_selected_open_ids(action_data)
+            selected_uids = read_selected_open_ids(action_data)
             logger.info(f"select_to: selected={selected_uids}")
             if not selected_uids:
                 draft = state.values.get("draft", "")
@@ -701,7 +597,7 @@ def handle_card_action(event):
         
         elif action_type == "select_cc":
             action_data = event.event.action
-            selected_uids = _read_selected_open_ids(action_data)
+            selected_uids = read_selected_open_ids(action_data)
             logger.info(f"select_cc: selected={selected_uids}")
             new_cc = [f"open_id={uid}" for uid in selected_uids]
             email_data["draft_cc"] = new_cc
@@ -734,23 +630,16 @@ def handle_card_action(event):
             action_data = event.event.action
             form_values = getattr(action_data, "form_value", None) or {}
             logger.info(f"save_to action data: value={action_data.value}, form_value={form_values}")
-            keep_uids = _normalize_uid_list(form_values.get("to_existing"))
-            add_uids = _normalize_uid_list(form_values.get("to_new"))
+            keep_uids = normalize_uid_list(form_values.get("to_existing"))
+            add_uids = normalize_uid_list(form_values.get("to_new"))
             external_raw = form_values.get("to_external_input", None)
-            external_emails = _normalize_email_list(external_raw)
+            external_emails = normalize_email_list(external_raw)
             if external_raw is None:
-                external_emails = _extract_external_emails_from_recipients(email_data.get("draft_to"))
-            merged_uids = []
-            seen = set()
-            for uid in keep_uids + add_uids:
-                if uid and uid not in seen:
-                    merged_uids.append(uid)
-                    seen.add(uid)
+                external_emails = extract_external_emails_from_recipients(email_data.get("draft_to"))
 
-            new_to = [f"open_id={uid}" for uid in merged_uids]
-            for email in external_emails:
-                if email not in new_to:
-                    new_to.append(email)
+            new_to = build_recipient_field(
+                merge_keep_and_add(keep_uids, add_uids), external_emails
+            )
 
             if not new_to:
                 draft = state.values.get("draft", "")
@@ -761,20 +650,20 @@ def handle_card_action(event):
                 }
 
             email_data["draft_to"] = new_to
-            _clear_recipient_edit_temp(email_data, "to")
+            clear_recipient_edit_temp(email_data, "to")
             if str(email_id).startswith("test_push_"):
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_to" not in mock_email:
                     mock_email["original_to"] = list(mock_email.get("to", []))
                 mock_email["draft_to"] = new_to
-                _clear_recipient_edit_temp(mock_email, "to")
+                clear_recipient_edit_temp(mock_email, "to")
             else:
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
                 if "original_to" not in current_email:
                     current_email["original_to"] = list(current_email.get("to", []))
                 current_email["draft_to"] = new_to
-                _clear_recipient_edit_temp(current_email, "to")
+                clear_recipient_edit_temp(current_email, "to")
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
@@ -828,11 +717,11 @@ def handle_card_action(event):
                         current_email = mock_state.values.get("email", {}).copy()
                         selected_raw = form_values.get(f"{field_type}_new", None)
                         if selected_raw is None:
-                            selected_new = _normalize_uid_list(current_email.get(selected_key))
+                            selected_new = normalize_uid_list(current_email.get(selected_key))
                         else:
-                            selected_new = _normalize_uid_list(selected_raw)
-                        current_options = _normalize_uid_list(current_email.get(options_key))
-                        merged_options = _merge_unique(current_options + matched_uids + selected_new)
+                            selected_new = normalize_uid_list(selected_raw)
+                        current_options = normalize_uid_list(current_email.get(options_key))
+                        merged_options = merge_unique(current_options + matched_uids + selected_new)
                         external_raw = form_values.get(f"{field_type}_external_input", None)
                         if external_raw is None:
                             external_input = str(current_email.get(external_key, "") or "")
@@ -852,11 +741,11 @@ def handle_card_action(event):
                         current_email = latest_state.values.get("email", {}).copy()
                         selected_raw = form_values.get(f"{field_type}_new", None)
                         if selected_raw is None:
-                            selected_new = _normalize_uid_list(current_email.get(selected_key))
+                            selected_new = normalize_uid_list(current_email.get(selected_key))
                         else:
-                            selected_new = _normalize_uid_list(selected_raw)
-                        current_options = _normalize_uid_list(current_email.get(options_key))
-                        merged_options = _merge_unique(current_options + matched_uids + selected_new)
+                            selected_new = normalize_uid_list(selected_raw)
+                        current_options = normalize_uid_list(current_email.get(options_key))
+                        merged_options = merge_unique(current_options + matched_uids + selected_new)
                         external_raw = form_values.get(f"{field_type}_external_input", None)
                         if external_raw is None:
                             external_input = str(current_email.get(external_key, "") or "")
@@ -898,38 +787,31 @@ def handle_card_action(event):
             action_data = event.event.action
             form_values = getattr(action_data, "form_value", None) or {}
             logger.info(f"save_cc action data: value={action_data.value}, form_value={form_values}")
-            keep_uids = _normalize_uid_list(form_values.get("cc_existing"))
-            add_uids = _normalize_uid_list(form_values.get("cc_new"))
+            keep_uids = normalize_uid_list(form_values.get("cc_existing"))
+            add_uids = normalize_uid_list(form_values.get("cc_new"))
             external_raw = form_values.get("cc_external_input", None)
-            external_emails = _normalize_email_list(external_raw)
+            external_emails = normalize_email_list(external_raw)
             if external_raw is None:
-                external_emails = _extract_external_emails_from_recipients(email_data.get("draft_cc"))
-            merged_uids = []
-            seen = set()
-            for uid in keep_uids + add_uids:
-                if uid and uid not in seen:
-                    merged_uids.append(uid)
-                    seen.add(uid)
+                external_emails = extract_external_emails_from_recipients(email_data.get("draft_cc"))
 
-            new_cc = [f"open_id={uid}" for uid in merged_uids]
-            for email in external_emails:
-                if email not in new_cc:
-                    new_cc.append(email)
+            new_cc = build_recipient_field(
+                merge_keep_and_add(keep_uids, add_uids), external_emails
+            )
             email_data["draft_cc"] = new_cc
-            _clear_recipient_edit_temp(email_data, "cc")
+            clear_recipient_edit_temp(email_data, "cc")
             if str(email_id).startswith("test_push_"):
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_cc" not in mock_email:
                     mock_email["original_cc"] = list(mock_email.get("cc", []))
                 mock_email["draft_cc"] = new_cc
-                _clear_recipient_edit_temp(mock_email, "cc")
+                clear_recipient_edit_temp(mock_email, "cc")
             else:
                 config = {"configurable": {"thread_id": email_id}}
                 current_email = state.values.get("email", {}).copy()
                 if "original_cc" not in current_email:
                     current_email["original_cc"] = list(current_email.get("cc", []))
                 current_email["draft_cc"] = new_cc
-                _clear_recipient_edit_temp(current_email, "cc")
+                clear_recipient_edit_temp(current_email, "cc")
                 safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
 
             draft = state.values.get("draft", "")
@@ -1233,116 +1115,24 @@ async def process_save_draft(email_id, state):
     except Exception as e:
         logger.error(f"Error in process_save_draft: {e}", exc_info=True)
 
-async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[str]:
-    """
-    Generate PDF and upload to Lark Drive. Returns dict with url and token if successful.
-    """
-    try:
-        logger.info(f"Starting PDF generation for {email_id}")
-        
-        # 1. Render HTML (CPU bound)
-        loop = asyncio.get_running_loop()
-        html_content = await loop.run_in_executor(None, render_email_html, email_data)
-        
-        if html_content:
-            logger.info(f"HTML Content generated for PDF. Size: {len(html_content)} bytes")
-        else:
-            logger.warning("HTML Content is empty or None.")
+async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[Dict[str, Any]]:
+    """Render email -> PDF -> Lark Drive. Delegates to lark_pdf_flow."""
+    from src.utils.lark_pdf_flow import generate_and_upload_pdf as _impl
+    return await _impl(email_id, email_data, upload_fn=upload_file_to_drive)
 
-        # 2. Convert to PDF (CPU/IO bound)
-        logger.info(f"Calling convert_html_to_pdf with content length: {len(html_content) if html_content else 0}")
-        try:
-             pdf_bytes = await loop.run_in_executor(None, convert_html_to_pdf, html_content)
-        except Exception as pdf_err:
-             logger.error(f"convert_html_to_pdf failed: {pdf_err}", exc_info=True)
-             return None
-        
-        if not pdf_bytes:
-            logger.error("PDF generation returned empty bytes.")
-            return None
-        
-        logger.info(f"PDF Generated. Size: {len(pdf_bytes)} bytes")
-
-        # 3. Upload to Drive (Network bound)
-        filename = f"Email_Export_{email_id}.pdf"
-        logger.info(f"Uploading PDF: {filename}")
-        
-        try:
-            upload_resp = await loop.run_in_executor(None, upload_file_to_drive, filename, pdf_bytes, len(pdf_bytes))
-        except Exception as up_err:
-            logger.error(f"upload_file_to_drive failed: {up_err}", exc_info=True)
-            return None
-        
-        logger.info(f"Upload Response Type: {type(upload_resp)}")
-        if not upload_resp:
-            logger.error("PDF Upload failed (response is empty/None).")
-            return None
-
-        file_url = upload_resp.get("url")
-        file_token = upload_resp.get("file_token")
-        logger.info(f"PDF Uploaded: {file_url} (Token: {file_token})")
-        return {"url": file_url, "file_token": file_token}
-        
-    except Exception as e:
-        logger.error(f"Error in generate_and_upload_pdf: {e}", exc_info=True)
-        return None
 
 async def process_pdf_generation_and_reply(email_id, state, message_id):
-    """
-    Generate PDF and reply with file link. (Deprecated Action Handler)
-    """
-    try:
-        email_data = state.values.get("email", {})
-        result = await generate_and_upload_pdf(email_id, email_data)
-        
-        if not result:
-            return
-
-        file_url = result["url"]
-        file_token = result["file_token"]
-
-        # Store token in state for later cleanup
-        config = {"configurable": {"thread_id": email_id}}
-        safe_async_wait(graph.aupdate_state(config, {"pdf_token": file_token}))
-
-        filename = f"Email_Export_{email_id}.pdf"
-
-        # 4. Reply with Card
-        card_content = {
-            "header": {
-                "template": "blue",
-                "title": {"content": "📄 PDF 原文已生成", "tag": "plain_text"}
-            },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": f"点击下方按钮查看 PDF 文件：\\nFilename: *{filename}*"}
-                },
-                {
-                    "tag": "action",
-                    "actions": [{
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "📂 打开 PDF"},
-                        "type": "primary",
-                        "url": file_url
-                    }]
-                }
-            ]
-        }
-        
-        req_msg = ReplyMessageRequest.builder() \
-            .message_id(message_id) \
-            .request_body(ReplyMessageRequestBody.builder() \
-                .msg_type("interactive") \
-                .content(json.dumps(card_content)) \
-                .build()) \
-            .build()
-        
-        lark_api_client.im.v1.message.reply(req_msg)
-        logger.info("PDF Reply sent successfully.")
-
-    except Exception as e:
-        logger.error(f"Error in PDF generation process: {e}", exc_info=True)
+    """Generate PDF and reply with file link. Delegates to lark_pdf_flow."""
+    from src.utils.lark_pdf_flow import process_pdf_generation_and_reply as _impl
+    await _impl(
+        email_id,
+        state,
+        message_id,
+        graph=graph,
+        lark_api_client=lark_api_client,
+        upload_fn=upload_file_to_drive,
+        safe_async_wait=safe_async_wait,
+    )
 
 
 def start_lark_ws():
