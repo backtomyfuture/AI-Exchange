@@ -13,3 +13,9 @@ triggers:
     operator: regex
     value: 呈阅|请知|请悉|谨呈|敬请知悉|请阅|知悉
   condition_logic: or
+auto_outcome:
+  priority: P3
+  need_reply: false
+  card_type: none
+  priority_level: 2
+  reply_rate: 5.0

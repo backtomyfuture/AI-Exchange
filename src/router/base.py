@@ -7,6 +7,23 @@ class SkillTrigger(BaseModel):
     conditions: Optional[List[Dict[str, Any]]] = None
     condition_logic: str = "and"
 
+class AutoOutcome(BaseModel):
+    """
+    Data-driven outcome for auto-discovered skills.
+
+    When a manifest declares ``auto_outcome``, the loader installs the generic
+    :class:`AutoOutcomeSkill` (no per-skill ``handler.py`` needed) which simply
+    applies these classification fields onto state. Reuses ``manifest.name`` for
+    the reasoning label so each rule remains observable in routing logs.
+    """
+    priority: str = "P3"
+    need_reply: bool = False
+    card_type: str = "none"
+    priority_level: int = 2
+    reply_rate: Optional[float] = None
+    intent: Optional[str] = None
+    action: Optional[str] = None  # e.g. "forward" / "transfer" - propagates downstream
+
 class SkillManifest(BaseModel):
     id: str
     name: str
@@ -15,6 +32,7 @@ class SkillManifest(BaseModel):
     triggers: Optional[SkillTrigger] = None
     execution_mode: str = "modifier" # "modifier", "action", "chain"
     depends_on: Optional[List[str]] = None  # Skill 依赖列表
+    auto_outcome: Optional[AutoOutcome] = None
 
 class BaseSkill:
     """

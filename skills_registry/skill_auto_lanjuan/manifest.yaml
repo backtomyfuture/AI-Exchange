@@ -12,3 +12,9 @@ triggers:
   - type: to_match
     operator: contains
     value: q-fu@tianjin-air.com
+auto_outcome:
+  priority: P1
+  need_reply: true
+  card_type: approval
+  priority_level: 8
+  reply_rate: 75.0
