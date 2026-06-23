@@ -91,6 +91,21 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         original_draft=pipeline_result.get("draft", ""),
     )
 
+    # Tier 2 substrate: write classification/skill labels back into Qdrant
+    # so future similar emails can vote on these skills via semantic retrieval.
+    try:
+        await asyncio.to_thread(
+            ctx.email_processor.update_email_labels,
+            email_id,
+            active_skills,
+            priority,
+            intent,
+            classification.get("need_reply"),
+        )
+    except Exception as e:
+        # Best-effort enrichment; never block notification on label writes.
+        logger.warning("update_email_labels failed for %s: %s", email_id, e)
+
     if classification.get("need_reply"):
         logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
         pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
