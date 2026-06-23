@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from src.graph.state import AgentState
+from src.router.engine import get_routing_engine
 from src.utils.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
@@ -9,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 async def retrieve_context(state: AgentState) -> AgentState:
     """
-    检索节点：线程检索 → 语义检索 → 经验记忆检索 → 线程摘要 → 风格指导，避免阻塞事件循环。
+    检索节点：线程检索 → 语义检索 → Tier 2 标签投票 → 经验记忆 → 线程摘要 → 风格指导，
+    全程使用 ``asyncio.to_thread`` 避免阻塞事件循环。
     """
     email = state.get("email", {})
     subject = email.get("subject", "")
@@ -38,6 +40,14 @@ async def retrieve_context(state: AgentState) -> AgentState:
         for r in semantic_results:
             if r.get("id") not in seen_ids:
                 results.append(r)
+
+    # Priority 2b: Tier 2 semantic routing - vote on past similar emails' labels.
+    tier2_delta: dict = {}
+    try:
+        engine = get_routing_engine()
+        tier2_delta = await engine.apply_tier2_hits(state, results)
+    except Exception as e:
+        logger.debug("Tier 2 routing skipped: %s", e)
 
     # Priority 3: experience memory (Tier 2 enhancement)
     experience_hints = await _retrieve_experience(subject, body, sender)
@@ -68,6 +78,17 @@ async def retrieve_context(state: AgentState) -> AgentState:
     }
     if metadata:
         updates["metadata"] = metadata
+
+    # Merge Tier 2 delta last so it doesn't get clobbered by metadata expansion above.
+    # Reducer-controlled fields (active_skills, routing_log, tool_calls) are already
+    # delta-shaped by apply_tier2_hits.
+    for k, v in tier2_delta.items():
+        if k == "metadata" and isinstance(v, dict):
+            merged = dict(updates.get("metadata") or {})
+            merged.update(v)
+            updates["metadata"] = merged
+        else:
+            updates[k] = v
 
     return updates
 

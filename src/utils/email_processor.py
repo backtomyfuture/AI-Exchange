@@ -293,6 +293,57 @@ class EmailProcessor:
                 return 0
         return 0
 
+    def update_email_labels(
+        self,
+        email_id: str,
+        active_skills: Optional[List[str]] = None,
+        priority: Optional[str] = None,
+        intent: Optional[str] = None,
+        need_reply: Optional[bool] = None,
+    ) -> bool:
+        """
+        Write classification/routing labels back into Qdrant payload for already-ingested emails.
+
+        Used by Tier 2 (semantic routing) to vote on past similar emails' skills.
+        Returns True if at least one point was updated.
+        """
+        if not email_id:
+            return False
+
+        payload_update: Dict[str, Any] = {}
+        if active_skills is not None:
+            payload_update["active_skills"] = list(active_skills)
+        if priority is not None:
+            payload_update["priority"] = priority
+        if intent is not None:
+            payload_update["intent"] = intent
+        if need_reply is not None:
+            payload_update["need_reply"] = bool(need_reply)
+        if not payload_update:
+            return False
+
+        try:
+            point_filter = models.Filter(
+                must=[models.FieldCondition(key="id", match=models.MatchValue(value=email_id))]
+            )
+            self.qdrant_client.set_payload(
+                collection_name=self.collection_name,
+                payload=payload_update,
+                points=point_filter,
+                wait=False,
+            )
+            logger.info("Updated Qdrant labels for %s: %s", email_id, payload_update)
+            return True
+        except UnexpectedResponse as e:
+            logger.error(f"Qdrant set_payload failed (unexpected response) for {email_id}: {e}")
+            return False
+        except ConnectionError as e:
+            logger.error(f"Qdrant connection error during set_payload for {email_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Qdrant set_payload failed for {email_id}: {e}")
+            return False
+
     def process_sent_email(self, original_email_data: dict, reply_content: str, reply_id: str = None) -> bool:
         """
         Create a synthetic email object for the sent reply and index it into Qdrant.

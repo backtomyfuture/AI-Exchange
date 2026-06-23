@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # 创建非 root 用户
 RUN useradd -m -u 1000 appuser

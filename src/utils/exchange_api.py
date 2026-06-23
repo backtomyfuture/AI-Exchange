@@ -49,7 +49,7 @@ class ExchangeClient:
     async def close(self):
         """Close the shared HTTP client."""
         if self._http_client and not self._http_client.is_closed:
-            await self._http_client.close()
+            await self._http_client.aclose()
             self._http_client = None
 
     async def get_all_folders(self, force_refresh: bool = False) -> dict:

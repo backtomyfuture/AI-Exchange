@@ -1,10 +1,15 @@
 import logging
-from typing import List, Dict, Any, Tuple
+from collections import Counter
+from typing import List, Dict, Any, Iterable, Tuple
 from src.graph.state import AgentState
 from src.router.tier1_reflex import Tier1ReflexRouter
 from src.router.manager import get_skill_manager
 
 logger = logging.getLogger(__name__)
+
+# Tier 2 voting thresholds - tuned conservatively to avoid mis-activations.
+TIER2_MIN_HITS = 2          # Skill must appear in at least N similar past emails.
+TIER2_MIN_RATIO = 0.5       # And in at least 50% of the inspected hits.
 
 class RoutingEngine:
     """
@@ -16,48 +21,152 @@ class RoutingEngine:
 
     async def execute_router(self, state: AgentState) -> AgentState:
         """
-        执行路由生命周期
+        执行路由生命周期。
+
+        注意：返回值是「本次新增」的增量（delta），由 LangGraph 的
+        ``operator.add`` reducer 自动与已有 ``routing_log`` / ``active_skills``
+        合并，所以这里**不要**把上游已有的条目再写回，否则会出现双累积。
         """
         email = state.get("email", {})
-        routing_log = state.get("routing_log", []) or []
-        active_skills = state.get("active_skills", []) or []
-        
+        new_log: List[str] = []
+        new_skills: List[str] = []
+        existing_skills = set(state.get("active_skills") or [])
+
         # --- Stage 1: Tier 1 (Reflex Layer) ---
         t1_matches = self.t1_router.route(email)
         if t1_matches:
-            routing_log.append(f"Tier 1 Match: {t1_matches}")
-            active_skills.extend(t1_matches)
-            
+            new_log.append(f"Tier 1 Match: {t1_matches}")
+            for sid in t1_matches:
+                if sid not in existing_skills and sid not in new_skills:
+                    new_skills.append(sid)
+
             # 立即执行匹配的 Skill 逻辑
             state = await self._apply_skills(state, t1_matches)
-            
-            # 如果匹配度极高或标记为 skip_llm，可以提前返回
-            # 这里我们保守一点，继续流转状态
-            state["routing_log"] = routing_log
-            state["active_skills"] = list(set(active_skills))
+            state["routing_log"] = new_log
+            state["active_skills"] = new_skills
             return state
 
         # --- Stage 2: Tier 2 (Semantic Layer) ---
-        # 注意：Tier 2 通常集成在 retriever_node 中，
-        # 因为它需要等待向量数据库的检索结果。
-        routing_log.append("Tier 1 No match, moving to Tier 2/3")
-        
+        # Tier 2 通常集成在 retriever_node 中，因为它需要等待向量数据库的检索结果。
+        new_log.append("Tier 1 No match, moving to Tier 2/3")
+
         # --- Stage 3: Tier 3 (LLM Reasoning Layer) ---
-        # 当 Tier 1/2 没有明确匹配时，调用 LLM 选择合适的 Skill
-        # 优化：仅在有可用 Skill 时才调用 LLM，避免无意义的 LLM 开销
+        # 仅在有可用 Skill 时才调用 LLM，避免无意义的 LLM 开销。
         skills = self.skill_manager.get_all_skills()
         if skills:
             t3_matches = await self._tier3_llm_route(state, skills)
             if t3_matches:
-                routing_log.append(f"Tier 3 LLM Match: {t3_matches}")
-                active_skills.extend(t3_matches)
+                new_log.append(f"Tier 3 LLM Match: {t3_matches}")
+                for sid in t3_matches:
+                    if sid not in existing_skills and sid not in new_skills:
+                        new_skills.append(sid)
                 state = await self._apply_skills(state, t3_matches)
         else:
-            routing_log.append("Tier 3 Skipped: No skills registered")
-        
-        state["routing_log"] = routing_log
-        state["active_skills"] = list(set(active_skills))
+            new_log.append("Tier 3 Skipped: No skills registered")
+
+        state["routing_log"] = new_log
+        state["active_skills"] = new_skills
         return state
+
+    def _tier2_route(
+        self,
+        hits: Iterable[Dict[str, Any]],
+        existing_skills: Iterable[str],
+        skills: Dict[str, Any] | None = None,
+        min_hits: int = TIER2_MIN_HITS,
+        min_ratio: float = TIER2_MIN_RATIO,
+    ) -> List[str]:
+        """
+        Tier 2: 基于历史 RAG hit 的标签做投票激活。
+
+        - 每条 hit 的 ``payload['active_skills']`` 视为一票。
+        - 同一邮件 (chunk 多条) 的同一标签按 ``hit['id']`` 去重，避免重复加权。
+        - 仅在某个 skill 的命中次数 >= ``min_hits`` 且占比 >= ``min_ratio`` 时激活。
+        - 已激活的 skill 不再回投。
+        - 若 ``skills`` 注册表给出，则过滤未知 ID。
+        """
+        existing = set(existing_skills or [])
+        valid_pool = set(skills.keys()) if skills else None
+
+        seen_pairs: set[Tuple[str, str]] = set()
+        skill_counter: Counter = Counter()
+        valid_emails: set[str] = set()
+
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+            email_id = str(hit.get("id") or hit.get("email_id") or "")
+            past_skills = hit.get("active_skills") or []
+            if not past_skills:
+                continue
+            valid_emails.add(email_id or id(hit))
+            for sid in past_skills:
+                if not isinstance(sid, str) or not sid:
+                    continue
+                if sid in existing:
+                    continue
+                if valid_pool is not None and sid not in valid_pool:
+                    continue
+                key = (email_id or str(id(hit)), sid)
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                skill_counter[sid] += 1
+
+        total_emails = max(1, len(valid_emails))
+        chosen: List[str] = []
+        for sid, count in skill_counter.most_common():
+            if count < min_hits:
+                continue
+            if (count / total_emails) < min_ratio:
+                continue
+            chosen.append(sid)
+        if chosen:
+            logger.info(
+                "Tier 2 activated %s from %d labelled hits (counter=%s)",
+                chosen,
+                total_emails,
+                dict(skill_counter),
+            )
+        return chosen
+
+    async def apply_tier2_hits(
+        self,
+        state: AgentState,
+        hits: Iterable[Dict[str, Any]],
+    ) -> AgentState:
+        """
+        Public Tier 2 entry called by retriever_node after Qdrant search.
+
+        Activates voted skills (delta only, reducer-aware) and runs their
+        handlers. Returns the **delta** state ready for LangGraph's reducer.
+        """
+        skills = self.skill_manager.get_all_skills()
+        existing = state.get("active_skills") or []
+        chosen = self._tier2_route(hits, existing, skills)
+        if not chosen:
+            return {}
+        new_state = await self._apply_skills(state, chosen)
+        delta: Dict[str, Any] = {
+            "active_skills": chosen,
+            "routing_log": [f"Tier 2 Match: {chosen}"],
+        }
+        # Forward any non-reducer state mutated by skills (system_prompt_modifier,
+        # priority_level, classification, metadata, tool_calls).
+        for key in (
+            "classification",
+            "metadata",
+            "system_prompt_modifier",
+            "priority_level",
+        ):
+            if key in new_state and new_state.get(key) != state.get(key):
+                delta[key] = new_state[key]
+        # tool_calls is reducer-managed; only forward the new entries.
+        new_tool_calls = new_state.get("tool_calls") or []
+        old_tool_calls = state.get("tool_calls") or []
+        if len(new_tool_calls) > len(old_tool_calls):
+            delta["tool_calls"] = new_tool_calls[len(old_tool_calls):]
+        return delta
 
     async def _tier3_llm_route(self, state: AgentState, skills: Dict[str, Any] = None) -> List[str]:
         """

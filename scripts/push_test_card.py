@@ -42,7 +42,7 @@ async def main():
         return
 
     # Process EML File
-    eml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'test_file', 'nas.eml'))
+    eml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tests', 'fixtures', 'nas.eml'))
     
     if not os.path.exists(eml_path):
         logger.error(f"EML file not found: {eml_path}")

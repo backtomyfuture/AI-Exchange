@@ -33,6 +33,13 @@ class CircuitBreaker:
     def is_open(self) -> bool:
         return self._is_open
 
+    def _push_state_metric(self) -> None:
+        try:
+            from src.observability.metrics import circuit_breaker_state
+            circuit_breaker_state.set(2 if self._is_open else 0)
+        except Exception:
+            pass
+
     def report_failure(self, error: Exception) -> bool:
         now = time.monotonic()
         self._failure_timestamps.append(now)
@@ -49,6 +56,7 @@ class CircuitBreaker:
                 self.window_seconds,
                 error,
             )
+            self._push_state_metric()
             return True
         return False
 
@@ -60,6 +68,7 @@ class CircuitBreaker:
         self.last_error = None
         if was_open:
             logger.info("Circuit Breaker CLOSED (System recovered)")
+            self._push_state_metric()
         return was_open
 
     def can_proceed(self) -> bool:

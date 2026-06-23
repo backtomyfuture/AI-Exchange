@@ -6,7 +6,6 @@ langgraph-checkpoint
 langgraph-checkpoint-postgres
 qdrant-client
 openai
-psycopg2-binary
 psycopg[pool]
 python-dotenv
 
@@ -22,6 +21,7 @@ uvicorn
 WeasyPrint
 PyYAML
 structlog
+prometheus_client
 
 # Testing dependencies
 pytest>=9.0.0

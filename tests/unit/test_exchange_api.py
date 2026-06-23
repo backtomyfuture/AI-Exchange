@@ -99,3 +99,19 @@ def test_sync_api_removed(mock_settings):
     """sync_emails has been removed after webhook migration."""
     client = ExchangeClient(settings=mock_settings)
     assert not hasattr(client, "sync_emails")
+
+
+@pytest.mark.asyncio
+async def test_close_closes_shared_async_client(mock_settings):
+    """Closing the ExchangeClient should close its shared httpx.AsyncClient."""
+    client = ExchangeClient(settings=mock_settings)
+    http_client = client.http_client
+
+    try:
+        await client.close()
+    finally:
+        if not http_client.is_closed:
+            await http_client.aclose()
+
+    assert http_client.is_closed
+    assert client._http_client is None

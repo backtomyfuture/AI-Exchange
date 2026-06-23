@@ -41,25 +41,27 @@ class SkillManager:
                     manifest_data = yaml.safe_load(f)
                     manifest = SkillManifest(**manifest_data)
 
-                # 2. 动态加载 handler.py
+                # 2. 动态加载 handler.py，或在 manifest 声明 auto_outcome 时使用通用 handler。
                 handler_path = os.path.join(skill_dir, "handler.py")
-                if not os.path.exists(handler_path):
-                    logger.warning(f"Skill {skill_id} missing handler.py, skipping.")
+                if os.path.exists(handler_path):
+                    spec = importlib.util.spec_from_file_location(f"skills.{skill_id}.handler", handler_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+
+                    skill_class = getattr(module, "Skill", None)
+                    if not skill_class:
+                        logger.error(f"Skill {skill_id} handler.py must define a 'Skill' class.")
+                        continue
+                    self.skills[skill_id] = skill_class(manifest=manifest)
+                elif manifest.auto_outcome is not None:
+                    # Data-driven skill: no handler.py needed, generic outcome class.
+                    from src.router.auto_skill import AutoOutcomeSkill
+                    self.skills[skill_id] = AutoOutcomeSkill(manifest=manifest)
+                else:
+                    logger.warning(
+                        f"Skill {skill_id} has no handler.py and no auto_outcome; skipping."
+                    )
                     continue
-
-                # 动态导入模块
-                spec = importlib.util.spec_from_file_location(f"skills.{skill_id}.handler", handler_path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-
-                # 查找继承自 BaseSkill 的类或名为 Skill 的类
-                skill_class = getattr(module, "Skill", None)
-                if not skill_class:
-                    logger.error(f"Skill {skill_id} handler.py must define a 'Skill' class.")
-                    continue
-
-                # 实例化并注册
-                self.skills[skill_id] = skill_class(manifest=manifest)
                 logger.info(f"Loaded Skill: {manifest.name} ({skill_id})")
 
             except Exception as e:

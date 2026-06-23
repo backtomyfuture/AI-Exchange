@@ -7,7 +7,7 @@ from src.exchange_service import process_and_archive_email
 
 logger = logging.getLogger("SelfHealing")
 
-STUCK_STATUSES = ("error", "ingested", "analyzed", "pending")
+STUCK_STATUSES = ("error", "delivery_failed", "ingested", "analyzed", "pending")
 STALE_THRESHOLD_SECONDS = 1800  # 30 minutes
 
 
@@ -27,7 +27,7 @@ class SelfHealer:
                     query = """
                         SELECT id, status, subject, updated_at
                         FROM emails_log
-                        WHERE status = 'error'
+                        WHERE status IN ('error', 'delivery_failed')
                            OR (status IN ('ingested', 'analyzed', 'pending')
                                AND updated_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes')
                         ORDER BY updated_at ASC

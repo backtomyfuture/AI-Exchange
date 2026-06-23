@@ -11,7 +11,7 @@ Order matters — it controls match priority. Gateways first.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -394,6 +394,14 @@ def match_provider(
     """Auto-detect provider from model name, API key prefix, or base URL."""
     model_lower = model.lower()
     base_lower = (api_base or "").lower()
+
+    # Pass 0: direct/OAuth model prefixes must win over a global gateway base URL.
+    for spec in PROVIDERS:
+        if not spec.is_oauth:
+            continue
+        for kw in spec.keywords:
+            if kw.lower() in model_lower:
+                return spec
 
     # Pass 1: gateway detection by key prefix or base URL keyword
     for spec in PROVIDERS:

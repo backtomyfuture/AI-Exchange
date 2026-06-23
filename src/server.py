@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
@@ -60,8 +60,12 @@ async def health_check():
             pass
 
         # Queue depth
-        from src.exchange_service import _webhook_queue
+        from src.exchange_service import _webhook_queue, WEBHOOK_QUEUE_MAXSIZE
         queue_depth = _webhook_queue.qsize() if _webhook_queue else 0
+        queue_capacity = (
+            _webhook_queue.maxsize if _webhook_queue and _webhook_queue.maxsize
+            else WEBHOOK_QUEUE_MAXSIZE
+        )
 
         # Circuit breaker
         from src.utils.circuit_breaker import circuit_breaker
@@ -74,6 +78,14 @@ async def health_check():
             "circuit_breaker_open": cb_open,
         }
 
+        circuit_breaker_state = {
+            "open": cb_open,
+            "failure_count": circuit_breaker.failure_count,
+            "failure_threshold": circuit_breaker.failure_threshold,
+            "window_seconds": circuit_breaker.window_seconds,
+            "last_error": circuit_breaker.last_error,
+        }
+
         healthy = db_ok and ctx.graph is not None and not cb_open
 
         return JSONResponse(
@@ -82,6 +94,8 @@ async def health_check():
                 "status": "healthy" if healthy else "degraded",
                 "checks": checks,
                 "queue_depth": queue_depth,
+                "queue_capacity": queue_capacity,
+                "circuit_breaker": circuit_breaker_state,
             }
         )
     except Exception as e:
@@ -90,6 +104,14 @@ async def health_check():
             status_code=503,
             content={"status": "error", "message": str(e)}
         )
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus scrape endpoint."""
+    from src.observability.metrics import render_metrics
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
 
 
 @app.post("/webhooks/exchange")
@@ -148,6 +170,12 @@ async def exchange_webhook(request: Request):
     except Exception as e:
         logger.exception(f"Failed to process Exchange webhook: {e}")
         raise HTTPException(status_code=502, detail="Failed to process webhook event")
+
+    if result.get("reason") == "queue_full":
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "queue_full", **result},
+        )
 
     return {"status": "ok", **result}
 

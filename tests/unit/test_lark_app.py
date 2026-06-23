@@ -98,3 +98,18 @@ def test_update_card_ui(mock_client_cls, mock_lark_deps, mock_env):
     lark_app.update_card_ui("msg_123", {"header": "test"})
     
     mock_instance.im.v1.message.patch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_pdf_generation_handles_failure(mock_env):
+    """Failure in PDF generation must be logged but never re-raise NameError on stale variables."""
+    state = MagicMock()
+    state.values = {"email": {"id": "fake-id", "subject": "x"}}
+
+    # Simulate generate_and_upload_pdf raising an exception inside the function.
+    with patch(
+        "src.utils.lark_app.generate_and_upload_pdf",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        # Should not raise NameError or any other exception (the function swallows and logs).
+        await lark_app.process_pdf_generation_and_reply("fake-id", state, "msg_456")

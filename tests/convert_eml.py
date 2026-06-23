@@ -58,4 +58,4 @@ def convert_eml(eml_path, output_path):
     print(f"Saved PDF to {output_path}")
 
 if __name__ == "__main__":
-    convert_eml("tests/nas.eml", "tests/nas.pdf")
+    convert_eml("tests/fixtures/nas.eml", "tests/fixtures/nas.pdf")
