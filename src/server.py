@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
@@ -104,6 +104,14 @@ async def health_check():
             status_code=503,
             content={"status": "error", "message": str(e)}
         )
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus scrape endpoint."""
+    from src.observability.metrics import render_metrics
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
 
 
 @app.post("/webhooks/exchange")

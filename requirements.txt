@@ -21,6 +21,7 @@ uvicorn
 WeasyPrint
 PyYAML
 structlog
+prometheus_client
 
 # Testing dependencies
 pytest>=9.0.0

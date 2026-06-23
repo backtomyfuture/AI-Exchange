@@ -49,11 +49,40 @@ def with_llm_retry(
                 raise CircuitOpenError(
                     "LLM circuit breaker is OPEN; refusing to call until recovery."
                 )
+
+            node = func.__module__.rsplit(".", 1)[-1]
+
             try:
-                return await _retried_async(*args, **kwargs)
+                from src.observability.metrics import (
+                    llm_call_duration_seconds,
+                    llm_calls_total,
+                )
+            except Exception:
+                llm_call_duration_seconds = None
+                llm_calls_total = None
+
+            import time as _time
+            t0 = _time.monotonic()
+            try:
+                result = await _retried_async(*args, **kwargs)
+                if llm_calls_total is not None:
+                    llm_calls_total.labels(node=node, outcome="success").inc()
+                return result
+            except RateLimitError:
+                if llm_calls_total is not None:
+                    llm_calls_total.labels(node=node, outcome="rate_limited").inc()
+                circuit_breaker.report_failure(RuntimeError("rate_limited"))
+                raise
             except Exception as exc:
+                if llm_calls_total is not None:
+                    llm_calls_total.labels(node=node, outcome="error").inc()
                 circuit_breaker.report_failure(exc)
                 raise
+            finally:
+                if llm_call_duration_seconds is not None:
+                    llm_call_duration_seconds.labels(node=node).observe(
+                        _time.monotonic() - t0
+                    )
 
         @retry(
             wait=wait_random_exponential(multiplier=base_wait, max=max_wait),

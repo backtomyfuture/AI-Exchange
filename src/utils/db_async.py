@@ -185,6 +185,13 @@ class AsyncDatabaseManager:
 
                 async with conn.cursor() as cur:
                     await cur.execute(query, tuple(params))
+
+            if status is not None:
+                try:
+                    from src.observability.metrics import record_email_status
+                    record_email_status(status)
+                except Exception:
+                    pass
         except psycopg.Error as e:
             logger.error(f"Failed to update status for {email_id}: {e}")
 

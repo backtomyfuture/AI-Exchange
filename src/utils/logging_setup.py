@@ -1,4 +1,7 @@
 import logging
+from contextlib import contextmanager
+from typing import Iterator
+
 import structlog
 
 
@@ -33,3 +36,19 @@ def setup_logging(log_level: str = "INFO"):
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+
+@contextmanager
+def log_email_context(email_id: str | None) -> Iterator[None]:
+    """
+    Bind ``email_id`` into the structlog contextvars for the duration of the
+    ``with`` block. Every structlog log record emitted from inside the block
+    (including from background tasks scheduled with ``await``) carries the
+    ``email_id`` field automatically. Idempotent: nested context calls layer
+    correctly because we use ``bound_contextvars`` from structlog.
+    """
+    if not email_id:
+        yield
+        return
+    with structlog.contextvars.bound_contextvars(email_id=email_id):
+        yield

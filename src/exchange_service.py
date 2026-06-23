@@ -148,6 +148,11 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                 email_id, "delivery_failed",
                 error_message="Approval card send returned failure",
             )
+        try:
+            from src.observability.metrics import record_card_dispatch
+            record_card_dispatch("approval", delivered)
+        except Exception:
+            pass
         return {"delivered": delivered, "kind": "approval"}
 
     if priority == "P1" or intent == "通知":
@@ -177,10 +182,20 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                 email_id, "delivery_failed",
                 error_message="Read-only card send returned failure",
             )
+        try:
+            from src.observability.metrics import record_card_dispatch
+            record_card_dispatch("read_only", delivered)
+        except Exception:
+            pass
         return {"delivered": delivered, "kind": "read_only"}
 
     logger.info(f"No reply needed for email: {email_id}")
     await ctx.db_manager.update_status(email_id, "skipped")
+    try:
+        from src.observability.metrics import record_card_dispatch
+        record_card_dispatch("skipped", True)
+    except Exception:
+        pass
     # An intentional skip is a successful "delivery" (user does not need to see it).
     return {"delivered": True, "kind": "skipped"}
 
@@ -207,6 +222,17 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
     """
     thread_id = email_data.get("id", str(time.time()))
     config = {"configurable": {"thread_id": thread_id}}
+
+    from src.utils.logging_setup import log_email_context
+    with log_email_context(thread_id):
+        return await _process_and_archive_email_inner(
+            email_data, ctx, skip_analysis, force_reprocess, thread_id, config
+        )
+
+
+async def _process_and_archive_email_inner(
+    email_data, ctx, skip_analysis, force_reprocess, thread_id, config
+):
     event_type = email_data.get("_event_type", "unknown")
     folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(
@@ -363,6 +389,11 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
 
     try:
         queue.put_nowait((email_data, skip_analysis))
+        try:
+            from src.observability.metrics import webhook_queue_depth
+            webhook_queue_depth.set(queue.qsize())
+        except Exception:
+            pass
     except asyncio.QueueFull:
         logger.error(
             "Webhook queue full (max=%s); rejecting %s id=%s. Sender should retry.",
