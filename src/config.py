@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
     EXCHANGE_FOLDER_SENTITEMS: str = "已发送邮件"
     EXCHANGE_FOLDER_DRAFTS: str = "草稿"
+    # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
+    LEADER_SENDERS: str = "lanjuan@tianjin-air.com,xt_zong@tianjin-air.com"
 
     # Lark
     LARK_APP_ID: str = ""
