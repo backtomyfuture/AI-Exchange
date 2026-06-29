@@ -85,6 +85,9 @@
 - `build_read_only_card()`: `src/utils/card_builder.py`
 - `send_read_only_card()`: `src/utils/lark_app.py`
 
+> [!NOTE]
+> 自 2026-06-29 起，非回复邮件的只读卡片推送由 `src/utils/notification_policy.py::decide_notification_kind` 决定：仅当「我是直接收件人 / 发件人在 `LEADER_SENDERS` / priority∈{P0,P1}」且非垃圾邮件时推送，其余静默归档。详见 `docs/superpowers/specs/2026-06-29-lark-push-filtering-design.md`。
+
 ---
 
 ## 6. 项目优化记录 (2026-02-02)

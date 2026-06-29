@@ -10,10 +10,12 @@ class Skill(BaseSkill):
         - 如果我在 TO 收件人中 → P0 + 需要回复（审批卡片）
         - 如果我不在 TO 中（仅 CC 或知会）→ P1 只读通知，不需要拟稿
         """
+        from src.utils.notification_policy import is_direct_recipient
+
         email = state.get("email", {})
         classification = state.get("classification", {})
 
-        if self._is_direct_recipient(email):
+        if is_direct_recipient(email):
             classification.update({
                 "priority": "P0",
                 "need_reply": True,
@@ -31,20 +33,3 @@ class Skill(BaseSkill):
                 "card_type": "read_only",
             })
             return {"classification": classification, "priority_level": 8}
-
-    @staticmethod
-    def _is_direct_recipient(email: dict) -> bool:
-        """Check if the configured user email is in the TO field."""
-        from src.config import get_settings
-        me = (get_settings().EXCHANGE_ACCOUNT_EMAIL or "").lower()
-        if not me:
-            return True  # fallback: assume direct recipient
-
-        to_list = email.get("to") or []
-        if isinstance(to_list, str):
-            to_list = [to_list]
-
-        for t in to_list:
-            if me in str(t).lower():
-                return True
-        return False
