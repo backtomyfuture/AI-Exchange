@@ -4,6 +4,7 @@ import logging
 import re
 from src.init_app import get_app_context
 from src.utils import lark_app
+from src.utils.notification_policy import decide_notification_kind
 
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
@@ -97,6 +98,8 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
     intent = classification.get("intent", "Unknown")
     routing_log = pipeline_result.get("routing_log", [])
     active_skills = pipeline_result.get("active_skills", [])
+    email_data = pipeline_result.get("email", {})
+    kind = decide_notification_kind(classification, email_data)
 
     await ctx.db_manager.update_status(
         email_id, None,
@@ -120,7 +123,7 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         # Best-effort enrichment; never block notification on label writes.
         logger.warning("update_email_labels failed for %s: %s", email_id, e)
 
-    if classification.get("need_reply"):
+    if kind == "approval":
         logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
         pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
         pdf_url = pdf_result.get("url") if pdf_result else None
@@ -155,8 +158,8 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             pass
         return {"delivered": delivered, "kind": "approval"}
 
-    if priority == "P1" or intent == "通知":
-        logger.info(f"Email is important ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
+    if kind == "read_only":
+        logger.info(f"Email is read-worthy ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
         pdf_result = await lark_app.generate_and_upload_pdf(email_id, pipeline_result.get("email", {}))
         pdf_url = pdf_result.get("url") if pdf_result else None
         pdf_token = pdf_result.get("file_token") if pdf_result else None
