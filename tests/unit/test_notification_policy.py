@@ -59,6 +59,8 @@ def _cls(need_reply=False, intent="通知", priority="P3"):
     (_cls(priority="P3"), {"to": ["me@example.com"], "sender": "x@x.com"}, "read_only"),
     # 仅抄送 + VIP 发件 → 推送
     (_cls(priority="P3"), {"to": ["boss@example.com"], "sender": "vp@corp.com"}, "read_only"),
+    # 仅抄送 + 非 VIP + P0 → 推送
+    (_cls(priority="P0"), {"to": ["boss@example.com"], "sender": "random@corp.com"}, "read_only"),
     # 仅抄送 + 非 VIP + P1 → 推送
     (_cls(priority="P1"), {"to": ["boss@example.com"], "sender": "random@corp.com"}, "read_only"),
     # 仅抄送 + 非 VIP + P2 → 静默
