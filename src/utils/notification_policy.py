@@ -33,3 +33,22 @@ def is_vip_sender(email: dict) -> bool:
         return False
     sender = str(email.get("sender") or "").lower()
     return any(leader in sender for leader in leaders)
+
+
+def decide_notification_kind(classification: dict, email: dict) -> str:
+    """返回 'approval' | 'read_only' | 'skipped'。
+
+    需回复 → approval；否则按「值得阅读」规则决定 read_only / skipped。
+    """
+    if classification.get("need_reply"):
+        return "approval"
+
+    if classification.get("intent") == "垃圾邮件":
+        return "skipped"
+    if is_direct_recipient(email):
+        return "read_only"
+    if is_vip_sender(email):
+        return "read_only"
+    if classification.get("priority") in ("P0", "P1"):
+        return "read_only"
+    return "skipped"
