@@ -1,6 +1,5 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
-import asyncio
 from src.exchange_service import process_and_archive_email
 
 @pytest.fixture

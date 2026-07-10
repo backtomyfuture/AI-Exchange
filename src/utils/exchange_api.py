@@ -4,6 +4,13 @@ import logging
 from typing import List, Dict, Any, Optional
 logger = logging.getLogger("ExchangeClient")
 
+SENTITEMS_FOLDER_ALIASES = {"已发送邮件", "已发送", "sent items", "sentitems", "sent"}
+DRAFTS_FOLDER_ALIASES = {"草稿", "drafts", "draft"}
+
+
+def _normalize_folder_name(name: str | None) -> str:
+    return re.sub(r"[\s_-]+", "", (name or "").strip().casefold())
+
 class ExchangeClient:
     """
     Exchange 接口客户端，封装 HTTP 调用逻辑。
@@ -126,15 +133,27 @@ class ExchangeClient:
                 "folder_class": folder.get("folder_class", ""),
             }
 
-            if folder_name == self._sentitems_name:
+            if self._is_sentitems_folder(folder_name):
                 self.sentitems_folder_id = folder_id
-            elif folder_name == self._drafts_name:
+            elif self._is_drafts_folder(folder_name):
                 self.drafts_folder_id = folder_id
 
         for folder_id, node in self._folder_tree.items():
             parent_id = node["parent_id"]
             if parent_id and parent_id in self._folder_tree:
                 self._folder_tree[parent_id]["children"].append(folder_id)
+
+    def _is_sentitems_folder(self, folder_name: str) -> bool:
+        aliases = {self._sentitems_name, *SENTITEMS_FOLDER_ALIASES}
+        return _normalize_folder_name(folder_name) in {
+            _normalize_folder_name(alias) for alias in aliases
+        }
+
+    def _is_drafts_folder(self, folder_name: str) -> bool:
+        aliases = {self._drafts_name, *DRAFTS_FOLDER_ALIASES}
+        return _normalize_folder_name(folder_name) in {
+            _normalize_folder_name(alias) for alias in aliases
+        }
 
     def compute_folder_policies(
         self,

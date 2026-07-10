@@ -7,7 +7,6 @@
 
 import base64
 import logging
-import random
 from io import BytesIO
 from typing import List, Dict
 

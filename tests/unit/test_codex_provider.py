@@ -3,7 +3,6 @@
 Tests use mocking — actual OAuth + API calls are not made.
 """
 
-import json
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage

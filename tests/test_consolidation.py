@@ -1,7 +1,6 @@
 import asyncio
 import unittest
 from unittest.mock import MagicMock, patch, AsyncMock
-import sys
 
 # Import src.main. Since we are in the same project, we can import it.
 # We might need to ensure src is in path, but usually python -m handles that.

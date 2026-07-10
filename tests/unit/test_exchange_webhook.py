@@ -35,7 +35,7 @@ def test_exchange_webhook_invalid_signature_returns_403():
         mock_settings.return_value = MagicMock(EXCHANGE_WEBHOOK_SECRET="test-secret")
         response = client.post(
             "/webhooks/exchange",
-            data=body,
+            content=body,
             headers={
                 "Content-Type": "application/json",
                 "X-Exchange-Signature": "invalid-signature",
@@ -69,7 +69,7 @@ def test_exchange_webhook_valid_signature_enqueues_event():
 
         response = client.post(
             "/webhooks/exchange",
-            data=body,
+            content=body,
             headers={
                 "Content-Type": "application/json",
                 "X-Exchange-Event": "NewMailEvent",
@@ -106,7 +106,7 @@ def test_exchange_webhook_queue_full_returns_503():
 
         response = client.post(
             "/webhooks/exchange",
-            data=body,
+            content=body,
             headers={
                 "Content-Type": "application/json",
                 "X-Exchange-Event": "NewMailEvent",

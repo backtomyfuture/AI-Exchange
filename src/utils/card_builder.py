@@ -2,12 +2,10 @@
 Lark Card Builder - 飞书卡片构建模块
 从 lark_app.py 拆分，负责卡片 JSON 结构的构建逻辑。
 """
-import os
 import re
 import logging
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
-from urllib.parse import quote
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)

@@ -24,7 +24,6 @@ async def test_drafter_uses_system_prompt_modifier():
     with patch("src.utils.llm_factory.LLMFactory") as mock_factory:
         mock_factory.create_llm.return_value = mock_llm
 
-        original_from_messages = None
         with patch("src.nodes.drafter.ChatPromptTemplate") as mock_prompt_cls:
             mock_chain = MagicMock()
             mock_chain.ainvoke = AsyncMock(return_value=mock_response)
@@ -38,7 +37,7 @@ async def test_drafter_uses_system_prompt_modifier():
             mock_prompt_cls.from_messages.side_effect = capture_from_messages
 
             from src.nodes.drafter import generate_draft
-            result = await generate_draft(state)
+            await generate_draft(state)
 
     # The system message (first tuple) should contain the modifier text
     assert len(captured_messages) >= 1

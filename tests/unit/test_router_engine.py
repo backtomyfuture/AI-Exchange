@@ -9,9 +9,8 @@
 """
 
 import pytest
-from unittest.mock import AsyncMock, Mock, patch, MagicMock
+from unittest.mock import AsyncMock, Mock, patch
 from src.router.engine import RoutingEngine
-from src.graph.state import AgentState
 
 
 @pytest.fixture
@@ -92,7 +91,7 @@ class TestRoutingEngineTier1:
             with patch.object(engine, '_tier3_llm_route', new_callable=AsyncMock) as mock_t3:
                 mock_t3.return_value = ['skill_project_tracker']
                 
-                with patch.object(engine, '_apply_skills', return_value=sample_state) as mock_apply:
+                with patch.object(engine, '_apply_skills', return_value=sample_state):
                     result = await engine.execute_router(sample_state)
                     
                     # 验证进入Tier 3
@@ -100,8 +99,8 @@ class TestRoutingEngineTier1:
                     
                     # 验证routing_log记录流程
                     log = result.get("routing_log", [])
-                    assert any("Tier 1 No match" in str(l) for l in log)
-                    assert any("Tier 3" in str(l) for l in log)
+                    assert any("Tier 1 No match" in str(entry) for entry in log)
+                    assert any("Tier 3" in str(entry) for entry in log)
 
 
 class TestRoutingEngineTier3:

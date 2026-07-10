@@ -1,6 +1,5 @@
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
-import json
 from src.utils import lark_app
 
 @pytest.fixture
@@ -108,7 +107,7 @@ async def test_process_pdf_generation_handles_failure(mock_env):
 
     # Simulate generate_and_upload_pdf raising an exception inside the function.
     with patch(
-        "src.utils.lark_app.generate_and_upload_pdf",
+        "src.utils.lark_pdf_flow.generate_and_upload_pdf",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
         # Should not raise NameError or any other exception (the function swallows and logs).

@@ -7,8 +7,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastapi.testclient import TestClient
-from src.server import app, logger
-from src.init_app import app_context
+from src.server import app
 
 class TestServer(unittest.TestCase):
     def setUp(self):

@@ -46,5 +46,4 @@ async def test_polling_scheduler_flow(mocker):
     assert mock_process.called
     assert mock_process.call_args[0][0]["id"] == "msg1"
     # Ensure skip_analysis was passed as False (we want to re-analyze missed emails)
-    assert mock_process.call_args[1]["skip_analysis"] == False
-
+    assert not mock_process.call_args[1]["skip_analysis"]

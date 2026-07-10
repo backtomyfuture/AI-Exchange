@@ -1,5 +1,4 @@
 import time
-import pytest
 
 
 def _make_fresh_cb():

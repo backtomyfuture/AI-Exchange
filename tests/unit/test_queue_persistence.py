@@ -59,7 +59,11 @@ async def test_successful_email_marked_as_read():
     with patch("src.exchange_service._upload_attachments_to_lark", new_callable=AsyncMock), \
          patch("src.exchange_service._ingest_to_qdrant", new_callable=AsyncMock), \
          patch("src.exchange_service._run_ai_pipeline", new_callable=AsyncMock, return_value=pipeline_result), \
-         patch("src.exchange_service._dispatch_notification", new_callable=AsyncMock), \
+         patch(
+             "src.exchange_service._dispatch_notification",
+             new_callable=AsyncMock,
+             return_value={"delivered": True, "kind": "skipped"},
+         ), \
          patch("src.exchange_service._mark_email_read", new_callable=AsyncMock) as mock_mark:
 
         from src.exchange_service import process_and_archive_email

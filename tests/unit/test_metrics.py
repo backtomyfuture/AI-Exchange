@@ -1,6 +1,5 @@
 """Unit tests for ``src.observability.metrics`` and the ``/metrics`` endpoint."""
 
-import pytest
 from fastapi.testclient import TestClient
 
 from src.observability import metrics as m
@@ -13,9 +12,6 @@ def _scrape() -> str:
 
 
 def test_record_email_status_increments_counter():
-    before = _scrape()
-    before_count = before.count('emails_processed_total{status="ingested"}')
-
     m.record_email_status("ingested")
     m.record_email_status("ingested")
     m.record_email_status("error")

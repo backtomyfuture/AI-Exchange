@@ -19,8 +19,6 @@ async def test_concurrent_processing_limited_by_semaphore():
     max_observed = 0
     lock = asyncio.Lock()
 
-    original_process = es.process_and_archive_email
-
     async def tracked_process(email_data, ctx, skip_analysis=False):
         nonlocal active_count, max_observed
         async with lock:

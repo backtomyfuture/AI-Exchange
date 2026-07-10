@@ -1,7 +1,7 @@
 """OAuth base chat model tests."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 from langchain_core.messages import HumanMessage, AIMessage
 
 from src.providers.oauth_base import OAuthChatModel

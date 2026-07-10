@@ -1,5 +1,5 @@
 from typing import Any, Dict, Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from src.graph.state import AgentState
 
 class SkillTrigger(BaseModel):

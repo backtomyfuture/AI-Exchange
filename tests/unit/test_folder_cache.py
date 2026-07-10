@@ -142,6 +142,20 @@ async def test_sentitems_and_drafts_identified_by_name():
 
 
 @pytest.mark.asyncio
+async def test_system_folders_identified_when_config_uses_english_aliases():
+    client = _make_client()
+    client._sentitems_name = "Sent Items"
+    client._drafts_name = "Drafts"
+    patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)
+
+    with patcher:
+        await client.get_all_folders()
+
+    assert client.sentitems_folder_id == "SENT_ID"
+    assert client.drafts_folder_id == "DRAFTS_ID"
+
+
+@pytest.mark.asyncio
 async def test_compute_folder_policies_recursive_inheritance():
     client = _make_client()
     patcher, _ = _mock_httpx(MOCK_FOLDERS_RESPONSE)

@@ -1,7 +1,6 @@
 """Tests for the data-driven AutoOutcomeSkill (replaces 21 duplicate handlers)."""
 
 import os
-import tempfile
 import textwrap
 
 import pytest

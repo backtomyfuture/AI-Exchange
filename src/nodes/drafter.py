@@ -24,7 +24,6 @@ async def generate_draft(state: AgentState) -> AgentState:
     llm = get_llm_for_role("drafter", temperature=0.7)
 
     feedback = state.get("feedback")
-    prev_draft = state.get("draft")
 
     if feedback:
         logger.info("Applying user feedback as final draft content.")

@@ -1,5 +1,4 @@
 import asyncio
-import os
 from src.init_app import get_app_context
 from src.utils.db_async import AsyncDatabaseManager
 
@@ -16,7 +15,7 @@ async def verify():
     # 2. Async DB
     print("[2] Checking Async Database Manager...")
     if isinstance(ctx.db_manager, AsyncDatabaseManager):
-        print(f"[Check] ctx.db_manager is AsyncDatabaseManager: PASS")
+        print("[Check] ctx.db_manager is AsyncDatabaseManager: PASS")
     else:
         print(f"[Check] ctx.db_manager is {type(ctx.db_manager)}: FAIL")
         return

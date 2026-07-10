@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 @pytest.mark.asyncio
 async def test_self_healer_get_stuck_emails_uses_pool():
     """SelfHealer should use get_connection async context manager."""
-    mock_cursor = AsyncMock()
+    mock_cursor = MagicMock()
     mock_cursor.fetchall = AsyncMock(return_value=[])
     mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
     mock_cursor.__aexit__ = AsyncMock(return_value=False)
 
-    mock_conn = AsyncMock()
+    mock_conn = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
     mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn.__aexit__ = AsyncMock(return_value=False)
@@ -33,7 +33,6 @@ async def test_self_healer_get_stuck_emails_uses_pool():
 async def test_db_get_records_by_date():
     """db_manager.get_records_by_date should query emails for a specific date."""
     from contextlib import asynccontextmanager
-    from unittest.mock import patch
 
     mock_cursor = AsyncMock()
     mock_cursor.fetchall = AsyncMock(return_value=[

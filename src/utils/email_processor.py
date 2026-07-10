@@ -9,7 +9,6 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
 from src.config import get_settings

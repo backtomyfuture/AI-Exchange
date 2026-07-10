@@ -44,7 +44,8 @@ class SkillEvaluator:
             actual = set(final_state.get("active_skills", []))
             
             is_correct = expected == actual
-            if is_correct: correct += 1
+            if is_correct:
+                correct += 1
             
             results.append({
                 "input": email["subject"],

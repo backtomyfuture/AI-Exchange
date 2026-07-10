@@ -1,23 +1,23 @@
-import os
 import json
 import logging
 import asyncio
 import re
 import html
-import io
 import hashlib
 import hmac
 from typing import Dict, Any, List, Optional
 import lark_oapi
-from lark_oapi.api.im.v1 import *
-from lark_oapi.api.contact.v3 import *
+from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
+from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
+from lark_oapi.api.im.v1.model.patch_message_request import PatchMessageRequest
+from lark_oapi.api.im.v1.model.patch_message_request_body import PatchMessageRequestBody
+from lark_oapi.api.im.v1.model.reply_message_request import ReplyMessageRequest
+from lark_oapi.api.im.v1.model.reply_message_request_body import ReplyMessageRequestBody
 from lark_oapi.ws import Client as WsClient
-from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse, CallBackCard, CallBackToast
+from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse, CallBackToast
 
-from src.utils.card_builder import LarkCardBuilder, html_to_lark_md
+from src.utils.card_builder import LarkCardBuilder
 from src.config import get_settings, resolve_secret
-from src.utils.email_renderer import render_email_html
-from src.utils.pdf_generator import convert_html_to_pdf
 from src.utils.lark_recipient_editor import (
     build_recipient_field,
     clear_recipient_edit_temp,
@@ -205,7 +205,8 @@ def _resolve_current_user_email(chat_id: str):
     Dynamically resolve the current user's email based on LARK_CHAT_ID.
     Logic: GetChat -> OwnerID (OpenID) -> GetUser -> Email/Username
     """
-    if not lark_api_client: return
+    if not lark_api_client:
+        return
 
     try:
         # Import models here to avoid circular/early import issues if sdk not ready
@@ -291,7 +292,8 @@ def update_card_ui(message_id, card_content):
     """
     Update the card UI via API (Patch Message).
     """
-    if not lark_api_client: return
+    if not lark_api_client:
+        return
     try:
         # Patch Request
         req = PatchMessageRequest.builder() \
@@ -329,7 +331,7 @@ def handle_card_action(event):
         if isinstance(action_value, str):
             try:
                 data = json.loads(action_value)
-            except:
+            except Exception:
                 return
         else:
             data = action_value
@@ -394,9 +396,6 @@ def handle_card_action(event):
 
         logger.info(f"State fetched for {email_id}. Action: {action_type}")
 
-        # Prepare Base Response (ACK)
-        response = P2CardActionTriggerResponse()
-        
         if action_type == "view_original":
             logger.info("Executing Request: View Original (H5 Strategy)")
             
@@ -1077,23 +1076,28 @@ async def process_save_draft(email_id, state):
             # Extract from legacy format "name='...', email_address='...'" or just return string
             if "email_address='" in str(recipient_str):
                 m = re.search(r"email_address='(.*?)'", str(recipient_str))
-                if m: return m.group(1)
+                if m:
+                    return m.group(1)
             
             return str(recipient_str)
     
         final_to = []
         raw_to = email_data.get("draft_to", [])
-        if isinstance(raw_to, str): raw_to = [raw_to]
+        if isinstance(raw_to, str):
+            raw_to = [raw_to]
         for r in raw_to:
             resolved = resolve_recipient(r)
-            if resolved: final_to.append(resolved)
+            if resolved:
+                final_to.append(resolved)
 
         final_cc = []
         raw_cc = email_data.get("draft_cc", [])
-        if isinstance(raw_cc, str): raw_cc = [raw_cc]
+        if isinstance(raw_cc, str):
+            raw_cc = [raw_cc]
         for r in raw_cc:
             resolved = resolve_recipient(r)
-            if resolved: final_cc.append(resolved)
+            if resolved:
+                final_cc.append(resolved)
 
         subject = "Re: " + email_data.get("subject", "")
         body = draft + "<br><br>--<br>AI Generated Draft"

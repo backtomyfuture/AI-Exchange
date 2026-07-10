@@ -3,13 +3,13 @@ import sys
 import os
 import unittest
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.utils import lark_app
-from src.utils.lark_app import handle_card_action, _mock_store
+from src.utils.lark_app import handle_card_action
 
 class TestViewOriginal(unittest.TestCase):
     def setUp(self):
@@ -62,7 +62,7 @@ class TestViewOriginal(unittest.TestCase):
         mock_event.event.context.open_message_id = "msg_thread_root_123"
         
         # Run handling
-        response = handle_card_action(mock_event)
+        handle_card_action(mock_event)
         
         # Verify NO file upload was called
         self.assertFalse(lark_app.lark_api_client.im.v1.file.create.called)

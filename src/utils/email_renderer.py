@@ -1,6 +1,6 @@
 import html
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime
@@ -19,7 +19,7 @@ def _format_datetime_cn(dt_str: str) -> str:
         if 'T' in raw:
             dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
             return dt.strftime("%Y年%-m月%-d日 %H:%M")
-    except:
+    except Exception:
         pass
     
     # 尝试解析其他格式
@@ -27,7 +27,7 @@ def _format_datetime_cn(dt_str: str) -> str:
         # 格式: 2026-02-04 10:30:00
         dt = datetime.strptime(str(dt_str)[:19], "%Y-%m-%d %H:%M:%S")
         return dt.strftime("%Y年%-m月%-d日 %H:%M")
-    except:
+    except Exception:
         pass
     
     return str(dt_str)

@@ -4,7 +4,6 @@ Verify that with_llm_retry integrates with the global circuit_breaker:
 - Fast-fails with CircuitOpenError when the breaker is already open.
 """
 
-import asyncio
 import pytest
 
 from src.utils import circuit_breaker as cb_module

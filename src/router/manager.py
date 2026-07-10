@@ -2,7 +2,7 @@ import os
 import yaml
 import importlib.util
 import logging
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 from src.router.base import BaseSkill, SkillManifest
 
 logger = logging.getLogger(__name__)

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from typing import List, Dict, Any
 from src.utils.circuit_breaker import circuit_breaker
 from src.exchange_service import process_and_archive_email
@@ -95,7 +94,7 @@ class SelfHealer:
                         from src.utils import lark_app
                         lark_app.send_system_notification(
                             title="✅ 系统服务已恢复 (System Recovered)",
-                            content=f"自愈进程已通过探测邮件验证服务健康度。故障已排除，系统恢复自动处理新邮件。",
+                            content="自愈进程已通过探测邮件验证服务健康度。故障已排除，系统恢复自动处理新邮件。",
                             template="green"
                         )
                 else:
