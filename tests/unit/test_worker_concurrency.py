@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import src.exchange_service as exchange_service
 from src.exchange_service import WORKER_CONCURRENCY, WebhookWorker
 
 
@@ -256,6 +257,90 @@ async def test_stop_timeout_accounts_for_events_not_taken_by_consumers(
         assert worker.shutdown_cancelled_count == 3
     finally:
         processor.release()
+        while not worker.queue.empty():
+            worker.queue.get_nowait()
+            worker.queue.task_done()
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancellation_finishes_cleanup_before_reraising(ctx, processor):
+    processor.block()
+    worker = WebhookWorker(ctx, concurrency=2)
+    await worker.start()
+    tasks = tuple(worker.consumer_tasks)
+    stop_task = None
+    try:
+        for index in range(5):
+            await worker.enqueue_event(_new_mail_payload(f"mail-{index}"))
+        await _wait_until(lambda: processor.await_count == 2)
+
+        stop_task = asyncio.create_task(worker.stop(drain_timeout=60.0))
+        await asyncio.sleep(0)
+        assert stop_task.done() is False
+        with pytest.raises(RuntimeError, match="not accepting"):
+            await worker.enqueue_event(_new_mail_payload("mail-after-stop"))
+
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        assert all(task.done() for task in tasks)
+        assert worker.queue.empty()
+        await asyncio.wait_for(worker.queue.join(), timeout=1.0)
+        assert worker.shutdown_cancelled_count == 3
+
+        await worker.stop(drain_timeout=0.01)
+        assert worker.shutdown_cancelled_count == 3
+    finally:
+        processor.release()
+        if stop_task is not None:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+        while not worker.queue.empty():
+            worker.queue.get_nowait()
+            worker.queue.task_done()
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_module_stop_worker_clears_globals_when_cancelled(
+    ctx,
+    processor,
+    monkeypatch,
+):
+    processor.block()
+    worker = WebhookWorker(ctx, concurrency=2)
+    await worker.start()
+    stop_task = None
+    monkeypatch.setattr(exchange_service, "_worker", worker)
+    monkeypatch.setattr(exchange_service, "_webhook_queue", worker.queue)
+    monkeypatch.setattr(exchange_service, "_worker_ctx", ctx)
+    monkeypatch.setattr(exchange_service, "_worker_semaphore", worker._semaphore)
+    try:
+        for index in range(5):
+            await worker.enqueue_event(_new_mail_payload(f"mail-{index}"))
+        await _wait_until(lambda: processor.await_count == 2)
+
+        stop_task = asyncio.create_task(exchange_service.stop_worker())
+        await asyncio.sleep(0)
+        assert stop_task.done() is False
+
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+        assert exchange_service._worker is None
+        assert exchange_service._webhook_queue is None
+        assert exchange_service._worker_ctx is None
+        assert exchange_service._worker_semaphore is None
+        assert worker.queue.empty()
+        await asyncio.wait_for(worker.queue.join(), timeout=1.0)
+    finally:
+        processor.release()
+        if stop_task is not None:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
         while not worker.queue.empty():
             worker.queue.get_nowait()
             worker.queue.task_done()

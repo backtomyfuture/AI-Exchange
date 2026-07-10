@@ -509,45 +509,63 @@ class WebhookWorker:
             return
 
         tasks = tuple(self._consumer_tasks)
-        timed_out = False
+        drain_completed = False
         try:
             async with asyncio.timeout(drain_timeout):
                 await self._queue.join()
+            drain_completed = True
         except TimeoutError:
-            timed_out = True
             logger.warning(
                 "Timed out draining Exchange webhook queue after %.1f seconds; "
                 "cancelling consumers.",
                 drain_timeout,
             )
         finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._consumer_tasks.clear()
-            if timed_out:
-                cancelled = 0
-                while True:
-                    try:
-                        self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    self._queue.task_done()
-                    cancelled += 1
+            cleanup_task = asyncio.create_task(
+                self._finish_stop(tasks, cancel_queued=not drain_completed),
+                name="exchange-webhook-stop-cleanup",
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
 
-                self._shutdown_cancelled_count += cancelled
-                if cancelled:
-                    logger.warning(
-                        "Webhook shutdown cancelled queued events: shutdown_cancelled=%d",
-                        cancelled,
-                    )
+    async def _finish_stop(
+        self,
+        tasks: tuple[asyncio.Task, ...],
+        *,
+        cancel_queued: bool,
+    ) -> None:
+        """Collect consumers and account for work cancelled by shutdown."""
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._consumer_tasks.clear()
+
+        if cancel_queued:
+            cancelled = 0
+            while True:
                 try:
-                    from src.observability.metrics import webhook_queue_depth
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._queue.task_done()
+                cancelled += 1
 
-                    webhook_queue_depth.set(self._queue.qsize())
-                except Exception:
-                    pass
-            logger.info("Exchange webhook worker stopped.")
+            self._shutdown_cancelled_count += cancelled
+            if cancelled:
+                logger.warning(
+                    "Webhook shutdown cancelled queued events: shutdown_cancelled=%d",
+                    cancelled,
+                )
+            try:
+                from src.observability.metrics import webhook_queue_depth
+
+                webhook_queue_depth.set(self._queue.qsize())
+            except Exception:
+                pass
+        logger.info("Exchange webhook worker stopped.")
 
     async def enqueue_event(self, payload: dict, header_event: str | None = None) -> dict:
         """Route and enqueue a webhook event."""
@@ -611,13 +629,17 @@ async def start_worker(ctx=None):
 async def stop_worker():
     """Stop webhook worker (backward-compatible module-level function)."""
     global _worker, _webhook_queue, _worker_ctx, _worker_semaphore
-    if _worker is None:
+    worker = _worker
+    if worker is None:
         return
-    await _worker.stop()
-    _worker = None
-    _webhook_queue = None
-    _worker_ctx = None
-    _worker_semaphore = None
+    try:
+        await worker.stop()
+    finally:
+        if _worker is worker:
+            _worker = None
+            _webhook_queue = None
+            _worker_ctx = None
+            _worker_semaphore = None
 
 
 async def enqueue_webhook_event(payload: dict, header_event: str | None = None) -> dict:
