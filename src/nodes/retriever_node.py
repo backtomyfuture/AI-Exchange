@@ -1,8 +1,14 @@
 import asyncio
 import logging
 
+from src.config import get_settings
 from src.graph.state import AgentState
 from src.router.engine import get_routing_engine
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    token_budget_from_settings,
+)
 from src.utils.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
@@ -99,7 +105,7 @@ async def _generate_thread_summary(context_results: list[dict], subject: str) ->
         return ""
     try:
         from src.providers.factory import get_llm_for_role
-        llm = get_llm_for_role("summarizer", temperature=0)
+        llm = get_llm_for_role("summary", temperature=0)
 
         thread_text_parts = []
         for i, ctx in enumerate(context_results[:5]):
@@ -113,10 +119,17 @@ async def _generate_thread_summary(context_results: list[dict], subject: str) ->
             "只输出摘要，不要解释。\n\n"
             f"主题: {subject}\n\n" + "\n---\n".join(thread_text_parts)
         )
+        enforce_model_input_budget(
+            "summary",
+            prompt,
+            budget=token_budget_from_settings(get_settings()),
+        )
         response = await llm.ainvoke(prompt)
         summary = response.content.strip()
         logger.info("Thread summary generated (%d chars)", len(summary))
         return summary
+    except ModelInputTooLarge:
+        raise
     except Exception as e:
         logger.debug("Thread summary generation skipped: %s", e)
         return ""

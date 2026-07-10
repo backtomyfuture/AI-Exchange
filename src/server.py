@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
+from src.safety.input_limits import input_limits_from_settings
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
@@ -119,10 +120,10 @@ async def exchange_webhook(request: Request):
     """
     Exchange NewMail Webhook endpoint with HMAC-SHA256 signature verification.
     """
-    signature = request.headers.get("X-Webhook-Signature") or request.headers.get("X-Exchange-Signature")
-    header_event = request.headers.get("X-Exchange-Event")
-    logger.info(f"Received webhook request: method={request.method} headers={dict(request.headers)}")
-
+    settings = get_settings()
+    signature = request.headers.get("X-Webhook-Signature") or request.headers.get(
+        "X-Exchange-Signature"
+    )
     if not signature:
         logger.warning("Missing X-Webhook-Signature in webhook request")
         raise HTTPException(status_code=400, detail="Missing signature")
@@ -131,12 +132,21 @@ async def exchange_webhook(request: Request):
     if signature.startswith("sha256="):
         signature = signature[len("sha256="):]
 
-    settings = get_settings()
     webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
     if not webhook_secret:
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
 
-    body_bytes = await request.body()
+    max_bytes = input_limits_from_settings(settings).webhook_bytes
+    body_parts: list[bytes] = []
+    body_size = 0
+    async for chunk in request.stream():
+        body_size += len(chunk)
+        if body_size > max_bytes:
+            raise HTTPException(status_code=413, detail="Webhook payload too large")
+        body_parts.append(chunk)
+    body_bytes = b"".join(body_parts)
+    header_event = request.headers.get("X-Exchange-Event")
+
     expected_signature = hmac.new(
         webhook_secret.encode("utf-8"),
         body_bytes,
@@ -148,18 +158,20 @@ async def exchange_webhook(request: Request):
 
     try:
         payload = json.loads(body_bytes.decode("utf-8"))
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON payload: {body_bytes.decode('utf-8')} ({e})")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning("Exchange webhook payload is not valid JSON")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
+
+    if not isinstance(payload, dict):
+        logger.warning("Exchange webhook payload root is not an object")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     try:
         result = await enqueue_exchange_webhook(payload, header_event=header_event)
         logger.info(
-            "Exchange webhook routed: event_header=%s event_payload=%s item_id=%s parent_folder_id=%s queued=%s reason=%s route=%s folder=%s",
+            "Exchange webhook routed: event_header=%s event_payload=%s queued=%s reason=%s route=%s folder=%s",
             header_event,
             payload.get("event_type") or payload.get("event"),
-            payload.get("item_id"),
-            payload.get("parent_folder_id"),
             result.get("queued"),
             result.get("reason"),
             result.get("route"),
@@ -168,7 +180,10 @@ async def exchange_webhook(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception(f"Failed to process Exchange webhook: {e}")
+        logger.error(
+            "Failed to process Exchange webhook: error_type=%s",
+            type(e).__name__,
+        )
         raise HTTPException(status_code=502, detail="Failed to process webhook event")
 
     if result.get("reason") == "queue_full":

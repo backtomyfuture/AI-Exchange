@@ -1,7 +1,14 @@
 import json
 import logging
 from langchain_core.prompts import ChatPromptTemplate
+from src.config import get_settings
 from src.graph.state import AgentState
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    rendered_messages_for_budget,
+    token_budget_from_settings,
+)
 from src.utils.retry_decorator import with_llm_retry
 
 logger = logging.getLogger(__name__)
@@ -16,9 +23,6 @@ async def review_draft(state: AgentState) -> AgentState:
 
     if not draft or review_count >= 1:
         return await _run_content_guard(state, draft, email)
-
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("reviewer", temperature=0)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一个邮件质量审核员。请评估以下回复草稿的质量。
@@ -38,6 +42,22 @@ async def review_draft(state: AgentState) -> AgentState:
 {draft}""")
     ])
 
+    payload = {
+        "subject": email.get("subject", ""),
+        "body": email.get("body", "")[:1000],
+        "draft": draft,
+    }
+    rendered_prompt = rendered_messages_for_budget(
+        prompt.format_messages(**payload)
+    )
+    enforce_model_input_budget(
+        "reviewer",
+        rendered_prompt,
+        budget=token_budget_from_settings(get_settings()),
+    )
+
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("reviewer", temperature=0)
     chain = prompt | llm
 
     @with_llm_retry(max_attempts=2)
@@ -45,11 +65,7 @@ async def review_draft(state: AgentState) -> AgentState:
         return await chain.ainvoke(payload)
 
     try:
-        response = await invoke_review({
-            "subject": email.get("subject", ""),
-            "body": email.get("body", "")[:1000],
-            "draft": draft,
-        })
+        response = await invoke_review(payload)
 
         result = json.loads(response.content.strip())
 
@@ -65,6 +81,8 @@ async def review_draft(state: AgentState) -> AgentState:
                 "metadata": metadata,
                 "next_step": "drafter",
             }
+    except ModelInputTooLarge:
+        raise
     except Exception as e:
         logger.warning("Draft review failed, passing through: %s", e)
         return await _run_content_guard(state, draft, email)

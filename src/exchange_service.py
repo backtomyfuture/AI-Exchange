@@ -2,6 +2,7 @@ import asyncio
 import time
 import logging
 import re
+from src.config import get_settings
 from src.domain.email_state import (
     SAFE_DUPLICATE_READ_STATUSES,
     InitialEmailWriteResult,
@@ -9,6 +10,7 @@ from src.domain.email_state import (
 )
 from src.domain.errors import DatabaseOperationError
 from src.init_app import get_app_context
+from src.safety.input_limits import input_limits_from_settings, validate_email_input
 from src.utils import lark_app
 from src.utils.notification_policy import decide_notification_kind
 
@@ -251,6 +253,8 @@ async def process_and_archive_email(
 async def _process_and_archive_email_inner(
     email_data, ctx, skip_analysis, force_reprocess, thread_id, config
 ) -> ProcessingOutcome:
+    validate_email_input(email_data, input_limits_from_settings(get_settings()))
+
     event_type = email_data.get("_event_type", "unknown")
     folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(

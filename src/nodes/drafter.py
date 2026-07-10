@@ -1,6 +1,13 @@
 import logging
 from langchain_core.prompts import ChatPromptTemplate
+from src.config import get_settings
 from src.graph.state import AgentState
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    rendered_messages_for_budget,
+    token_budget_from_settings,
+)
 from src.utils.retry_decorator import with_llm_retry
 
 logger = logging.getLogger(__name__)
@@ -19,9 +26,6 @@ async def generate_draft(state: AgentState) -> AgentState:
         context_str += f"发件人: {ctx.get('sender', '未知')}\n"
         context_str += f"主题: {ctx.get('subject', '无主题')}\n"
         context_str += f"内容: {ctx.get('body', '')[:300]}...\n\n"
-
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("drafter", temperature=0.7)
 
     feedback = state.get("feedback")
 
@@ -88,27 +92,41 @@ async def generate_draft(state: AgentState) -> AgentState:
 {body}
 </email_content>""")
     ])
-    chain = prompt | llm
-    
-    @with_llm_retry(max_attempts=3)
-    async def invoke_with_retry(payload):
-        return await chain.ainvoke(payload)
-
     # Check for Forwarding action - Skip LLM
     classification = state.get("classification", {})
     if classification.get("action") == "forward":
         logger.info("Action is 'forward'. Skipping LLM draft generation. Using existing draft.")
         return state
 
+    payload = {
+        "context": context_str if context_str else "无相关历史背景",
+        "extra_context": extra_context,
+        "sender": email.get("sender", ""),
+        "subject": email.get("subject", ""),
+        "body": email.get("body", ""),
+    }
+    rendered_prompt = rendered_messages_for_budget(
+        prompt.format_messages(**payload)
+    )
+    enforce_model_input_budget(
+        "drafter",
+        rendered_prompt,
+        budget=token_budget_from_settings(get_settings()),
+    )
+
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("drafter", temperature=0.7)
+    chain = prompt | llm
+
+    @with_llm_retry(max_attempts=3)
+    async def invoke_with_retry(payload):
+        return await chain.ainvoke(payload)
+
     try:
         logger.info("Generating draft with LLM and retrieved context.")
-        response = await invoke_with_retry({
-            "context": context_str if context_str else "无相关历史背景",
-            "extra_context": extra_context,
-            "sender": email.get("sender", ""),
-            "subject": email.get("subject", ""),
-            "body": email.get("body", "")
-        })
+        response = await invoke_with_retry(payload)
+    except ModelInputTooLarge:
+        raise
     except Exception as e:
         # 如果达到最大重试次数，返回错误提示
         from langchain_core.messages import AIMessage

@@ -1,9 +1,15 @@
 import logging
 from collections import Counter
 from typing import List, Dict, Any, Iterable, Tuple
+from src.config import get_settings
 from src.graph.state import AgentState
 from src.router.tier1_reflex import Tier1ReflexRouter
 from src.router.manager import get_skill_manager
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    token_budget_from_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +207,11 @@ class RoutingEngine:
 请只输出技能 ID，例如: skill_vip_handling, skill_project_tracker
 如果没有合适的技能，请返回: NONE"""
 
+            enforce_model_input_budget(
+                "router",
+                prompt,
+                budget=token_budget_from_settings(get_settings()),
+            )
             llm = get_llm_for_role("router", temperature=0)
             response = await llm.ainvoke(prompt)
             
@@ -217,6 +228,8 @@ class RoutingEngine:
             logger.info(f"Tier 3 LLM matched skills: {valid_ids}")
             return valid_ids
             
+        except ModelInputTooLarge:
+            raise
         except Exception as e:
             logger.error(f"Tier 3 LLM routing error: {e}")
             return []
@@ -281,5 +294,4 @@ def get_routing_engine() -> RoutingEngine:
     if _routing_engine is None:
         _routing_engine = RoutingEngine()
     return _routing_engine
-
 

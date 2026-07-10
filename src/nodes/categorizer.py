@@ -5,6 +5,13 @@ from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
+from src.config import get_settings
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    rendered_messages_for_budget,
+    token_budget_from_settings,
+)
 from src.utils.retry_decorator import with_llm_retry
 from src.router.engine import get_routing_engine
 
@@ -61,9 +68,6 @@ async def categorize_email(state: AgentState) -> AgentState:
     subject = email.get("subject", "")
     body = email.get("body", "")
 
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("categorizer", temperature=0)
-    
     # Use JsonOutputParser for robust parsing of LLM output
     parser = JsonOutputParser(pydantic_object=EmailClassification)
 
@@ -89,6 +93,25 @@ async def categorize_email(state: AgentState) -> AgentState:
         experience=experience_ctx,
     )
 
+    image_analysis = email.get("image_analysis", "")
+    image_info = (
+        "【注意：该邮件包含图片附件，以下是图片内容的解析结果】:\n"
+        f"{image_analysis}"
+        if image_analysis
+        else ""
+    )
+    payload = {"subject": subject, "body": body, "image_info": image_info}
+    rendered_prompt = rendered_messages_for_budget(
+        prompt.format_messages(**payload)
+    )
+    enforce_model_input_budget(
+        "categorizer",
+        rendered_prompt,
+        budget=token_budget_from_settings(get_settings()),
+    )
+
+    from src.providers.factory import get_llm_for_role
+    llm = get_llm_for_role("categorizer", temperature=0)
     chain = prompt | llm | parser
 
     # 调用 LLM 进行分类
@@ -98,12 +121,11 @@ async def categorize_email(state: AgentState) -> AgentState:
 
     try:
         # Expected result is a dict because parser converts it
-        image_analysis = email.get("image_analysis", "")
-        image_info = f"【注意：该邮件包含图片附件，以下是图片内容的解析结果】:\n{image_analysis}" if image_analysis else ""
-        
-        result = await invoke_with_retry({"subject": subject, "body": body, "image_info": image_info})
+        result = await invoke_with_retry(payload)
         classification_result = EmailClassification(**result)
         logger.info(f"Classification success: {classification_result}")
+    except ModelInputTooLarge:
+        raise
     except Exception as e:
         logger.error(f"Classification failed (Parsing Error or Max Retries): {e}")
         # Fallback default

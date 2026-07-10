@@ -2,6 +2,8 @@ import httpx
 import re
 import logging
 from typing import List, Dict, Any, Optional
+from src.safety.http_response import read_json_limited
+from src.safety.input_limits import input_limits_from_settings
 logger = logging.getLogger("ExchangeClient")
 
 SENTITEMS_FOLDER_ALIASES = {"已发送邮件", "已发送", "sent items", "sentitems", "sent"}
@@ -26,6 +28,7 @@ class ExchangeClient:
         self.api_key = resolve_secret(settings.EXCHANGE_API_KEY)
         self.account_id = settings.EXCHANGE_ACCOUNT_ID
         self.ssl_verify = settings.EXCHANGE_SSL_VERIFY
+        self._input_limits = input_limits_from_settings(settings)
 
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
@@ -248,12 +251,19 @@ class ExchangeClient:
             list_url = f"{self.api_url}/list"
             logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
 
-            response = await client.get(list_url, params=params, timeout=10.0)
-            if response.status_code != 200:
-                logger.error("列表获取失败: %s - %s", response.status_code, response.text)
-                return []
-
-            data = response.json()
+            async with client.stream(
+                "GET",
+                list_url,
+                params=params,
+                timeout=10.0,
+            ) as response:
+                if response.status_code != 200:
+                    logger.error("列表获取失败: status=%s", response.status_code)
+                    return []
+                data = await read_json_limited(
+                    response,
+                    max_bytes=self._input_limits.exchange_response_bytes,
+                )
             # 打印原始数据结构以供调试
             logger.info(
                 "列表接口返回数据状态: %s, 消息: %s",
@@ -261,7 +271,14 @@ class ExchangeClient:
                 data.get("message"),
             )
 
-            items = data.get("data", {}).get("items", [])
+            list_data = data.get("data")
+            if not isinstance(list_data, dict):
+                logger.warning("列表接口 data 字段不是对象")
+                return []
+            items = list_data.get("items", [])
+            if not isinstance(items, list):
+                logger.warning("列表接口 items 字段不是数组")
+                return []
             if not items:
                 logger.info("目前没有未读邮件。")
 
@@ -288,35 +305,43 @@ class ExchangeClient:
 
                 try:
                     logger.info("正在请求详情: %s", detail_url)
-                    detail_resp = await client.get(
+                    async with client.stream(
+                        "GET",
                         detail_url,
                         params={"account_id": self.account_id},
-                        timeout=10.0
-                    )
-                    if detail_resp.status_code == 200:
-                        detail_data = detail_resp.json().get("data", {})
-                        if detail_data:
-                            # 确保包含 ID，以便后续跟踪
-                            if "id" not in detail_data:
-                                detail_data["id"] = email_id
-                            full_emails.append(detail_data)
+                        timeout=10.0,
+                    ) as detail_resp:
+                        if detail_resp.status_code == 200:
+                            detail_payload = await read_json_limited(
+                                detail_resp,
+                                max_bytes=self._input_limits.exchange_response_bytes,
+                            )
+                            detail_data = detail_payload.get("data")
+                            if isinstance(detail_data, dict) and detail_data:
+                                # 确保包含 ID，以便后续跟踪
+                                if "id" not in detail_data:
+                                    detail_data["id"] = email_id
+                                full_emails.append(detail_data)
+                            else:
+                                logger.warning("邮件详情为空 (ID: %s)", email_id)
                         else:
-                            logger.warning("邮件详情为空 (ID: %s)", email_id)
-                    else:
-                        logger.error(
-                            "详情获取失败 (ID: %s): %s - %s",
-                            email_id,
-                            detail_resp.status_code,
-                            detail_resp.text,
-                        )
+                            logger.error(
+                                "详情获取失败 (ID: %s): status=%s",
+                                email_id,
+                                detail_resp.status_code,
+                            )
                 except Exception as detail_err:
-                    logger.error("请求详情异常 (ID: %s): %s", email_id, detail_err)
+                    logger.error(
+                        "请求详情异常 (ID: %s): error_type=%s",
+                        email_id,
+                        type(detail_err).__name__,
+                    )
 
             if full_emails:
                 logger.info("成功获取 %s 封邮件的完整详情", len(full_emails))
             return full_emails
         except Exception as e:
-            logger.error("获取邮件异常: %s", e)
+            logger.error("获取邮件异常: error_type=%s", type(e).__name__)
             return []
 
     async def send_email(self, to: str, subject: str, body: str) -> bool:
@@ -462,7 +487,11 @@ class ExchangeClient:
             logger.error("Failed to delete email %s: %s", email_id, e)
             return False
 
-    async def get_email(self, email_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_email(
+        self,
+        email_id: str,
+        account_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Fetch full details for a specific email by ID.
         """
@@ -473,21 +502,30 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 endpoint,
                 params={"account_id": target_account_id},
-            )
-            if response.status_code == 200:
-                return response.json().get("data", {})
-            else:
+            ) as response:
+                if response.status_code == 200:
+                    payload = await read_json_limited(
+                        response,
+                        max_bytes=self._input_limits.exchange_response_bytes,
+                    )
+                    email_data = payload.get("data")
+                    return email_data if isinstance(email_data, dict) and email_data else None
                 logger.error(
-                    "Failed to get email details for %s: %s",
+                    "Failed to get email details for %s: status=%s",
                     email_id,
                     response.status_code,
                 )
         except Exception as e:
-            logger.error("Exception getting email %s: %s", email_id, e)
-        return {}
+            logger.error(
+                "Exception getting email %s: error_type=%s",
+                email_id,
+                type(e).__name__,
+            )
+        return None
 
     async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
         """

@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
     EXCHANGE_FOLDER_SENTITEMS: str = "已发送邮件"
     EXCHANGE_FOLDER_DRAFTS: str = "草稿"
+    WEBHOOK_MAX_BYTES: PositiveInt = 1_048_576
+    EXCHANGE_RESPONSE_MAX_BYTES: PositiveInt = 67_108_864
+    EMAIL_BODY_MAX_BYTES: PositiveInt = 10_485_760
+    EMAIL_ATTACHMENT_MAX_COUNT: PositiveInt = 20
+    EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: PositiveInt = 26_214_400
+    EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: PositiveInt = 52_428_800
     # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
     LEADER_SENDERS: str = "lanjuan@tianjin-air.com,xt_zong@tianjin-air.com"
 
@@ -53,6 +59,9 @@ class Settings(BaseSettings):
     OPENAI_API_BASE: str = ""
     LLM_MODEL: str = "gemini-3-flash"
     LLM_MAX_RPM: float = 15.0
+    LLM_MAX_INPUT_TOKENS: PositiveInt = 122_880
+    LLM_MAX_OUTPUT_TOKENS: PositiveInt = 8_192
+    LLM_MAX_TOTAL_TOKENS: PositiveInt = 131_072
 
     # Per-role model overrides (leave empty to use LLM_MODEL)
     LLM_CATEGORIZER_MODEL: str = ""
