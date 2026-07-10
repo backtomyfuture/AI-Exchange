@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -79,6 +80,28 @@ def processor():
 @pytest.fixture
 def worker(ctx, processor):
     return WebhookWorker(ctx)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("concurrency", 0),
+        ("concurrency", -1),
+        ("concurrency", "3"),
+        ("concurrency", 1.5),
+        ("concurrency", True),
+        ("concurrency", False),
+        ("queue_maxsize", 0),
+        ("queue_maxsize", -1),
+        ("queue_maxsize", "500"),
+        ("queue_maxsize", 1.5),
+        ("queue_maxsize", True),
+        ("queue_maxsize", False),
+    ],
+)
+def test_worker_rejects_non_positive_or_non_integer_limits(ctx, field, value):
+    with pytest.raises(ValueError, match=field):
+        WebhookWorker(ctx, **{field: value})
 
 
 @pytest.mark.asyncio
@@ -201,6 +224,41 @@ async def test_stop_timeout_cancels_and_collects_consumers(worker, processor):
         await worker.stop(drain_timeout=0.01)
     finally:
         processor.release()
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_timeout_accounts_for_events_not_taken_by_consumers(
+    ctx,
+    processor,
+    caplog,
+):
+    processor.block()
+    worker = WebhookWorker(ctx, concurrency=2)
+    await worker.start()
+    try:
+        for index in range(5):
+            await worker.enqueue_event(_new_mail_payload(f"mail-{index}"))
+
+        await _wait_until(lambda: processor.await_count == 2)
+        assert worker.queue.qsize() == 3
+
+        with caplog.at_level(logging.WARNING, logger="ExchangeService"):
+            await worker.stop(drain_timeout=0.01)
+
+        assert worker.queue.empty()
+        await asyncio.wait_for(worker.queue.join(), timeout=1.0)
+        assert worker.shutdown_cancelled_count == 3
+        assert "shutdown_cancelled=3" in caplog.text
+        assert "sender@example.com" not in caplog.text
+
+        await worker.stop(drain_timeout=0.01)
+        assert worker.shutdown_cancelled_count == 3
+    finally:
+        processor.release()
+        while not worker.queue.empty():
+            worker.queue.get_nowait()
+            worker.queue.task_done()
         await worker.stop()
 
 

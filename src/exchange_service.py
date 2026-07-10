@@ -461,11 +461,19 @@ class WebhookWorker:
         queue_maxsize: int = WEBHOOK_QUEUE_MAXSIZE,
         concurrency: int = WORKER_CONCURRENCY,
     ):
+        for name, value in (
+            ("queue_maxsize", queue_maxsize),
+            ("concurrency", concurrency),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
         self._ctx = ctx
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         self.concurrency = concurrency
         self._consumer_tasks: list[asyncio.Task] = []
         self._accepting = True
+        self._shutdown_cancelled_count = 0
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
     @property
@@ -475,6 +483,11 @@ class WebhookWorker:
     @property
     def consumer_tasks(self) -> tuple[asyncio.Task, ...]:
         return tuple(self._consumer_tasks)
+
+    @property
+    def shutdown_cancelled_count(self) -> int:
+        """Return queued events explicitly cancelled during timed-out shutdowns."""
+        return self._shutdown_cancelled_count
 
     async def start(self):
         """Start the fixed set of background consumers once."""
@@ -496,10 +509,12 @@ class WebhookWorker:
             return
 
         tasks = tuple(self._consumer_tasks)
+        timed_out = False
         try:
             async with asyncio.timeout(drain_timeout):
                 await self._queue.join()
         except TimeoutError:
+            timed_out = True
             logger.warning(
                 "Timed out draining Exchange webhook queue after %.1f seconds; "
                 "cancelling consumers.",
@@ -510,6 +525,28 @@ class WebhookWorker:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._consumer_tasks.clear()
+            if timed_out:
+                cancelled = 0
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    self._queue.task_done()
+                    cancelled += 1
+
+                self._shutdown_cancelled_count += cancelled
+                if cancelled:
+                    logger.warning(
+                        "Webhook shutdown cancelled queued events: shutdown_cancelled=%d",
+                        cancelled,
+                    )
+                try:
+                    from src.observability.metrics import webhook_queue_depth
+
+                    webhook_queue_depth.set(self._queue.qsize())
+                except Exception:
+                    pass
             logger.info("Exchange webhook worker stopped.")
 
     async def enqueue_event(self, payload: dict, header_event: str | None = None) -> dict:
