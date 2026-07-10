@@ -452,67 +452,100 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
 # ---------------------------------------------------------------------------
 
 class WebhookWorker:
-    """Encapsulates webhook worker state: queue, task, context, semaphore."""
+    """Process webhook events with a fixed set of queue consumers."""
 
-    def __init__(self, ctx, queue_maxsize: int = WEBHOOK_QUEUE_MAXSIZE):
+    def __init__(
+        self,
+        ctx,
+        *,
+        queue_maxsize: int = WEBHOOK_QUEUE_MAXSIZE,
+        concurrency: int = WORKER_CONCURRENCY,
+    ):
         self._ctx = ctx
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
-        self._task: asyncio.Task | None = None
-        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+        self.concurrency = concurrency
+        self._consumer_tasks: list[asyncio.Task] = []
+        self._accepting = True
+        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
 
     @property
     def queue(self) -> asyncio.Queue:
         return self._queue
 
-    async def start(self):
-        """Start the background worker loop."""
-        if self._task and not self._task.done():
-            return
-        self._task = asyncio.create_task(self._worker_loop())
+    @property
+    def consumer_tasks(self) -> tuple[asyncio.Task, ...]:
+        return tuple(self._consumer_tasks)
 
-    async def stop(self):
-        """Cancel the worker task and clean up."""
-        if self._task is None:
+    async def start(self):
+        """Start the fixed set of background consumers once."""
+        if self._consumer_tasks or not self._accepting:
             return
-        self._task.cancel()
+        self._consumer_tasks = [
+            asyncio.create_task(
+                self._consume(),
+                name=f"exchange-webhook-consumer-{index}",
+            )
+            for index in range(self.concurrency)
+        ]
+        logger.info("Exchange webhook worker started (concurrency=%d).", self.concurrency)
+
+    async def stop(self, drain_timeout: float = 30.0):
+        """Close intake, drain queued work, then collect all consumers."""
+        self._accepting = False
+        if not self._consumer_tasks:
+            return
+
+        tasks = tuple(self._consumer_tasks)
         try:
-            await self._task
-        except asyncio.CancelledError:
-            logger.info("Exchange webhook worker cancelled.")
-        self._task = None
+            async with asyncio.timeout(drain_timeout):
+                await self._queue.join()
+        except TimeoutError:
+            logger.warning(
+                "Timed out draining Exchange webhook queue after %.1f seconds; "
+                "cancelling consumers.",
+                drain_timeout,
+            )
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._consumer_tasks.clear()
+            logger.info("Exchange webhook worker stopped.")
 
     async def enqueue_event(self, payload: dict, header_event: str | None = None) -> dict:
         """Route and enqueue a webhook event."""
+        if not self._accepting:
+            raise RuntimeError("Exchange webhook worker is not accepting events")
         return await _enqueue_event_impl(self._queue, self._ctx, payload, header_event)
 
-    async def _worker_loop(self):
-        """Background loop: dequeue and process with concurrency control."""
-        logger.info("Exchange webhook worker started (concurrency=%d).", WORKER_CONCURRENCY)
+    async def _consume(self):
+        """Process queue items inline so task completion tracks real work."""
         while True:
             email_data, skip_analysis = await self._queue.get()
-            asyncio.create_task(self._process_one(email_data, skip_analysis))
-            self._queue.task_done()
+            try:
+                await self._process_one(email_data, skip_analysis)
+            finally:
+                self._queue.task_done()
 
     async def _process_one(self, email_data, skip_analysis):
-        """Process a single webhook event with semaphore-based concurrency."""
-        async with self._semaphore:
-            try:
-                if "body" not in email_data:
-                    email_id = email_data.get("id")
-                    logger.info(f"Fetching details for {email_id}...")
-                    full_details = await self._ctx.exchange_client.get_email(email_id)
-                    if full_details:
-                        email_data.update(full_details)
-                    else:
-                        logger.warning(
-                            "Skip webhook event because detail fetch failed (id=%s, event=%s).",
-                            email_id,
-                            email_data.get("_event_type", "unknown"),
-                        )
-                        return
-                await process_and_archive_email(email_data, self._ctx, skip_analysis)
-            except Exception as e:
-                logger.error(f"Worker processing error: {e}")
+        """Process one webhook event inside its fixed consumer."""
+        try:
+            if "body" not in email_data:
+                email_id = email_data.get("id")
+                logger.info(f"Fetching details for {email_id}...")
+                full_details = await self._ctx.exchange_client.get_email(email_id)
+                if full_details:
+                    email_data.update(full_details)
+                else:
+                    logger.warning(
+                        "Skip webhook event because detail fetch failed (id=%s, event=%s).",
+                        email_id,
+                        email_data.get("_event_type", "unknown"),
+                    )
+                    return
+            await process_and_archive_email(email_data, self._ctx, skip_analysis)
+        except Exception as e:
+            logger.error(f"Worker processing error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +561,7 @@ _worker_semaphore: asyncio.Semaphore | None = None
 async def start_worker(ctx=None):
     """Start webhook worker (backward-compatible module-level function)."""
     global _worker, _webhook_queue, _worker_ctx, _worker_semaphore
-    if _worker is not None and _worker._task and not _worker._task.done():
+    if _worker is not None and any(not task.done() for task in _worker.consumer_tasks):
         return
     ctx = ctx or get_app_context()
     _worker = WebhookWorker(ctx)
