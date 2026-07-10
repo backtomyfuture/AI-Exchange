@@ -11,6 +11,9 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from src.domain.email_state import InitialEmailWriteResult
+from src.domain.errors import DatabaseOperationError
+
 logger = logging.getLogger(__name__)
 
 
@@ -117,10 +120,12 @@ class AsyncDatabaseManager:
         except psycopg.Error as e:
             logger.error(f"DB Initialization failed: {e}")
 
-    async def log_initial_email(self, email_data: Dict[str, Any]) -> bool:
+    async def log_initial_email(
+        self, email_data: Dict[str, Any]
+    ) -> InitialEmailWriteResult:
         """
         Record a new email in the database.
-        Returns True if this is a new record, False if it already exists.
+        Return a typed result that distinguishes creation from duplication.
         """
         try:
             async with self.get_connection() as conn:
@@ -135,10 +140,34 @@ class AsyncDatabaseManager:
                     str(email_data.get("sender")),
                     normalize_timestamp_input(email_data.get("received_at"))
                 ))
-                    return cur.rowcount > 0
+                    if cur.rowcount > 0:
+                        return InitialEmailWriteResult.CREATED
+                    return InitialEmailWriteResult.DUPLICATE
         except psycopg.Error as e:
             logger.error(f"Failed to log initial email {email_data.get('id')}: {e}")
-            return False
+            raise DatabaseOperationError(
+                operation="log_initial_email",
+                retryable=isinstance(e, psycopg.OperationalError),
+                message=str(e),
+            ) from e
+
+    async def get_email_status(self, email_id: str) -> str | None:
+        """Return the persisted processing status for an email, if present."""
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT status FROM emails_log WHERE id = %s", (email_id,)
+                    )
+                    row = await cur.fetchone()
+                    return row["status"] if row else None
+        except psycopg.Error as e:
+            logger.error(f"Failed to get status for {email_id}: {e}")
+            raise DatabaseOperationError(
+                operation="get_email_status",
+                retryable=isinstance(e, psycopg.OperationalError),
+                message=str(e),
+            ) from e
 
     async def update_status(self, email_id: str, status: Optional[str], **kwargs):
         """Update the status and optional fields of an email log.
@@ -185,6 +214,12 @@ class AsyncDatabaseManager:
 
                 async with conn.cursor() as cur:
                     await cur.execute(query, tuple(params))
+                    if cur.rowcount != 1:
+                        raise DatabaseOperationError(
+                            operation="update_status",
+                            retryable=False,
+                            message=f"Email {email_id} was not updated",
+                        )
 
             if status is not None:
                 try:
@@ -194,6 +229,36 @@ class AsyncDatabaseManager:
                     pass
         except psycopg.Error as e:
             logger.error(f"Failed to update status for {email_id}: {e}")
+            raise DatabaseOperationError(
+                operation="update_status",
+                retryable=isinstance(e, psycopg.OperationalError),
+                message=str(e),
+            ) from e
+
+    async def compare_and_set_status(
+        self,
+        email_id: str,
+        *,
+        expected: frozenset[str],
+        target: str,
+    ) -> bool:
+        """Atomically transition an email when its current status is expected."""
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE emails_log SET status=%s, updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=%s AND status=ANY(%s)",
+                        (target, email_id, list(expected)),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as e:
+            logger.error(f"Failed to compare and set status for {email_id}: {e}")
+            raise DatabaseOperationError(
+                operation="compare_and_set_status",
+                retryable=isinstance(e, psycopg.OperationalError),
+                message=str(e),
+            ) from e
 
     async def check_email_exists(self, email_id: str) -> bool:
         """Check if an email ID has already been logged/processed."""

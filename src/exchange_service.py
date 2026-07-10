@@ -2,6 +2,11 @@ import asyncio
 import time
 import logging
 import re
+from src.domain.email_state import (
+    SAFE_DUPLICATE_READ_STATUSES,
+    InitialEmailWriteResult,
+    ProcessingOutcome,
+)
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.utils.notification_policy import decide_notification_kind
@@ -215,7 +220,12 @@ async def _mark_email_read(email_id: str, ctx) -> None:
         logger.error(f"Exception marking email {email_id} as read: {e}")
 
 
-async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False, force_reprocess: bool = False):
+async def process_and_archive_email(
+    email_data,
+    ctx,
+    skip_analysis: bool = False,
+    force_reprocess: bool = False,
+) -> ProcessingOutcome:
     """
     Process a single email based on route decision.
 
@@ -235,7 +245,7 @@ async def process_and_archive_email(email_data, ctx, skip_analysis: bool = False
 
 async def _process_and_archive_email_inner(
     email_data, ctx, skip_analysis, force_reprocess, thread_id, config
-):
+) -> ProcessingOutcome:
     event_type = email_data.get("_event_type", "unknown")
     folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(
@@ -255,20 +265,23 @@ async def _process_and_archive_email_inner(
     if "draft_cc" not in email_data:
         email_data["draft_cc"] = email_data.get("cc", [])
 
-    is_new = await ctx.db_manager.log_initial_email(email_data)
-    if not is_new and not force_reprocess:
+    initial_write = await ctx.db_manager.log_initial_email(email_data)
+    if initial_write is InitialEmailWriteResult.DUPLICATE and not force_reprocess:
         logger.info("Email %s already exists in DB.", thread_id)
         if not skip_analysis:
-            await _mark_email_read(thread_id, ctx)
-        return
+            status = await ctx.db_manager.get_email_status(thread_id)
+            if status in SAFE_DUPLICATE_READ_STATUSES:
+                await _mark_email_read(thread_id, ctx)
+        return ProcessingOutcome.DUPLICATE
 
     logger.info("Email %s logged to DB as 'pending'.", thread_id)
 
     if skip_analysis:
         await _archive_only(thread_id, email_data, ctx, event_type)
-        return
+        return ProcessingOutcome.ARCHIVED
 
     await _run_ai_path(thread_id, email_data, ctx, config)
+    return ProcessingOutcome.PROCESSED
 
 
 async def _archive_only(thread_id: str, email_data: dict, ctx, event_type: str) -> None:

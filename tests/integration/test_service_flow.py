@@ -1,5 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
+from src.domain.email_state import InitialEmailWriteResult, ProcessingOutcome
+from src.domain.errors import DatabaseOperationError
 from src.exchange_service import process_and_archive_email
 
 @pytest.fixture
@@ -18,8 +20,8 @@ async def test_process_flow_new_email(mock_context):
     # Setup
     email_data = {"id": "msg_1", "subject": "Test", "body": "Content"}
     
-    # 1. db_manager.log_initial_email returns True (is_new)
-    mock_context.db_manager.log_initial_email.return_value = True
+    # 1. db_manager.log_initial_email returns a typed creation result
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.CREATED
     
     # 2. graph.astream yields events
     # We simulate the graph analyzing and drafting
@@ -44,7 +46,9 @@ async def test_process_flow_new_email(mock_context):
     
     # Mock lark_app.send_approval_card globally
     with patch("src.exchange_service.lark_app.send_approval_card") as mock_lark_send:
-        await process_and_archive_email(email_data, mock_context)
+        result = await process_and_archive_email(email_data, mock_context)
+
+        assert result is ProcessingOutcome.PROCESSED
         
         # Verify steps
         # Ingestion
@@ -66,9 +70,11 @@ async def test_process_flow_new_email(mock_context):
 async def test_process_flow_skip_analysis(mock_context):
     """Test skipping AI analysis."""
     email_data = {"id": "msg_2", "subject": "Archive Me"}
-    mock_context.db_manager.log_initial_email.return_value = True
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.CREATED
     
-    await process_and_archive_email(email_data, mock_context, skip_analysis=True)
+    result = await process_and_archive_email(email_data, mock_context, skip_analysis=True)
+
+    assert result is ProcessingOutcome.ARCHIVED
     
     # Should ingest but skip graph
     mock_context.email_processor.process_email.assert_called()
@@ -80,12 +86,21 @@ async def test_process_flow_skip_analysis(mock_context):
     mock_context.exchange_client.mark_as_read.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_process_flow_duplicate_email(mock_context):
+@pytest.mark.parametrize(
+    "status",
+    ["waiting_approval", "notified_readonly", "skipped", "sent"],
+)
+async def test_process_flow_duplicate_email_with_safe_status_marks_read(
+    mock_context, status
+):
     """Test processing an already logged email."""
     email_data = {"id": "msg_dup"}
-    mock_context.db_manager.log_initial_email.return_value = False
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.DUPLICATE
+    mock_context.db_manager.get_email_status.return_value = status
     
-    await process_and_archive_email(email_data, mock_context)
+    result = await process_and_archive_email(email_data, mock_context)
+
+    assert result is ProcessingOutcome.DUPLICATE
     
     # Should skip almost everything except maybe mark as read? 
     # Logic: if not is_new: log "already exists".
@@ -94,3 +109,46 @@ async def test_process_flow_duplicate_email(mock_context):
     mock_context.email_processor.process_email.assert_not_called()
     mock_context.graph.astream.assert_not_called()
     mock_context.exchange_client.mark_as_read.assert_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, "pending", "delivery_failed", "error"])
+async def test_process_flow_duplicate_email_with_unsafe_status_stays_unread(
+    mock_context, status
+):
+    email_data = {"id": "msg_dup_unsafe"}
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.DUPLICATE
+    mock_context.db_manager.get_email_status.return_value = status
+
+    result = await process_and_archive_email(email_data, mock_context)
+
+    assert result is ProcessingOutcome.DUPLICATE
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_archive_duplicate_never_marks_read_even_with_safe_status(mock_context):
+    email_data = {"id": "msg_archive_dup"}
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.DUPLICATE
+    mock_context.db_manager.get_email_status.return_value = "sent"
+
+    result = await process_and_archive_email(
+        email_data, mock_context, skip_analysis=True
+    )
+
+    assert result is ProcessingOutcome.DUPLICATE
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_database_failure_never_marks_read(mock_context):
+    mock_context.db_manager.log_initial_email.side_effect = DatabaseOperationError(
+        operation="log_initial_email",
+        retryable=True,
+        message="database unavailable",
+    )
+
+    with pytest.raises(DatabaseOperationError):
+        await process_and_archive_email({"id": "mail-3"}, mock_context)
+
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
