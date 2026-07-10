@@ -35,14 +35,13 @@ class AsyncDatabaseManager:
     def __init__(self, settings):
         self._dsn = settings.database_url
         self._pool: Optional[AsyncConnectionPool] = None
-        self._initialized = False
 
     @property
     def dsn(self) -> str:
         return self._dsn
 
     async def open(self):
-        """Open the connection pool and initialize database schema."""
+        """Open the connection pool without mutating database schema."""
         try:
             if self._pool is None:
                 self._pool = AsyncConnectionPool(
@@ -54,10 +53,6 @@ class AsyncDatabaseManager:
                 )
                 await self._pool.open()
                 logger.info("AsyncDatabaseManager connection pool opened (min=2, max=10).")
-
-            if not self._initialized:
-                await self._init_db()
-                self._initialized = True
         except psycopg.OperationalError as e:
             logger.error(f"Failed to open PostgreSQL connection pool: {e}")
             raise
@@ -68,57 +63,6 @@ class AsyncDatabaseManager:
             await self.open()
         async with self._pool.connection() as conn:
             yield conn
-
-    async def _init_db(self):
-        """Initialize the audit log table and key-value store."""
-        try:
-            async with self.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS emails_log (
-                        id TEXT PRIMARY KEY,
-                        subject TEXT,
-                        sender TEXT,
-                        received_at TIMESTAMP,
-                        status TEXT DEFAULT 'pending',
-                        classification JSONB,
-                        draft_content TEXT,
-                        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-
-                    await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS app_kv_store (
-                        key TEXT PRIMARY KEY,
-                        value TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-
-                    await cur.execute(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name='emails_log';"
-                    )
-                    rows = await cur.fetchall()
-                    columns = [row["column_name"] for row in rows]
-                    if "classification" not in columns:
-                        await cur.execute("ALTER TABLE emails_log ADD COLUMN classification JSONB;")
-
-                    await cur.execute("""
-                    DO $$ 
-                    BEGIN 
-                        IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'processed_emails') THEN
-                            DROP TABLE processed_emails;
-                        END IF;
-                    END $$;
-                """)
-
-                    await cur.execute("""
-                    CREATE OR REPLACE VIEW processed_emails AS 
-                    SELECT id, processed_at FROM emails_log;
-                """)
-        except psycopg.Error as e:
-            logger.error(f"DB Initialization failed: {e}")
 
     async def log_initial_email(
         self, email_data: Dict[str, Any]

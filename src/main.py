@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from src.config import get_settings
 from src.utils.logging_setup import setup_logging
 
-from src.db.migrate import run_migrations
+from src.db.schema import require_current_database
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.exchange_service import start_worker as exchange_start_worker
@@ -30,15 +30,13 @@ async def lifespan(app: FastAPI):
     setup_logging(get_settings().LOG_LEVEL)
     logger.info("Starting AI Assistant Unified Service (Web + Worker)...")
 
-    # 0. Apply pending DB migrations (idempotent). Runs before pool/graph init
-    # so AsyncPostgresSaver.setup() will see all checkpoint tables already in
-    # place; CREATE INDEX CONCURRENTLY entries are run with autocommit here to
-    # avoid the transaction-block failure documented in AGENTS.md.
+    # 0. Runtime startup is read-only. Deployment must run the explicit
+    # bootstrap command before the service can become ready.
     settings = get_settings()
     try:
-        await run_migrations(settings.database_url)
+        await require_current_database(settings.database_url)
     except Exception as exc:
-        logger.exception("Database migrations failed at startup: %s", exc)
+        logger.exception("Database revision check failed at startup: %s", exc)
         raise
 
     # 1. Initialize Shared Context

@@ -85,7 +85,6 @@ class AppContext:
         
         if self.graph is None:
             checkpointer = AsyncPostgresSaver(self.pool)
-            await checkpointer.setup() 
             self.graph = build_graph(checkpointer=checkpointer)
             logger.info("Graph initialized with AsyncPostgresSaver.")
 
