@@ -55,10 +55,11 @@ def upgrade() -> None:
             WHERE n.nspname = current_schema()
               AND c.relname = 'processed_emails';
 
-            IF relation_kind IN ('r', 'p') THEN
-                DROP TABLE processed_emails;
-            ELSIF relation_kind = 'm' THEN
-                DROP MATERIALIZED VIEW processed_emails;
+            IF relation_kind IS NOT NULL AND relation_kind <> 'v' THEN
+                RAISE EXCEPTION
+                    'processed_emails exists as relation kind %; back up and migrate it explicitly before retrying because only an ordinary view may be replaced automatically',
+                    relation_kind
+                    USING ERRCODE = 'wrong_object_type';
             END IF;
         END
         $$
