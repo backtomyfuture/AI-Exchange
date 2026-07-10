@@ -13,6 +13,30 @@ def mock_context():
     ctx.exchange_client = AsyncMock()
     return ctx
 
+
+def configure_completed_graph(mock_context, email_data, *, classification, events=()):
+    async def mock_astream(*args, **kwargs):
+        for event in events:
+            yield event
+
+    mock_context.graph.astream = mock_astream
+    mock_state = MagicMock()
+    mock_state.values = {
+        "classification": classification,
+        "draft": "",
+        "context": [],
+        "email": email_data,
+    }
+    mock_context.graph.aget_state.return_value = mock_state
+
+
+def fail_status_write(mock_context, status, error):
+    async def update_status(email_id, next_status, **kwargs):
+        if next_status == status:
+            raise error
+
+    mock_context.db_manager.update_status.side_effect = update_status
+
 @pytest.mark.asyncio
 async def test_process_flow_new_email(mock_context):
     """Test full processing of a new email that requires reply."""
@@ -151,4 +175,96 @@ async def test_database_failure_never_marks_read(mock_context):
     with pytest.raises(DatabaseOperationError):
         await process_and_archive_email({"id": "mail-3"}, mock_context)
 
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ingested_status_write_failure_propagates_and_never_marks_read(
+    mock_context,
+):
+    email_data = {"id": "mail-ingested-db-failure"}
+    classification = {"need_reply": False, "intent": "垃圾邮件"}
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.CREATED
+    configure_completed_graph(
+        mock_context,
+        email_data,
+        classification=classification,
+    )
+    failure = DatabaseOperationError(
+        operation="update_status",
+        retryable=True,
+        message="ingested status write failed",
+    )
+    fail_status_write(mock_context, "ingested", failure)
+
+    outcome = None
+    with pytest.raises(DatabaseOperationError) as caught:
+        outcome = await process_and_archive_email(email_data, mock_context)
+
+    assert caught.value is failure
+    assert outcome is not ProcessingOutcome.PROCESSED
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_analyzed_status_write_failure_propagates_and_never_marks_read(
+    mock_context,
+):
+    email_data = {"id": "mail-analyzed-db-failure"}
+    classification = {"need_reply": False, "intent": "垃圾邮件"}
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.CREATED
+    configure_completed_graph(
+        mock_context,
+        email_data,
+        classification=classification,
+        events=({"categorizer": {"classification": classification}},),
+    )
+    failure = DatabaseOperationError(
+        operation="update_status",
+        retryable=True,
+        message="analyzed status write failed",
+    )
+    fail_status_write(mock_context, "analyzed", failure)
+
+    outcome = None
+    with pytest.raises(DatabaseOperationError) as caught:
+        outcome = await process_and_archive_email(email_data, mock_context)
+
+    assert caught.value is failure
+    assert outcome is not ProcessingOutcome.PROCESSED
+    mock_context.exchange_client.mark_as_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notification_status_write_failure_propagates_and_never_marks_read(
+    mock_context,
+):
+    email_data = {"id": "mail-notification-db-failure"}
+    classification = {"need_reply": True}
+    mock_context.db_manager.log_initial_email.return_value = InitialEmailWriteResult.CREATED
+    configure_completed_graph(
+        mock_context,
+        email_data,
+        classification=classification,
+    )
+    failure = DatabaseOperationError(
+        operation="update_status",
+        retryable=True,
+        message="notification status write failed",
+    )
+    fail_status_write(mock_context, "waiting_approval", failure)
+
+    outcome = None
+    with (
+        patch(
+            "src.exchange_service.lark_app.generate_and_upload_pdf",
+            new=AsyncMock(return_value=None),
+        ),
+        patch("src.exchange_service.lark_app.send_approval_card", return_value=True),
+        pytest.raises(DatabaseOperationError) as caught,
+    ):
+        outcome = await process_and_archive_email(email_data, mock_context)
+
+    assert caught.value is failure
+    assert outcome is not ProcessingOutcome.PROCESSED
     mock_context.exchange_client.mark_as_read.assert_not_awaited()

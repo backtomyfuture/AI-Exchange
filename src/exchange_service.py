@@ -7,6 +7,7 @@ from src.domain.email_state import (
     InitialEmailWriteResult,
     ProcessingOutcome,
 )
+from src.domain.errors import DatabaseOperationError
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.utils.notification_policy import decide_notification_kind
@@ -45,6 +46,8 @@ async def _ingest_to_qdrant(email_id: str, email_data: dict, ctx) -> None:
         await asyncio.to_thread(ctx.email_processor.process_email, email_data)
         logger.info(f"Email {email_id} ingested to Qdrant.")
         await ctx.db_manager.update_status(email_id, "ingested")
+    except DatabaseOperationError:
+        raise
     except Exception as e:
         logger.error(f"Failed to ingest email {email_id}: {e}")
 
@@ -77,6 +80,8 @@ async def _run_ai_pipeline(email_id: str, email_data: dict, ctx, config: dict):
             "routing_log": state.values.get("routing_log", []),
             "active_skills": state.values.get("active_skills", []),
         }
+    except DatabaseOperationError:
+        raise
     except Exception as e:
         logger.exception(f"Error executing graph for {email_id}: {e}")
         return None
@@ -316,6 +321,8 @@ async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> N
                 thread_id,
                 dispatch_result.get("kind"),
             )
+    except DatabaseOperationError:
+        raise
     except Exception as e:
         logger.error("Pipeline failed for %s, leaving unread for retry: %s", thread_id, e)
         await ctx.db_manager.update_status(thread_id, "error")
