@@ -304,6 +304,48 @@ async def test_stop_cancellation_finishes_cleanup_before_reraising(ctx, processo
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_shielded_cleanup_waits_for_cleanup(worker):
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_finish_stop = worker._finish_stop
+    stop_task = None
+
+    async def delayed_finish_stop(tasks, *, cancel_queued):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await original_finish_stop(tasks, cancel_queued=cancel_queued)
+
+    await worker.start()
+    tasks = tuple(worker.consumer_tasks)
+    try:
+        with patch.object(worker, "_finish_stop", side_effect=delayed_finish_stop):
+            stop_task = asyncio.create_task(worker.stop(drain_timeout=1.0))
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+
+            stop_task.cancel()
+            await asyncio.sleep(0)
+            assert stop_task.done() is False
+
+            release_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await stop_task
+
+        assert all(task.done() for task in tasks)
+        assert worker.queue.empty()
+        await asyncio.wait_for(worker.queue.join(), timeout=1.0)
+        assert not any(
+            task.get_name() == "exchange-webhook-stop-cleanup" and not task.done()
+            for task in asyncio.all_tasks()
+        )
+    finally:
+        release_cleanup.set()
+        if stop_task is not None:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_module_stop_worker_clears_globals_when_cancelled(
     ctx,
     processor,

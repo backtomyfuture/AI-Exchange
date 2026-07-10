@@ -486,7 +486,7 @@ class WebhookWorker:
 
     @property
     def shutdown_cancelled_count(self) -> int:
-        """Return queued events explicitly cancelled during timed-out shutdowns."""
+        """Return queued events cancelled after incomplete shutdown drains."""
         return self._shutdown_cancelled_count
 
     async def start(self):
