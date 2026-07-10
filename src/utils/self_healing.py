@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import List, Dict, Any
+from src.safety.input_limits import InputLimitExceeded
 from src.utils.circuit_breaker import circuit_breaker
 from src.exchange_service import process_and_archive_email
 
@@ -55,18 +56,28 @@ class SelfHealer:
             
             email_data['id'] = email_id
             
-            # Step 2: Delete old DB record to reset state machine
-            async with self.ctx.db_manager.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("DELETE FROM emails_log WHERE id = %s", (email_id,))
-            
-            # Step 3: Run full processing pipeline
+            # Step 2: Run full processing pipeline without deleting durable state.
             # This uses the new fixed process_and_archive_email
-            await process_and_archive_email(email_data, self.ctx)
+            await process_and_archive_email(
+                email_data,
+                self.ctx,
+                force_reprocess=True,
+            )
             logger.info(f"Self-healing: ✅ Successfully recovered email {email_id}")
             return True
+        except InputLimitExceeded as exc:
+            logger.error(
+                "Self-healing input rejected: email_id=%s category=%s",
+                email_id,
+                exc.category,
+            )
+            return False
         except Exception as e:
-            logger.error(f"Self-healing: ❌ Failed to recover email {email_id}: {e}")
+            logger.error(
+                "Self-healing recovery failed: email_id=%s error_type=%s",
+                email_id,
+                type(e).__name__,
+            )
             return False
 
     async def run_healing_cycle(self):

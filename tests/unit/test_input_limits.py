@@ -123,6 +123,95 @@ def test_encoded_content_takes_precedence_over_declared_size():
 
 
 @pytest.mark.parametrize(
+    "attachments",
+    [
+        None,
+        {"content": "AAAA"},
+        "AAAA",
+        1,
+    ],
+)
+def test_attachments_container_must_be_a_list_or_tuple(attachments):
+    with pytest.raises(InputLimitExceeded) as caught:
+        validate_email_input(
+            {"body": "ok", "attachments": attachments},
+            InputLimits(),
+        )
+
+    assert caught.value.category == "attachment_format"
+
+
+@pytest.mark.parametrize("attachment", [None, "AAAA", 1, ["AAAA"]])
+def test_each_attachment_must_be_a_mapping(attachment):
+    with pytest.raises(InputLimitExceeded) as caught:
+        validate_email_input(
+            {"body": "ok", "attachments": [attachment]},
+            InputLimits(),
+        )
+
+    assert caught.value.category == "attachment_format"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"AAAA",
+        bytearray(b"AAAA"),
+        memoryview(b"AAAA"),
+        {"encoded": "AAAA"},
+        ["AAAA"],
+        1,
+        True,
+    ],
+)
+def test_attachment_content_must_be_base64_text(content):
+    with pytest.raises(InputLimitExceeded) as caught:
+        validate_email_input(
+            {"body": "ok", "attachments": [{"content": content}]},
+            InputLimits(),
+        )
+
+    assert caught.value.category == "attachment_format"
+
+
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {},
+        {"content": None},
+        {"size": None},
+        {"size": -1},
+        {"size": True},
+        {"size": 1.5},
+        {"size": "4"},
+    ],
+)
+def test_metadata_only_attachment_requires_non_negative_integer_size(attachment):
+    with pytest.raises(InputLimitExceeded) as caught:
+        validate_email_input(
+            {"body": "ok", "attachments": [attachment]},
+            InputLimits(),
+        )
+
+    assert caught.value.category == "attachment_format"
+
+
+def test_valid_encoded_and_metadata_only_attachments_remain_compatible():
+    validate_email_input(
+        {
+            "body": "ok",
+            "attachments": [
+                {"content": "AAAA", "size": 100_000},
+                {"content": ""},
+                {"size": 0},
+                {"size": 4},
+            ],
+        },
+        InputLimits(),
+    )
+
+
+@pytest.mark.parametrize(
     "field_name",
     [
         "WEBHOOK_MAX_BYTES",
@@ -184,6 +273,45 @@ async def test_common_email_boundary_rejects_before_mutation_or_side_effects(
             )
 
     assert caught.value.category == "body_bytes"
+    assert "draft_to" not in email
+    assert "draft_cc" not in email
+    ctx.db_manager.log_initial_email.assert_not_awaited()
+    mock_upload.assert_not_awaited()
+    mock_ingest.assert_not_awaited()
+    mock_graph.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_malicious_attachment_is_rejected_at_common_boundary_without_side_effects():
+    from src.exchange_service import process_and_archive_email
+
+    email = {
+        "id": "malicious-attachment",
+        "sender": "sender@example.com",
+        "body": "ok",
+        "attachments": [{"content": bytearray(b"AAAA")}],
+    }
+    ctx = MagicMock()
+    ctx.db_manager = AsyncMock()
+    ctx.email_processor = MagicMock()
+    ctx.graph = AsyncMock()
+    ctx.exchange_client = AsyncMock()
+
+    with patch(
+        "src.exchange_service._upload_attachments_to_lark",
+        new_callable=AsyncMock,
+    ) as mock_upload, patch(
+        "src.exchange_service._ingest_to_qdrant",
+        new_callable=AsyncMock,
+    ) as mock_ingest, patch(
+        "src.exchange_service._run_ai_pipeline",
+        new_callable=AsyncMock,
+    ) as mock_graph:
+        mock_graph.return_value = None
+        with pytest.raises(InputLimitExceeded) as caught:
+            await process_and_archive_email(email, ctx)
+
+    assert caught.value.category == "attachment_format"
     assert "draft_to" not in email
     assert "draft_cc" not in email
     ctx.db_manager.log_initial_email.assert_not_awaited()

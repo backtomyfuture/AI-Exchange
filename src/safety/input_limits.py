@@ -63,7 +63,9 @@ def input_limits_from_settings(settings: Any) -> InputLimits:
 
 def _attachment_size_upper_bound(attachment: Mapping[str, Any]) -> int:
     encoded = attachment.get("content")
-    if isinstance(encoded, (str, bytes)) and encoded:
+    if encoded is not None:
+        if not isinstance(encoded, str):
+            raise InputLimitExceeded("attachment_format")
         return len(encoded) * 3 // 4
 
     declared_size = attachment.get("size")
@@ -74,7 +76,7 @@ def _attachment_size_upper_bound(attachment: Mapping[str, Any]) -> int:
     ):
         return declared_size
 
-    return 0
+    raise InputLimitExceeded("attachment_format")
 
 
 def validate_email_input(email: Mapping[str, Any], limits: InputLimits) -> None:
@@ -84,15 +86,16 @@ def validate_email_input(email: Mapping[str, Any], limits: InputLimits) -> None:
     if len(body.encode("utf-8")) > limits.body_bytes:
         raise InputLimitExceeded("body_bytes")
 
-    attachments = email.get("attachments") or []
+    attachments = email.get("attachments", [])
+    if not isinstance(attachments, (list, tuple)):
+        raise InputLimitExceeded("attachment_format")
     if len(attachments) > limits.attachment_count:
         raise InputLimitExceeded("attachment_count")
 
-    sizes = [
-        _attachment_size_upper_bound(attachment)
-        for attachment in attachments
-        if isinstance(attachment, Mapping)
-    ]
+    if any(not isinstance(attachment, Mapping) for attachment in attachments):
+        raise InputLimitExceeded("attachment_format")
+
+    sizes = [_attachment_size_upper_bound(attachment) for attachment in attachments]
     if sum(sizes) > limits.attachment_total_bytes:
         raise InputLimitExceeded("attachment_total_bytes")
 

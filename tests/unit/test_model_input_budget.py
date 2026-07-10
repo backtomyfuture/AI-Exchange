@@ -250,7 +250,7 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry():
 
 
 @pytest.mark.asyncio
-async def test_thread_summary_budgets_full_prompt_and_uses_summary_role():
+async def test_thread_summary_budgets_full_prompt_before_model_factory():
     captured: dict = {}
     provider_calls = 0
 
@@ -282,12 +282,34 @@ async def test_thread_summary_budgets_full_prompt_and_uses_summary_role():
         with pytest.raises(ModelInputTooLarge):
             await _generate_thread_summary(contexts, "budget-thread-subject")
 
-    mock_get_llm.assert_called_once_with("summary", temperature=0)
+    mock_get_llm.assert_not_called()
     assert captured["role"] == "summary"
     assert "budget-thread-subject" in captured["value"]
     assert "budget-context-body-one" in captured["value"]
     assert "budget-context-body-two" in captured["value"]
     assert provider_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_thread_summary_uses_summary_role_for_small_prompt():
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(
+        return_value=SimpleNamespace(content="  concise summary  ")
+    )
+    contexts = [
+        {"sender": "one", "subject": "first", "body": "body one"},
+        {"sender": "two", "subject": "second", "body": "body two"},
+    ]
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=llm,
+    ) as mock_get_llm:
+        result = await _generate_thread_summary(contexts, "small subject")
+
+    assert result == "concise summary"
+    mock_get_llm.assert_called_once_with("summary", temperature=0)
+    llm.ainvoke.assert_awaited_once()
 
 
 @pytest.mark.asyncio

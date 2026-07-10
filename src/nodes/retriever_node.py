@@ -105,7 +105,6 @@ async def _generate_thread_summary(context_results: list[dict], subject: str) ->
         return ""
     try:
         from src.providers.factory import get_llm_for_role
-        llm = get_llm_for_role("summary", temperature=0)
 
         thread_text_parts = []
         for i, ctx in enumerate(context_results[:5]):
@@ -124,6 +123,7 @@ async def _generate_thread_summary(context_results: list[dict], subject: str) ->
             prompt,
             budget=token_budget_from_settings(get_settings()),
         )
+        llm = get_llm_for_role("summary", temperature=0)
         response = await llm.ainvoke(prompt)
         summary = response.content.strip()
         logger.info("Thread summary generated (%d chars)", len(summary))
