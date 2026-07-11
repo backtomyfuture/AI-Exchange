@@ -165,8 +165,13 @@ class EncryptedFileContentStore:
         try:
             current_fd = os.open(parts[0], _DIRECTORY_FLAGS)
             for part in parts[1:-1]:
-                next_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=current_fd)
-                os.close(current_fd)
+                next_fd: int | None = None
+                try:
+                    next_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=current_fd)
+                    os.close(current_fd)
+                except Exception:
+                    self._close_fd(next_fd)
+                    raise
                 current_fd = next_fd
             return current_fd, parts[-1]
         except Exception:

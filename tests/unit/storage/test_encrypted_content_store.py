@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import errno
 import hashlib
 import hmac
 import inspect
@@ -216,6 +217,46 @@ async def test_store_creates_multiple_missing_parent_directories(tmp_path, valid
         "attachments": [],
     }
     assert stat.S_IMODE(root.resolve().stat().st_mode) == 0o700
+
+
+def test_root_parent_fd_transfer_closes_both_fds_when_close_fails(
+    tmp_path,
+    valid_key,
+    monkeypatch,
+):
+    from src.storage import EncryptedFileContentStore, encrypted_files
+
+    root = tmp_path / "nested" / "content"
+    store = EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
+    original_open = os.open
+    original_close = os.close
+    opened_fds: list[int] = []
+    close_failed = False
+
+    def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+        fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened_fds.append(fd)
+        return fd
+
+    def fail_first_close(fd):
+        nonlocal close_failed
+        if not close_failed:
+            close_failed = True
+            raise OSError("injected-close-failure")
+        return original_close(fd)
+
+    monkeypatch.setattr(encrypted_files.os, "open", tracked_open)
+    monkeypatch.setattr(encrypted_files.os, "close", fail_first_close)
+
+    with pytest.raises(encrypted_files._UnsafeStoragePathError):
+        store._open_root_parent()
+
+    assert close_failed is True
+    assert len(opened_fds) >= 2
+    for fd in opened_fds:
+        with pytest.raises(OSError) as caught:
+            os.fstat(fd)
+        assert caught.value.errno == errno.EBADF
 
 
 def test_content_store_settings_have_fail_closed_defaults(monkeypatch):
