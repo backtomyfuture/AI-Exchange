@@ -91,3 +91,40 @@ def test_invalid_content_store_config_fails_before_external_clients_and_hides_ke
     connection_pool.assert_not_called()
     assert context.content_store is None
     assert secret_marker not in caplog.text
+
+
+def test_symlink_content_store_root_fails_before_external_clients(
+    tmp_path,
+):
+    from src import init_app
+    from src.storage import ContentStoreConfigurationError
+
+    key = base64.b64encode(bytes(range(32))).decode("ascii")
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    root = tmp_path / "content"
+    root.symlink_to(target, target_is_directory=True)
+    settings = _settings(tmp_path, key=key)
+    context = init_app.AppContext()
+    exchange_patch, processor_patch, db_patch, pool_patch = (
+        _external_component_patches()
+    )
+
+    with (
+        patch.object(init_app, "get_settings", return_value=settings),
+        exchange_patch as exchange_client,
+        processor_patch as email_processor,
+        db_patch as db_manager,
+        pool_patch as connection_pool,
+        pytest.raises(
+            ContentStoreConfigurationError,
+            match="invalid_content_store_root",
+        ),
+    ):
+        context.initialize()
+
+    exchange_client.assert_not_called()
+    email_processor.assert_not_called()
+    db_manager.assert_not_called()
+    connection_pool.assert_not_called()
+    assert context.content_store is None

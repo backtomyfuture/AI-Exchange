@@ -38,7 +38,9 @@ RUN fc-cache -fv
 COPY . .
 
 # 设置目录权限；预建挂载点以便新 named volume 继承 appuser 所有权
-RUN mkdir -p /app/data/content && chown -R appuser:appuser /app
+RUN mkdir -p /app/data/content && \
+    chown -R appuser:appuser /app && \
+    chmod 0700 /app/data/content
 
 # 切换到非 root 用户
 USER appuser

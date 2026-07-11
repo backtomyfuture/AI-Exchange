@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import hmac
 import inspect
@@ -9,6 +10,7 @@ import os
 import stat
 import struct
 import time
+import threading
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -111,6 +113,19 @@ def test_store_rejects_missing_bad_base64_and_wrong_length_keys(root, key):
     assert not root.exists()
 
 
+def test_unicode_key_is_removed_from_public_exception_chain(root):
+    from src.storage import ContentStoreConfigurationError, EncryptedFileContentStore
+
+    marker = "SECRET-密钥-MARKER"
+    with pytest.raises(ContentStoreConfigurationError) as caught:
+        EncryptedFileContentStore(root=root, key=marker, key_version="v1")
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert marker not in repr(error)
+    assert marker not in repr(error.args)
+
+
 def test_store_rejects_unsafe_current_key_version_before_touching_disk(root, valid_key):
     from src.storage import ContentStoreConfigurationError, EncryptedFileContentStore
 
@@ -132,6 +147,21 @@ def test_store_rejects_unsafe_content_roots_before_touching_disk(
             key=valid_key,
             key_version="v1",
         )
+
+
+@pytest.mark.parametrize("root_kind", ["regular_file", "public_directory"])
+def test_store_rejects_existing_non_private_roots(tmp_path, valid_key, root_kind):
+    from src.storage import ContentStoreConfigurationError, EncryptedFileContentStore
+
+    root = tmp_path / "content"
+    if root_kind == "regular_file":
+        root.write_bytes(b"not-a-directory")
+    else:
+        root.mkdir(mode=0o700)
+        root.chmod(0o755)
+
+    with pytest.raises(ContentStoreConfigurationError, match="invalid_content_store_root"):
+        EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
 
 
 def test_content_store_settings_have_fail_closed_defaults(monkeypatch):
@@ -373,15 +403,25 @@ async def test_store_rejects_symlinked_storage_directories(
     valid_key,
     link_level,
 ):
-    from src.storage import ContentStoreWriteError, EncryptedFileContentStore
+    from src.storage import (
+        ContentStoreConfigurationError,
+        ContentStoreWriteError,
+        EncryptedFileContentStore,
+    )
 
     outside = tmp_path / "outside"
     outside.mkdir()
     root = tmp_path / "content"
     if link_level == "root":
         root.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(
+            ContentStoreConfigurationError,
+            match="invalid_content_store_root",
+        ):
+            EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
+        return
     else:
-        root.mkdir()
+        root.mkdir(mode=0o700)
         (root / "8").symlink_to(outside, target_is_directory=True)
 
     store = EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
@@ -390,6 +430,75 @@ async def test_store_rejects_symlinked_storage_directories(
 
     assert not list(outside.rglob("*.enc"))
     assert not list(outside.rglob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_put_account_swap_does_not_follow_symlink_target(
+    store,
+    root,
+    tmp_path,
+    monkeypatch,
+):
+    from src.storage import ContentStoreWriteError, encrypted_files
+
+    root.mkdir(mode=0o700)
+    account_dir = root / "8"
+    account_dir.mkdir(mode=0o700)
+    detached = tmp_path / "detached-account"
+    attacker = tmp_path / "attacker-target"
+    attacker.mkdir(mode=0o700)
+    original_open = os.open
+    swapped = False
+
+    def swap_before_temp_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and os.fspath(path).endswith(".tmp"):
+            account_dir.rename(detached)
+            account_dir.symlink_to(attacker, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(encrypted_files.os, "open", swap_before_temp_open)
+    with pytest.raises(ContentStoreWriteError, match="content_write_failed"):
+        await store.put_email(8, "mail-account-swap", {"body": "secret"})
+
+    assert swapped is True
+    assert not list(attacker.rglob("*.enc"))
+    assert not list(attacker.rglob("*.tmp"))
+    assert not list(detached.rglob("*.enc"))
+    assert not list(detached.rglob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_post_replace_account_swap_removes_completed_final(
+    store,
+    root,
+    tmp_path,
+    monkeypatch,
+):
+    from src.storage import ContentStoreWriteError, encrypted_files
+
+    root.mkdir(mode=0o700)
+    account_dir = root / "8"
+    account_dir.mkdir(mode=0o700)
+    detached = tmp_path / "detached-after-replace"
+    attacker = tmp_path / "attacker-after-replace"
+    attacker.mkdir(mode=0o700)
+    original_replace = os.replace
+
+    def replace_then_swap(source, target, **kwargs):
+        result = original_replace(source, target, **kwargs)
+        account_dir.rename(detached)
+        account_dir.symlink_to(attacker, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(encrypted_files.os, "replace", replace_then_swap)
+    with pytest.raises(ContentStoreWriteError, match="content_write_failed"):
+        await store.put_email(8, "mail-post-replace-swap", {"body": "secret"})
+
+    assert not list(detached.rglob("*.enc"))
+    assert not list(detached.rglob("*.tmp"))
+    assert not list(attacker.rglob("*.enc"))
 
 
 @pytest.mark.asyncio
@@ -437,9 +546,61 @@ async def test_reference_identity_is_authenticated_as_aad(store, root):
     source = root / "8" / f"{ref.object_id}.enc"
     target = root / "8" / f"{alternate_object_id}.enc"
     target.write_bytes(source.read_bytes())
+    target.chmod(0o600)
 
     with pytest.raises(ContentStoreIntegrityError, match="content_authentication_failed"):
         await store.load_email(alternate_ref)
+
+
+@pytest.mark.asyncio
+async def test_load_and_delete_reject_symlinked_account_without_touching_outside(
+    store,
+    root,
+    tmp_path,
+):
+    from src.storage import ContentStoreFormatError, ContentStoreWriteError
+
+    ref = await store.put_email(8, "mail-account-symlink", {"body": "secret"})
+    account_dir = root / "8"
+    outside = tmp_path / "outside-account"
+    account_dir.rename(outside)
+    account_dir.symlink_to(outside, target_is_directory=True)
+    outside_file = outside / f"{ref.object_id}.enc"
+
+    with pytest.raises(ContentStoreFormatError, match="content_read_failed"):
+        await store.load_email(ref)
+    with pytest.raises(ContentStoreWriteError, match="content_delete_failed"):
+        await store.delete(ref)
+    assert outside_file.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_level", ["root", "final"])
+async def test_load_and_delete_do_not_follow_root_or_final_symlinks(
+    store,
+    root,
+    tmp_path,
+    link_level,
+):
+    from src.storage import ContentStoreFormatError, ContentStoreWriteError
+
+    ref = await store.put_email(8, f"mail-{link_level}-symlink", {"body": "secret"})
+    final_path = root / "8" / f"{ref.object_id}.enc"
+    if link_level == "root":
+        outside_root = tmp_path / "outside-root"
+        root.rename(outside_root)
+        root.symlink_to(outside_root, target_is_directory=True)
+        outside_file = outside_root / "8" / f"{ref.object_id}.enc"
+    else:
+        outside_file = tmp_path / "outside-final.enc"
+        final_path.rename(outside_file)
+        final_path.symlink_to(outside_file)
+
+    with pytest.raises(ContentStoreFormatError, match="content_read_failed"):
+        await store.load_email(ref)
+    with pytest.raises(ContentStoreWriteError, match="content_delete_failed"):
+        await store.delete(ref)
+    assert outside_file.exists()
 
 
 @pytest.mark.asyncio
@@ -502,6 +663,9 @@ async def test_atomic_write_uses_exclusive_sibling_temp_fsync_and_replace(
     fsynced_kinds = []
     replacements = []
 
+    root.mkdir(mode=0o700)
+    (root / "8").mkdir(mode=0o700)
+
     def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
         opened.append((os.fspath(path), flags, mode))
         return original_open(path, flags, mode, dir_fd=dir_fd)
@@ -511,13 +675,20 @@ async def test_atomic_write_uses_exclusive_sibling_temp_fsync_and_replace(
         fsynced_kinds.append("dir" if stat.S_ISDIR(mode) else "file")
         return original_fsync(fd)
 
-    def tracked_replace(source, target):
+    def tracked_replace(source, target, *, src_dir_fd=None, dst_dir_fd=None):
         source_path = os.fspath(source)
         target_path = os.fspath(target)
-        replacements.append((source_path, target_path))
-        assert os.path.dirname(source_path) == os.path.dirname(target_path)
-        assert stat.S_IMODE(os.stat(source_path).st_mode) == 0o600
-        return original_replace(source, target)
+        replacements.append((source_path, target_path, src_dir_fd, dst_dir_fd))
+        assert src_dir_fd == dst_dir_fd
+        assert stat.S_IMODE(
+            os.stat(source_path, dir_fd=src_dir_fd, follow_symlinks=False).st_mode
+        ) == 0o600
+        return original_replace(
+            source,
+            target,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
 
     monkeypatch.setattr(encrypted_files.os, "open", tracked_open)
     monkeypatch.setattr(encrypted_files.os, "fsync", tracked_fsync)
@@ -532,7 +703,8 @@ async def test_atomic_write_uses_exclusive_sibling_temp_fsync_and_replace(
     assert temp_opens[0][2] == 0o600
     assert fsynced_kinds == ["file", "dir"]
     assert len(replacements) == 1
-    assert replacements[0][1] == os.fspath(root / "8" / f"{ref.object_id}.enc")
+    assert replacements[0][1] == f"{ref.object_id}.enc"
+    assert replacements[0][2] is not None
     assert not list(root.rglob("*.tmp"))
 
 
@@ -646,6 +818,9 @@ async def test_parent_fsync_failure_leaves_only_a_complete_authenticated_final(
     original_fsync = os.fsync
     calls = 0
 
+    root.mkdir(mode=0o700)
+    (root / "8").mkdir(mode=0o700)
+
     def fail_second_fsync(fd):
         nonlocal calls
         calls += 1
@@ -707,6 +882,48 @@ async def test_concurrent_puts_allocate_distinct_objects_with_atomic_reads(store
         *(store.load_email(ref) for ref in refs)
     )
     assert {item["body"] for item in loaded} == {f"body-{index}" for index in range(24)}
+
+
+@pytest.mark.asyncio
+async def test_reader_sees_only_not_found_before_replace_and_complete_after(
+    store,
+    monkeypatch,
+):
+    from src.storage import ContentRef, ContentStoreNotFoundError, encrypted_files
+    from src.storage.content_store import serialize_email_envelope
+
+    entered_replace = threading.Event()
+    release_replace = threading.Event()
+    captured_target = []
+    original_replace = os.replace
+
+    def paused_replace(source, target, **kwargs):
+        captured_target.append(os.fspath(target))
+        entered_replace.set()
+        assert release_replace.wait(timeout=3)
+        return original_replace(source, target, **kwargs)
+
+    monkeypatch.setattr(encrypted_files.os, "replace", paused_replace)
+    email = {"body": "complete-after-replace", "attachments": []}
+    writer = asyncio.create_task(store.put_email(8, "mail-overlap", email))
+    assert await asyncio.to_thread(entered_replace.wait, 3)
+
+    object_id = Path(captured_target[0]).stem
+    envelope = serialize_email_envelope("mail-overlap", email)
+    pending_ref = ContentRef(
+        8,
+        object_id,
+        "v1",
+        hashlib.sha256(envelope).hexdigest(),
+    )
+    for _ in range(4):
+        with pytest.raises(ContentStoreNotFoundError, match="content_not_found"):
+            await store.load_email(pending_ref)
+
+    release_replace.set()
+    written_ref = await writer
+    assert written_ref == pending_ref
+    assert await store.load_email(written_ref) == email
 
 
 async def _assert_heartbeat_runs_while(operation):
