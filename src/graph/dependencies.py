@@ -10,6 +10,9 @@ class DraftStore(Protocol):
     async def save_draft(self, email_id: str, content: str) -> str:
         raise NotImplementedError
 
+    async def save_draft_if_status(self, email_id: str, content: str) -> bool:
+        raise NotImplementedError
+
     async def load_draft(self, draft_id: str) -> str:
         raise NotImplementedError
 

@@ -23,6 +23,10 @@ from src.graph.state_factory import (
 from src.graph.resource_locks import get_graph_resource_lock
 from src.init_app import get_app_context
 from src.safety.input_limits import input_limits_from_settings, validate_email_input
+from src.safety.manual_review import (
+    build_manual_review_delta,
+    normalize_manual_review_code,
+)
 from src.utils import lark_app
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.utils.notification_policy import decide_notification_kind
@@ -31,6 +35,17 @@ from src.storage import ContentRef
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
 WEBHOOK_QUEUE_MAXSIZE = 500
+MANUAL_REVIEW_SOURCE_STATUSES = frozenset(
+    {
+        "pending",
+        "recovering",
+        "ingested",
+        "analyzed",
+        "drafted",
+        "error",
+        "delivery_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -202,15 +217,28 @@ async def _run_ai_pipeline(
             await consume(None)
             state = await ctx.graph.aget_state(config)
         if state.values.get("next_step") == "drafter":
-            raise RuntimeError("review_rewrite_limit_exceeded")
+            update = build_manual_review_delta(
+                state.values,
+                "graph_rewrite_limit",
+                review_result={
+                    "passed": False,
+                    "issues": "graph_rewrite_limit",
+                },
+            )
+            await ctx.graph.aupdate_state(config, update)
+            state = await ctx.graph.aget_state(config)
 
         state_values = state.values
         draft_id = state_values.get("draft_id")
+        is_manual_review = (
+            state_values.get("next_step") == "manual_review"
+            or state_values.get("approval_status") == "manual_review"
+        )
         draft = (
             await ctx.db_manager.load_draft(
                 require_owned_draft_id(state_values, draft_id)
             )
-            if draft_id is not None
+            if draft_id is not None and not is_manual_review
             else ""
         )
         projection_email = deepcopy(dict(email_data))
@@ -233,6 +261,9 @@ async def _run_ai_pipeline(
             "email": projection_email,
             "routing_log": state_values.get("routing_log", []),
             "active_skills": state_values.get("active_skills", []),
+            "approval_status": state_values.get("approval_status", ""),
+            "next_step": state_values.get("next_step", ""),
+            "safe_error_summary": state_values.get("safe_error_summary"),
         }
     except DatabaseOperationError:
         raise
@@ -850,8 +881,7 @@ async def _process_and_archive_email_inner(
         await _archive_only(thread_id, email_data, ctx, event_type)
         return ProcessingOutcome.ARCHIVED
 
-    await _run_ai_path(thread_id, email_data, ctx, config)
-    return ProcessingOutcome.PROCESSED
+    return await _run_ai_path(thread_id, email_data, ctx, config)
 
 
 async def _delete_unclaimed_content_candidate(ref: ContentRef, ctx, *, reason: str) -> None:
@@ -1318,7 +1348,12 @@ async def _cleanup_graph_drive_files(
         logger.warning("Cleanup state update was not confirmed")
 
 
-async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> None:
+async def _run_ai_path(
+    thread_id: str,
+    email_data: dict,
+    ctx,
+    config: dict,
+) -> ProcessingOutcome:
     """
     Inbox route: upload -> ingest -> AI -> notify, with two-phase mark_as_read.
 
@@ -1385,7 +1420,58 @@ async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> N
                 preserve_pdf_token=baseline.pdf_token,
             )
             await ctx.db_manager.update_status(thread_id, "error")
-            return
+            return ProcessingOutcome.FAILED
+
+        if (
+            pipeline_result.get("next_step") == "manual_review"
+            or pipeline_result.get("approval_status") == "manual_review"
+        ):
+            safe_code = normalize_manual_review_code(
+                pipeline_result.get("safe_error_summary")
+            )
+            try:
+                manual_persisted = await ctx.db_manager.compare_and_set_manual_review(
+                    thread_id,
+                    expected=MANUAL_REVIEW_SOURCE_STATUSES,
+                    error_code=safe_code,
+                )
+            except DatabaseOperationError as claim_exc:
+                logger.error(
+                    "Manual-review persistence is ambiguous: error_type=%s",
+                    type(claim_exc).__name__,
+                )
+                try:
+                    manual_persisted = (
+                        await ctx.db_manager.get_email_status(thread_id)
+                        == "manual_review"
+                    )
+                except Exception as read_exc:
+                    logger.error(
+                        "Manual-review readback failed: error_type=%s",
+                        type(read_exc).__name__,
+                    )
+                    return ProcessingOutcome.FAILED
+            if not manual_persisted:
+                logger.warning(
+                    "Manual-review CAS lost; preserving newer state and resources"
+                )
+                return ProcessingOutcome.FAILED
+            try:
+                await _cleanup_graph_drive_files(
+                    thread_id,
+                    ctx,
+                    fallback_attachment_tokens=attachment_tokens,
+                    preserve_attachment_tokens=list(baseline.attachment_tokens),
+                    preserve_pdf_token=baseline.pdf_token,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Manual-review cleanup failed: error_type=%s",
+                    type(exc).__name__,
+                )
+            return ProcessingOutcome.MANUAL_REVIEW
 
         dispatch_result = await _dispatch_notification(thread_id, pipeline_result, ctx, config)
         notification_committed = bool(
@@ -1414,6 +1500,8 @@ async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> N
                 thread_id,
                 dispatch_result.get("kind"),
             )
+            return ProcessingOutcome.FAILED
+        return ProcessingOutcome.PROCESSED
     except NotificationSideEffectCommittedError as committed:
         # The card already references the current attachment/PDF handles.
         # Preserve them even though the local status write must be retried.
@@ -1456,6 +1544,7 @@ async def _run_ai_path(thread_id: str, email_data: dict, ctx, config: dict) -> N
             type(exc).__name__,
         )
         await ctx.db_manager.update_status(thread_id, "error")
+        return ProcessingOutcome.FAILED
 
 
 def _extract_id(raw) -> str | None:
@@ -1728,7 +1817,19 @@ class WebhookWorker:
                         email_data.get("_event_type", "unknown"),
                     )
                     return
-            await process_and_archive_email(email_data, self._ctx, skip_analysis)
+            outcome = await process_and_archive_email(
+                email_data,
+                self._ctx,
+                skip_analysis,
+            )
+            if outcome in {
+                ProcessingOutcome.FAILED,
+                ProcessingOutcome.MANUAL_REVIEW,
+            }:
+                logger.warning(
+                    "Webhook processing ended without automatic completion: outcome=%s",
+                    outcome.value,
+                )
         except Exception as exc:
             logger.error("Worker processing failed: error_type=%s", type(exc).__name__)
 

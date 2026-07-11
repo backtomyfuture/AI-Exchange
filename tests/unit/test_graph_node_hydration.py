@@ -347,9 +347,19 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
             "approval_status": "approved",
         }
     )
+    persisted_status = {"value": "approved"}
+
+    async def compare_and_set_status(_email_id, *, expected, target):
+        if persisted_status["value"] not in expected:
+            return False
+        persisted_status["value"] = target
+        return True
+
     ctx = SimpleNamespace(
         exchange_client=SimpleNamespace(reply_email=AsyncMock(return_value=True)),
-        db_manager=SimpleNamespace(update_status=AsyncMock()),
+        db_manager=SimpleNamespace(
+            compare_and_set_status=AsyncMock(side_effect=compare_and_set_status),
+        ),
         email_processor=SimpleNamespace(process_sent_email=MagicMock()),
     )
 
@@ -363,5 +373,6 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
         cc=["cc@example.com"],
     )
     assert result == {"next_step": "end"}
+    assert persisted_status["value"] == "sent"
     assert "email" not in result
     assert "draft" not in result

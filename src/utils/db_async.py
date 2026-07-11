@@ -257,6 +257,38 @@ class AsyncDatabaseManager:
             ) from None
         return email_id
 
+    async def save_draft_if_status(self, email_id: str, content: str) -> bool:
+        """Update a draft only while the email still awaits approval."""
+        if (
+            not isinstance(email_id, str)
+            or not email_id.strip()
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            raise ValueError("invalid_draft_edit")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET draft_content = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND status = %s
+                        """,
+                        (content, email_id, "waiting_approval"),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as exc:
+            logger.error(
+                "Conditional draft persistence failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="save_draft_if_status",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="conditional draft persistence failed",
+            ) from None
+
     async def load_draft(self, draft_id: str) -> str:
         if not isinstance(draft_id, str) or not draft_id:
             raise DatabaseOperationError(
@@ -386,6 +418,152 @@ class AsyncDatabaseManager:
                 operation="compare_and_set_status",
                 retryable=isinstance(exc, psycopg.OperationalError),
                 message="email status compare-and-set failed",
+            ) from None
+
+    async def claim_self_healing(
+        self,
+        email_id: str,
+        *,
+        immediate: frozenset[str],
+        stale: frozenset[str],
+        stale_after_seconds: int,
+    ) -> bool:
+        """Atomically claim eligible recovery work without stealing live work."""
+        if (
+            not isinstance(email_id, str)
+            or not email_id.strip()
+            or not immediate
+            or not stale
+            or any(not isinstance(status, str) or not status for status in immediate | stale)
+            or isinstance(stale_after_seconds, bool)
+            or not isinstance(stale_after_seconds, int)
+            or stale_after_seconds <= 0
+        ):
+            raise ValueError("invalid_self_healing_claim")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET status = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND (
+                            status = ANY(%s)
+                            OR (
+                                status = ANY(%s)
+                                AND updated_at < CURRENT_TIMESTAMP
+                                    - (%s * INTERVAL '1 second')
+                            )
+                        )
+                        """,
+                        (
+                            "recovering",
+                            email_id,
+                            sorted(immediate),
+                            sorted(stale),
+                            stale_after_seconds,
+                        ),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as exc:
+            logger.error(
+                "Self-healing claim failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="claim_self_healing",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="self-healing claim failed",
+            ) from None
+
+    async def compare_and_set_manual_review(
+        self,
+        email_id: str,
+        *,
+        expected: frozenset[str],
+        error_code: str,
+    ) -> bool:
+        """Atomically enter manual review and persist its bounded reason."""
+        if (
+            not isinstance(email_id, str)
+            or not email_id.strip()
+            or not isinstance(error_code, str)
+            or not error_code
+            or len(error_code.encode("utf-8")) > 256
+        ):
+            raise ValueError("invalid_manual_review_transition")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET status = %s,
+                            error_message = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND status = ANY(%s)
+                        """,
+                        (
+                            "manual_review",
+                            error_code,
+                            email_id,
+                            list(expected),
+                        ),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as exc:
+            logger.error(
+                "Manual-review transition failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="compare_and_set_manual_review",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="manual-review transition failed",
+            ) from None
+
+    async def recover_incomplete_approval_states(self) -> int:
+        """Fail closed for approval/send transitions left ambiguous at restart."""
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET status = %s,
+                            error_message = CASE status
+                                WHEN %s THEN %s
+                                WHEN %s THEN %s
+                                WHEN %s THEN %s
+                                WHEN %s THEN %s
+                                ELSE error_message
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status = ANY(%s)
+                        """,
+                        (
+                            "manual_review",
+                            "approved",
+                            "approval_handoff_incomplete",
+                            "sending",
+                            "send_outcome_unknown",
+                            "saving_draft",
+                            "draft_save_outcome_unknown",
+                            "recovering",
+                            "self_healing_interrupted",
+                            ["approved", "sending", "saving_draft", "recovering"],
+                        ),
+                    )
+                    return cur.rowcount
+        except psycopg.Error as exc:
+            logger.error(
+                "Approval state recovery failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="recover_incomplete_approval_states",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="approval state recovery failed",
             ) from None
 
     async def check_email_exists(self, email_id: str) -> bool:

@@ -11,6 +11,10 @@ from src.safety.model_budget import (
     enforce_model_input_budget,
     token_budget_from_settings,
 )
+from src.safety.manual_review import (
+    build_manual_review_delta,
+    manual_review_classification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,30 @@ class RoutingEngine:
         # 仅在有可用 Skill 时才调用 LLM，避免无意义的 LLM 开销。
         skills = self.skill_manager.get_all_skills()
         if skills:
-            t3_matches = await self._tier3_llm_route(state, skills)
+            try:
+                t3_matches = await self._tier3_llm_route(state, skills)
+            except ModelInputTooLarge:
+                delta = build_manual_review_delta(
+                    {},
+                    "router_input_too_large",
+                    classification=manual_review_classification(
+                        "router_input_too_large"
+                    ),
+                )
+                return delta
+            except Exception as exc:
+                logger.error(
+                    "Tier 3 LLM routing unavailable: error_type=%s",
+                    type(exc).__name__,
+                )
+                delta = build_manual_review_delta(
+                    {},
+                    "router_model_failed",
+                    classification=manual_review_classification(
+                        "router_model_failed"
+                    ),
+                )
+                return delta
             if t3_matches:
                 routing_log.append(f"Tier 3 LLM Match: {t3_matches}")
                 for sid in t3_matches:
@@ -227,16 +254,26 @@ class RoutingEngine:
             llm = get_llm_for_role("router", temperature=0)
             response = await llm.ainvoke(prompt)
             
-            content = response.content.strip()
-            if "NONE" in content.upper():
+            raw_content = getattr(response, "content", None)
+            if not isinstance(raw_content, str):
+                raise RuntimeError("router_schema_invalid")
+            content = raw_content.strip()
+            if content.upper() == "NONE":
                 logger.info("Tier 3 LLM: No matching skill found")
                 return []
+            if not content:
+                raise RuntimeError("router_schema_invalid")
             
             # 解析 LLM 返回的技能 ID 列表
             matched_ids = [s.strip() for s in content.split(",") if s.strip()]
+            if (
+                not matched_ids
+                or any(skill_id.upper() == "NONE" for skill_id in matched_ids)
+                or any(skill_id not in skills for skill_id in matched_ids)
+            ):
+                raise RuntimeError("router_schema_invalid")
             
-            # 验证返回的 ID 是否真实存在
-            valid_ids = [sid for sid in matched_ids if sid in skills]
+            valid_ids = list(dict.fromkeys(matched_ids))
             logger.info("Tier 3 LLM matched skill count=%d", len(valid_ids))
             return valid_ids
             
@@ -247,7 +284,7 @@ class RoutingEngine:
                 "Tier 3 LLM routing failed: error_type=%s",
                 type(exc).__name__,
             )
-            return []
+            raise RuntimeError("router_model_failed") from None
 
     async def _apply_skills(self, state: AgentState, skill_ids: List[str]) -> AgentState:
         """
@@ -271,22 +308,36 @@ class RoutingEngine:
         
         for sid in ordered_skills:
             skill = self.skill_manager.get_skill(sid)
-            if skill:
-                try:
-                    update = await skill.execute(new_state)
-                    # 不可变合并：创建新字典而非修改原字典
-                    for key, val in update.items():
-                        if isinstance(val, dict) and key in new_state and isinstance(new_state[key], dict):
-                            new_state[key] = {**new_state[key], **val}
-                        else:
-                            new_state[key] = val
-                    logger.info("Applied skill logic: skill=%s", sid)
-                except Exception as exc:
-                    logger.error(
-                        "Skill execution failed: skill=%s error_type=%s",
-                        sid,
-                        type(exc).__name__,
-                    )
+            if skill is None:
+                logger.error("Configured skill is unavailable: skill=%s", sid)
+                raise RuntimeError("router_skill_failed")
+            try:
+                candidate_state = deepcopy(new_state)
+                update = await skill.execute(candidate_state)
+                if not isinstance(update, dict):
+                    raise TypeError("invalid_skill_update")
+                # 不可变合并：创建新字典而非修改原字典
+                for key, val in update.items():
+                    if (
+                        isinstance(val, dict)
+                        and key in candidate_state
+                        and isinstance(candidate_state[key], dict)
+                    ):
+                        candidate_state[key] = {
+                            **candidate_state[key],
+                            **val,
+                        }
+                    else:
+                        candidate_state[key] = val
+                new_state = candidate_state
+                logger.info("Applied skill logic: skill=%s", sid)
+            except Exception as exc:
+                logger.error(
+                    "Skill execution failed: skill=%s error_type=%s",
+                    sid,
+                    type(exc).__name__,
+                )
+                raise RuntimeError("router_skill_failed") from None
         return new_state
 
 

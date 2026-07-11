@@ -1,13 +1,16 @@
 import asyncio
 import logging
 from typing import List, Dict, Any
+from src.domain.email_state import ProcessingOutcome
 from src.safety.input_limits import InputLimitExceeded
 from src.utils.circuit_breaker import circuit_breaker
 from src.exchange_service import process_and_archive_email
 
 logger = logging.getLogger("SelfHealing")
 
-STUCK_STATUSES = ("error", "delivery_failed", "ingested", "analyzed", "pending")
+IMMEDIATE_STUCK_STATUSES = frozenset({"error", "delivery_failed"})
+STALE_STUCK_STATUSES = frozenset({"ingested", "analyzed", "pending"})
+STUCK_STATUSES = tuple(sorted(IMMEDIATE_STUCK_STATUSES | STALE_STUCK_STATUSES))
 STALE_THRESHOLD_SECONDS = 1800  # 30 minutes
 
 
@@ -35,35 +38,80 @@ class SelfHealer:
                     """
                     await cur.execute(query)
                     return await cur.fetchall()
-        except Exception as e:
-            logger.error(f"Failed to query stuck emails for self-healing: {e}")
+        except Exception as exc:
+            logger.error(
+                "Failed to query stuck emails for self-healing: error_type=%s",
+                type(exc).__name__,
+            )
             return []
+
+    async def _release_claim(self, email_id: str) -> None:
+        """Best-effort release that cannot overwrite a newer terminal state."""
+        try:
+            await self.ctx.db_manager.compare_and_set_status(
+                email_id,
+                expected=frozenset({"recovering"}),
+                target="error",
+            )
+        except Exception as exc:
+            logger.error(
+                "Self-healing claim release failed: email_id=%s error_type=%s",
+                email_id,
+                type(exc).__name__,
+            )
 
     async def reprocess_single(self, email_id: str) -> bool:
         """
         Reprocess a single email. Re-uses logic from recovery script but integrated.
         """
-        logger.info(f"Self-healing: Attempting to reprocess email {email_id}")
-        
+        logger.info("Self-healing: Attempting to reprocess email %s", email_id)
+
+        claimed = False
         try:
+            claimed = await self.ctx.db_manager.claim_self_healing(
+                email_id,
+                immediate=IMMEDIATE_STUCK_STATUSES,
+                stale=STALE_STUCK_STATUSES,
+                stale_after_seconds=STALE_THRESHOLD_SECONDS,
+            )
+            if not claimed:
+                logger.info(
+                    "Self-healing claim skipped: email_id=%s",
+                    email_id,
+                )
+                return False
+
             # Step 1: Fetch email data from Exchange
             email_data = await self.ctx.exchange_client.get_email(email_id)
             if not email_data:
-                logger.error(f"Self-healing: Could not fetch email {email_id} from Exchange")
-                # Mark as 'skipped' or 'not_found' to avoid infinite loops? 
-                # For now just leave it, maybe it's a temp API issue.
+                logger.error(
+                    "Self-healing could not fetch email: email_id=%s",
+                    email_id,
+                )
+                await self._release_claim(email_id)
                 return False
             
             email_data['id'] = email_id
             
             # Step 2: Run full processing pipeline without deleting durable state.
             # This uses the new fixed process_and_archive_email
-            await process_and_archive_email(
+            outcome = await process_and_archive_email(
                 email_data,
                 self.ctx,
                 force_reprocess=True,
             )
-            logger.info(f"Self-healing: ✅ Successfully recovered email {email_id}")
+            if outcome not in {
+                ProcessingOutcome.PROCESSED,
+                ProcessingOutcome.ARCHIVED,
+            }:
+                logger.warning(
+                    "Self-healing did not recover email: email_id=%s outcome=%s",
+                    email_id,
+                    outcome.value if isinstance(outcome, ProcessingOutcome) else "invalid",
+                )
+                await self._release_claim(email_id)
+                return False
+            logger.info("Self-healing successfully recovered email %s", email_id)
             return True
         except InputLimitExceeded as exc:
             logger.error(
@@ -71,13 +119,17 @@ class SelfHealer:
                 email_id,
                 exc.category,
             )
+            if claimed:
+                await self._release_claim(email_id)
             return False
-        except Exception as e:
+        except Exception as exc:
             logger.error(
                 "Self-healing recovery failed: email_id=%s error_type=%s",
                 email_id,
-                type(e).__name__,
+                type(exc).__name__,
             )
+            if claimed:
+                await self._release_claim(email_id)
             return False
 
     async def run_healing_cycle(self):
@@ -141,8 +193,11 @@ class SelfHealer:
                 await self.run_healing_cycle()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.exception(f"Unexpected error in self-healing cycle: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error in self-healing cycle: error_type=%s",
+                    type(exc).__name__,
+                )
             
             await asyncio.sleep(self.interval)
         

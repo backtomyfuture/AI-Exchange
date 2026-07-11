@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from src.domain.email_state import ProcessingOutcome
 from src.exchange_service import process_and_archive_email
 
 logger = logging.getLogger("PollingScheduler")
@@ -25,14 +26,29 @@ async def run_polling_loop(ctx, interval: int, startup_delay: int = 10):
             for email_data in recent_emails:
                 # process_and_archive_email handles deduplication internally via db_manager.log_initial_email
                 # If it returns False (exists), logic stops.
-                await process_and_archive_email(email_data, ctx, skip_analysis=False)
+                outcome = await process_and_archive_email(
+                    email_data,
+                    ctx,
+                    skip_analysis=False,
+                )
+                if outcome in {
+                    ProcessingOutcome.FAILED,
+                    ProcessingOutcome.MANUAL_REVIEW,
+                }:
+                    logger.warning(
+                        "Polling item ended without automatic completion: outcome=%s",
+                        outcome.value,
+                    )
             
             logger.debug(f"Polling cycle checked {len(recent_emails)} items.")
 
         except asyncio.CancelledError:
             logger.info("Polling scheduler cancelled.")
             break
-        except Exception as e:
-            logger.error(f"Error in polling loop: {e}")
+        except Exception as exc:
+            logger.error(
+                "Error in polling loop: error_type=%s",
+                type(exc).__name__,
+            )
         
         await asyncio.sleep(interval)

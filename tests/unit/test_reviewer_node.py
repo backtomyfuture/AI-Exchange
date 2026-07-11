@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
+from langchain_core.runnables import RunnableLambda
 from src.nodes.reviewer import review_draft
 
 
@@ -69,13 +70,27 @@ async def test_review_fail_triggers_rewrite(graph_node_harness):
 
 
 @pytest.mark.asyncio
-async def test_review_skipped_on_second_attempt(graph_node_harness):
-    """Reviewer skips if review_count >= 1."""
+async def test_second_failed_review_moves_to_manual(graph_node_harness):
+    """A second failed review must not be silently approved."""
     state = graph_node_harness.state(
         {"id": "review-second", "subject": "Q", "body": "body"},
         draft="Some draft",
         metadata={"review_count": 1},
     )
-    result = await review_draft(state, graph_node_harness.dependencies)
-    assert result["review_result"]["passed"] is True
-    assert set(result) == {"review_result", "next_step"}
+    async def provider(_value):
+        return MagicMock(
+            content='{"pass": false, "issues": "still incomplete"}'
+        )
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(provider),
+    ), patch(
+        "src.nodes.reviewer.with_llm_retry",
+        side_effect=_passthrough_retry,
+    ):
+        result = await review_draft(state, graph_node_harness.dependencies)
+
+    assert result["review_result"]["passed"] is False
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "reviewer_rewrite_limit"

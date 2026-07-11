@@ -10,6 +10,7 @@ from src.safety.model_budget import (
     rendered_messages_for_budget,
     token_budget_from_settings,
 )
+from src.safety.manual_review import build_manual_review_delta
 from src.utils.retry_decorator import with_llm_retry
 
 logger = logging.getLogger(__name__)
@@ -116,48 +117,51 @@ async def generate_draft(
         "subject": email.get("subject", ""),
         "body": email.get("body", ""),
     }
-    rendered_prompt = rendered_messages_for_budget(
-        prompt.format_messages(**payload)
-    )
-    enforce_model_input_budget(
-        "drafter",
-        rendered_prompt,
-        budget=token_budget_from_settings(get_settings()),
-    )
-
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("drafter", temperature=0.7)
-    chain = prompt | llm
-
-    @with_llm_retry(max_attempts=3)
-    async def invoke_with_retry(payload):
-        return await chain.ainvoke(payload)
-
     try:
+        rendered_prompt = rendered_messages_for_budget(
+            prompt.format_messages(**payload)
+        )
+        enforce_model_input_budget(
+            "drafter",
+            rendered_prompt,
+            budget=token_budget_from_settings(get_settings()),
+        )
+
+        from src.providers.factory import get_llm_for_role
+        llm = get_llm_for_role("drafter", temperature=0.7)
+        chain = prompt | llm
+
+        @with_llm_retry(max_attempts=3)
+        async def invoke_with_retry(payload):
+            return await chain.ainvoke(payload)
+
         logger.info(
             "Generating draft: reviewer_rewrite=%s",
             bool(review_issues),
         )
         response = await invoke_with_retry(payload)
+        response_content = getattr(response, "content", None)
+        if not isinstance(response_content, str):
+            return build_manual_review_delta(state, "drafter_model_failed")
     except ModelInputTooLarge:
-        raise
+        return build_manual_review_delta(state, "drafter_input_too_large")
     except Exception as exc:
         logger.error(
             "Draft generation failed: error_type=%s",
             type(exc).__name__,
         )
-        # Safe user-facing draft; never persist exception text.
-        from langchain_core.messages import AIMessage
-        response = AIMessage(content="草稿生成暂时失败，请稍后重试。")
+        return build_manual_review_delta(state, "drafter_model_failed")
 
     # 更新状态，清除反馈以防循环
     import re
-    cleaned_draft = str(response.content or "")
+    cleaned_draft = response_content
     # 保险起见，清理可能存在的标签
     cleaned_draft = re.sub(r'<thought>.*?</thought>', '', cleaned_draft, flags=re.DOTALL)
     cleaned_draft = re.sub(r'<draft>', '', cleaned_draft)
     cleaned_draft = re.sub(r'</draft>', '', cleaned_draft)
     cleaned_draft = cleaned_draft.strip()
+    if not cleaned_draft:
+        return build_manual_review_delta(state, "drafter_empty_response")
 
     draft_id = await dependencies.drafts.save_draft(state["email_id"], cleaned_draft)
     return sanitize_graph_delta(

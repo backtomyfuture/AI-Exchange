@@ -13,6 +13,8 @@ from src.nodes.retriever_node import retrieve_context
 from src.nodes.drafter import generate_draft
 from src.nodes.reviewer import review_draft
 from src.nodes.sender import send_final_email
+from src.nodes.manual_review import enter_manual_review
+from src.domain.errors import DatabaseOperationError
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,8 @@ def _guard_graph_node(
             if pass_config:
                 return await node(state, config=config)
             return await node(state)
+        except DatabaseOperationError:
+            raise
         except Exception as exc:
             logger.error(
                 "Graph node failed: node=%s error_type=%s",
@@ -99,22 +103,51 @@ def build_graph(
             pass_config=True,
         ),
     )
+    workflow.add_node(
+        "manual_review",
+        _guard_graph_node("manual_review", enter_manual_review),
+    )
 
     workflow.set_entry_point("categorizer")
 
+    def route_after_categorizer(state: AgentState):
+        if state.get("next_step") == "manual_review":
+            return "manual_review"
+        need_reply = (state.get("classification") or {}).get("need_reply")
+        if need_reply is True:
+            return "retriever"
+        if need_reply is False:
+            return "end"
+        return "manual_review"
+
     workflow.add_conditional_edges(
         "categorizer",
-        lambda state: state["classification"]["need_reply"],
+        route_after_categorizer,
         {
-            True: "retriever",
-            False: END
-        }
+            "retriever": "retriever",
+            "manual_review": "manual_review",
+            "end": END,
+        },
     )
 
     workflow.add_edge("retriever", "drafter")
-    workflow.add_edge("drafter", "reviewer")
+
+    workflow.add_conditional_edges(
+        "drafter",
+        lambda state: (
+            "manual_review"
+            if state.get("next_step") == "manual_review"
+            else "reviewer"
+        ),
+        {
+            "manual_review": "manual_review",
+            "reviewer": "reviewer",
+        },
+    )
 
     def route_after_review(state: AgentState):
+        if state.get("next_step") == "manual_review":
+            return "manual_review"
         if state.get("next_step") == "drafter":
             return "drafter"
         # If approved (updated via human action), go to sender
@@ -126,10 +159,16 @@ def build_graph(
     workflow.add_conditional_edges(
         "reviewer",
         route_after_review,
-        {"drafter": "drafter", "continue": END, "sender": "sender"}
+        {
+            "manual_review": "manual_review",
+            "drafter": "drafter",
+            "continue": END,
+            "sender": "sender",
+        },
     )
 
     workflow.add_edge("sender", END)
+    workflow.add_edge("manual_review", END)
 
     if checkpointer is None:
         checkpointer = MemorySaver()

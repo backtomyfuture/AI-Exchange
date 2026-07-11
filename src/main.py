@@ -42,6 +42,14 @@ async def lifespan(app: FastAPI):
     # 1. Initialize Shared Context
     ctx = get_app_context()
     await ctx.setup_async()
+    recovered_actions = (
+        await ctx.db_manager.recover_incomplete_approval_states()
+    )
+    if recovered_actions:
+        logger.warning(
+            "Moved incomplete approval/send actions to manual review: count=%d",
+            recovered_actions,
+        )
     
     # 2. Initialize Lark App (API & WS)
     # We pass the current running loop (uvicorn's loop)
@@ -121,6 +129,14 @@ async def main():
     """Entrypoint for tests: init components and run background loop."""
     ctx = get_app_context()
     await ctx.setup_async()
+    recovered_actions = (
+        await ctx.db_manager.recover_incomplete_approval_states()
+    )
+    if recovered_actions:
+        logger.warning(
+            "Moved incomplete approval/send actions to manual review: count=%d",
+            recovered_actions,
+        )
     worker_loop = asyncio.get_running_loop()
     lark_app.init_lark_app(
         ctx.db_manager,

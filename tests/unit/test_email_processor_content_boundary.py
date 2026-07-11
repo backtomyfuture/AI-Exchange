@@ -92,6 +92,7 @@ async def test_new_email_persists_content_ref_before_any_downstream_work(skip_an
 
     async def downstream(*_args, **_kwargs):
         order.append("downstream")
+        return ProcessingOutcome.PROCESSED
 
     target = "src.exchange_service._archive_only" if skip_analysis else "src.exchange_service._run_ai_path"
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
@@ -198,6 +199,7 @@ async def test_many_initial_recipients_remain_valid_and_are_capped_at_graph_boun
         "src.exchange_service._run_ai_path",
         new_callable=AsyncMock,
     ) as downstream:
+        downstream.return_value = ProcessingOutcome.PROCESSED
         outcome = await process_and_archive_email(email, ctx)
 
     assert outcome is ProcessingOutcome.PROCESSED
@@ -217,6 +219,7 @@ async def test_force_retry_reuses_existing_database_ref_without_new_object():
 
     async def downstream(*_args, **_kwargs):
         order.append("downstream")
+        return ProcessingOutcome.PROCESSED
 
     ctx.db_manager.get_content_ref.side_effect = get_ref
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
@@ -841,8 +844,9 @@ async def test_ai_path_passes_attachment_tokens_into_slim_pipeline_state():
         "src.exchange_service._run_ai_pipeline",
         new=AsyncMock(return_value=None),
     ) as pipeline:
-        await _run_ai_path("mail-1", {"id": "mail-1"}, ctx, config)
+        outcome = await _run_ai_path("mail-1", {"id": "mail-1"}, ctx, config)
 
+    assert outcome is ProcessingOutcome.FAILED
     pipeline.assert_awaited_once_with(
         "mail-1",
         ctx,

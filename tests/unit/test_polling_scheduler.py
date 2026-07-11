@@ -2,6 +2,7 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
+from src.domain.email_state import ProcessingOutcome
 from src.scheduler.polling import run_polling_loop
 
 @pytest.mark.asyncio
@@ -47,3 +48,27 @@ async def test_polling_scheduler_flow(mocker):
     assert mock_process.call_args[0][0]["id"] == "msg1"
     # Ensure skip_analysis was passed as False (we want to re-analyze missed emails)
     assert not mock_process.call_args[1]["skip_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_polling_scheduler_observes_failed_outcome_without_raw_error(
+    mocker,
+    caplog,
+):
+    process = mocker.patch(
+        "src.scheduler.polling.process_and_archive_email",
+        new=AsyncMock(return_value=ProcessingOutcome.FAILED),
+    )
+    ctx = MagicMock()
+    ctx.exchange_client.get_recent_emails = AsyncMock(
+        side_effect=[
+            [{"id": "msg-failed", "subject": "Test"}],
+            asyncio.CancelledError(),
+        ]
+    )
+    caplog.set_level("WARNING", logger="PollingScheduler")
+
+    await run_polling_loop(ctx, interval=0, startup_delay=0)
+
+    process.assert_awaited_once()
+    assert "failed" in caplog.text

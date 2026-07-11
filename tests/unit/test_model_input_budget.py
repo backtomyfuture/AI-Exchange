@@ -134,8 +134,7 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
         "acquire",
         new_callable=AsyncMock,
     ) as mock_acquire:
-        with pytest.raises(ModelInputTooLarge):
-            await categorize_email(state, graph_node_harness.dependencies)
+        result = await categorize_email(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "categorizer"
     assert "budget-subject" in captured["value"]
@@ -145,6 +144,8 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
     assert "priority" in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "categorizer_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -193,8 +194,7 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
         "acquire",
         new_callable=AsyncMock,
     ) as mock_acquire:
-        with pytest.raises(ModelInputTooLarge):
-            await generate_draft(state, graph_node_harness.dependencies)
+        result = await generate_draft(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "drafter"
     for fragment in (
@@ -210,6 +210,8 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
         assert fragment in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "drafter_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -245,8 +247,7 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry(
         "acquire",
         new_callable=AsyncMock,
     ) as mock_acquire:
-        with pytest.raises(ModelInputTooLarge):
-            await review_draft(state, graph_node_harness.dependencies)
+        result = await review_draft(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "reviewer"
     assert "邮件质量审核员" in captured["value"]
@@ -255,6 +256,8 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry(
     assert "budget-review-draft" in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "reviewer_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -381,8 +384,10 @@ async def test_categorizer_fallback_does_not_swallow_model_input_too_large(
         "src.nodes.categorizer.with_llm_retry",
         side_effect=_passthrough_retry,
     ):
-        with pytest.raises(ModelInputTooLarge):
-            await categorize_email(state, graph_node_harness.dependencies)
+        result = await categorize_email(state, graph_node_harness.dependencies)
+
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "categorizer_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -406,8 +411,10 @@ async def test_drafter_fallback_does_not_swallow_model_input_too_large(
         "src.nodes.drafter.with_llm_retry",
         side_effect=_passthrough_retry,
     ):
-        with pytest.raises(ModelInputTooLarge):
-            await generate_draft(state, graph_node_harness.dependencies)
+        result = await generate_draft(state, graph_node_harness.dependencies)
+
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "drafter_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -427,5 +434,7 @@ async def test_reviewer_fallback_does_not_swallow_model_input_too_large(
         "src.nodes.reviewer.with_llm_retry",
         side_effect=_passthrough_retry,
     ):
-        with pytest.raises(ModelInputTooLarge):
-            await review_draft(state, graph_node_harness.dependencies)
+        result = await review_draft(state, graph_node_harness.dependencies)
+
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "reviewer_input_too_large"

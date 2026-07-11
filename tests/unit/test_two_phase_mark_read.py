@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.domain.email_state import ProcessingOutcome
 from src.domain.errors import DatabaseOperationError
 from src.exchange_service import (
     _checkpoint_ai_path_resources,
@@ -854,13 +855,14 @@ async def test_failed_replacement_card_restores_old_pdf_without_deleting_it(ctx)
         "src.exchange_service.lark_app.delete_file_from_drive",
         return_value=True,
     ) as delete:
-        await _run_ai_path(
+        outcome = await _run_ai_path(
             "msg-c1",
             {"id": "msg-c1"},
             ctx,
             {"configurable": {"thread_id": "msg-c1"}},
         )
 
+    assert outcome is ProcessingOutcome.FAILED
     assert {call.args[0] for call in delete.call_args_list} == {"NEW-PDF"}
     assert state.values["pdf_token"] == "OLD-PDF"
     assert "OLD-PDF" not in state.values["attachment_tokens"]

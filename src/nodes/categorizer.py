@@ -2,7 +2,7 @@
 import logging
 from copy import deepcopy
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
@@ -15,6 +15,10 @@ from src.safety.model_budget import (
     rendered_messages_for_budget,
     token_budget_from_settings,
 )
+from src.safety.manual_review import (
+    build_manual_review_delta,
+    manual_review_classification,
+)
 from src.utils.retry_decorator import with_llm_retry
 from src.router.engine import get_routing_engine
 
@@ -22,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 class EmailClassification(BaseModel):
     """邮件分类结果的结构化定义"""
+    model_config = ConfigDict(strict=True)
+
     priority: Literal["P0", "P1", "P2", "P3"] = Field(description="邮件优先级：P0最高，P3最低")
     need_reply: bool = Field(description="是否需要回复这封邮件")
     intent: Literal["咨询", "审批", "通知", "垃圾邮件"] = Field(description="邮件的主要意图")
@@ -42,7 +48,26 @@ async def categorize_email(
     local_state["email"] = email
 
     engine = get_routing_engine()
-    routed_state = await engine.execute_router(local_state)
+    try:
+        routed_state = await engine.execute_router(local_state)
+    except Exception as exc:
+        logger.error(
+            "Routing execution failed: error_type=%s",
+            type(exc).__name__,
+        )
+        code = "router_execution_failed"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
+        )
+    if routed_state.get("next_step") == "manual_review":
+        safe_code = routed_state.get("safe_error_summary")
+        return build_manual_review_delta(
+            state,
+            safe_code,
+            classification=manual_review_classification(safe_code),
+        )
 
     routing_updates = {}
     for key in (
@@ -129,44 +154,45 @@ async def categorize_email(
         else ""
     )
     payload = {"subject": subject, "body": body, "image_info": image_info}
-    rendered_prompt = rendered_messages_for_budget(
-        prompt.format_messages(**payload)
-    )
-    enforce_model_input_budget(
-        "categorizer",
-        rendered_prompt,
-        budget=token_budget_from_settings(get_settings()),
-    )
-
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("categorizer", temperature=0)
-    chain = prompt | llm | parser
-
-    # 调用 LLM 进行分类
-    @with_llm_retry(max_attempts=3)
-    async def invoke_with_retry(payload):
-        return await chain.ainvoke(payload)
-
     try:
+        rendered_prompt = rendered_messages_for_budget(
+            prompt.format_messages(**payload)
+        )
+        enforce_model_input_budget(
+            "categorizer",
+            rendered_prompt,
+            budget=token_budget_from_settings(get_settings()),
+        )
+
+        from src.providers.factory import get_llm_for_role
+        llm = get_llm_for_role("categorizer", temperature=0)
+        chain = prompt | llm | parser
+
+        @with_llm_retry(max_attempts=3)
+        async def invoke_with_retry(payload):
+            return await chain.ainvoke(payload)
+
         # Expected result is a dict because parser converts it
         result = await invoke_with_retry(payload)
         classification_result = EmailClassification(**result)
         logger.info("Classification completed successfully")
     except ModelInputTooLarge:
-        raise
+        code = "categorizer_input_too_large"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
+        )
     except Exception as exc:
         logger.error(
-            "Classification failed; using safe default: error_type=%s",
+            "Classification failed; manual review required: error_type=%s",
             type(exc).__name__,
         )
-        # Fallback default
-        classification_result = EmailClassification(
-            priority="P3", 
-            need_reply=False, 
-            intent="通知", 
-            summary=subject or "分类失败，已降级处理",
-            reasoning="分类服务暂时不可用，已采用安全默认值",
-            confidence=0.0,
+        code = "categorizer_model_failed"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
         )
 
     updates = {

@@ -73,15 +73,23 @@ class FakeContentStore:
 
 
 class FakeDraftStore:
-    def __init__(self):
+    def __init__(self, *, status_getter=None):
         self.values = {}
         self.saves = []
         self.loads = []
+        self.status_getter = status_getter or (lambda: "waiting_approval")
 
     async def save_draft(self, email_id, content):
         self.saves.append((email_id, content))
         self.values[email_id] = content
         return email_id
+
+    async def save_draft_if_status(self, email_id, content):
+        if self.status_getter() != "waiting_approval":
+            return False
+        self.saves.append((email_id, content))
+        self.values[email_id] = content
+        return True
 
     async def load_draft(self, draft_id):
         self.loads.append(draft_id)
@@ -211,18 +219,6 @@ def _draft_retry(contents):
     return factory
 
 
-def _review_retry(**_kwargs):
-    def decorator(_function):
-        async def wrapped(_payload):
-            return SimpleNamespace(
-                content='{"pass": false, "issues": "REVIEW-ISSUE-SENTINEL"}'
-            )
-
-        return wrapped
-
-    return decorator
-
-
 def _walk_values(value, seen=None):
     seen = seen or set()
     identity = id(value)
@@ -273,7 +269,10 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         "draft_to": ["recipient@example.com"],
     }
     content_store = FakeContentStore(email)
-    drafts = FakeDraftStore()
+    persisted_status = {"value": "pending"}
+    drafts = FakeDraftStore(
+        status_getter=lambda: persisted_status["value"],
+    )
     dependencies = GraphDependencies(content_store=content_store, drafts=drafts)
     saver = RecordingInMemorySaver()
     graph = build_graph(checkpointer=saver, dependencies=dependencies)
@@ -292,13 +291,28 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         }
     ]
     draft_retry = _draft_retry([first_draft, second_draft])
+    async def update_status(_email_id, status, **_kwargs):
+        if status is not None:
+            persisted_status["value"] = status
+
+    async def compare_and_set_status(_email_id, *, expected, target):
+        if persisted_status["value"] not in expected:
+            return False
+        persisted_status["value"] = target
+        return True
+
+    database = SimpleNamespace(
+        get_content_ref=AsyncMock(return_value=_ref()),
+        load_draft=AsyncMock(side_effect=lambda draft_id: drafts.values[draft_id]),
+        update_status=AsyncMock(side_effect=update_status),
+        compare_and_set_status=AsyncMock(side_effect=compare_and_set_status),
+        get_email_status=AsyncMock(
+            side_effect=lambda _email_id: persisted_status["value"]
+        ),
+    )
     sender_context = SimpleNamespace(
         exchange_client=SimpleNamespace(reply_email=AsyncMock(return_value=True)),
-        db_manager=SimpleNamespace(
-            get_content_ref=AsyncMock(return_value=_ref()),
-            load_draft=AsyncMock(side_effect=lambda draft_id: drafts.values[draft_id]),
-            update_status=AsyncMock(),
-        ),
+        db_manager=database,
         content_store=content_store,
         graph=graph,
         email_processor=SimpleNamespace(
@@ -320,6 +334,22 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
     def classification_factory(**_kwargs):
         return lambda _function: classification_wrapper
 
+    review_responses = iter(
+        [
+            '{"pass": false, "issues": "REVIEW-ISSUE-SENTINEL"}',
+            '{"pass": true, "issues": ""}',
+        ]
+    )
+
+    def review_factory(**_kwargs):
+        def decorator(_function):
+            async def wrapped(_payload):
+                return SimpleNamespace(content=next(review_responses))
+
+            return wrapped
+
+        return decorator
+
     with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
         "src.nodes.retriever_node.get_routing_engine", return_value=router
     ), patch(
@@ -327,7 +357,7 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
     ), patch(
         "src.nodes.drafter.with_llm_retry", side_effect=draft_retry
     ), patch(
-        "src.nodes.reviewer.with_llm_retry", side_effect=_review_retry
+        "src.nodes.reviewer.with_llm_retry", side_effect=review_factory
     ), patch(
         "src.nodes.retriever_node.get_retriever", return_value=retriever
     ), patch(
@@ -348,6 +378,16 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         "src.nodes.drafter.enforce_model_input_budget"
     ), patch(
         "src.nodes.reviewer.enforce_model_input_budget"
+    ), patch(
+        "src.utils.content_guard.ContentGuard.run_all_checks",
+        new=AsyncMock(
+            return_value={
+                "passed": True,
+                "summary": "",
+                "sensitive_issues": [],
+                "hallucination_issues": [],
+            }
+        ),
     ), patch(
         "src.init_app.get_app_context", return_value=sender_context
     ):
@@ -406,17 +446,15 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
             assert dispatch == {"delivered": True, "kind": "approval"}
             assert send_card.call_args.kwargs["draft"] == second_draft
 
-            draft_id = await drafts.save_draft(email["id"], human_draft)
-            human_update = sanitize_graph_delta(
-                second_interrupt.values,
-                {
-                    "draft_id": draft_id,
-                    "approval_status": "modify",
-                    "feedback": human_draft,
-                },
+            edit_saved = await asyncio.to_thread(
+                lark_app.process_modification,
+                email["id"],
+                human_draft,
             )
-            assert set(human_update) == {"draft_id", "approval_status"}
-            await graph.aupdate_state(config, human_update)
+            assert edit_saved is True
+            edited_state = await graph.aget_state(config)
+            assert edited_state.values["draft_id"] == email["id"]
+            assert edited_state.values["approval_status"] == "pending"
 
             loop = asyncio.get_running_loop()
             scheduled = []
@@ -451,10 +489,16 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
     )
     sender_context.db_manager.update_status.assert_any_await(
         email["id"],
-        "approved",
+        None,
         approver_user_id="approver-1",
         final_draft=human_draft,
     )
+    assert persisted_status["value"] == "sent"
+    assert [
+        call.kwargs["target"]
+        for call in sender_context.db_manager.compare_and_set_status.await_args_list
+        if call.args[0] == email["id"]
+    ] == ["approved", "sending", "sent"]
     sender_context.email_processor.process_sent_email.assert_called_once()
     sent_email = sender_context.email_processor.process_sent_email.call_args.kwargs
     assert body_marker in sent_email["original_email_data"]["body"]

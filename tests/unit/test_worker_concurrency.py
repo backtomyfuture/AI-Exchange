@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import src.exchange_service as exchange_service
+from src.domain.email_state import ProcessingOutcome
 from src.exchange_service import WORKER_CONCURRENCY, WebhookWorker
 
 
@@ -81,6 +82,23 @@ def processor():
 @pytest.fixture
 def worker(ctx, processor):
     return WebhookWorker(ctx)
+
+
+@pytest.mark.asyncio
+async def test_worker_observes_failed_processing_outcome(ctx, caplog):
+    worker = WebhookWorker(ctx)
+    caplog.set_level(logging.WARNING, logger="ExchangeService")
+    with patch(
+        "src.exchange_service.process_and_archive_email",
+        new=AsyncMock(return_value=ProcessingOutcome.FAILED),
+    ) as process:
+        await worker._process_one(
+            {"id": "failed-mail", "body": "bounded"},
+            False,
+        )
+
+    process.assert_awaited_once()
+    assert "failed" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -301,7 +301,7 @@ class TestRoutingEngineSkillApplication:
 
     @pytest.mark.asyncio
     async def test_apply_skills_with_error_handling(self, sample_state, mock_settings):
-        """测试Skill执行错误时的容错处理"""
+        """Skill执行错误必须整体失败，不能保留或继续部分路由。"""
         engine = RoutingEngine()
         
         # Mock一个会抛异常的skill
@@ -321,14 +321,12 @@ class TestRoutingEngineSkillApplication:
         
         with patch.object(engine.skill_manager, 'get_skill', side_effect=get_skill_side_effect):
             with patch('src.router.dependency.resolve_skill_order', return_value=['failing', 'normal']):
-                result = await engine._apply_skills(sample_state, ['failing', 'normal'])
-                
-                # 验证即使第一个skill失败,第二个仍然执行
+                with pytest.raises(RuntimeError, match="router_skill_failed"):
+                    await engine._apply_skills(sample_state, ['failing', 'normal'])
+
                 failing_skill.execute.assert_called_once()
-                normal_skill.execute.assert_called_once()
-                
-                # 验证正常skill的状态被合并
-                assert result["metadata"]["success"] is True
+                normal_skill.execute.assert_not_called()
+                assert "success" not in sample_state.get("metadata", {})
 
 
     @pytest.mark.asyncio

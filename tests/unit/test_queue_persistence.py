@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.storage import ContentRef
+from src.domain.email_state import ProcessingOutcome
 
 
 def _wire_content_store(ctx):
@@ -70,9 +71,10 @@ async def test_failed_email_not_marked_as_read():
          patch("src.exchange_service._mark_email_read", new_callable=AsyncMock) as mock_mark:
 
         from src.exchange_service import process_and_archive_email
-        await process_and_archive_email(email_data, mock_ctx)
+        outcome = await process_and_archive_email(email_data, mock_ctx)
 
         mock_mark.assert_not_called()
+        assert outcome is ProcessingOutcome.FAILED
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ class InitialEmailWriteResult(StrEnum):
 
 class ProcessingOutcome(StrEnum):
     PROCESSED = "processed"
+    FAILED = "failed"
     DUPLICATE = "duplicate"
     ARCHIVED = "archived"
     MANUAL_REVIEW = "manual_review"

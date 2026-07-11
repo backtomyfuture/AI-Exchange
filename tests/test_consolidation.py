@@ -24,6 +24,9 @@ class TestServiceConsolidation(unittest.IsolatedAsyncioTestCase):
         # option A: AsyncMock
         mock_ctx.setup_async = AsyncMock()
         mock_ctx.close = AsyncMock()
+        mock_ctx.db_manager.recover_incomplete_approval_states = AsyncMock(
+            return_value=0
+        )
         
         mock_get_ctx.return_value = mock_ctx
         
@@ -38,6 +41,7 @@ class TestServiceConsolidation(unittest.IsolatedAsyncioTestCase):
         # Check if context was initialized
         mock_get_ctx.assert_called_once()
         mock_ctx.setup_async.assert_called_once()
+        mock_ctx.db_manager.recover_incomplete_approval_states.assert_awaited_once()
         
         # Check if Lark was initialized
         mock_lark_app.init_lark_app.assert_called_once()

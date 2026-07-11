@@ -21,15 +21,23 @@ class FakeContentStore:
 
 
 class FakeDraftStore:
-    def __init__(self, values=None):
+    def __init__(self, values=None, *, status_getter=None):
         self.values = dict(values or {})
         self.saves = []
         self.loads = []
+        self.status_getter = status_getter or (lambda: "waiting_approval")
 
     async def save_draft(self, email_id, content):
         self.saves.append((email_id, content))
         self.values[email_id] = content
         return email_id
+
+    async def save_draft_if_status(self, email_id, content):
+        if self.status_getter() != "waiting_approval":
+            return False
+        self.saves.append((email_id, content))
+        self.values[email_id] = content
+        return True
 
     async def load_draft(self, draft_id):
         self.loads.append(draft_id)
@@ -112,13 +120,30 @@ def production_lark_boundary(monkeypatch):
     )
     drafts = FakeDraftStore({"mail-1": "COMPLETE-DRAFT-SENTINEL"})
     dependencies = GraphDependencies(content_store=content_store, drafts=drafts)
+    database = SimpleNamespace(status="waiting_approval")
+
+    async def compare_and_set_status(_email_id, *, expected, target):
+        if database.status not in expected:
+            return False
+        database.status = target
+        return True
+
+    async def get_email_status(_email_id):
+        return database.status
+
+    async def update_status(_email_id, status, **_kwargs):
+        if status is not None:
+            database.status = status
+
+    database.compare_and_set_status = AsyncMock(
+        side_effect=compare_and_set_status
+    )
+    database.get_email_status = AsyncMock(side_effect=get_email_status)
+    database.update_status = AsyncMock(side_effect=update_status)
+    drafts.status_getter = lambda: database.status
     monkeypatch.setattr(lark_app, "graph", graph)
     monkeypatch.setattr(lark_app, "graph_dependencies", dependencies)
-    monkeypatch.setattr(
-        lark_app,
-        "db_manager",
-        SimpleNamespace(update_status=AsyncMock()),
-    )
+    monkeypatch.setattr(lark_app, "db_manager", database)
     monkeypatch.setattr(lark_app, "card_builder", MagicMock())
     lark_app.card_builder.build_approval_card.return_value = {"card": "ok"}
     monkeypatch.setattr(lark_app, "worker_loop", None)
@@ -562,7 +587,6 @@ def test_draft_edit_saves_full_text_and_updates_graph_with_id_only(
     update = graph.aupdate_state.await_args.args[1]
     assert update == {
         "draft_id": "mail-1",
-        "approval_status": "modify",
     }
     assert "EDITED-DRAFT-SENTINEL" not in str(update)
     assert "draft" not in state.values
@@ -664,6 +688,34 @@ def test_recipient_search_persists_only_bounded_ui_state(
     assert "email" not in graph.aupdate_state.await_args.args[1]
 
 
+def test_late_recipient_search_result_is_dropped_after_approval(
+    production_lark_boundary,
+    monkeypatch,
+):
+    _state_value, graph, _dependencies = production_lark_boundary
+
+    def approve_while_searching(_keyword):
+        lark_app.db_manager.status = "approved"
+        return ["late-candidate"]
+
+    lark_app.card_builder.search_person_picker_candidates.side_effect = (
+        approve_while_searching
+    )
+    patch_card = MagicMock()
+    monkeypatch.setattr(lark_app, "update_card_ui", patch_card)
+
+    result = lark_app.handle_card_action(
+        _event(
+            "search_to",
+            form_value={"to_search_keyword": "late"},
+        )
+    )
+
+    assert result["toast"]["type"] == "info"
+    graph.aupdate_state.assert_not_awaited()
+    patch_card.assert_not_called()
+
+
 def _close_scheduled(coroutine):
     coroutine.close()
 
@@ -679,9 +731,14 @@ def test_approval_loads_final_draft_but_graph_update_stays_small(
     assert dependencies.drafts.loads == ["mail-1"]
     lark_app.db_manager.update_status.assert_awaited_once_with(
         "mail-1",
-        "approved",
+        None,
         approver_user_id="approver-1",
         final_draft="COMPLETE-DRAFT-SENTINEL",
+    )
+    lark_app.db_manager.compare_and_set_status.assert_awaited_once_with(
+        "mail-1",
+        expected=frozenset({"waiting_approval"}),
+        target="approved",
     )
     update = graph.aupdate_state.await_args.args[1]
     assert update == {"approval_status": "approved"}
@@ -701,9 +758,14 @@ def test_rejection_updates_only_small_status_and_reason_stays_in_database(
     assert "语气不当" not in str(update)
     lark_app.db_manager.update_status.assert_awaited_once_with(
         "mail-1",
-        "rejected",
+        None,
         approver_user_id="approver-1",
         rejection_reason="语气不当",
+    )
+    lark_app.db_manager.compare_and_set_status.assert_awaited_once_with(
+        "mail-1",
+        expected=frozenset({"waiting_approval"}),
+        target="rejected",
     )
 
 

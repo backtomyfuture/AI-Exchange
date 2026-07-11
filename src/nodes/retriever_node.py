@@ -12,6 +12,7 @@ from src.safety.model_budget import (
     enforce_model_input_budget,
     token_budget_from_settings,
 )
+from src.safety.manual_review import build_manual_review_delta
 from src.utils.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,11 @@ async def retrieve_context(
         engine = get_routing_engine()
         tier2_delta = await engine.apply_tier2_hits(local_state, results)
     except Exception as exc:
-        logger.debug("Tier 2 routing skipped: error_type=%s", type(exc).__name__)
+        logger.error(
+            "Tier 2 routing failed; manual review required: error_type=%s",
+            type(exc).__name__,
+        )
+        return build_manual_review_delta(state, "router_skill_failed")
 
     # Priority 3: experience memory (Tier 2 enhancement)
     experience_hints = await _retrieve_experience(subject, body, sender)
@@ -82,7 +87,16 @@ async def retrieve_context(
 
     # Priority 4: thread summary (Phase 3)
     if results:
-        thread_summary = await _generate_thread_summary(results, subject)
+        try:
+            thread_summary = await _generate_thread_summary(results, subject)
+        except ModelInputTooLarge:
+            return build_manual_review_delta(state, "summary_input_too_large")
+        except Exception as exc:
+            logger.error(
+                "Thread summary unavailable; manual review required: error_type=%s",
+                type(exc).__name__,
+            )
+            return build_manual_review_delta(state, "summary_model_failed")
         if thread_summary:
             metadata["thread_summary"] = thread_summary
 
@@ -164,17 +178,20 @@ async def _generate_thread_summary(context_results: list[dict], subject: str) ->
         )
         llm = get_llm_for_role("summary", temperature=0)
         response = await llm.ainvoke(prompt)
-        summary = response.content.strip()
+        content = getattr(response, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("summary_empty_response")
+        summary = content.strip()
         logger.info("Thread summary generated (%d chars)", len(summary))
         return summary
     except ModelInputTooLarge:
         raise
     except Exception as exc:
-        logger.debug(
-            "Thread summary generation skipped: error_type=%s",
+        logger.error(
+            "Thread summary generation failed: error_type=%s",
             type(exc).__name__,
         )
-        return ""
+        raise RuntimeError("summary_model_failed") from None
 
 
 async def _retrieve_style_guidance(sender: str) -> str:
