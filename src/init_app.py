@@ -7,7 +7,8 @@ from src.graph.builder import build_graph
 from src.utils.exchange_api import ExchangeClient
 from src.utils.email_processor import EmailProcessor
 from src.utils.db_async import AsyncDatabaseManager
-from src.config import get_settings
+from src.config import get_settings, resolve_secret
+from src.storage import EncryptedFileContentStore
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ class AppContext:
         self.db_manager = None
         self.graph = None
         self.pool = None
+        self.content_store = None
 
     def initialize(self):
         """
@@ -27,6 +29,12 @@ class AppContext:
         """
         logger.info("Initializing Application Context...")
         settings = get_settings()
+
+        self.content_store = EncryptedFileContentStore(
+            root=settings.CONTENT_STORE_ROOT,
+            key=resolve_secret(settings.CONTENT_STORE_KEY),
+            key_version=settings.CONTENT_STORE_KEY_VERSION,
+        )
 
         # Suppress verbose logs from third-party libraries globally
         logging.getLogger("fontTools").setLevel(logging.ERROR)

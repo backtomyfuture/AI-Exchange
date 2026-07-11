@@ -13,6 +13,7 @@ beautifulsoup4
 tqdm
 tenacity
 httpx
+cryptography>=44,<46
 pydantic
 lark-oapi
 pydantic-settings

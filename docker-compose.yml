@@ -49,6 +49,7 @@ services:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./skills_registry:/app/skills_registry
+      - content_data:/app/data/content
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -63,3 +64,6 @@ services:
         limits:
           cpus: '2'
           memory: 2G
+
+volumes:
+  content_data:

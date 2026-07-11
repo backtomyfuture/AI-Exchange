@@ -34,4 +34,5 @@ dependencies = [
     "weasyprint>=68.1",
     "prometheus-client>=0.21.0",
     "alembic>=1.15,<2",
+    "cryptography>=44,<46",
 ]

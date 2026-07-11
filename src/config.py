@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # Server
     EXTERNAL_URL: str = "http://localhost:8000"
 
+    # Encrypted content storage. Empty key is an intentional fail-closed default.
+    CONTENT_STORE_ROOT: str = "/app/data/content"
+    CONTENT_STORE_KEY: SecretStr = SecretStr("")
+    CONTENT_STORE_KEY_VERSION: str = "v1"
+
     # LLM (global defaults)
     OPENAI_API_KEY: SecretStr = SecretStr("")
     OPENAI_API_BASE: str = ""
