@@ -164,6 +164,60 @@ def test_store_rejects_existing_non_private_roots(tmp_path, valid_key, root_kind
         EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
 
 
+@pytest.mark.asyncio
+async def test_store_supports_canonical_parent_behind_symlink(tmp_path, valid_key):
+    from src.storage import EncryptedFileContentStore
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    logical_parent = tmp_path / "logical-parent"
+    logical_parent.symlink_to(real_parent, target_is_directory=True)
+    logical_root = logical_parent / "content"
+
+    store = EncryptedFileContentStore(
+        root=logical_root,
+        key=valid_key,
+        key_version="v1",
+    )
+    attacker_parent = tmp_path / "attacker-parent"
+    attacker_parent.mkdir()
+    logical_parent.unlink()
+    logical_parent.symlink_to(attacker_parent, target_is_directory=True)
+    ref = await store.put_email(
+        8,
+        "mail-parent-symlink",
+        {"body": "persisted", "attachments": []},
+    )
+
+    assert await store.load_email(ref) == {
+        "body": "persisted",
+        "attachments": [],
+    }
+    canonical_root = real_parent / "content"
+    assert canonical_root.is_symlink() is False
+    assert stat.S_IMODE(canonical_root.stat().st_mode) == 0o700
+    assert not (attacker_parent / "content").exists()
+
+
+@pytest.mark.asyncio
+async def test_store_creates_multiple_missing_parent_directories(tmp_path, valid_key):
+    from src.storage import EncryptedFileContentStore
+
+    root = tmp_path / "missing-one" / "missing-two" / "content"
+    store = EncryptedFileContentStore(root=root, key=valid_key, key_version="v1")
+    ref = await store.put_email(
+        8,
+        "mail-missing-parents",
+        {"body": "persisted", "attachments": []},
+    )
+
+    assert await store.load_email(ref) == {
+        "body": "persisted",
+        "attachments": [],
+    }
+    assert stat.S_IMODE(root.resolve().stat().st_mode) == 0o700
+
+
 def test_content_store_settings_have_fail_closed_defaults(monkeypatch):
     from src.config import Settings, resolve_secret
 

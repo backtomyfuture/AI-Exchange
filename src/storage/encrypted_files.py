@@ -81,7 +81,13 @@ class EncryptedFileContentStore:
         ):
             raise ContentStoreConfigurationError("invalid_content_store_root")
 
-        self._root = validated_root
+        try:
+            validated_root.parent.mkdir(parents=True, exist_ok=True)
+            canonical_parent = validated_root.parent.resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise ContentStoreConfigurationError("invalid_content_store_root") from None
+
+        self._root = canonical_parent / validated_root.name
         self._key = decoded_key
         self._key_version = validated_version
         self._preflight_root()
