@@ -81,7 +81,20 @@ def _attachment_size_upper_bound(attachment: Mapping[str, Any]) -> int:
     raise InputLimitExceeded("attachment_format")
 
 
-def validate_email_input(email: Mapping[str, Any], limits: InputLimits) -> None:
+def validate_email_input(
+    email: Mapping[str, Any],
+    limits: InputLimits,
+    *,
+    require_graph_metadata: bool = False,
+) -> None:
+    if require_graph_metadata:
+        from src.graph.state_factory import validate_initial_graph_metadata
+
+        try:
+            validate_initial_graph_metadata(email)
+        except ValueError as exc:
+            raise InputLimitExceeded(str(exc)) from None
+
     body = email.get("body") or ""
     if not isinstance(body, str):
         body = str(body)

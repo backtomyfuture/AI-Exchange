@@ -20,7 +20,7 @@ from src.exchange_service import (
 from src.graph.state_factory import build_initial_graph_state
 from src.graph.state import AgentState
 from src.safety.input_limits import InputLimitExceeded
-from src.storage import ContentRef
+from src.storage import ContentRef, ContentStoreReferenceError
 from src.utils.email_processor import EmailProcessor
 
 
@@ -153,6 +153,60 @@ async def test_invalid_base64_is_rejected_before_database_or_content_writes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email", "category"),
+    [
+        ({"id": "x" * 513}, "invalid_email_id"),
+        (
+            {"id": "mail-oversized-sender", "sender": "s" * 321},
+            "invalid_draft_to",
+        ),
+        (
+            {"id": "mail-oversized-cc", "draft_cc": ["c" * 321]},
+            "invalid_draft_cc",
+        ),
+    ],
+)
+async def test_invalid_graph_identifiers_are_rejected_before_any_write(
+    email,
+    category,
+):
+    order: list[str] = []
+    ctx = _ctx(order)
+
+    with pytest.raises(InputLimitExceeded) as caught:
+        await process_and_archive_email(email, ctx)
+
+    assert caught.value.category == category
+    assert order == []
+    ctx.db_manager.log_initial_email.assert_not_awaited()
+    ctx.content_store.put_email.assert_not_awaited()
+    ctx.db_manager.set_content_ref_if_absent.assert_not_awaited()
+    ctx.graph.astream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_many_initial_recipients_remain_valid_and_are_capped_at_graph_boundary():
+    order: list[str] = []
+    ctx = _ctx(order)
+    email = {
+        "id": "mail-many-recipients",
+        "draft_to": [f"user-{index}@example.com" for index in range(11)],
+    }
+
+    with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._run_ai_path",
+        new_callable=AsyncMock,
+    ) as downstream:
+        outcome = await process_and_archive_email(email, ctx)
+
+    assert outcome is ProcessingOutcome.PROCESSED
+    assert order == ["db-log", "put", "db-ref"]
+    downstream.assert_awaited_once()
+    assert build_initial_graph_state(email, _ref())["draft_to"] == email["draft_to"][:10]
+
+
+@pytest.mark.asyncio
 async def test_force_retry_reuses_existing_database_ref_without_new_object():
     order: list[str] = []
     ctx = _ctx(order, initial=InitialEmailWriteResult.DUPLICATE)
@@ -264,6 +318,44 @@ async def test_ref_write_failure_with_different_winner_deletes_only_candidate():
     ctx.content_store.delete.assert_awaited_once_with(_ref())
 
 
+@pytest.mark.parametrize("claim_result", ["false", "error"])
+@pytest.mark.asyncio
+async def test_foreign_account_ref_winner_still_deletes_unclaimed_candidate(
+    claim_result,
+):
+    order: list[str] = []
+    ctx = _ctx(order)
+    foreign_winner = ContentRef(
+        account_id=9,
+        object_id="00000000-0000-4000-8000-000000000039",
+        key_version="v1",
+        sha256="f" * 64,
+    )
+    if claim_result == "false":
+        ctx.db_manager.set_content_ref_if_absent.side_effect = None
+        ctx.db_manager.set_content_ref_if_absent.return_value = False
+    else:
+        ctx.db_manager.set_content_ref_if_absent.side_effect = DatabaseOperationError(
+            operation="set_content_ref_if_absent",
+            retryable=True,
+            message="ambiguous claim",
+        )
+    ctx.db_manager.get_content_ref.return_value = foreign_winner
+
+    with patch("src.exchange_service.get_settings", return_value=_settings()), pytest.raises(
+        ContentStoreReferenceError,
+        match="content_account_mismatch",
+    ):
+        await _ensure_durable_content_ref(
+            "mail-1",
+            {"id": "mail-1"},
+            ctx,
+            reuse_existing=False,
+        )
+
+    ctx.content_store.delete.assert_awaited_once_with(_ref())
+
+
 @pytest.mark.asyncio
 async def test_ref_write_failure_with_uncertain_readback_never_deletes_candidate(caplog):
     order: list[str] = []
@@ -295,6 +387,7 @@ async def test_ref_write_failure_with_uncertain_readback_never_deletes_candidate
         ("missing", True),
         ("committed", False),
         ("winner", True),
+        ("foreign", True),
         ("unknown", False),
     ],
 )
@@ -312,9 +405,9 @@ async def test_cancelled_ref_claim_reconciles_candidate_before_propagating(
         ctx.db_manager.get_content_ref.return_value = None
     elif readback == "committed":
         ctx.db_manager.get_content_ref.return_value = _ref()
-    elif readback == "winner":
+    elif readback in {"winner", "foreign"}:
         ctx.db_manager.get_content_ref.return_value = ContentRef(
-            account_id=8,
+            account_id=9 if readback == "foreign" else 8,
             object_id="00000000-0000-4000-8000-000000000029",
             key_version="v1",
             sha256="9" * 64,
@@ -583,6 +676,46 @@ async def test_pipeline_restart_builds_slim_state_from_database_ref():
         "https://example.invalid/file"
     )
     ctx.db_manager.get_content_ref.assert_awaited_once_with("mail-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_draft_id", ["", 0, False])
+async def test_pipeline_rejects_non_none_malformed_draft_id_without_loading_it(
+    malformed_draft_id,
+):
+    ctx = _ctx([])
+    ctx.db_manager.get_content_ref.return_value = _ref()
+    ctx.content_store.load_email.return_value = {
+        "id": "mail-1",
+        "subject": "subject",
+        "sender": "a@example.com",
+    }
+
+    async def stream(_initial_state, *, config):
+        if False:
+            yield config
+
+    ctx.graph.astream = stream
+    ctx.graph.aget_state.return_value = SimpleNamespace(
+        values={
+            "email_id": "mail-1",
+            "classification": {"need_reply": False},
+            "draft_id": malformed_draft_id,
+            "context_summaries": [],
+            "routing_log": [],
+            "active_skills": [],
+        }
+    )
+
+    with patch("src.exchange_service.get_settings", return_value=_settings()):
+        result = await _run_ai_pipeline(
+            "mail-1",
+            ctx,
+            {"configurable": {"thread_id": "mail-1"}},
+        )
+
+    assert result is None
+    ctx.db_manager.load_draft.assert_not_awaited()
 
 
 def test_email_processor_never_creates_a_second_image_base64_copy():

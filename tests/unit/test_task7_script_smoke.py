@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +20,39 @@ from src.graph.dependencies import GraphDependencies
 from src.graph.state_factory import content_ref_from_json
 from src.domain.email_state import ProcessingOutcome
 from src.utils import lark_app
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["manual_nodes_test.py", "test_notification_logic.py"],
+)
+def test_task7_smoke_scripts_can_be_imported_outside_repository(
+    script_name,
+    tmp_path,
+):
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / script_name
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import runpy; "
+                f"runpy.run_path({str(script_path)!r}, run_name='task7_import_smoke')"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.asyncio
@@ -286,7 +322,7 @@ async def test_push_test_main_sends_pdf_url_string(mock_env, monkeypatch):
     monkeypatch.setattr("email.message_from_binary_file", lambda *_args, **_kwargs: message)
     monkeypatch.setattr("builtins.open", MagicMock())
     monkeypatch.setattr(push_test_card, "_extract_body", lambda _message: "body")
-    inject_debug = AsyncMock()
+    inject_debug = AsyncMock(return_value=True)
     monkeypatch.setattr(push_test_card, "_inject_debug_original", inject_debug)
     monkeypatch.setattr(
         push_test_card,
@@ -329,7 +365,7 @@ def _configure_push_test_main_pdf_outcome(monkeypatch, outcome):
     message.walk.return_value = []
     send_card = MagicMock(return_value=True)
     register_state = MagicMock()
-    inject_debug = AsyncMock()
+    inject_debug = AsyncMock(return_value=True)
     delete_file = MagicMock(return_value=False)
 
     monkeypatch.setenv("LARK_APP_ID", "app-id")
@@ -416,3 +452,71 @@ async def test_push_test_main_continues_without_pdf_after_cleanup_recovery(
     assert send_card.call_args.kwargs["pdf_url"] is None
     assert register_state.call_args.kwargs["pdf_token"] is None
     assert inject_debug.await_args.kwargs["pdf_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_push_test_main_stops_and_cleans_pdf_when_server_injection_fails(
+    mock_env,
+    monkeypatch,
+):
+    send_card, register_state, inject_debug, delete_file = (
+        _configure_push_test_main_pdf_outcome(
+            monkeypatch,
+            {
+                "url": "https://example.test/pdf",
+                "file_token": "PDF-TOKEN",
+            },
+        )
+    )
+    inject_debug.return_value = False
+    delete_file.return_value = True
+    remove_debug = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        push_test_card,
+        "_remove_debug_original",
+        remove_debug,
+    )
+
+    with pytest.raises(RuntimeError, match="test_card_debug_injection_failed"):
+        await push_test_card.main()
+
+    register_state.assert_called_once()
+    send_card.assert_not_called()
+    remove_debug.assert_awaited_once_with("test_push_REAL_EML")
+    delete_file.assert_called_once_with("PDF-TOKEN")
+    assert "test_push_REAL_EML" not in lark_app._mock_store
+
+
+@pytest.mark.asyncio
+async def test_push_test_main_cleans_state_and_files_when_card_send_returns_false(
+    mock_env,
+    monkeypatch,
+):
+    send_card, register_state, inject_debug, delete_file = (
+        _configure_push_test_main_pdf_outcome(
+            monkeypatch,
+            {
+                "url": "https://example.test/pdf",
+                "file_token": "PDF-TOKEN",
+            },
+        )
+    )
+    remove_debug = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        push_test_card,
+        "_remove_debug_original",
+        remove_debug,
+        raising=False,
+    )
+    send_card.return_value = False
+    delete_file.return_value = True
+    lark_app._mock_store["test_push_REAL_EML"] = MagicMock()
+
+    with pytest.raises(RuntimeError, match="test_card_delivery_failed"):
+        await push_test_card.main()
+
+    register_state.assert_called_once()
+    inject_debug.assert_awaited_once()
+    remove_debug.assert_awaited_once_with("test_push_REAL_EML")
+    delete_file.assert_called_once_with("PDF-TOKEN")
+    assert "test_push_REAL_EML" not in lark_app._mock_store

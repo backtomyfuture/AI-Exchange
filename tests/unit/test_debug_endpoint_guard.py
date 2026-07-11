@@ -41,7 +41,7 @@ async def test_debug_endpoint_allowed_in_debug_mode():
         from httpx import AsyncClient, ASGITransport
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post("/debug/inject_email", json={
-                "id": "test_debug", "subject": "x", "sender": "x",
+                "id": "test_push_debug", "subject": "x", "sender": "x",
                 "to": ["x"], "body": "x", "received_at": "2026-01-01"
             })
             assert resp.status_code == 200

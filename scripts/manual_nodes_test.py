@@ -6,11 +6,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
+import sys
 from copy import deepcopy
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from dotenv import load_dotenv
+
+# Allow direct execution from any working directory.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.config import get_settings
 from src.graph.dependencies import GraphDependencies

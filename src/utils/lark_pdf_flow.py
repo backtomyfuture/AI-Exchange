@@ -17,7 +17,6 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
-from weakref import WeakValueDictionary
 
 from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
@@ -25,6 +24,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 from src.graph.dependencies import GraphDependencies
+from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import (
     MAX_TOKENS,
     hydrate_email_for_rendering,
@@ -34,7 +34,6 @@ from src.utils.email_renderer import render_email_html
 from src.utils.pdf_generator import convert_html_to_pdf
 
 logger = logging.getLogger(__name__)
-_pdf_flow_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 
 @dataclass(frozen=True)
@@ -54,14 +53,6 @@ def _token_tuple(*tokens: object) -> tuple[str, ...]:
         if isinstance(token, str) and token and token not in result:
             result.append(token)
     return tuple(result)
-
-
-def _get_pdf_flow_lock(email_id: str) -> asyncio.Lock:
-    lock = _pdf_flow_locks.get(email_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _pdf_flow_locks[email_id] = lock
-    return lock
 
 
 def _prepare_pdf_token_transition(
@@ -782,7 +773,7 @@ async def process_pdf_generation_and_reply(
     delete_fn: Callable[[str], bool],
 ) -> PdfFlowOutcome | None:
     """Serialize PDF token transitions for one email inside this worker."""
-    async with _get_pdf_flow_lock(email_id):
+    async with get_graph_resource_lock(email_id):
         return await _process_pdf_generation_and_reply_locked(
             email_id,
             state,

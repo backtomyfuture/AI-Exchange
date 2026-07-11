@@ -1,4 +1,5 @@
 import pytest
+from typing import get_args, get_type_hints
 from unittest.mock import MagicMock, patch, AsyncMock
 from src.utils import lark_app
 
@@ -154,3 +155,10 @@ async def test_process_pdf_shim_returns_explicit_flow_outcome(mock_env):
 
     assert result is outcome
     implementation.assert_awaited_once()
+
+
+def test_generate_pdf_shim_type_contract_includes_flow_outcome():
+    from src.utils.lark_pdf_flow import PdfFlowOutcome
+
+    return_hint = get_type_hints(lark_app.generate_and_upload_pdf)["return"]
+    assert PdfFlowOutcome in get_args(return_hint)

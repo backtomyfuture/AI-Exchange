@@ -7,14 +7,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, StateGraph
 
 from src.exchange_service import _dispatch_notification, _run_ai_pipeline
 from src.graph.builder import build_graph
 from src.graph.dependencies import GraphDependencies
+from src.graph.state import AgentState
 from src.graph.state_factory import (
     MAX_CHECKPOINT_BYTES,
+    MAX_LOGICAL_STATE_BYTES,
     build_initial_graph_state,
     sanitize_graph_delta,
+    serialized_state_size,
 )
 from src.storage import ContentRef
 from src.utils import lark_app
@@ -149,6 +153,44 @@ async def test_recording_saver_observes_real_compiled_flow(monkeypatch):
 
     methods = {record[0] for record in saver.records}
     assert methods == {"put", "aput", "put_writes", "aput_writes"}
+    assert saver.records
+    for _method, _kind, _decoded, (tag, payload) in saver.records:
+        assert len(tag.encode("utf-8")) + len(payload) < MAX_CHECKPOINT_BYTES
+
+
+@pytest.mark.asyncio
+async def test_extreme_legal_state_still_fits_real_checkpoint_serializer(monkeypatch):
+    monkeypatch.setattr(
+        "src.graph.state_factory.get_settings",
+        lambda: SimpleNamespace(EXCHANGE_ACCOUNT_ID=8),
+    )
+    base = build_initial_graph_state({"id": "checkpoint-boundary"}, _ref())
+    tokens = [
+        f"t{index}" + "x" * (510 - len(str(index)))
+        for index in range(21)
+    ]
+    delta = sanitize_graph_delta(
+        base,
+        {
+            "attachment_tokens": tokens,
+            "system_prompt_modifier": "m" * 924,
+        },
+    )
+    state = {**base, **delta}
+    assert serialized_state_size(state) == MAX_LOGICAL_STATE_BYTES - 1
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("noop", lambda _state: {})
+    workflow.set_entry_point("noop")
+    workflow.add_edge("noop", END)
+    saver = RecordingInMemorySaver()
+    graph = workflow.compile(checkpointer=saver)
+
+    await graph.ainvoke(
+        state,
+        config={"configurable": {"thread_id": "checkpoint-boundary"}},
+    )
+
     assert saver.records
     for _method, _kind, _decoded, (tag, payload) in saver.records:
         assert len(tag.encode("utf-8")) + len(payload) < MAX_CHECKPOINT_BYTES

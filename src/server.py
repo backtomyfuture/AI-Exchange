@@ -243,6 +243,11 @@ async def inject_test_email(data: MockEmailData):
     settings = get_settings()
     if not settings.DEBUG:
         raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+    if not lark_app.is_test_card_id(data.id):
+        raise HTTPException(
+            status_code=400,
+            detail="Debug email id must use the test_push_ namespace",
+        )
 
     logger.info(f"Injecting mock email: {data.id}")
     
@@ -279,6 +284,28 @@ async def inject_test_email(data: MockEmailData):
     lark_app._mock_store[data.id] = mock_state
     return {"status": "ok", "id": data.id}
 
+
+@app.delete("/debug/inject_email/{email_id:path}")
+async def delete_test_email(email_id: str):
+    """Remove only an explicitly namespaced DEBUG test-card state."""
+    settings = get_settings()
+    if not settings.DEBUG:
+        raise HTTPException(
+            status_code=403,
+            detail="Debug endpoints disabled in production",
+        )
+    if not lark_app.is_test_card_id(email_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Debug email id must use the test_push_ namespace",
+        )
+    removed = lark_app._mock_store.pop(email_id, None) is not None
+    return {
+        "status": "ok",
+        "id": email_id,
+        "removed": removed,
+    }
+
 @app.get("/email/{email_id:path}", response_class=HTMLResponse)
 async def view_email(email_id: str):
     """
@@ -286,7 +313,9 @@ async def view_email(email_id: str):
     """
     settings = get_settings()
     is_explicit_debug_email = (
-        bool(settings.DEBUG) and email_id in lark_app._mock_store
+        bool(settings.DEBUG)
+        and lark_app.is_test_card_id(email_id)
+        and email_id in lark_app._mock_store
     )
     if is_explicit_debug_email:
         state = lark_app._mock_store[email_id]

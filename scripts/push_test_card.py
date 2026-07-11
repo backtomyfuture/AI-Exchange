@@ -16,6 +16,7 @@ from email import policy
 from email.header import decode_header
 from types import SimpleNamespace
 from typing import Any, Callable
+from urllib.parse import quote
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -270,7 +271,7 @@ async def _inject_debug_original(
     classification: dict[str, Any],
     attachment_tokens: list[str],
     pdf_token: str | None,
-) -> None:
+) -> bool:
     """可选地把测试原文送入启用 DEBUG 的本地服务进程。"""
     try:
         import requests
@@ -294,11 +295,55 @@ async def _inject_debug_original(
         )
         response.raise_for_status()
         logger.info("Mock email injected successfully")
+        return True
     except Exception as exc:
         logger.warning(
-            "Mock email injection skipped: error_type=%s",
+            "Mock email injection failed: error_type=%s",
             type(exc).__name__,
         )
+        return False
+
+
+async def _cleanup_test_card_files(
+    tokens: list[str],
+    *,
+    delete_fn: Callable[[str], bool],
+) -> None:
+    for token in dict.fromkeys(item for item in tokens if item):
+        try:
+            deleted = await asyncio.to_thread(delete_fn, token)
+        except Exception as exc:
+            logger.error(
+                "Test card file cleanup failed: error_type=%s",
+                type(exc).__name__,
+            )
+            deleted = False
+        if not deleted:
+            logger.error("Test card file cleanup remains unresolved")
+
+
+async def _remove_debug_original(email_id: str) -> bool:
+    """Best-effort removal of a test state after confirmed card-send failure."""
+    try:
+        import requests
+
+        external_url = os.getenv("EXTERNAL_URL", "http://localhost:8000")
+        debug_url = (
+            f"{external_url}/debug/inject_email/{quote(email_id, safe='')}"
+        )
+        response = await asyncio.to_thread(
+            requests.delete,
+            debug_url,
+            timeout=5,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Mock email cleanup failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return False
 
 
 async def main() -> None:
@@ -399,7 +444,7 @@ async def main() -> None:
         attachment_tokens=attachment_tokens,
         pdf_token=pdf_token,
     )
-    await _inject_debug_original(
+    injected = await _inject_debug_original(
         email_data,
         draft=draft,
         context=context,
@@ -407,6 +452,14 @@ async def main() -> None:
         attachment_tokens=attachment_tokens,
         pdf_token=pdf_token,
     )
+    if not injected:
+        await _remove_debug_original(email_data["id"])
+        await _cleanup_test_card_files(
+            [*attachment_tokens, *([pdf_token] if pdf_token else [])],
+            delete_fn=lark_app.delete_file_from_drive,
+        )
+        lark_app._mock_store.pop(email_data["id"], None)
+        raise RuntimeError("test_card_debug_injection_failed")
 
     logger.info("Sending test card")
     sent = lark_app.send_approval_card(
@@ -421,6 +474,13 @@ async def main() -> None:
         logger.info("Test card sent successfully")
     else:
         logger.error("Test card delivery failed")
+        await _remove_debug_original(email_data["id"])
+        await _cleanup_test_card_files(
+            [*attachment_tokens, *([pdf_token] if pdf_token else [])],
+            delete_fn=lark_app.delete_file_from_drive,
+        )
+        lark_app._mock_store.pop(email_data["id"], None)
+        raise RuntimeError("test_card_delivery_failed")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,4 @@
 import asyncio
-import time
 import logging
 import re
 from copy import deepcopy
@@ -18,8 +17,10 @@ from src.graph.state_factory import (
     build_initial_graph_state,
     cap_identifier_list,
     require_owned_content_ref,
+    require_owned_draft_id,
     sanitize_graph_delta,
 )
+from src.graph.resource_locks import get_graph_resource_lock
 from src.init_app import get_app_context
 from src.safety.input_limits import input_limits_from_settings, validate_email_input
 from src.utils import lark_app
@@ -143,8 +144,21 @@ async def _run_ai_pipeline(
     preserved_attachment_tokens: list[str] | None = None,
     preserved_pdf_token: str | None = None,
     attachment_links: list[dict[str, str]] | None = None,
+    _state_lock_held: bool = False,
 ):
     """Rebuild slim State from durable refs and return a transient edge projection."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            return await _run_ai_pipeline(
+                email_id,
+                ctx,
+                config,
+                attachment_tokens=attachment_tokens,
+                preserved_attachment_tokens=preserved_attachment_tokens,
+                preserved_pdf_token=preserved_pdf_token,
+                attachment_links=attachment_links,
+                _state_lock_held=True,
+            )
     try:
         ref = _require_owned_ref(await ctx.db_manager.get_content_ref(email_id))
         email_data = await ctx.content_store.load_email(ref)
@@ -192,7 +206,13 @@ async def _run_ai_pipeline(
 
         state_values = state.values
         draft_id = state_values.get("draft_id")
-        draft = await ctx.db_manager.load_draft(draft_id) if draft_id else ""
+        draft = (
+            await ctx.db_manager.load_draft(
+                require_owned_draft_id(state_values, draft_id)
+            )
+            if draft_id is not None
+            else ""
+        )
         projection_email = deepcopy(dict(email_data))
         projection_email["draft_to"] = list(state_values.get("draft_to") or [])
         projection_email["draft_cc"] = list(state_values.get("draft_cc") or [])
@@ -228,14 +248,29 @@ async def _stage_notification_pdf(
     email_id: str,
     ctx,
     pdf_result: object,
+    *,
+    _state_lock_held: bool = False,
 ) -> NotificationPdfStage:
     """Persist a PDF token, reconciling ambiguous writes before any card send."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            return await _stage_notification_pdf(
+                email_id,
+                ctx,
+                pdf_result,
+                _state_lock_held=True,
+            )
     if pdf_result is None:
         return NotificationPdfStage(ready=True)
     if isinstance(pdf_result, PdfFlowOutcome):
         tracked = True
         for token in pdf_result.cleanup_tokens:
-            if not await _retain_cleanup_token(email_id, ctx, token):
+            if not await _retain_cleanup_token(
+                email_id,
+                ctx,
+                token,
+                _state_lock_held=True,
+            ):
                 tracked = False
         if pdf_result.protected_tokens:
             try:
@@ -291,6 +326,7 @@ async def _stage_notification_pdf(
                 email_id,
                 ctx,
                 token,
+                _state_lock_held=True,
             )
             if not safely_reconciled:
                 return NotificationPdfStage(
@@ -317,6 +353,7 @@ async def _stage_notification_pdf(
                 email_id,
                 ctx,
                 token,
+                _state_lock_held=True,
             )
             return NotificationPdfStage(
                 ready=safely_reconciled,
@@ -355,7 +392,12 @@ async def _stage_notification_pdf(
                 isinstance(old_token, str)
                 and old_token
                 and old_token != token
-                and not await _retain_cleanup_token(email_id, ctx, old_token)
+                and not await _retain_cleanup_token(
+                    email_id,
+                    ctx,
+                    old_token,
+                    _state_lock_held=True,
+                )
             ):
                 return NotificationPdfStage(
                     ready=False,
@@ -372,6 +414,7 @@ async def _stage_notification_pdf(
                 email_id,
                 ctx,
                 token,
+                _state_lock_held=True,
             )
             return NotificationPdfStage(
                 ready=safely_reconciled,
@@ -385,6 +428,7 @@ async def _stage_notification_pdf(
             email_id,
             ctx,
             token,
+            _state_lock_held=True,
         )
         return NotificationPdfStage(
             ready=safely_reconciled,
@@ -400,8 +444,22 @@ async def _stage_notification_pdf(
     )
 
 
-async def _retain_cleanup_token(email_id: str, ctx, token: str) -> bool:
+async def _retain_cleanup_token(
+    email_id: str,
+    ctx,
+    token: str,
+    *,
+    _state_lock_held: bool = False,
+) -> bool:
     """Keep a bounded cleanup handle when a remote Drive deletion is inconclusive."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            return await _retain_cleanup_token(
+                email_id,
+                ctx,
+                token,
+                _state_lock_held=True,
+            )
     config = {"configurable": {"thread_id": email_id}}
     try:
         state = await ctx.graph.aget_state(config)
@@ -412,7 +470,8 @@ async def _retain_cleanup_token(email_id: str, ctx, token: str) -> bool:
         tokens.append(token)
         update = sanitize_graph_delta(values, {"attachment_tokens": tokens})
         await ctx.graph.aupdate_state(config, update)
-        return True
+        current = await ctx.graph.aget_state(config)
+        return token in (current.values.get("attachment_tokens") or [])
     except Exception as exc:
         logger.error(
             "Remote cleanup handle persistence failed: error_type=%s",
@@ -429,7 +488,13 @@ async def _retain_cleanup_token(email_id: str, ctx, token: str) -> bool:
             return False
 
 
-async def _delete_drive_token_or_retain(email_id: str, ctx, token: str) -> bool:
+async def _delete_drive_token_or_retain(
+    email_id: str,
+    ctx,
+    token: str,
+    *,
+    _state_lock_held: bool = False,
+) -> bool:
     """Return true only when a Drive token is deleted or durably tracked."""
     try:
         deleted = await asyncio.to_thread(lark_app.delete_file_from_drive, token)
@@ -441,11 +506,31 @@ async def _delete_drive_token_or_retain(email_id: str, ctx, token: str) -> bool:
         deleted = False
     if deleted:
         return True
-    return await _retain_cleanup_token(email_id, ctx, token)
+    return await _retain_cleanup_token(
+        email_id,
+        ctx,
+        token,
+        _state_lock_held=_state_lock_held,
+    )
 
 
-async def _remove_cleanup_token(email_id: str, ctx, token: str) -> None:
+async def _remove_cleanup_token(
+    email_id: str,
+    ctx,
+    token: str,
+    *,
+    _state_lock_held: bool = False,
+) -> None:
     """Best-effort removal of a stale handle after confirmed remote deletion."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            await _remove_cleanup_token(
+                email_id,
+                ctx,
+                token,
+                _state_lock_held=True,
+            )
+        return
     config = {"configurable": {"thread_id": email_id}}
     try:
         state = await ctx.graph.aget_state(config)
@@ -704,7 +789,12 @@ async def process_and_archive_email(
     - skip_analysis=True: ingest only -> mark archived (no upload/AI/notify/mark_read)
     - force_reprocess=True: proceed even if email already exists in DB
     """
-    thread_id = email_data.get("id", str(time.time()))
+    validate_email_input(
+        email_data,
+        input_limits_from_settings(get_settings()),
+        require_graph_metadata=True,
+    )
+    thread_id = email_data["id"]
     config = {"configurable": {"thread_id": thread_id}}
 
     from src.utils.logging_setup import log_email_context
@@ -717,8 +807,6 @@ async def process_and_archive_email(
 async def _process_and_archive_email_inner(
     email_data, ctx, skip_analysis, force_reprocess, thread_id, config
 ) -> ProcessingOutcome:
-    validate_email_input(email_data, input_limits_from_settings(get_settings()))
-
     event_type = email_data.get("_event_type", "unknown")
     folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(
@@ -766,6 +854,19 @@ async def _process_and_archive_email_inner(
     return ProcessingOutcome.PROCESSED
 
 
+async def _delete_unclaimed_content_candidate(ref: ContentRef, ctx, *, reason: str) -> None:
+    try:
+        await ctx.content_store.delete(ref)
+    except asyncio.CancelledError:
+        logger.error("Unclaimed content cleanup was cancelled: reason=%s", reason)
+    except Exception as cleanup_exc:
+        logger.error(
+            "Unclaimed content cleanup failed: reason=%s error_type=%s",
+            reason,
+            type(cleanup_exc).__name__,
+        )
+
+
 async def _ensure_durable_content_ref(
     email_id: str,
     email_data: dict,
@@ -793,8 +894,6 @@ async def _ensure_durable_content_ref(
         # back before deciding whether this attempt's object is unclaimed.
         try:
             persisted_ref = await ctx.db_manager.get_content_ref(email_id)
-            if persisted_ref is not None:
-                persisted_ref = _require_owned_ref(persisted_ref)
         except asyncio.CancelledError:
             logger.error("Content reference cancellation read-back was cancelled")
             raise cancel_exc from None
@@ -805,6 +904,22 @@ async def _ensure_durable_content_ref(
                 type(read_exc).__name__,
             )
             raise cancel_exc from None
+
+        if persisted_ref is not None:
+            try:
+                persisted_ref = _require_owned_ref(persisted_ref)
+            except Exception as validation_exc:
+                if isinstance(persisted_ref, ContentRef) and persisted_ref != ref:
+                    await _delete_unclaimed_content_candidate(
+                        ref,
+                        ctx,
+                        reason="cancelled_foreign_winner",
+                    )
+                logger.error(
+                    "Content reference cancellation winner invalid: error_type=%s",
+                    type(validation_exc).__name__,
+                )
+                raise cancel_exc from None
 
         if persisted_ref is None or persisted_ref != ref:
             try:
@@ -830,7 +945,15 @@ async def _ensure_durable_content_ref(
             raise write_exc from None
 
         if persisted_ref is not None:
-            persisted_ref = _require_owned_ref(persisted_ref)
+            try:
+                persisted_ref = _require_owned_ref(persisted_ref)
+            except Exception:
+                await _delete_unclaimed_content_candidate(
+                    ref,
+                    ctx,
+                    reason="ambiguous_foreign_winner",
+                )
+                raise
             if persisted_ref == ref:
                 logger.warning("Content reference commit confirmed by read-back")
                 return ref
@@ -896,7 +1019,15 @@ async def _ensure_durable_content_ref(
             retryable=True,
             message="content reference claim unresolved",
         )
-    persisted_ref = _require_owned_ref(persisted_ref)
+    try:
+        persisted_ref = _require_owned_ref(persisted_ref)
+    except Exception:
+        await _delete_unclaimed_content_candidate(
+            ref,
+            ctx,
+            reason="false_claim_foreign_winner",
+        )
+        raise
     if persisted_ref == ref:
         return ref
     try:
@@ -957,8 +1088,21 @@ async def _checkpoint_ai_path_resources(
     *,
     attachment_tokens: list[str],
     pdf_token: str | None,
+    _state_lock_held: bool = False,
 ) -> CleanupHandleSnapshot:
     """Create and read back a restartable slim cleanup checkpoint."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            return await _checkpoint_ai_path_resources(
+                email_id,
+                email_data,
+                ref,
+                ctx,
+                config,
+                attachment_tokens=attachment_tokens,
+                pdf_token=pdf_token,
+                _state_lock_held=True,
+            )
     current = await _snapshot_cleanup_handles(email_id, ctx)
     requested_tokens = cap_identifier_list(
         attachment_tokens,
@@ -1052,8 +1196,20 @@ async def _cleanup_graph_drive_files(
     fallback_attachment_tokens: list[str],
     preserve_attachment_tokens: list[str] | None = None,
     preserve_pdf_token: str | None = None,
+    _state_lock_held: bool = False,
 ) -> None:
     """Best-effort remote cleanup while retaining failed handles in slim State."""
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            await _cleanup_graph_drive_files(
+                email_id,
+                ctx,
+                fallback_attachment_tokens=fallback_attachment_tokens,
+                preserve_attachment_tokens=preserve_attachment_tokens,
+                preserve_pdf_token=preserve_pdf_token,
+                _state_lock_held=True,
+            )
+        return
     config = {"configurable": {"thread_id": email_id}}
     state = None
     values: Mapping[str, object] = {}

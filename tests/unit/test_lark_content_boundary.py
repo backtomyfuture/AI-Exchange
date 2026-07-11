@@ -246,6 +246,31 @@ def test_seeded_mock_with_debug_disabled_uses_production_boundary(
         lark_app._mock_store.pop(email_id, None)
 
 
+def test_debug_true_non_test_seed_uses_production_action_boundary(
+    production_lark_boundary,
+    monkeypatch,
+):
+    _state, graph, dependencies = production_lark_boundary
+    email_id = "REAL-EXCHANGE-ID"
+    _seed_test_card(email_id)
+    monkeypatch.setattr(
+        lark_app,
+        "get_settings",
+        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+    )
+    try:
+        result = lark_app.handle_card_action(
+            _event("edit_draft", email_id=email_id)
+        )
+
+        graph.aget_state.assert_awaited_once()
+        assert dependencies.content_store.loads == [(_ref(), False)]
+        assert dependencies.drafts.loads == ["mail-1"]
+        assert result["toast"]["content"] == "编辑正文"
+    finally:
+        lark_app._mock_store.pop(email_id, None)
+
+
 @pytest.mark.parametrize(
     ("action", "option", "form_value", "expected_status"),
     [

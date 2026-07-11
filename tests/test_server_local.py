@@ -127,6 +127,41 @@ class TestServer(unittest.TestCase):
         )
 
     @patch("src.server.get_app_context")
+    def test_debug_true_non_test_seed_cannot_shadow_production_content(
+        self,
+        mock_get_ctx,
+    ):
+        email_id = "REAL-EXCHANGE-ID"
+        state = MagicMock()
+        state.values = {"email": {**self.mock_email_data, "body": "MOCK-BODY"}}
+        lark_app._mock_store[email_id] = state
+        ref = ContentRef(
+            account_id=8,
+            object_id="00000000-0000-4000-8000-000000000147",
+            key_version="v1",
+            sha256="e" * 64,
+        )
+        ctx = MagicMock()
+        ctx.db_manager.get_content_ref = AsyncMock(return_value=ref)
+        ctx.content_store.load_email = AsyncMock(
+            return_value={**self.mock_email_data, "id": email_id, "body": "PRODUCTION-BODY"}
+        )
+        mock_get_ctx.return_value = ctx
+        try:
+            with patch(
+                "src.server.get_settings",
+                return_value=SimpleNamespace(DEBUG=True, EXCHANGE_ACCOUNT_ID=8),
+            ):
+                response = self.client.get(f"/email/{email_id}")
+        finally:
+            lark_app._mock_store.pop(email_id, None)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("PRODUCTION-BODY", response.text)
+        self.assertNotIn("MOCK-BODY", response.text)
+        ctx.db_manager.get_content_ref.assert_awaited_once_with(email_id)
+
+    @patch("src.server.get_app_context")
     def test_debug_prefix_without_seed_uses_production_content_boundary(
         self,
         mock_get_ctx,
@@ -203,6 +238,66 @@ class TestServer(unittest.TestCase):
                 values["recipient_candidates"],
                 {"to": ["candidate-1"], "cc": []},
             )
+        finally:
+            lark_app._mock_store.pop(email_id, None)
+
+    def test_debug_injection_rejects_non_test_namespace(self):
+        email_id = "REAL-EXCHANGE-ID"
+        lark_app._mock_store.pop(email_id, None)
+        with patch(
+            "src.server.get_settings",
+            return_value=SimpleNamespace(DEBUG=True),
+        ):
+            response = self.client.post(
+                "/debug/inject_email",
+                json={
+                    "id": email_id,
+                    "subject": "must reject",
+                    "sender": "sender@example.com",
+                    "to": ["recipient@example.com"],
+                    "body": "MOCK-BODY",
+                    "received_at": "2026-07-11T00:00:00Z",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn(email_id, lark_app._mock_store)
+
+    def test_debug_injection_delete_removes_only_explicit_test_state(self):
+        email_id = "test_push_debug_delete"
+        lark_app._mock_store[email_id] = MagicMock()
+        try:
+            with patch(
+                "src.server.get_settings",
+                return_value=SimpleNamespace(DEBUG=True),
+            ):
+                response = self.client.delete(
+                    f"/debug/inject_email/{email_id}"
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json(),
+                {"status": "ok", "id": email_id, "removed": True},
+            )
+            self.assertNotIn(email_id, lark_app._mock_store)
+        finally:
+            lark_app._mock_store.pop(email_id, None)
+
+    def test_debug_injection_delete_rejects_non_test_namespace(self):
+        email_id = "REAL-EXCHANGE-ID"
+        lark_app._mock_store[email_id] = MagicMock()
+        try:
+            with patch(
+                "src.server.get_settings",
+                return_value=SimpleNamespace(DEBUG=True),
+            ):
+                response = self.client.delete(
+                    f"/debug/inject_email/{email_id}"
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(email_id, lark_app._mock_store)
         finally:
             lark_app._mock_store.pop(email_id, None)
 

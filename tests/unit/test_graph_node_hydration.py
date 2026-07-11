@@ -8,7 +8,7 @@ from langchain_core.runnables import RunnableLambda
 
 from src.graph.dependencies import GraphDependencies
 from src.graph.builder import build_graph
-from src.graph.state_factory import build_initial_graph_state
+from src.graph.state_factory import build_initial_graph_state, hydrate_graph_content
 from src.nodes.categorizer import categorize_email
 from src.nodes.drafter import generate_draft
 from src.nodes.retriever_node import retrieve_context
@@ -81,6 +81,19 @@ def _dependencies(email=None):
     })
     drafts = FakeDraftStore()
     return GraphDependencies(content_store=content_store, drafts=drafts)
+
+
+@pytest.mark.asyncio
+async def test_hydration_rejects_a_draft_owned_by_another_email():
+    dependencies = _dependencies()
+    dependencies.drafts.values["mail-2"] = "OTHER-MAIL-DRAFT-SENTINEL"
+    state = _state()
+    state["draft_id"] = "mail-2"
+
+    with pytest.raises(ValueError, match="draft_email_mismatch"):
+        await hydrate_graph_content(state, dependencies)
+
+    assert dependencies.drafts.loads == []
 
 
 def _classification_retry(**_kwargs):

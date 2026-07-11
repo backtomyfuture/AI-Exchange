@@ -12,6 +12,11 @@ from src.storage import ContentRef, ContentStoreReferenceError
 
 
 MAX_CHECKPOINT_BYTES = 16_384
+# LangGraph persists channel versions, updated-channel metadata and checkpoint
+# envelopes in addition to the logical State.  Keep a fixed 4 KiB reserve so
+# every real serializer unit remains strictly below the 16 KiB hard limit.
+CHECKPOINT_WRAPPER_HEADROOM_BYTES = 4_096
+MAX_LOGICAL_STATE_BYTES = MAX_CHECKPOINT_BYTES - CHECKPOINT_WRAPPER_HEADROOM_BYTES
 MAX_SUBJECT_BYTES = 768
 MAX_SENDER_BYTES = 320
 MAX_ID_BYTES = 512
@@ -179,7 +184,7 @@ def serialized_state_size(value: Mapping[str, Any]) -> int:
 
 
 def ensure_state_size(value: Mapping[str, Any]) -> None:
-    if serialized_state_size(value) >= MAX_CHECKPOINT_BYTES:
+    if serialized_state_size(value) >= MAX_LOGICAL_STATE_BYTES:
         raise ValueError("graph_state_too_large")
 
 
@@ -191,6 +196,55 @@ def _bounded_identifier(value: object, *, field: str) -> str:
     ):
         raise ValueError(f"invalid_{field}")
     return value
+
+
+def validate_initial_graph_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    reject_recipient_excess: bool = False,
+) -> dict[str, list[str]]:
+    """Validate identifiers that would otherwise fail after durable writes."""
+    if not isinstance(metadata, Mapping):
+        raise ValueError("invalid_email_metadata")
+    _bounded_identifier(metadata.get("id"), field="email_id")
+
+    raw_to = (
+        metadata.get("draft_to")
+        if "draft_to" in metadata
+        else ([metadata.get("sender")] if metadata.get("sender") else [])
+    )
+    raw_cc = (
+        metadata.get("draft_cc")
+        if "draft_cc" in metadata
+        else metadata.get("cc", [])
+    )
+    return {
+        "draft_to": cap_identifier_list(
+            raw_to,
+            field="draft_to",
+            max_items=MAX_RECIPIENTS,
+            max_item_bytes=MAX_RECIPIENT_BYTES,
+            reject_excess=reject_recipient_excess,
+        ),
+        "draft_cc": cap_identifier_list(
+            raw_cc,
+            field="draft_cc",
+            max_items=MAX_RECIPIENTS,
+            max_item_bytes=MAX_RECIPIENT_BYTES,
+            reject_excess=reject_recipient_excess,
+        ),
+    }
+
+
+def require_owned_draft_id(
+    state: Mapping[str, Any],
+    draft_id: object,
+) -> str:
+    email_id = _bounded_identifier(state.get("email_id"), field="email_id")
+    owned_draft_id = _bounded_identifier(draft_id, field="draft_id")
+    if owned_draft_id != email_id:
+        raise ValueError("draft_email_mismatch")
+    return owned_draft_id
 
 
 def _sanitize_classification(value: object) -> dict[str, Any]:
@@ -413,7 +467,7 @@ def sanitize_graph_delta(
         result["draft_id"] = (
             None
             if delta["draft_id"] is None
-            else _bounded_identifier(delta["draft_id"], field="draft_id")
+            else require_owned_draft_id(state, delta["draft_id"])
         )
     for field in ("draft_to", "draft_cc"):
         if field in delta:
@@ -555,7 +609,7 @@ async def hydrate_draft_from_state(
     dependencies: GraphDependencies,
 ) -> str:
     """Resolve a full draft through its bounded stable identifier."""
-    draft_id = _bounded_identifier(state.get("draft_id"), field="draft_id")
+    draft_id = require_owned_draft_id(state, state.get("draft_id"))
     draft = await dependencies.drafts.load_draft(draft_id)
     if not isinstance(draft, str):
         raise ValueError("invalid_hydrated_draft")
@@ -581,15 +635,8 @@ def build_initial_graph_state(
     metadata: Mapping[str, Any],
     ref: ContentRef,
 ) -> dict[str, Any]:
-    if not isinstance(metadata, Mapping):
-        raise ValueError("invalid_email_metadata")
-    email_id = metadata.get("id")
-    if (
-        not isinstance(email_id, str)
-        or not email_id
-        or len(email_id.encode("utf-8")) > MAX_ID_BYTES
-    ):
-        raise ValueError("invalid_email_id")
+    recipients = validate_initial_graph_metadata(metadata)
+    email_id = metadata["id"]
 
     email_metadata = {
         key: truncate_utf8(metadata.get(key, ""), max_bytes=max_bytes)
@@ -603,18 +650,8 @@ def build_initial_graph_state(
         "classification": {},
         "context_summaries": [],
         "draft_id": None,
-        "draft_to": cap_identifier_list(
-            metadata.get("draft_to", []),
-            field="draft_to",
-            max_items=MAX_RECIPIENTS,
-            max_item_bytes=MAX_RECIPIENT_BYTES,
-        ),
-        "draft_cc": cap_identifier_list(
-            metadata.get("draft_cc", []),
-            field="draft_cc",
-            max_items=MAX_RECIPIENTS,
-            max_item_bytes=MAX_RECIPIENT_BYTES,
-        ),
+        "draft_to": recipients["draft_to"],
+        "draft_cc": recipients["draft_cc"],
         "active_skills": [],
         "routing_log": [],
         "priority_level": 0,

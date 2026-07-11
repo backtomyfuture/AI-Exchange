@@ -7,17 +7,23 @@ leave the email unread on the server so SelfHealer / human can retry.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.domain.errors import DatabaseOperationError
 from src.exchange_service import (
+    _checkpoint_ai_path_resources,
+    _cleanup_graph_drive_files,
     _dispatch_notification,
+    _retain_cleanup_token,
     _run_ai_path,
+    _run_ai_pipeline,
     process_and_archive_email,
 )
 from src.storage import ContentRef
+from src.utils import lark_app, lark_pdf_flow
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 
 
@@ -56,6 +62,452 @@ def _pipeline_result(need_reply=True, priority="P1", intent="审批"):
         "routing_log": [],
         "active_skills": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cleanup_handle_retention_never_loses_a_token():
+    values = {"attachment_tokens": [], "pdf_token": None}
+
+    async def get_state(_config):
+        await asyncio.sleep(0.01)
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        return snapshot
+
+    async def update_state(_config, delta):
+        await asyncio.sleep(0)
+        values.update(delta)
+
+    context = MagicMock()
+    context.graph = MagicMock()
+    context.graph.aget_state = AsyncMock(side_effect=get_state)
+    context.graph.aupdate_state = AsyncMock(side_effect=update_state)
+
+    results = await asyncio.gather(
+        _retain_cleanup_token("mail-concurrent", context, "TOKEN-A"),
+        _retain_cleanup_token("mail-concurrent", context, "TOKEN-B"),
+    )
+
+    assert results == [True, True]
+    assert set(values["attachment_tokens"]) == {"TOKEN-A", "TOKEN-B"}
+
+
+@pytest.mark.asyncio
+async def test_cleanup_and_concurrent_retain_share_the_same_email_lock():
+    values = {
+        "attachment_tokens": ["OLD"],
+        "pdf_token": None,
+    }
+    delete_started = threading.Event()
+    allow_delete = threading.Event()
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        snapshot.next = ()
+        return snapshot
+
+    async def update_state(_config, delta, **_kwargs):
+        values.update(delta)
+
+    def delete_file(_token):
+        delete_started.set()
+        assert allow_delete.wait(timeout=2)
+        return True
+
+    context = MagicMock()
+    context.graph = MagicMock()
+    context.graph.aget_state = AsyncMock(side_effect=get_state)
+    context.graph.aupdate_state = AsyncMock(side_effect=update_state)
+
+    with patch(
+        "src.exchange_service.lark_app.delete_file_from_drive",
+        side_effect=delete_file,
+    ):
+        cleanup_task = asyncio.create_task(
+            _cleanup_graph_drive_files(
+                "mail-concurrent-cleanup",
+                context,
+                fallback_attachment_tokens=[],
+            )
+        )
+        assert await asyncio.to_thread(delete_started.wait, 1)
+
+        retain_task = asyncio.create_task(
+            _retain_cleanup_token(
+                "mail-concurrent-cleanup",
+                context,
+                "NEW",
+            )
+        )
+        completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+        allow_delete.set()
+        await asyncio.gather(cleanup_task, retain_task)
+
+    assert completed == set()
+    assert values["attachment_tokens"] == ["NEW"]
+
+
+@pytest.mark.asyncio
+async def test_seed_checkpoint_and_concurrent_retain_share_the_same_email_lock():
+    values = {
+        "attachment_tokens": [],
+        "pdf_token": None,
+    }
+    seed_read_started = asyncio.Event()
+    allow_seed_read = asyncio.Event()
+    reads = 0
+
+    async def get_state(_config):
+        nonlocal reads
+        reads += 1
+        snapshot = MagicMock()
+        snapshot.values = dict(values)
+        snapshot.values["attachment_tokens"] = list(values["attachment_tokens"])
+        if reads == 1:
+            seed_read_started.set()
+            await allow_seed_read.wait()
+        return snapshot
+
+    async def update_state(_config, delta, **_kwargs):
+        values.update(delta)
+
+    context = MagicMock()
+    context.graph = MagicMock()
+    context.graph.aget_state = AsyncMock(side_effect=get_state)
+    context.graph.aupdate_state = AsyncMock(side_effect=update_state)
+    ref = ContentRef(
+        account_id=8,
+        object_id="00000000-0000-4000-8000-000000000058",
+        key_version="v1",
+        sha256="6" * 64,
+    )
+
+    seed_task = asyncio.create_task(
+        _checkpoint_ai_path_resources(
+            "mail-concurrent-seed",
+            {"id": "mail-concurrent-seed"},
+            ref,
+            context,
+            {"configurable": {"thread_id": "mail-concurrent-seed"}},
+            attachment_tokens=[],
+            pdf_token=None,
+        )
+    )
+    await seed_read_started.wait()
+    retain_task = asyncio.create_task(
+        _retain_cleanup_token(
+            "mail-concurrent-seed",
+            context,
+            "NEW",
+        )
+    )
+    completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+    allow_seed_read.set()
+    await asyncio.gather(seed_task, retain_task)
+
+    assert completed == set()
+    assert "NEW" in values["attachment_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_pdf_flow_and_exchange_updates_share_the_same_email_lock():
+    values = {"attachment_tokens": [], "pdf_token": None}
+    flow_started = asyncio.Event()
+    allow_flow = asyncio.Event()
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        return snapshot
+
+    async def update_state(_config, delta):
+        values.update(delta)
+
+    async def blocked_pdf_flow(*_args, **_kwargs):
+        flow_started.set()
+        await allow_flow.wait()
+        return None
+
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    context = MagicMock(graph=graph)
+
+    with patch.object(
+        lark_pdf_flow,
+        "_process_pdf_generation_and_reply_locked",
+        side_effect=blocked_pdf_flow,
+    ):
+        flow_task = asyncio.create_task(
+            lark_pdf_flow.process_pdf_generation_and_reply(
+                "mail-shared-pdf-lock",
+                MagicMock(),
+                "message-id",
+                graph=graph,
+                dependencies=MagicMock(),
+                lark_api_client=MagicMock(),
+                upload_fn=MagicMock(),
+                delete_fn=MagicMock(),
+            )
+        )
+        await flow_started.wait()
+        retain_task = asyncio.create_task(
+            _retain_cleanup_token(
+                "mail-shared-pdf-lock",
+                context,
+                "NEW",
+            )
+        )
+        completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+        allow_flow.set()
+        await asyncio.gather(flow_task, retain_task)
+
+    assert completed == set()
+    assert values["attachment_tokens"] == ["NEW"]
+
+
+@pytest.mark.asyncio
+async def test_action_cleanup_and_exchange_updates_share_the_same_email_lock():
+    values = {"attachment_tokens": ["OLD"], "pdf_token": None}
+    delete_started = threading.Event()
+    allow_delete = threading.Event()
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        return snapshot
+
+    async def update_state(_config, delta):
+        values.update(delta)
+
+    def delete_file(_token):
+        delete_started.set()
+        assert allow_delete.wait(timeout=2)
+        return True
+
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    context = MagicMock(graph=graph)
+    state = MagicMock()
+    state.values = {
+        "attachment_tokens": ["OLD"],
+        "pdf_token": None,
+    }
+
+    with patch.object(lark_app, "graph", graph), patch.object(
+        lark_app,
+        "delete_file_from_drive",
+        side_effect=delete_file,
+    ):
+        cleanup_task = asyncio.create_task(
+            lark_app._cleanup_action_drive_tokens(
+                "mail-shared-action-lock",
+                state,
+            )
+        )
+        assert await asyncio.to_thread(delete_started.wait, 1)
+        retain_task = asyncio.create_task(
+            _retain_cleanup_token(
+                "mail-shared-action-lock",
+                context,
+                "NEW",
+            )
+        )
+        completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+        allow_delete.set()
+        await asyncio.gather(cleanup_task, retain_task)
+
+    assert completed == set()
+    assert values["attachment_tokens"] == ["NEW"]
+
+
+@pytest.mark.asyncio
+async def test_action_cleanup_reconciles_stale_targets_before_remote_delete():
+    values = {
+        "attachment_tokens": ["NEW"],
+        "pdf_token": "OLD",
+    }
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        return snapshot
+
+    async def update_state(_config, delta):
+        values.update(delta)
+
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    stale_state = MagicMock()
+    stale_state.values = {
+        "attachment_tokens": ["OLD"],
+        "pdf_token": "NEW",
+    }
+    delete_file = MagicMock(return_value=True)
+
+    with patch.object(lark_app, "graph", graph), patch.object(
+        lark_app,
+        "delete_file_from_drive",
+        delete_file,
+    ):
+        await lark_app._cleanup_action_drive_tokens(
+            "mail-stale-action-cleanup",
+            stale_state,
+        )
+
+    assert [call.args[0] for call in delete_file.call_args_list] == ["NEW"]
+    assert values == {
+        "attachment_tokens": [],
+        "pdf_token": "OLD",
+    }
+
+
+@pytest.mark.asyncio
+async def test_graph_resume_holds_resource_lock_until_action_cleanup_finishes():
+    email_id = "mail-resume-cleanup-lock"
+    values = {"attachment_tokens": [], "pdf_token": None}
+    resume_started = asyncio.Event()
+    allow_resume = asyncio.Event()
+
+    async def invoke(_input, *, config):
+        resume_started.set()
+        await allow_resume.wait()
+        return config
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = {
+            "attachment_tokens": list(values["attachment_tokens"]),
+            "pdf_token": values["pdf_token"],
+        }
+        return snapshot
+
+    async def update_state(_config, delta):
+        values.update(delta)
+
+    graph = MagicMock()
+    graph.ainvoke = AsyncMock(side_effect=invoke)
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    context = MagicMock(graph=graph)
+    initial_state = MagicMock()
+    initial_state.values = dict(values)
+    config = {"configurable": {"thread_id": email_id}}
+
+    with patch.object(lark_app, "graph", graph):
+        resume_task = asyncio.create_task(
+            lark_app._resume_graph_then_cleanup(
+                email_id,
+                initial_state,
+                config,
+            )
+        )
+        await resume_started.wait()
+        retain_task = asyncio.create_task(
+            _retain_cleanup_token(email_id, context, "NEW")
+        )
+        completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+        allow_resume.set()
+        await asyncio.gather(resume_task, retain_task)
+
+    assert completed == set()
+    assert values["attachment_tokens"] == ["NEW"]
+
+
+@pytest.mark.asyncio
+async def test_ai_graph_seed_and_resource_updates_share_the_same_email_lock():
+    email_id = "mail-shared-ai-lock"
+    values = {
+        "email_id": email_id,
+        "classification": {"need_reply": False},
+        "draft_id": None,
+        "draft_to": [],
+        "draft_cc": [],
+        "context_summaries": [],
+        "routing_log": [],
+        "active_skills": [],
+        "attachment_tokens": [],
+        "pdf_token": None,
+    }
+    pipeline_started = asyncio.Event()
+    allow_pipeline = asyncio.Event()
+
+    async def stream(_initial_state, *, config):
+        pipeline_started.set()
+        await allow_pipeline.wait()
+        if False:
+            yield config
+
+    async def get_state(_config):
+        snapshot = MagicMock()
+        snapshot.values = dict(values)
+        snapshot.values["attachment_tokens"] = list(values["attachment_tokens"])
+        return snapshot
+
+    async def update_state(_config, delta):
+        values.update(delta)
+
+    graph = MagicMock()
+    graph.astream = stream
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    ref = ContentRef(
+        account_id=8,
+        object_id="00000000-0000-4000-8000-000000000059",
+        key_version="v1",
+        sha256="7" * 64,
+    )
+    context = MagicMock()
+    context.graph = graph
+    context.db_manager.get_content_ref = AsyncMock(return_value=ref)
+    context.db_manager.update_status = AsyncMock()
+    context.db_manager.load_draft = AsyncMock()
+    context.content_store.load_email = AsyncMock(return_value={"id": email_id})
+
+    with patch(
+        "src.exchange_service.get_settings",
+        return_value=MagicMock(EXCHANGE_ACCOUNT_ID=8),
+    ):
+        pipeline_task = asyncio.create_task(
+            _run_ai_pipeline(
+                email_id,
+                context,
+                {"configurable": {"thread_id": email_id}},
+            )
+        )
+        await pipeline_started.wait()
+        retain_task = asyncio.create_task(
+            _retain_cleanup_token(email_id, context, "NEW")
+        )
+        completed, _pending = await asyncio.wait({retain_task}, timeout=0.05)
+        allow_pipeline.set()
+        pipeline_result, retained = await asyncio.gather(
+            pipeline_task,
+            retain_task,
+        )
+
+    assert completed == set()
+    assert retained is True
+    assert pipeline_result is not None
+    assert values["attachment_tokens"] == ["NEW"]
 
 
 @pytest.mark.asyncio
@@ -586,6 +1038,7 @@ async def test_process_email_skips_mark_read_when_dispatch_fails(ctx):
 
     final_state = MagicMock()
     final_state.values = {
+        "email_id": "msg-fail",
         "classification": {"need_reply": True, "priority": "P1", "intent": "审批"},
         "draft_id": "msg-fail",
         "context_summaries": [],
@@ -620,6 +1073,7 @@ async def test_process_email_marks_read_only_after_successful_dispatch(ctx):
 
     final_state = MagicMock()
     final_state.values = {
+        "email_id": "msg-ok",
         "classification": {"need_reply": True, "priority": "P1", "intent": "审批"},
         "draft_id": "msg-ok",
         "context_summaries": [],

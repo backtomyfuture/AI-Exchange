@@ -6,6 +6,7 @@ import pytest
 
 from src.graph.state_factory import (
     MAX_CHECKPOINT_BYTES,
+    MAX_LOGICAL_STATE_BYTES,
     build_initial_graph_state,
     cap_string_list,
     content_ref_from_json,
@@ -120,7 +121,14 @@ def test_initial_state_allowlists_metadata_without_mutating_caller():
 
 def test_state_size_guard_rejects_oversized_serialized_state():
     with pytest.raises(ValueError, match="graph_state_too_large"):
-        ensure_state_size({"safe_error_summary": "x" * MAX_CHECKPOINT_BYTES})
+        ensure_state_size({"safe_error_summary": "x" * MAX_LOGICAL_STATE_BYTES})
+
+
+def test_draft_id_must_belong_to_the_current_email():
+    state = build_initial_graph_state({"id": "mail-A"}, _content_ref())
+
+    with pytest.raises(ValueError, match="draft_email_mismatch"):
+        sanitize_graph_delta(state, {"draft_id": "mail-B"})
 
 
 def test_persistent_email_identifier_fails_closed_instead_of_being_truncated():

@@ -20,6 +20,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTr
 from src.utils.card_builder import LarkCardBuilder
 from src.config import get_settings, resolve_secret
 from src.graph.dependencies import GraphDependencies
+from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import (
     hydrate_draft_from_state,
     hydrate_graph_content,
@@ -35,6 +36,7 @@ from src.utils.lark_recipient_editor import (
     normalize_uid_list,
     read_selected_open_ids,
 )
+from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.commands.router import CommandRouter
 from src.commands.handlers import (
     init_commands,
@@ -50,6 +52,7 @@ from src.commands.handlers import (
 )
 
 logger = logging.getLogger(__name__)
+TEST_CARD_ID_PREFIX = "test_push_"
 
 # Global instances
 lark_ws_client: Optional[WsClient] = None
@@ -195,9 +198,13 @@ def _require_graph_dependencies() -> GraphDependencies:
     return graph_dependencies
 
 
+def is_test_card_id(email_id: Any) -> bool:
+    return isinstance(email_id, str) and email_id.startswith(TEST_CARD_ID_PREFIX)
+
+
 def _is_explicit_test_card(email_id: Any) -> bool:
     """Only DEBUG-mode entries explicitly seeded in memory are test cards."""
-    if not isinstance(email_id, str):
+    if not is_test_card_id(email_id):
         return False
     try:
         debug_enabled = bool(get_settings().DEBUG)
@@ -266,22 +273,64 @@ def _collect_cleanup_tokens(state) -> List[str]:
     Collect all file tokens that need to be cleaned up from the state.
     Includes bounded top-level attachment tokens and the generated PDF token.
     """
-    tokens = set()
-    
-    # 1. Explicit tokens
-    if state.values.get("attachment_tokens"):
-        tokens.update(state.values["attachment_tokens"])
-        
-    # 2. PDF Token
-    if state.values.get("pdf_token"):
-        tokens.add(state.values["pdf_token"])
-        
-    return list(tokens)
+    tokens: List[str] = []
+    for token in state.values.get("attachment_tokens") or []:
+        if isinstance(token, str) and token and token not in tokens:
+            tokens.append(token)
+    pdf_token = state.values.get("pdf_token")
+    if isinstance(pdf_token, str) and pdf_token and pdf_token not in tokens:
+        tokens.append(pdf_token)
+    return tokens
 
 
-async def _cleanup_action_drive_tokens(email_id: str, state: Any) -> None:
+async def _cleanup_action_drive_tokens(
+    email_id: str,
+    state: Any,
+    *,
+    _state_lock_held: bool = False,
+    _targets: tuple[str, ...] | None = None,
+) -> None:
     """Delete action-scoped Drive files and remove only confirmed successes."""
-    targets = _collect_cleanup_tokens(state)
+    if not _state_lock_held:
+        async with get_graph_resource_lock(email_id):
+            config = {"configurable": {"thread_id": email_id}}
+            try:
+                latest = await graph.aget_state(config)
+                stale_attachment_tokens = set(
+                    state.values.get("attachment_tokens") or []
+                )
+                latest_attachment_tokens = set(
+                    latest.values.get("attachment_tokens") or []
+                )
+                stale_pdf_token = state.values.get("pdf_token")
+                latest_pdf_token = latest.values.get("pdf_token")
+            except Exception as exc:
+                logger.warning(
+                    "Action cleanup reconciliation failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+
+            if (
+                stale_attachment_tokens == latest_attachment_tokens
+                and stale_pdf_token == latest_pdf_token
+            ):
+                targets = tuple(_collect_cleanup_tokens(latest))
+            else:
+                stale_targets = set(_collect_cleanup_tokens(state))
+                targets = tuple(
+                    token
+                    for token in (latest.values.get("attachment_tokens") or [])
+                    if token in stale_targets and token != latest_pdf_token
+                )
+            await _cleanup_action_drive_tokens(
+                email_id,
+                latest,
+                _state_lock_held=True,
+                _targets=targets,
+            )
+        return
+    targets = list(_targets) if _targets is not None else _collect_cleanup_tokens(state)
     if not targets:
         return
 
@@ -332,10 +381,23 @@ async def _resume_graph_then_cleanup(
     config: dict[str, Any],
 ) -> None:
     """Resume the workflow first, then reconcile action cleanup handles."""
-    try:
-        await graph.ainvoke(None, config=config)
-    finally:
-        await _cleanup_action_drive_tokens(email_id, state)
+    async with get_graph_resource_lock(email_id):
+        try:
+            await graph.ainvoke(None, config=config)
+        finally:
+            try:
+                latest = await graph.aget_state(config)
+            except Exception as exc:
+                logger.warning(
+                    "Post-action cleanup state lookup failed: error_type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                await _cleanup_action_drive_tokens(
+                    email_id,
+                    latest,
+                    _state_lock_held=True,
+                )
 
 def _resolve_current_user_email(chat_id: str):
 
@@ -1399,7 +1461,9 @@ async def _process_test_card_pdf_generation_and_reply(
             type(exc).__name__,
         )
 
-async def generate_and_upload_pdf(email_id: str) -> Optional[Dict[str, Any]]:
+async def generate_and_upload_pdf(
+    email_id: str,
+) -> Optional[Dict[str, Any]] | PdfFlowOutcome:
     """Resolve strict Graph refs, render email -> PDF, then upload."""
     from src.utils.lark_pdf_flow import generate_and_upload_pdf as _impl
     config = {"configurable": {"thread_id": email_id}}
@@ -1413,7 +1477,11 @@ async def generate_and_upload_pdf(email_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-async def process_pdf_generation_and_reply(email_id, state, message_id):
+async def process_pdf_generation_and_reply(
+    email_id,
+    state,
+    message_id,
+) -> PdfFlowOutcome | None:
     """Generate PDF and reply with file link. Delegates to lark_pdf_flow."""
     from src.utils.lark_pdf_flow import process_pdf_generation_and_reply as _impl
     return await _impl(
