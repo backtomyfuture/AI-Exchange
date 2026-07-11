@@ -163,15 +163,12 @@ class EmailProcessor:
             # --- 1. Process Attachments Metadata (Lazy Image Analysis) ---
             attachments = email.get("attachments", [])
             attachment_summaries = []
-            image_attachments = []  # 暂存图片数据，延迟到拟稿阶段分析
             valid_attachments_metadata = []
 
             for att in attachments:
                 name = att.get("name", "unknown")
                 ftype = att.get("content_type", "application/octet-stream")
                 size = att.get("size", 0)
-                content_b64 = att.get("content", "")
-                
                 # Metadata summary for embedding intent
                 meta_str = f"附件: {name} ({ftype}, {size} bytes)"
                 attachment_summaries.append(meta_str)
@@ -182,15 +179,6 @@ class EmailProcessor:
                     "content_type": ftype,
                     "size": size
                 })
-
-                # Collect image attachments for deferred analysis (no Vision API call here)
-                if content_b64 and ftype.startswith("image/"):
-                    image_attachments.append({
-                        "name": name,
-                        "content": content_b64,
-                        "mime_type": ftype
-                    })
-                    logger.info(f"Collected image attachment for deferred analysis: {name} ({ftype})")
 
             # --- 2. Construct Full Text ---
             # Structure: Subject + Attachment Metadata + Body (no image descriptions at this stage)
@@ -211,11 +199,6 @@ class EmailProcessor:
             parts.append("【邮件正文】:\n" + raw_body)
             
             full_text = "\n\n".join(parts)
-            
-            # Store image attachment data for deferred analysis by retriever_node
-            if image_attachments:
-                email["_image_attachments"] = image_attachments
-                logger.info(f"Stored {len(image_attachments)} image(s) for deferred analysis.")
             
             chunks = self.text_splitter.split_text(full_text)
             
@@ -240,13 +223,14 @@ class EmailProcessor:
                     chunk_id = self.generate_deterministic_uuid(f"{base_id}_{i}_{chunk[:20]}")
                     
                     payload = email.copy()
+                    # Legacy callers may still include image payload copies.  Never
+                    # persist those bytes to Qdrant, while keeping the caller's
+                    # dictionary untouched.
+                    payload.pop("_image_attachments", None)
                     payload["attachments_metadata"] = valid_attachments_metadata
                     
                     if "attachments" in payload:
                         del payload["attachments"]
-                    if "_image_attachments" in payload:
-                        del payload["_image_attachments"]
-                        
                     payload["chunk_index"] = i
                     payload["chunk_text"] = chunk
                     

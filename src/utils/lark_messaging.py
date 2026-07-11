@@ -49,12 +49,15 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
             .build()
 
         response = lark_api_client.im.v1.message.create(request)
-    except Exception as e:
-        logger.exception(f"Exception sending Lark approval card for {email_id}: {e}")
+    except Exception as exc:
+        logger.error(
+            "Lark approval card send failed: error_type=%s",
+            type(exc).__name__,
+        )
         return False
 
     if not response.success():
-        logger.error(f"Failed to send Lark card: {response.code} - {response.msg}")
+        logger.error("Lark approval card rejected: code=%s", response.code)
         return False
     logger.info(f"Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
     return True
@@ -96,12 +99,15 @@ def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
             .build()
 
         response = lark_api_client.im.v1.message.create(request)
-    except Exception as e:
-        logger.exception(f"Exception sending Lark read-only card for {email_id}: {e}")
+    except Exception as exc:
+        logger.error(
+            "Lark read-only card send failed: error_type=%s",
+            type(exc).__name__,
+        )
         return False
 
     if not response.success():
-        logger.error(f"Failed to send read-only Lark card: {response.code} - {response.msg}")
+        logger.error("Lark read-only card rejected: code=%s", response.code)
         return False
     logger.info(f"Read-only Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
     return True
@@ -145,12 +151,15 @@ def send_system_notification(title: str, content: str, template: str = "red",
             .build()
 
         response = lark_api_client.im.v1.message.create(request)
-    except Exception as e:
-        logger.exception(f"Exception sending Lark system notification: {e}")
+    except Exception as exc:
+        logger.error(
+            "Lark system notification failed: error_type=%s",
+            type(exc).__name__,
+        )
         return False
 
     if not response.success():
-        logger.error(f"Failed to send system notification: {response.code} - {response.msg}")
+        logger.error("Lark system notification rejected: code=%s", response.code)
         return False
     logger.info(f"System notification sent: {title}")
     return True

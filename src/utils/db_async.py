@@ -9,10 +9,13 @@ from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from src.domain.email_state import InitialEmailWriteResult
 from src.domain.errors import DatabaseOperationError
+from src.graph.state_factory import content_ref_from_json, content_ref_to_json
+from src.storage import ContentRef
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +56,11 @@ class AsyncDatabaseManager:
                 )
                 await self._pool.open()
                 logger.info("AsyncDatabaseManager connection pool opened (min=2, max=10).")
-        except psycopg.OperationalError as e:
-            logger.error(f"Failed to open PostgreSQL connection pool: {e}")
+        except psycopg.OperationalError as exc:
+            logger.error(
+                "Failed to open PostgreSQL connection pool: error_type=%s",
+                type(exc).__name__,
+            )
             raise
 
     @asynccontextmanager
@@ -87,13 +93,16 @@ class AsyncDatabaseManager:
                     if cur.rowcount > 0:
                         return InitialEmailWriteResult.CREATED
                     return InitialEmailWriteResult.DUPLICATE
-        except psycopg.Error as e:
-            logger.error(f"Failed to log initial email {email_data.get('id')}: {e}")
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to log initial email: error_type=%s",
+                type(exc).__name__,
+            )
             raise DatabaseOperationError(
                 operation="log_initial_email",
-                retryable=isinstance(e, psycopg.OperationalError),
-                message=str(e),
-            ) from e
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="initial email persistence failed",
+            ) from None
 
     async def get_email_status(self, email_id: str) -> str | None:
         """Return the persisted processing status for an email, if present."""
@@ -105,13 +114,182 @@ class AsyncDatabaseManager:
                     )
                     row = await cur.fetchone()
                     return row["status"] if row else None
-        except psycopg.Error as e:
-            logger.error(f"Failed to get status for {email_id}: {e}")
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to get email status: error_type=%s",
+                type(exc).__name__,
+            )
             raise DatabaseOperationError(
                 operation="get_email_status",
-                retryable=isinstance(e, psycopg.OperationalError),
-                message=str(e),
-            ) from e
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="email status read failed",
+            ) from None
+
+    async def set_content_ref(self, email_id: str, ref: ContentRef) -> None:
+        payload = content_ref_to_json(ref)
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET content_ref = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (Jsonb(payload), email_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise DatabaseOperationError(
+                            operation="set_content_ref",
+                            retryable=False,
+                            message="email row missing",
+                        )
+        except DatabaseOperationError:
+            raise
+        except psycopg.Error as exc:
+            logger.error(
+                "Content reference persistence failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="set_content_ref",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="content reference persistence failed",
+            ) from None
+
+    async def set_content_ref_if_absent(
+        self,
+        email_id: str,
+        ref: ContentRef,
+    ) -> bool:
+        """Atomically claim an empty content_ref slot for concurrent retries."""
+        payload = content_ref_to_json(ref)
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET content_ref = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND content_ref IS NULL
+                        """,
+                        (Jsonb(payload), email_id),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as exc:
+            logger.error(
+                "Content reference claim failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="set_content_ref_if_absent",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="content reference claim failed",
+            ) from None
+
+    async def get_content_ref(self, email_id: str) -> ContentRef | None:
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT content_ref FROM emails_log WHERE id = %s",
+                        (email_id,),
+                    )
+                    row = await cur.fetchone()
+        except psycopg.Error as exc:
+            logger.error(
+                "Content reference read failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="get_content_ref",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="content reference read failed",
+            ) from None
+
+        if row is None or row.get("content_ref") is None:
+            return None
+        raw_ref = row["content_ref"]
+        if isinstance(raw_ref, str):
+            try:
+                raw_ref = json.loads(raw_ref)
+            except json.JSONDecodeError:
+                from src.storage import ContentStoreReferenceError
+
+                raise ContentStoreReferenceError("invalid_content_ref") from None
+        return content_ref_from_json(raw_ref)
+
+    async def save_draft(self, email_id: str, content: str) -> str:
+        if not isinstance(email_id, str) or not email_id or not isinstance(content, str):
+            raise DatabaseOperationError(
+                operation="save_draft",
+                retryable=False,
+                message="invalid draft input",
+            )
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET draft_content = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (content, email_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise DatabaseOperationError(
+                            operation="save_draft",
+                            retryable=False,
+                            message="email row missing",
+                        )
+        except DatabaseOperationError:
+            raise
+        except psycopg.Error as exc:
+            logger.error(
+                "Draft persistence failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="save_draft",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="draft persistence failed",
+            ) from None
+        return email_id
+
+    async def load_draft(self, draft_id: str) -> str:
+        if not isinstance(draft_id, str) or not draft_id:
+            raise DatabaseOperationError(
+                operation="load_draft",
+                retryable=False,
+                message="invalid draft identifier",
+            )
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT draft_content FROM emails_log WHERE id = %s",
+                        (draft_id,),
+                    )
+                    row = await cur.fetchone()
+        except psycopg.Error as exc:
+            logger.error(
+                "Draft read failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="load_draft",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="draft read failed",
+            ) from None
+
+        if row is None or not isinstance(row.get("draft_content"), str):
+            raise DatabaseOperationError(
+                operation="load_draft",
+                retryable=False,
+                message="draft not found",
+            )
+        return row["draft_content"]
 
     async def update_status(self, email_id: str, status: Optional[str], **kwargs):
         """Update the status and optional fields of an email log.
@@ -171,13 +349,16 @@ class AsyncDatabaseManager:
                     record_email_status(status)
                 except Exception:
                     pass
-        except psycopg.Error as e:
-            logger.error(f"Failed to update status for {email_id}: {e}")
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to update email status: error_type=%s",
+                type(exc).__name__,
+            )
             raise DatabaseOperationError(
                 operation="update_status",
-                retryable=isinstance(e, psycopg.OperationalError),
-                message=str(e),
-            ) from e
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="email status update failed",
+            ) from None
 
     async def compare_and_set_status(
         self,
@@ -196,13 +377,16 @@ class AsyncDatabaseManager:
                         (target, email_id, list(expected)),
                     )
                     return cur.rowcount == 1
-        except psycopg.Error as e:
-            logger.error(f"Failed to compare and set status for {email_id}: {e}")
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to compare and set email status: error_type=%s",
+                type(exc).__name__,
+            )
             raise DatabaseOperationError(
                 operation="compare_and_set_status",
-                retryable=isinstance(e, psycopg.OperationalError),
-                message=str(e),
-            ) from e
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="email status compare-and-set failed",
+            ) from None
 
     async def check_email_exists(self, email_id: str) -> bool:
         """Check if an email ID has already been logged/processed."""
@@ -211,8 +395,11 @@ class AsyncDatabaseManager:
                 async with conn.cursor() as cur:
                     await cur.execute("SELECT 1 FROM emails_log WHERE id = %s", (email_id,))
                     return await cur.fetchone() is not None
-        except psycopg.Error as e:
-            logger.error(f"Failed to check email existence for {email_id}: {e}")
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to check email existence: error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     async def get_processed_count(self) -> int:
@@ -240,8 +427,11 @@ class AsyncDatabaseManager:
                         (target_date,)
                     )
                     return await cur.fetchall()
-        except Exception as e:
-            logger.error(f"Failed to get records by date: {e}")
+        except Exception as exc:
+            logger.error(
+                "Failed to get records by date: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     async def close(self):

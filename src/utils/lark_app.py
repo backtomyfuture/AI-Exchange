@@ -5,6 +5,7 @@ import re
 import html
 import hashlib
 import hmac
+from copy import deepcopy
 from typing import Dict, Any, List, Optional
 import lark_oapi
 from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
@@ -18,6 +19,12 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTr
 
 from src.utils.card_builder import LarkCardBuilder
 from src.config import get_settings, resolve_secret
+from src.graph.dependencies import GraphDependencies
+from src.graph.state_factory import (
+    hydrate_draft_from_state,
+    hydrate_graph_content,
+    sanitize_graph_delta,
+)
 from src.utils.lark_recipient_editor import (
     build_recipient_field,
     clear_recipient_edit_temp,
@@ -50,6 +57,7 @@ lark_api_client: Optional[lark_oapi.Client] = None
 card_builder: Optional[LarkCardBuilder] = None
 db_manager = None
 graph = None
+graph_dependencies: Optional[GraphDependencies] = None
 exchange_client = None
 worker_loop = None
 _mock_store = {} # Store for test card states
@@ -138,13 +146,21 @@ def delete_file_from_drive(file_token: str) -> bool:
     from src.utils.lark_file_ops import delete_file_from_drive as _impl
     return _impl(file_token, lark_api_client=lark_api_client)
 
-def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
+def init_lark_app(
+    db_mgr,
+    graph_instance,
+    ex_client,
+    worker_loop_arg=None,
+    *,
+    dependencies: GraphDependencies | None = None,
+):
     """
     Initialize global dependencies
     """
-    global db_manager, graph, exchange_client, lark_api_client, card_builder, worker_loop
+    global db_manager, graph, graph_dependencies, exchange_client, lark_api_client, card_builder, worker_loop
     db_manager = db_mgr
     graph = graph_instance
+    graph_dependencies = dependencies
     exchange_client = ex_client
     if worker_loop_arg:
         worker_loop = worker_loop_arg
@@ -172,13 +188,83 @@ def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
     init_commands(db_mgr)
     _register_builtin_commands()
 
+
+def _require_graph_dependencies() -> GraphDependencies:
+    if graph_dependencies is None:
+        raise RuntimeError("lark_graph_dependencies_unavailable")
+    return graph_dependencies
+
+
+def _is_explicit_test_card(email_id: Any) -> bool:
+    """Only DEBUG-mode entries explicitly seeded in memory are test cards."""
+    if not isinstance(email_id, str):
+        return False
+    try:
+        debug_enabled = bool(get_settings().DEBUG)
+    except Exception:
+        return False
+    return debug_enabled and email_id in _mock_store
+
+
+def _test_card_builder() -> LarkCardBuilder:
+    """Return a pure card renderer with no Lark or Exchange lookup clients."""
+    return LarkCardBuilder(None, exchange_client=None)
+
+
+def _search_test_card_candidates(state: Any, field: str, keyword: str) -> List[str]:
+    """Search only the candidate directory explicitly seeded in test memory."""
+    directories = state.values.get("recipient_candidates") or {}
+    candidates = directories.get(field) if isinstance(directories, dict) else []
+    needle = keyword.strip().casefold()
+    if not needle:
+        return []
+
+    matches: List[str] = []
+    for candidate in candidates or []:
+        if isinstance(candidate, str):
+            open_id = candidate.strip()
+            search_text = open_id
+        elif isinstance(candidate, dict):
+            open_id = str(candidate.get("open_id") or "").strip()
+            search_text = " ".join(
+                str(candidate.get(key) or "")
+                for key in ("search_text", "name", "email", "open_id")
+            )
+        else:
+            continue
+        if open_id and needle in search_text.casefold() and open_id not in matches:
+            matches.append(open_id)
+        if len(matches) >= 10:
+            break
+    return matches
+
+
+async def _hydrate_lark_projection(state) -> tuple[dict[str, Any], str]:
+    values = state.values
+    email_data, draft = await hydrate_graph_content(
+        values,
+        _require_graph_dependencies(),
+        require_draft=False,
+    )
+    recipient_ui = values.get("recipient_ui") or {}
+    for field in ("to", "cc"):
+        ui = recipient_ui.get(field) if isinstance(recipient_ui, dict) else None
+        if not isinstance(ui, dict):
+            continue
+        email_data[f"draft_{field}_options"] = list(ui.get("options") or [])
+        email_data[f"draft_{field}_new_selected"] = list(ui.get("selected") or [])
+        email_data[f"draft_{field}_external_input"] = ui.get("external_input", "")
+        email_data[f"draft_{field}_search_hint"] = ui.get("search_hint", "")
+    return email_data, draft
+
+
+def _bounded_human_update(state, delta: dict[str, Any]) -> dict[str, Any]:
+    return sanitize_graph_delta(state.values, delta)
+
 def _collect_cleanup_tokens(state) -> List[str]:
     """
     Collect all file tokens that need to be cleaned up from the state.
-    Includes:
-    1. 'attachment_tokens' (legacy/explicit list)
-    2. 'pdf_token' (generated PDF)
-    3. 'email.attachments[].lark_file_token' (original attachments)
+    Includes bounded top-level attachment tokens and the generated PDF token.
     """
     tokens = set()
     
@@ -190,14 +276,66 @@ def _collect_cleanup_tokens(state) -> List[str]:
     if state.values.get("pdf_token"):
         tokens.add(state.values["pdf_token"])
         
-    # 3. Email Attachments
-    email_data = state.values.get("email", {})
-    attachments = email_data.get("attachments", [])
-    for att in attachments:
-        if att.get("lark_file_token"):
-            tokens.add(att["lark_file_token"])
-            
     return list(tokens)
+
+
+async def _cleanup_action_drive_tokens(email_id: str, state: Any) -> None:
+    """Delete action-scoped Drive files and remove only confirmed successes."""
+    targets = _collect_cleanup_tokens(state)
+    if not targets:
+        return
+
+    deleted: set[str] = set()
+    for token in targets:
+        try:
+            if await asyncio.to_thread(delete_file_from_drive, token):
+                deleted.add(token)
+        except Exception as exc:
+            logger.error(
+                "Action Drive cleanup failed: error_type=%s",
+                type(exc).__name__,
+            )
+    if not deleted:
+        return
+
+    config = {"configurable": {"thread_id": email_id}}
+    try:
+        latest = await graph.aget_state(config)
+        values = latest.values
+        update = _bounded_human_update(
+            latest,
+            {
+                "attachment_tokens": [
+                    token
+                    for token in (values.get("attachment_tokens") or [])
+                    if token not in deleted
+                ],
+                "pdf_token": (
+                    None
+                    if values.get("pdf_token") in deleted
+                    else values.get("pdf_token")
+                ),
+            },
+        )
+        await graph.aupdate_state(config, update)
+    except Exception as exc:
+        # Stale handles are safe: a later retry can delete idempotently.
+        logger.warning(
+            "Action cleanup state update failed: error_type=%s",
+            type(exc).__name__,
+        )
+
+
+async def _resume_graph_then_cleanup(
+    email_id: str,
+    state: Any,
+    config: dict[str, Any],
+) -> None:
+    """Resume the workflow first, then reconcile action cleanup handles."""
+    try:
+        await graph.ainvoke(None, config=config)
+    finally:
+        await _cleanup_action_drive_tokens(email_id, state)
 
 def _resolve_current_user_email(chat_id: str):
 
@@ -220,7 +358,7 @@ def _resolve_current_user_email(chat_id: str):
         resp = lark_api_client.im.v1.chat.get(req)
         
         if not resp.success():
-            logger.warning(f"Failed to resolve identity (GetChat): {resp.code} - {resp.msg}")
+            logger.warning("Failed to resolve chat identity: code=%s", resp.code)
             return
             
         owner_id = resp.data.owner_id
@@ -232,7 +370,10 @@ def _resolve_current_user_email(chat_id: str):
         user_resp = lark_api_client.contact.v3.user.get(user_req)
         
         if not user_resp.success():
-             logger.warning(f"Failed to resolve identity (GetUser): {user_resp.code} - {user_resp.msg}")
+             logger.warning(
+                 "Failed to resolve user identity: code=%s",
+                 user_resp.code,
+             )
              return
              
         user = user_resp.data.user
@@ -256,8 +397,8 @@ def _resolve_current_user_email(chat_id: str):
             settings.EXCHANGE_ACCOUNT_EMAIL = effective_email
             logger.info(f"Global Identity Configured: EXCHANGE_ACCOUNT_EMAIL = {effective_email}")
             
-    except Exception as e:
-        logger.error(f"Error resolving identity: {e}")
+    except Exception as exc:
+        logger.error("Identity resolution failed: error_type=%s", type(exc).__name__)
 
 def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
                        classification: dict, pdf_url: str = None,
@@ -303,17 +444,17 @@ def update_card_ui(message_id, card_content):
                 .build()) \
             .build()
         
-        logger.info(f"Patching Card JSON: {json.dumps(card_content, ensure_ascii=False)}")
+        logger.info("Patching interactive card")
             
         resp = lark_api_client.im.v1.message.patch(req)
         
         logger.info(f"Patch Response Code: {resp.code}")
         if not resp.success():
-             logger.error(f"Failed to patch card {message_id}: {resp.code} - {resp.msg} - {resp.error}")
+             logger.error("Failed to patch card: code=%s", resp.code)
         else:
              logger.info(f"Patch Success for {message_id}")
-    except Exception as e:
-        logger.error(f"Error patching card: {e}")
+    except Exception as exc:
+        logger.error("Card patch failed: error_type=%s", type(exc).__name__)
 
 
 
@@ -355,44 +496,29 @@ def handle_card_action(event):
             config = {"configurable": {"thread_id": eid}}
             return safe_async_wait(graph.aget_state(config))
 
-        # Common data for UI updates
-        state = get_current_state(email_id) 
-        
-         # --- TEST CARD FALLBACK ---
-        # 对测试卡片总是使用MOCK STATE
-        if str(email_id).startswith("test_push_"):
-             logger.info(f"Injecting MOCK STATE for test card: {email_id}")
-             # Check if we have stored state
-             if email_id in _mock_store:
-                 state = _mock_store[email_id]
-             else:
-                 class MockState:
-                     def __init__(self):
-                         self.values = {
-                             "draft": "Thank you, I have received the update.",
-                             "email": {
-                                 "subject": "TEST: Complex Email Rendering",
-                                 "sender": "name='System', email_address='q-fu@tianjin-air.com'",
-                                 "to": ["name='Jarod', email_address='q-fu@tianjin-air.com'", "name='Zhang', email_address='yy-zhang1@tianjin-air.com'"],
-                                 "cc": ["name='Jarod-CC', email_address='q-fu@tianjin-air.com'", "name='Zhang-CC', email_address='yy-zhang1@tianjin-air.com'"],
-                                 "attachments": [{"name": "itinerary.pdf"}, {"name": "invoice_scan.jpg"}]
-                             },
-                             "classification": {
-                                "reasoning": "This is a test notification sent manually.",
-                                "summary": "这是一封系统生成的测试邮件，包含两个模拟附件（行程单和发票扫描件）。请确认系统是否正确解析并显示了这些内容。"
-                            }
-                         }
-                 state = MockState()
-                 _mock_store[email_id] = state
+        is_test_card = _is_explicit_test_card(email_id)
+        # Explicit test-card boundary: never touch production Graph or stores.
+        if is_test_card:
+             logger.info("Using explicitly seeded test-card state")
+             state = _mock_store[email_id]
+        else:
+            state = get_current_state(email_id)
 
         if not state or not state.values:
              logger.warning(f"No state found for {email_id}. Action: {action_type}")
              # Ensure we return a properly formatted error response
              return {"toast": {"type": "error", "content": "找不到任务状态或已失效"}}
              
-        email_data = state.values.get("email", {})
+        if is_test_card:
+            email_data = state.values.get("email", {})
+            draft = state.values.get("draft", "")
+            context_summaries = state.values.get("context", [])
+        else:
+            email_data, draft = safe_async_wait(_hydrate_lark_projection(state))
+            context_summaries = state.values.get("context_summaries", [])
         classification = state.values.get("classification", {})
         subject = email_data.get("subject", "Email")
+        action_card_builder = _test_card_builder() if is_test_card else card_builder
 
         logger.info(f"State fetched for {email_id}. Action: {action_type}")
 
@@ -445,14 +571,27 @@ def handle_card_action(event):
                         "content": "已发送链接至评论区"
                     }
                 }
-            except Exception as e:
-                logger.error(f"Error sending reply: {e}")
-                raise e
+            except Exception as exc:
+                logger.error(
+                    "Original-view reply failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                raise
 
         elif action_type == "view_original_pdf":
             logger.info("Executing Request: View Original PDF")
-            # Trigger background task
-            safe_async_run(process_pdf_generation_and_reply(email_id, state, message_id))
+            if is_test_card:
+                safe_async_run(
+                    _process_test_card_pdf_generation_and_reply(
+                        email_id,
+                        state,
+                        message_id,
+                    )
+                )
+            else:
+                safe_async_run(
+                    process_pdf_generation_and_reply(email_id, state, message_id)
+                )
             
             return {
                 "toast": {
@@ -505,15 +644,12 @@ def handle_card_action(event):
         # 只读卡片 - 标记已阅
         elif action_type == "mark_read":
             logger.info(f"Mark as read for email {email_id} by {user_id}")
-            safe_async_wait(db_manager.update_status(email_id, "read"))
-            
-            # Remove attachments (PDF + Originals)
-            att_tokens = _collect_cleanup_tokens(state)
-            
-            if att_tokens:
-                logger.info(f"Cleaning up {len(att_tokens)} attachments (mark_read)...")
-                for tok in att_tokens:
-                     safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
+            if is_test_card:
+                state.values["status"] = "read"
+            else:
+                safe_async_wait(db_manager.update_status(email_id, "read"))
+
+                safe_async_run(_cleanup_action_drive_tokens(email_id, state))
 
             new_card = LarkCardBuilder.get_processed_card("已阅", subject)
             return {
@@ -529,9 +665,8 @@ def handle_card_action(event):
             
         # 编辑收件人
         elif action_type == "edit_to":
-            draft = state.values.get("draft", "")
-            logger.info(f"edit_to: email_data={email_data}, draft={draft[:50] if draft else 'None'}")
-            edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="to")
+            logger.info("Editing recipient field: field=to")
+            edit_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field="to")
             return {
                 "toast": {"type": "info", "content": "编辑收件人"},
                 "card": {"type": "raw", "data": edit_card}
@@ -539,8 +674,7 @@ def handle_card_action(event):
         
         # 编辑抄送人
         elif action_type == "edit_cc":
-            draft = state.values.get("draft", "")
-            edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="cc")
+            edit_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field="cc")
             return {
                 "toast": {"type": "info", "content": "编辑抄送人"},
                 "card": {"type": "raw", "data": edit_card}
@@ -548,8 +682,7 @@ def handle_card_action(event):
         
         # 编辑正文
         elif action_type == "edit_draft":
-            draft = state.values.get("draft", "")
-            edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="draft")
+            edit_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field="draft")
             return {
                 "toast": {"type": "info", "content": "编辑正文"},
                 "card": {"type": "raw", "data": edit_card}
@@ -559,10 +692,9 @@ def handle_card_action(event):
         elif action_type == "select_to":
             action_data = event.event.action
             selected_uids = read_selected_open_ids(action_data)
-            logger.info(f"select_to: selected={selected_uids}")
+            logger.info("Recipient selection changed: field=to selected_count=%d", len(selected_uids))
             if not selected_uids:
-                draft = state.values.get("draft", "")
-                view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+                view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
                 return {
                     "toast": {"type": "warning", "content": "收件人至少保留 1 人"},
                     "card": {"type": "raw", "data": view_card}
@@ -572,23 +704,18 @@ def handle_card_action(event):
             email_data["draft_to"] = new_to
 
             # PERSISTENCE
-            if str(email_id).startswith("test_push_"):
+            if is_test_card:
                 # Update Mock Store
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_to" not in mock_email:
                     mock_email["original_to"] = list(mock_email.get("to", []))
                 mock_email["draft_to"] = new_to
             else:
-                # Update Graph State
                 config = {"configurable": {"thread_id": email_id}}
-                current_email = state.values.get("email", {}).copy()
-                if "original_to" not in current_email:
-                    current_email["original_to"] = list(current_email.get("to", []))
-                current_email["draft_to"] = new_to
-                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+                update = _bounded_human_update(state, {"draft_to": new_to})
+                safe_async_wait(graph.aupdate_state(config, update))
 
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": f"收件人已更新（{len(new_to)}人）"},
                 "card": {"type": "raw", "data": view_card}
@@ -597,28 +724,23 @@ def handle_card_action(event):
         elif action_type == "select_cc":
             action_data = event.event.action
             selected_uids = read_selected_open_ids(action_data)
-            logger.info(f"select_cc: selected={selected_uids}")
+            logger.info("Recipient selection changed: field=cc selected_count=%d", len(selected_uids))
             new_cc = [f"open_id={uid}" for uid in selected_uids]
             email_data["draft_cc"] = new_cc
 
             # PERSISTENCE
-            if str(email_id).startswith("test_push_"):
+            if is_test_card:
                 # Update Mock Store
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_cc" not in mock_email:
                     mock_email["original_cc"] = list(mock_email.get("cc", []))
                 mock_email["draft_cc"] = new_cc
             else:
-                # Update Graph State
                 config = {"configurable": {"thread_id": email_id}}
-                current_email = state.values.get("email", {}).copy()
-                if "original_cc" not in current_email:
-                    current_email["original_cc"] = list(current_email.get("cc", []))
-                current_email["draft_cc"] = new_cc
-                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+                update = _bounded_human_update(state, {"draft_cc": new_cc})
+                safe_async_wait(graph.aupdate_state(config, update))
 
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": f"抄送人已更新（{len(new_cc)}人）"},
                 "card": {"type": "raw", "data": view_card}
@@ -628,7 +750,7 @@ def handle_card_action(event):
         elif action_type == "save_to":
             action_data = event.event.action
             form_values = getattr(action_data, "form_value", None) or {}
-            logger.info(f"save_to action data: value={action_data.value}, form_value={form_values}")
+            logger.info("Saving recipient field: field=to")
             keep_uids = normalize_uid_list(form_values.get("to_existing"))
             add_uids = normalize_uid_list(form_values.get("to_new"))
             external_raw = form_values.get("to_external_input", None)
@@ -641,8 +763,7 @@ def handle_card_action(event):
             )
 
             if not new_to:
-                draft = state.values.get("draft", "")
-                edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="to")
+                edit_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field="to")
                 return {
                     "toast": {"type": "warning", "content": "收件人至少保留 1 人（飞书人员或外部邮箱）"},
                     "card": {"type": "raw", "data": edit_card}
@@ -650,7 +771,7 @@ def handle_card_action(event):
 
             email_data["draft_to"] = new_to
             clear_recipient_edit_temp(email_data, "to")
-            if str(email_id).startswith("test_push_"):
+            if is_test_card:
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_to" not in mock_email:
                     mock_email["original_to"] = list(mock_email.get("to", []))
@@ -658,15 +779,13 @@ def handle_card_action(event):
                 clear_recipient_edit_temp(mock_email, "to")
             else:
                 config = {"configurable": {"thread_id": email_id}}
-                current_email = state.values.get("email", {}).copy()
-                if "original_to" not in current_email:
-                    current_email["original_to"] = list(current_email.get("to", []))
-                current_email["draft_to"] = new_to
-                clear_recipient_edit_temp(current_email, "to")
-                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+                update = _bounded_human_update(
+                    state,
+                    {"draft_to": new_to, "recipient_ui": {"to": {}}},
+                )
+                safe_async_wait(graph.aupdate_state(config, update))
 
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": f"收件人已保存（{len(new_to)}人）"},
                 "card": {"type": "raw", "data": view_card}
@@ -678,12 +797,15 @@ def handle_card_action(event):
             action_data = event.event.action
             form_values = getattr(action_data, "form_value", None) or {}
             keyword = str(form_values.get(f"{field_type}_search_keyword", "")).strip()
-            logger.info("search_%s form_value=%s", field_type, form_values)
+            logger.info(
+                "Searching recipient candidates: field=%s keyword_bytes=%d",
+                field_type,
+                len(keyword.encode("utf-8")),
+            )
 
             if not keyword:
-                draft = state.values.get("draft", "")
-                edit_card = card_builder.build_approval_card(
-                    email_id, draft, [], email_data, classification, edit_field=field_type
+                edit_card = action_card_builder.build_approval_card(
+                    email_id, draft, context_summaries, email_data, classification, edit_field=field_type
                 )
                 return {
                     "toast": {"type": "warning", "content": "请输入关键词后再搜索"},
@@ -695,10 +817,17 @@ def handle_card_action(event):
 
             async def _search_and_patch_recipients():
                 try:
-                    matched_uids = await asyncio.to_thread(
-                        card_builder.search_person_picker_candidates,
-                        keyword,
-                    )
+                    if is_test_card:
+                        matched_uids = _search_test_card_candidates(
+                            state,
+                            field_type,
+                            keyword,
+                        )
+                    else:
+                        matched_uids = await asyncio.to_thread(
+                            card_builder.search_person_picker_candidates,
+                            keyword,
+                        )
                     options_key = f"draft_{field_type}_options"
                     hint_key = f"draft_{field_type}_search_hint"
                     selected_key = f"draft_{field_type}_new_selected"
@@ -709,7 +838,7 @@ def handle_card_action(event):
                             return f"本次命中 {len(matched_uids)} 人，累计候选 {total_candidates} 人。可继续搜索并勾选后保存。"
                         return f"未找到“{keyword}”匹配人员，累计候选 {total_candidates} 人。仅支持邮箱前缀精确搜索（@前部分）。"
 
-                    if str(email_id).startswith("test_push_"):
+                    if is_test_card:
                         mock_state = _mock_store.get(email_id)
                         if not mock_state:
                             return
@@ -737,46 +866,66 @@ def handle_card_action(event):
                     else:
                         config = {"configurable": {"thread_id": email_id}}
                         latest_state = await graph.aget_state(config)
-                        current_email = latest_state.values.get("email", {}).copy()
+                        latest_email, latest_draft = await _hydrate_lark_projection(
+                            latest_state
+                        )
+                        current_ui = latest_state.values.get("recipient_ui") or {}
+                        field_ui = current_ui.get(field_type) or {}
                         selected_raw = form_values.get(f"{field_type}_new", None)
                         if selected_raw is None:
-                            selected_new = normalize_uid_list(current_email.get(selected_key))
+                            selected_new = normalize_uid_list(field_ui.get("selected"))
                         else:
                             selected_new = normalize_uid_list(selected_raw)
-                        current_options = normalize_uid_list(current_email.get(options_key))
+                        current_options = normalize_uid_list(field_ui.get("options"))
                         merged_options = merge_unique(current_options + matched_uids + selected_new)
                         external_raw = form_values.get(f"{field_type}_external_input", None)
                         if external_raw is None:
-                            external_input = str(current_email.get(external_key, "") or "")
+                            external_input = str(field_ui.get("external_input", "") or "")
                         else:
                             external_input = str(external_raw or "").strip()
-                        current_email[options_key] = merged_options
-                        current_email[selected_key] = selected_new
-                        current_email[external_key] = external_input
-                        current_email[hint_key] = _next_hint(len(merged_options))
-                        await graph.aupdate_state(config, {"email": current_email})
+                        ui_delta = {
+                            field_type: {
+                                "options": merged_options,
+                                "selected": selected_new,
+                                "external_input": external_input,
+                                "search_hint": _next_hint(len(merged_options)),
+                            }
+                        }
+                        await graph.aupdate_state(
+                            config,
+                            _bounded_human_update(
+                                latest_state,
+                                {"recipient_ui": ui_delta},
+                            ),
+                        )
                         latest_state = await graph.aget_state(config)
-                        latest_email = latest_state.values.get("email", current_email)
+                        latest_email, latest_draft = await _hydrate_lark_projection(
+                            latest_state
+                        )
                         latest_classification = latest_state.values.get("classification", classification)
-                        latest_draft = latest_state.values.get("draft", "")
+                        latest_context = latest_state.values.get("context_summaries", [])
 
-                    edit_card = card_builder.build_approval_card(
+                    edit_card = action_card_builder.build_approval_card(
                         email_id,
                         latest_draft,
-                        [],
+                        latest_context if not is_test_card else context_summaries,
                         latest_email,
                         latest_classification,
                         edit_field=field_type,
                     )
                     update_card_ui(message_id, edit_card)
                     logger.info(
-                        "Recipient search finished: field=%s, keyword=%s, matches=%s",
+                        "Recipient search finished: field=%s keyword_bytes=%d matches=%d",
                         field_type,
-                        keyword,
+                        len(keyword.encode("utf-8")),
                         len(matched_uids),
                     )
-                except Exception as e:
-                    logger.error("Recipient search failed: field=%s, err=%s", field_type, e, exc_info=True)
+                except Exception as exc:
+                    logger.error(
+                        "Recipient search failed: field=%s error_type=%s",
+                        field_type,
+                        type(exc).__name__,
+                    )
 
             safe_async_run(_search_and_patch_recipients())
             return {"toast": {"type": "info", "content": f"正在搜索“{keyword}”，稍后自动更新候选人..."}}
@@ -785,7 +934,7 @@ def handle_card_action(event):
         elif action_type == "save_cc":
             action_data = event.event.action
             form_values = getattr(action_data, "form_value", None) or {}
-            logger.info(f"save_cc action data: value={action_data.value}, form_value={form_values}")
+            logger.info("Saving recipient field: field=cc")
             keep_uids = normalize_uid_list(form_values.get("cc_existing"))
             add_uids = normalize_uid_list(form_values.get("cc_new"))
             external_raw = form_values.get("cc_external_input", None)
@@ -798,7 +947,7 @@ def handle_card_action(event):
             )
             email_data["draft_cc"] = new_cc
             clear_recipient_edit_temp(email_data, "cc")
-            if str(email_id).startswith("test_push_"):
+            if is_test_card:
                 mock_email = _mock_store[email_id].values["email"]
                 if "original_cc" not in mock_email:
                     mock_email["original_cc"] = list(mock_email.get("cc", []))
@@ -806,15 +955,13 @@ def handle_card_action(event):
                 clear_recipient_edit_temp(mock_email, "cc")
             else:
                 config = {"configurable": {"thread_id": email_id}}
-                current_email = state.values.get("email", {}).copy()
-                if "original_cc" not in current_email:
-                    current_email["original_cc"] = list(current_email.get("cc", []))
-                current_email["draft_cc"] = new_cc
-                clear_recipient_edit_temp(current_email, "cc")
-                safe_async_wait(graph.aupdate_state(config, {"email": current_email}))
+                update = _bounded_human_update(
+                    state,
+                    {"draft_cc": new_cc, "recipient_ui": {"cc": {}}},
+                )
+                safe_async_wait(graph.aupdate_state(config, update))
 
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": f"抄送人已保存（{len(new_cc)}人）"},
                 "card": {"type": "raw", "data": view_card}
@@ -824,16 +971,16 @@ def handle_card_action(event):
         elif action_type in ("save_draft", "submit", "Button_submit", "form_submit_draft"):
             action_data = event.event.action
             form_values = getattr(action_data, 'form_value', None) or {}
-            logger.info(f"Form submit: form_value={form_values}, value={action_data.value}")
+            logger.info("Saving edited draft")
             new_draft = form_values.get("draft_input", "")
             if new_draft:
-                if str(email_id).startswith("test_push_"):
+                if is_test_card:
                      _mock_store[email_id].values["draft"] = new_draft
                 process_modification(email_id, new_draft)
-                logger.info(f"Draft updated to: {new_draft[:50]}...")
+                logger.info("Draft updated: bytes=%d", len(new_draft.encode("utf-8")))
             else:
-                new_draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, new_draft, [], email_data, classification, edit_field=None)
+                new_draft = draft
+            view_card = action_card_builder.build_approval_card(email_id, new_draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": "正文已保存"},
                 "card": {"type": "raw", "data": view_card}
@@ -841,8 +988,7 @@ def handle_card_action(event):
         
         # 取消编辑（通用）
         elif action_type == "cancel_edit":
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "info", "content": "已取消"},
                 "card": {"type": "raw", "data": view_card}
@@ -859,8 +1005,7 @@ def handle_card_action(event):
 
         # 保留旧的modify处理，兼容可能的旧卡片
         elif action_type == "modify":
-            draft = state.values.get("draft", "")
-            edit_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field="draft")
+            edit_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field="draft")
             return {
                 "toast": {"type": "info", "content": "编辑正文"},
                 "card": {"type": "raw", "data": edit_card}
@@ -870,26 +1015,28 @@ def handle_card_action(event):
             form_values = event.event.action.form_value or {}
             new_draft = form_values.get("draft_input", "")
             process_modification(email_id, new_draft)
-            view_card = card_builder.build_approval_card(email_id, new_draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, new_draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": "修改已保存"},
                 "card": {"type": "raw", "data": view_card}
             }
 
         elif action_type == "cancel_modification":
-            draft = state.values.get("draft", "")
-            view_card = card_builder.build_approval_card(email_id, draft, [], email_data, classification, edit_field=None)
+            view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "info", "content": "已取消编辑"},
                 "card": {"type": "raw", "data": view_card}
             }
 
-    except Exception as e:
-        logger.error(f"Error handling card action: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error(
+            "Card action failed: error_type=%s",
+            type(exc).__name__,
+        )
         err_resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "error"
-        toast.content = f"操作失败: {str(e)[:50]}"
+        toast.content = "操作失败，请稍后重试"
         err_resp.toast = toast
         return err_resp
 
@@ -944,11 +1091,11 @@ def _handle_p2_im_message_receive(event):
                 .build()
             resp = lark_api_client.im.v1.message.create(req)
             if not resp.success():
-                logger.error("Command reply send failed: %s - %s", resp.code, resp.msg)
+                logger.error("Command reply send failed: code=%s", resp.code)
 
         safe_async_run(_dispatch())
-    except Exception as e:
-        logger.error("Error handling message event: %s", e)
+    except Exception as exc:
+        logger.error("Message event failed: error_type=%s", type(exc).__name__)
 
 def build_final_response(text):
     """
@@ -995,61 +1142,76 @@ def safe_async_wait(coro):
             return loop.run_until_complete(coro)
 
 def process_approval(email_id, user_id):
+    if _is_explicit_test_card(email_id):
+        values = _mock_store[email_id].values
+        values["approval_status"] = "approved"
+        values["approver_user_id"] = user_id
+        values["status"] = "approved"
+        return
+
     config = {"configurable": {"thread_id": email_id}}
     state = safe_async_wait(graph.aget_state(config))
-
-    final_draft = state.values.get("draft", "") if state and state.values else ""
+    final_draft = safe_async_wait(
+        hydrate_draft_from_state(state.values, _require_graph_dependencies())
+    )
     safe_async_wait(db_manager.update_status(
         email_id, "approved",
         approver_user_id=user_id,
         final_draft=final_draft,
     ))
 
-    safe_async_wait(graph.aupdate_state(config, {"approval_status": "approved"}))
-    logger.info(f"Approval processed for {email_id} by {user_id}. Executing graph...")
+    update = _bounded_human_update(state, {"approval_status": "approved"})
+    safe_async_wait(graph.aupdate_state(config, update))
+    logger.info("Approval processed; resuming graph")
     
-    att_tokens = _collect_cleanup_tokens(state)
-
-    if att_tokens:
-        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
-        for tok in att_tokens:
-             safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
-
-    safe_async_run(graph.ainvoke(None, config=config))
+    safe_async_run(_resume_graph_then_cleanup(email_id, state, config))
 
 def process_rejection(email_id, user_id, reason: str = ""):
+    if _is_explicit_test_card(email_id):
+        values = _mock_store[email_id].values
+        values["approval_status"] = "rejected"
+        values["approver_user_id"] = user_id
+        values["rejection_reason"] = reason
+        values["status"] = "rejected"
+        return
+
     config = {"configurable": {"thread_id": email_id}}
-    safe_async_wait(graph.aupdate_state(config, {"approval_status": "rejected"}))
+    state = safe_async_wait(graph.aget_state(config))
+    update = _bounded_human_update(state, {"approval_status": "rejected"})
+    safe_async_wait(graph.aupdate_state(config, update))
     kwargs = {"approver_user_id": user_id}
     if reason:
         kwargs["rejection_reason"] = reason
     safe_async_wait(db_manager.update_status(email_id, "rejected", **kwargs))
-    logger.info(f"Rejection processed for {email_id} by {user_id} reason={reason}. Executing graph...")
-    # Remove attachments (PDF + Originals)
-    state = safe_async_wait(graph.aget_state(config))
-    
-    att_tokens = _collect_cleanup_tokens(state)
-
-    if att_tokens:
-        logger.info(f"Cleaning up {len(att_tokens)} attachments...")
-        for tok in att_tokens:
-             safe_async_run(asyncio.to_thread(delete_file_from_drive, tok))
-
-    safe_async_run(graph.ainvoke(None, config=config))
+    logger.info("Rejection processed; resuming graph")
+    safe_async_run(_resume_graph_then_cleanup(email_id, state, config))
     
 def process_modification(email_id, new_draft):
+    if _is_explicit_test_card(email_id):
+        values = _mock_store[email_id].values
+        values["draft"] = new_draft
+        values["approval_status"] = "modify"
+        values["status"] = "modified"
+        return
     config = {"configurable": {"thread_id": email_id}}
-    safe_async_wait(graph.aupdate_state(config, {
-        "draft": new_draft, 
-        "approval_status": "modify"
-    }))
+    state = safe_async_wait(graph.aget_state(config))
+    dependencies = _require_graph_dependencies()
+    draft_id = safe_async_wait(dependencies.drafts.save_draft(email_id, new_draft))
+    update = _bounded_human_update(
+        state,
+        {"draft_id": draft_id, "approval_status": "modify"},
+    )
+    safe_async_wait(graph.aupdate_state(config, update))
     safe_async_wait(db_manager.update_status(email_id, "modified"))
-    logger.info(f"Modification saved for {email_id}. New draft length: {len(new_draft)}")
+    logger.info("Modification saved: bytes=%d", len(new_draft.encode("utf-8")))
 
 async def process_save_draft(email_id, state):
     try:
-        draft = state.values.get("draft", "")
-        email_data = state.values.get("email", {})
+        if _is_explicit_test_card(email_id):
+            state.values["status"] = "draft_saved"
+            return
+
+        email_data, draft = await _hydrate_lark_projection(state)
         
         # 1. Resolve Recipients (Copy logic from sender.py)
         from lark_oapi.api.contact.v3 import GetUserRequest
@@ -1069,8 +1231,11 @@ async def process_save_draft(email_id, state):
                             if email:
                                 return email
                     return None
-                except Exception as e:
-                    logger.error(f"Error resolving open_id {open_id}: {e}")
+                except Exception as exc:
+                    logger.error(
+                        "Recipient resolution failed: error_type=%s",
+                        type(exc).__name__,
+                    )
                     return None
             
             # Extract from legacy format "name='...', email_address='...'" or just return string
@@ -1103,39 +1268,163 @@ async def process_save_draft(email_id, state):
         body = draft + "<br><br>--<br>AI Generated Draft"
         
         if exchange_client:
-             logger.info(f"Saving draft for {email_id}. To: {final_to}, Cc: {final_cc}")
+             logger.info(
+                 "Saving Exchange draft: to_count=%d cc_count=%d",
+                 len(final_to),
+                 len(final_cc),
+             )
              await exchange_client.create_draft(final_to, subject, body, cc=final_cc)
         
         await db_manager.update_status(email_id, "draft_saved")
 
-        # Remove attachments (PDF + Originals)
-        att_tokens = _collect_cleanup_tokens(state)
+        await _cleanup_action_drive_tokens(email_id, state)
 
-        if att_tokens:
-            logger.info(f"Cleaning up {len(att_tokens)} attachments (async)...")
-            for tok in att_tokens:
-                 await asyncio.to_thread(delete_file_from_drive, tok)
+    except Exception as exc:
+        logger.error(
+            "Exchange draft save failed: error_type=%s",
+            type(exc).__name__,
+        )
 
-    except Exception as e:
-        logger.error(f"Error in process_save_draft: {e}", exc_info=True)
 
-async def generate_and_upload_pdf(email_id: str, email_data: dict) -> Optional[Dict[str, Any]]:
-    """Render email -> PDF -> Lark Drive. Delegates to lark_pdf_flow."""
+async def _render_test_card_pdf(email_data: Dict[str, Any]) -> Optional[bytes]:
+    """Render explicitly seeded test data without Graph or persistence stores."""
+    from src.utils.email_renderer import render_email_html
+    from src.utils.pdf_generator import convert_html_to_pdf
+
+    try:
+        loop = asyncio.get_running_loop()
+        isolated_email = deepcopy(email_data)
+        html_content = await loop.run_in_executor(
+            None,
+            render_email_html,
+            isolated_email,
+        )
+        if not html_content:
+            return None
+        return await loop.run_in_executor(
+            None,
+            convert_html_to_pdf,
+            html_content,
+        )
+    except Exception as exc:
+        logger.error(
+            "Test-card PDF render failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return None
+
+
+async def _process_test_card_pdf_generation_and_reply(
+    email_id: str,
+    state: Any,
+    message_id: str,
+) -> None:
+    """Render/reply from explicit in-memory test state only."""
+    if not _is_explicit_test_card(email_id):
+        return
+    if _mock_store.get(email_id) is not state or not lark_api_client:
+        return
+
+    pdf_bytes = await _render_test_card_pdf(state.values.get("email") or {})
+    if not pdf_bytes:
+        return
+
+    filename = f"Email_Export_{email_id}.pdf"
+    try:
+        result = await asyncio.to_thread(
+            upload_file_to_drive,
+            filename,
+            pdf_bytes,
+            len(pdf_bytes),
+        )
+    except Exception as exc:
+        logger.error(
+            "Test-card PDF upload failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return
+    if not isinstance(result, dict):
+        return
+
+    file_url = result.get("url")
+    file_token = result.get("file_token")
+    if not isinstance(file_url, str) or not file_url:
+        return
+    if not isinstance(file_token, str) or not file_token:
+        return
+
+    state.values["pdf_token"] = file_token
+    card_content = {
+        "header": {
+            "template": "blue",
+            "title": {"content": "📄 PDF 原文已生成", "tag": "plain_text"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"点击下方按钮查看测试 PDF：\nFilename: *{filename}*",
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📂 打开 PDF"},
+                        "type": "primary",
+                        "url": file_url,
+                    }
+                ],
+            },
+        ],
+    }
+    request = (
+        ReplyMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            ReplyMessageRequestBody.builder()
+            .msg_type("interactive")
+            .content(json.dumps(card_content))
+            .build()
+        )
+        .build()
+    )
+    try:
+        lark_api_client.im.v1.message.reply(request)
+    except Exception as exc:
+        logger.error(
+            "Test-card PDF reply failed: error_type=%s",
+            type(exc).__name__,
+        )
+
+async def generate_and_upload_pdf(email_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve strict Graph refs, render email -> PDF, then upload."""
     from src.utils.lark_pdf_flow import generate_and_upload_pdf as _impl
-    return await _impl(email_id, email_data, upload_fn=upload_file_to_drive)
+    config = {"configurable": {"thread_id": email_id}}
+    state = await graph.aget_state(config)
+    return await _impl(
+        email_id,
+        state,
+        dependencies=_require_graph_dependencies(),
+        upload_fn=upload_file_to_drive,
+        delete_fn=delete_file_from_drive,
+    )
 
 
 async def process_pdf_generation_and_reply(email_id, state, message_id):
     """Generate PDF and reply with file link. Delegates to lark_pdf_flow."""
     from src.utils.lark_pdf_flow import process_pdf_generation_and_reply as _impl
-    await _impl(
+    return await _impl(
         email_id,
         state,
         message_id,
         graph=graph,
+        dependencies=_require_graph_dependencies(),
         lark_api_client=lark_api_client,
         upload_fn=upload_file_to_drive,
-        safe_async_wait=safe_async_wait,
+        delete_fn=delete_file_from_drive,
     )
 
 

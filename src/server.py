@@ -6,10 +6,12 @@ import logging
 import re
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
 from src.safety.input_limits import input_limits_from_settings
+from src.graph.state_factory import require_owned_content_ref
+from src.storage import ContentStoreError, ContentStoreReferenceError
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
@@ -99,11 +101,11 @@ async def health_check():
                 "circuit_breaker": circuit_breaker_state,
             }
         )
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
+    except Exception as exc:
+        logger.error("Health check failed: error_type=%s", type(exc).__name__)
         return JSONResponse(
             status_code=503,
-            content={"status": "error", "message": str(e)}
+            content={"status": "error", "message": "health_check_failed"},
         )
 
 
@@ -220,10 +222,18 @@ class MockEmailData(BaseModel):
     subject: str
     sender: str
     to: List[str]
-    cc: List[str] = []
+    cc: List[str] = Field(default_factory=list)
     body: str
     received_at: str
-    attachments: List[Dict[str, Any]] = []
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    draft: str = ""
+    context: List[Dict[str, Any]] = Field(default_factory=list)
+    classification: Dict[str, Any] = Field(default_factory=dict)
+    attachment_tokens: List[str] = Field(default_factory=list)
+    pdf_token: Optional[str] = None
+    recipient_candidates: Dict[str, List[Any]] = Field(
+        default_factory=lambda: {"to": [], "cc": []}
+    )
 
 @app.post("/debug/inject_email")
 async def inject_test_email(data: MockEmailData):
@@ -241,17 +251,29 @@ async def inject_test_email(data: MockEmailData):
     # So we structure it accordingly.
     
     mock_state = type('MockState', (), {})()
+    email_data = {
+        "id": data.id,
+        "subject": data.subject,
+        "sender": data.sender,
+        "to": data.to,
+        "cc": data.cc,
+        "draft_to": list(data.to),
+        "draft_cc": list(data.cc),
+        "body": data.body,
+        "received_at": data.received_at,
+        "attachments": data.attachments,
+    }
     mock_state.values = {
-        "email": {
-            "id": data.id,
-            "subject": data.subject,
-            "sender": data.sender,
-            "to": data.to,
-            "cc": data.cc,
-            "body": data.body,
-            "received_at": data.received_at,
-            "attachments": data.attachments
-        }
+        "email": email_data,
+        "draft": data.draft,
+        "context": data.context,
+        "classification": data.classification or {
+            "need_reply": True,
+            "reasoning": "debug_injection",
+        },
+        "attachment_tokens": data.attachment_tokens,
+        "pdf_token": data.pdf_token,
+        "recipient_candidates": data.recipient_candidates,
     }
     
     lark_app._mock_store[data.id] = mock_state
@@ -262,46 +284,44 @@ async def view_email(email_id: str):
     """
     Serve the email content as Outlook-style HTML.
     """
-    app_ctx = get_app_context()
-    
-    # 1. Try to get state from Graph
-    if not app_ctx.graph:
-        logger.error("Graph not initialized.")
-        raise HTTPException(status_code=503, detail="Service not ready")
-
-    config = {"configurable": {"thread_id": email_id}}
-    state = None
-    
-    # Check for test card
-    if str(email_id).startswith("test_push_"):
-        if email_id in lark_app._mock_store:
-             state = lark_app._mock_store[email_id]
-        else:
-             # Fallback for cross-process test
-             if email_id == "test_push_REAL_USER":
-                 return HTMLResponse("""
-                 <html><body>
-                 <div style="padding: 20px; font-family: sans-serif;">
-                     <h1>🚀 Flight Status Update [TEST FALLBACK]</h1>
-                     <p>This is a test email content served from the server fallback.</p>
-                     <p><b>Sender:</b> System &lt;q-fu@tianjin-air.com&gt;</p>
-                     <p><b>Subject:</b> TEST: Complex Email Rendering</p>
-                     <p>If you see this, the Web View link is working!</p>
-                 </div>
-                 </body></html>
-                 """)
-             return HTMLResponse("<h1>Test Card Not Found in Memory</h1>")
+    settings = get_settings()
+    is_explicit_debug_email = (
+        bool(settings.DEBUG) and email_id in lark_app._mock_store
+    )
+    if is_explicit_debug_email:
+        state = lark_app._mock_store[email_id]
+        email_data = state.values.get("email", {})
     else:
+        app_ctx = get_app_context()
         try:
-             state = await app_ctx.graph.aget_state(config)
-        except Exception as e:
-             logger.error(f"Error getting state: {e}")
-             raise HTTPException(status_code=500, detail="Internal Error")
-
-    if not state or not state.values:
-        raise HTTPException(status_code=404, detail="Email not found or session expired")
-        
-    email_data = state.values.get("email", {})
+            ref = await app_ctx.db_manager.get_content_ref(email_id)
+            if ref is None:
+                raise HTTPException(status_code=404, detail="Email content not found")
+            owned_ref = require_owned_content_ref(
+                ref,
+                expected_account_id=settings.EXCHANGE_ACCOUNT_ID,
+            )
+            email_data = await app_ctx.content_store.load_email(
+                owned_ref,
+                include_attachments=True,
+            )
+            loaded_id = email_data.get("id")
+            if loaded_id not in (None, "", email_id):
+                raise ContentStoreReferenceError("content_email_mismatch")
+        except HTTPException:
+            raise
+        except (ContentStoreError, ContentStoreReferenceError) as exc:
+            logger.warning(
+                "Original email content unavailable: error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=404, detail="Email content unavailable")
+        except Exception as exc:
+            logger.error(
+                "Original email load failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise HTTPException(status_code=500, detail="Internal Error")
     
     # Use shared renderer
     from src.utils.email_renderer import render_email_html

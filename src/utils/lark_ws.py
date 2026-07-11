@@ -10,9 +10,20 @@ from typing import Any
 from src.utils import lark_app
 
 
-def init_lark_app(db_mgr, graph_instance, ex_client, worker_loop_arg=None):
+def init_lark_app(
+    db_mgr,
+    graph_instance,
+    ex_client,
+    worker_loop_arg=None,
+    *,
+    dependencies=None,
+):
     return lark_app.init_lark_app(
-        db_mgr, graph_instance, ex_client, worker_loop_arg=worker_loop_arg
+        db_mgr,
+        graph_instance,
+        ex_client,
+        worker_loop_arg=worker_loop_arg,
+        dependencies=dependencies,
     )
 
 

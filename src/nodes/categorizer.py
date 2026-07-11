@@ -1,10 +1,13 @@
 
 import logging
+from copy import deepcopy
 from typing import Literal
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
+from src.graph.dependencies import GraphDependencies
+from src.graph.state_factory import hydrate_email_from_state, sanitize_graph_delta
 from src.config import get_settings
 from src.safety.model_budget import (
     ModelInputTooLarge,
@@ -26,20 +29,38 @@ class EmailClassification(BaseModel):
     reasoning: str = Field(description="简短的分类理由")
     confidence: float = Field(description="分类置信度，0.0 到 1.0 之间", ge=0.0, le=1.0)
 
-async def categorize_email(state: AgentState) -> AgentState:
+async def categorize_email(
+    state: AgentState,
+    dependencies: GraphDependencies,
+) -> AgentState:
     """
     分类节点：先执行路由引擎（Tier 1/2/3），再根据邮件内容进行优先级和意图分类。
     """
     # Step 0: Execute Routing Engine (Tier 1/2/3)
-    engine = get_routing_engine()
-    state = await engine.execute_router(state)
+    email = await hydrate_email_from_state(state, dependencies)
+    local_state = deepcopy(dict(state))
+    local_state["email"] = email
 
-    current_classification = state.get("classification", {})
+    engine = get_routing_engine()
+    routed_state = await engine.execute_router(local_state)
+
+    routing_updates = {}
+    for key in (
+        "routing_log",
+        "active_skills",
+        "system_prompt_modifier",
+        "priority_level",
+        "metadata",
+        "tool_calls",
+    ):
+        if key in routed_state and routed_state.get(key) != state.get(key):
+            routing_updates[key] = routed_state[key]
+
+    current_classification = deepcopy(routed_state.get("classification", {}))
     if current_classification.get("action") in ["forward", "transfer"]:
         logger.info(f"Skipping LLM Categorization due to existing action: {current_classification.get('action')}")
 
         # Fill in missing classification fields that LLM would normally produce
-        email = state.get("email", {})
         if not current_classification.get("summary"):
             subject = email.get("subject", "")
             sender = email.get("sender", "")
@@ -54,17 +75,24 @@ async def categorize_email(state: AgentState) -> AgentState:
         if reasoning.startswith("Triggered by skill"):
             current_classification["reasoning"] = "系统规则自动触发转发"
 
-        updates = {"next_step": "drafter", "classification": current_classification}
-        # routing_log / active_skills are reducer-managed (operator.add).
-        # Only echo back non-reducer fields so we don't double-accumulate the lists.
-        if "system_prompt_modifier" in state:
-            updates["system_prompt_modifier"] = state["system_prompt_modifier"]
-        for key in ("routing_log", "active_skills"):
-            if key in state:
-                updates[key] = state[key]
-        return updates
+        updates = {
+            "next_step": "drafter",
+            "classification": current_classification,
+            **routing_updates,
+        }
+        routed_email = routed_state.get("email")
+        if isinstance(routed_email, dict):
+            for field in ("draft_to", "draft_cc"):
+                if field in routed_email:
+                    updates[field] = routed_email[field]
+        fixed_draft = routed_state.get("draft")
+        if isinstance(fixed_draft, str):
+            updates["draft_id"] = await dependencies.drafts.save_draft(
+                state["email_id"],
+                fixed_draft,
+            )
+        return sanitize_graph_delta(state, updates)
 
-    email = state.get("email", {})
     subject = email.get("subject", "")
     body = email.get("body", "")
 
@@ -72,7 +100,7 @@ async def categorize_email(state: AgentState) -> AgentState:
     parser = JsonOutputParser(pydantic_object=EmailClassification)
 
     experience_ctx = ""
-    experience_hints = (state.get("metadata") or {}).get("experience_hints", [])
+    experience_hints = (routed_state.get("metadata") or {}).get("experience_hints", [])
     if experience_hints:
         hint_lines = []
         for h in experience_hints[:3]:
@@ -123,18 +151,21 @@ async def categorize_email(state: AgentState) -> AgentState:
         # Expected result is a dict because parser converts it
         result = await invoke_with_retry(payload)
         classification_result = EmailClassification(**result)
-        logger.info(f"Classification success: {classification_result}")
+        logger.info("Classification completed successfully")
     except ModelInputTooLarge:
         raise
-    except Exception as e:
-        logger.error(f"Classification failed (Parsing Error or Max Retries): {e}")
+    except Exception as exc:
+        logger.error(
+            "Classification failed; using safe default: error_type=%s",
+            type(exc).__name__,
+        )
         # Fallback default
         classification_result = EmailClassification(
             priority="P3", 
             need_reply=False, 
             intent="通知", 
             summary=subject or "分类失败，已降级处理",
-            reasoning=f"Auto-fallback due to error: {str(e)[:50]}",
+            reasoning="分类服务暂时不可用，已采用安全默认值",
             confidence=0.0,
         )
 
@@ -142,7 +173,5 @@ async def categorize_email(state: AgentState) -> AgentState:
         "classification": classification_result.model_dump(),
         "next_step": "rag_search" if classification_result.need_reply else "end",
     }
-    for key in ("routing_log", "active_skills", "system_prompt_modifier"):
-        if key in state:
-            updates[key] = state[key]
-    return updates
+    updates.update(routing_updates)
+    return sanitize_graph_delta(state, updates)

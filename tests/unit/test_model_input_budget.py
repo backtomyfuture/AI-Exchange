@@ -91,7 +91,9 @@ def _oversize_provider(role: str) -> RunnableLambda:
 
 
 @pytest.mark.asyncio
-async def test_categorizer_budgets_complete_rendered_messages_before_retry():
+async def test_categorizer_budgets_complete_rendered_messages_before_retry(
+    graph_node_harness,
+):
     captured: dict = {}
     provider_calls = 0
 
@@ -100,14 +102,15 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry():
         provider_calls += 1
         return {"never": "called"}
 
-    state = {
-        "email": {
+    state = graph_node_harness.state(
+        {
+            "id": "budget-category",
             "subject": "budget-subject",
             "body": "budget-body",
             "image_analysis": "budget-image-analysis",
         },
-        "classification": {},
-        "metadata": {
+        classification={},
+        metadata={
             "experience_hints": [
                 {
                     "category": "budget-history-category",
@@ -116,7 +119,7 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry():
                 }
             ]
         },
-    }
+    )
     router = MagicMock()
     router.execute_router = AsyncMock(return_value=state)
 
@@ -132,7 +135,7 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry():
         new_callable=AsyncMock,
     ) as mock_acquire:
         with pytest.raises(ModelInputTooLarge):
-            await categorize_email(state)
+            await categorize_email(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "categorizer"
     assert "budget-subject" in captured["value"]
@@ -145,7 +148,9 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry():
 
 
 @pytest.mark.asyncio
-async def test_drafter_budgets_modifiers_history_and_metadata_before_retry():
+async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
+    graph_node_harness,
+):
     captured: dict = {}
     provider_calls = 0
 
@@ -154,28 +159,28 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry():
         provider_calls += 1
         return SimpleNamespace(content="never called")
 
-    state = {
-        "email": {
+    state = graph_node_harness.state(
+        {
+            "id": "budget-draft",
             "sender": "budget-sender",
             "subject": "budget-subject",
             "body": "budget-body",
         },
-        "context": [
+        context=[
             {
                 "sender": "budget-history-sender",
                 "subject": "budget-history-subject",
                 "body": "budget-history-body",
             }
         ],
-        "classification": {},
-        "feedback": None,
-        "system_prompt_modifier": "budget-system-modifier",
-        "metadata": {
+        classification={},
+        system_prompt_modifier="budget-system-modifier",
+        metadata={
             "style_guidance": "budget-style-guidance",
             "preference_hints": [{"pattern": "budget-preference-hint"}],
             "thread_summary": "budget-thread-summary",
         },
-    }
+    )
 
     with patch(
         "src.providers.factory.get_llm_for_role",
@@ -189,7 +194,7 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry():
         new_callable=AsyncMock,
     ) as mock_acquire:
         with pytest.raises(ModelInputTooLarge):
-            await generate_draft(state)
+            await generate_draft(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "drafter"
     for fragment in (
@@ -208,7 +213,9 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry():
 
 
 @pytest.mark.asyncio
-async def test_reviewer_budgets_complete_rendered_messages_before_retry():
+async def test_reviewer_budgets_complete_rendered_messages_before_retry(
+    graph_node_harness,
+):
     captured: dict = {}
     provider_calls = 0
 
@@ -217,14 +224,15 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry():
         provider_calls += 1
         return SimpleNamespace(content='{"pass": true}')
 
-    state = {
-        "email": {
+    state = graph_node_harness.state(
+        {
+            "id": "budget-review",
             "subject": "budget-review-subject",
             "body": "budget-review-body",
         },
-        "draft": "budget-review-draft",
-        "metadata": {},
-    }
+        draft="budget-review-draft",
+        metadata={},
+    )
 
     with patch(
         "src.providers.factory.get_llm_for_role",
@@ -238,7 +246,7 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry():
         new_callable=AsyncMock,
     ) as mock_acquire:
         with pytest.raises(ModelInputTooLarge):
-            await review_draft(state)
+            await review_draft(state, graph_node_harness.dependencies)
 
     assert captured["role"] == "reviewer"
     assert "邮件质量审核员" in captured["value"]
@@ -357,11 +365,12 @@ async def test_tier3_router_budgets_prompt_with_all_skill_descriptions():
 
 
 @pytest.mark.asyncio
-async def test_categorizer_fallback_does_not_swallow_model_input_too_large():
-    state = {
-        "email": {"subject": "subject", "body": "body"},
-        "classification": {},
-    }
+async def test_categorizer_fallback_does_not_swallow_model_input_too_large(
+    graph_node_harness,
+):
+    state = graph_node_harness.state(
+        {"id": "oversize-category", "subject": "subject", "body": "body"},
+    )
     router = MagicMock()
     router.execute_router = AsyncMock(return_value=state)
 
@@ -373,17 +382,22 @@ async def test_categorizer_fallback_does_not_swallow_model_input_too_large():
         side_effect=_passthrough_retry,
     ):
         with pytest.raises(ModelInputTooLarge):
-            await categorize_email(state)
+            await categorize_email(state, graph_node_harness.dependencies)
 
 
 @pytest.mark.asyncio
-async def test_drafter_fallback_does_not_swallow_model_input_too_large():
-    state = {
-        "email": {"sender": "sender", "subject": "subject", "body": "body"},
-        "context": [],
-        "classification": {},
-        "feedback": None,
-    }
+async def test_drafter_fallback_does_not_swallow_model_input_too_large(
+    graph_node_harness,
+):
+    state = graph_node_harness.state(
+        {
+            "id": "oversize-draft",
+            "sender": "sender",
+            "subject": "subject",
+            "body": "body",
+        },
+        context=[],
+    )
 
     with patch(
         "src.providers.factory.get_llm_for_role",
@@ -393,16 +407,18 @@ async def test_drafter_fallback_does_not_swallow_model_input_too_large():
         side_effect=_passthrough_retry,
     ):
         with pytest.raises(ModelInputTooLarge):
-            await generate_draft(state)
+            await generate_draft(state, graph_node_harness.dependencies)
 
 
 @pytest.mark.asyncio
-async def test_reviewer_fallback_does_not_swallow_model_input_too_large():
-    state = {
-        "email": {"subject": "subject", "body": "body"},
-        "draft": "draft",
-        "metadata": {},
-    }
+async def test_reviewer_fallback_does_not_swallow_model_input_too_large(
+    graph_node_harness,
+):
+    state = graph_node_harness.state(
+        {"id": "oversize-review", "subject": "subject", "body": "body"},
+        draft="draft",
+        metadata={},
+    )
 
     with patch(
         "src.providers.factory.get_llm_for_role",
@@ -412,4 +428,4 @@ async def test_reviewer_fallback_does_not_swallow_model_input_too_large():
         side_effect=_passthrough_retry,
     ):
         with pytest.raises(ModelInputTooLarge):
-            await review_draft(state)
+            await review_draft(state, graph_node_harness.dependencies)

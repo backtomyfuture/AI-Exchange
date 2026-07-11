@@ -3,7 +3,8 @@ import sys
 import os
 import unittest
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -62,7 +63,16 @@ class TestViewOriginal(unittest.TestCase):
         mock_event.event.context.open_message_id = "msg_thread_root_123"
         
         # Run handling
-        handle_card_action(mock_event)
+        with patch(
+            "src.utils.lark_app.get_settings",
+            return_value=SimpleNamespace(
+                DEBUG=True,
+                EXTERNAL_URL="https://example.test",
+            ),
+        ):
+            handle_card_action(mock_event)
+
+        self.assertFalse(lark_app.graph.aget_state.called)
         
         # Verify NO file upload was called
         self.assertFalse(lark_app.lark_api_client.im.v1.file.create.called)

@@ -1,78 +1,83 @@
+#!/usr/bin/env python3
+"""Smoke-test notification routing against the current Task 7 contract."""
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import MagicMock, AsyncMock
-
-# Mock environment setup
-import sys
-import os
-sys.path.append(os.getcwd())
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.exchange_service import _dispatch_notification
 
-# Mock logger
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def test_notification_logic():
-    print("Testing Notification Logic...")
 
-    # Mock Context and Lark App
-    ctx = MagicMock()
-    ctx.db_manager.update_status = AsyncMock()
-    
-    # Mock lark_app module
-    import src.utils.lark_app as lark_app
-    lark_app.generate_and_upload_pdf = AsyncMock(return_value="http://mock.pdf.url")
-    lark_app.send_read_only_card = MagicMock()
-    lark_app.send_approval_card = MagicMock()
+async def run_notification_smoke() -> list[dict[str, object]]:
+    """Exercise approval/read-only/skip routing without production services."""
+    ctx = SimpleNamespace(
+        db_manager=SimpleNamespace(update_status=AsyncMock()),
+        email_processor=SimpleNamespace(update_email_labels=MagicMock()),
+    )
+    cases = [
+        {
+            "classification": {
+                "priority": "P1",
+                "intent": "通知",
+                "need_reply": False,
+            },
+            "email": {"subject": "Urgent Notice"},
+            "draft": "",
+            "context": [],
+        },
+        {
+            "classification": {
+                "priority": "P2",
+                "intent": "通知",
+                "need_reply": False,
+            },
+            "email": {"subject": "General Notification"},
+        },
+        {
+            "classification": {
+                "priority": "P3",
+                "intent": "垃圾邮件",
+                "need_reply": False,
+            },
+            "email": {"subject": "Spam"},
+        },
+    ]
 
-    # Case 1: Priority P1, Need Reply False -> Should send Read-Only
-    print("\n[Case 1] High Priority (P1), No Reply Needed")
-    pipeline_result_p1 = {
-        "classification": {"priority": "P1", "intent": "通知", "need_reply": False},
-        "email": {"subject": "Urgent Notice"},
-        "draft": "",
-        "context": []
-    }
-    await _dispatch_notification("email_p1", pipeline_result_p1, ctx, {})
-    
-    if lark_app.send_read_only_card.called:
-        print("✅ SUCCESS: send_read_only_card called for P1 email.")
-    else:
-        print("❌ FAILED: send_read_only_card NOT called for P1 email.")
+    with patch(
+        "src.exchange_service.lark_app.generate_and_upload_pdf",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "src.exchange_service.lark_app.send_read_only_card",
+        return_value=True,
+    ), patch(
+        "src.exchange_service.lark_app.send_approval_card",
+        return_value=True,
+    ):
+        return [
+            await _dispatch_notification(
+                f"notification-smoke-{index}",
+                pipeline_result,
+                ctx,
+                {},
+            )
+            for index, pipeline_result in enumerate(cases, start=1)
+        ]
 
-    # Reset mocks
-    lark_app.send_read_only_card.reset_mock()
-    lark_app.send_approval_card.reset_mock()
 
-    # Case 2: Intent Notification, Need Reply False -> Should send Read-Only
-    print("\n[Case 2] Intent '通知', No Reply Needed")
-    pipeline_result_notify = {
-        "classification": {"priority": "P2", "intent": "通知", "need_reply": False},
-        "email": {"subject": "General Notification"},
-    }
-    await _dispatch_notification("email_notify", pipeline_result_notify, ctx, {})
+async def main() -> None:
+    results = await run_notification_smoke()
+    expected = ["read_only", "read_only", "skipped"]
+    actual = [result["kind"] for result in results]
+    if actual != expected or not all(result["delivered"] for result in results):
+        raise SystemExit(f"notification smoke failed: {actual}")
+    logger.info("Notification smoke passed: kinds=%s", actual)
 
-    if lark_app.send_read_only_card.called:
-        print("✅ SUCCESS: send_read_only_card called for Notification email.")
-    else:
-        print("❌ FAILED: send_read_only_card NOT called for Notification email.")
-
-    # Reset mocks
-    lark_app.send_read_only_card.reset_mock()
-
-    # Case 3: Low Priority, No Reply Needed -> Should SKIP
-    print("\n[Case 3] Low Priority (P3), No Reply Needed")
-    pipeline_result_low = {
-        "classification": {"priority": "P3", "intent": "广告", "need_reply": False},
-        "email": {"subject": "Spam"},
-    }
-    await _dispatch_notification("email_low", pipeline_result_low, ctx, {})
-
-    if not lark_app.send_read_only_card.called and not lark_app.send_approval_card.called:
-        print("✅ SUCCESS: No card sent for P3 email.")
-    else:
-        print("❌ FAILED: Card sent for P3 email unexpectedly.")
 
 if __name__ == "__main__":
-    asyncio.run(test_notification_logic())
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())

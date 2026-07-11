@@ -46,7 +46,13 @@ async def lifespan(app: FastAPI):
     # 2. Initialize Lark App (API & WS)
     # We pass the current running loop (uvicorn's loop)
     worker_loop = asyncio.get_running_loop()
-    lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=worker_loop)
+    lark_app.init_lark_app(
+        ctx.db_manager,
+        ctx.graph,
+        ctx.exchange_client,
+        worker_loop_arg=worker_loop,
+        dependencies=ctx.graph_dependencies,
+    )
     
     # Start Lark WS in a background thread
     lark_app.start_lark_ws()
@@ -116,7 +122,13 @@ async def main():
     ctx = get_app_context()
     await ctx.setup_async()
     worker_loop = asyncio.get_running_loop()
-    lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=worker_loop)
+    lark_app.init_lark_app(
+        ctx.db_manager,
+        ctx.graph,
+        ctx.exchange_client,
+        worker_loop_arg=worker_loop,
+        dependencies=ctx.graph_dependencies,
+    )
     lark_app.start_lark_ws()
 
     try:

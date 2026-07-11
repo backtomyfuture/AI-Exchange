@@ -1,5 +1,6 @@
 import logging
 from collections import Counter
+from copy import deepcopy
 from typing import List, Dict, Any, Iterable, Tuple
 from src.config import get_settings
 from src.graph.state import AgentState
@@ -29,32 +30,30 @@ class RoutingEngine:
         """
         执行路由生命周期。
 
-        注意：返回值是「本次新增」的增量（delta），由 LangGraph 的
-        ``operator.add`` reducer 自动与已有 ``routing_log`` / ``active_skills``
-        合并，所以这里**不要**把上游已有的条目再写回，否则会出现双累积。
+        返回值由调用节点投影为有界 Graph delta；列表字段不依赖 reducer。
         """
         email = state.get("email", {})
-        new_log: List[str] = []
-        new_skills: List[str] = []
-        existing_skills = set(state.get("active_skills") or [])
+        routing_log: List[str] = list(state.get("routing_log") or [])
+        active_skills: List[str] = list(state.get("active_skills") or [])
+        existing_skills = set(active_skills)
 
         # --- Stage 1: Tier 1 (Reflex Layer) ---
         t1_matches = self.t1_router.route(email)
         if t1_matches:
-            new_log.append(f"Tier 1 Match: {t1_matches}")
+            routing_log.append(f"Tier 1 Match: {t1_matches}")
             for sid in t1_matches:
-                if sid not in existing_skills and sid not in new_skills:
-                    new_skills.append(sid)
+                if sid not in existing_skills and sid not in active_skills:
+                    active_skills.append(sid)
 
             # 立即执行匹配的 Skill 逻辑
             state = await self._apply_skills(state, t1_matches)
-            state["routing_log"] = new_log
-            state["active_skills"] = new_skills
+            state["routing_log"] = routing_log
+            state["active_skills"] = active_skills
             return state
 
         # --- Stage 2: Tier 2 (Semantic Layer) ---
         # Tier 2 通常集成在 retriever_node 中，因为它需要等待向量数据库的检索结果。
-        new_log.append("Tier 1 No match, moving to Tier 2/3")
+        routing_log.append("Tier 1 No match, moving to Tier 2/3")
 
         # --- Stage 3: Tier 3 (LLM Reasoning Layer) ---
         # 仅在有可用 Skill 时才调用 LLM，避免无意义的 LLM 开销。
@@ -62,16 +61,16 @@ class RoutingEngine:
         if skills:
             t3_matches = await self._tier3_llm_route(state, skills)
             if t3_matches:
-                new_log.append(f"Tier 3 LLM Match: {t3_matches}")
+                routing_log.append(f"Tier 3 LLM Match: {t3_matches}")
                 for sid in t3_matches:
-                    if sid not in existing_skills and sid not in new_skills:
-                        new_skills.append(sid)
+                    if sid not in existing_skills and sid not in active_skills:
+                        active_skills.append(sid)
                 state = await self._apply_skills(state, t3_matches)
         else:
-            new_log.append("Tier 3 Skipped: No skills registered")
+            routing_log.append("Tier 3 Skipped: No skills registered")
 
-        state["routing_log"] = new_log
-        state["active_skills"] = new_skills
+        state["routing_log"] = routing_log
+        state["active_skills"] = active_skills
         return state
 
     def _tier2_route(
@@ -144,34 +143,47 @@ class RoutingEngine:
         """
         Public Tier 2 entry called by retriever_node after Qdrant search.
 
-        Activates voted skills (delta only, reducer-aware) and runs their
-        handlers. Returns the **delta** state ready for LangGraph's reducer.
+        Activates voted skills and runs their handlers. Returns a transient,
+        local-only outcome which retriever_node projects into bounded State.
         """
         skills = self.skill_manager.get_all_skills()
         existing = state.get("active_skills") or []
         chosen = self._tier2_route(hits, existing, skills)
         if not chosen:
             return {}
-        new_state = await self._apply_skills(state, chosen)
+        before = deepcopy(dict(state))
+        new_state = await self._apply_skills(before, chosen)
         delta: Dict[str, Any] = {
             "active_skills": chosen,
             "routing_log": [f"Tier 2 Match: {chosen}"],
         }
-        # Forward any non-reducer state mutated by skills (system_prompt_modifier,
-        # priority_level, classification, metadata, tool_calls).
         for key in (
             "classification",
             "metadata",
             "system_prompt_modifier",
             "priority_level",
         ):
-            if key in new_state and new_state.get(key) != state.get(key):
-                delta[key] = new_state[key]
-        # tool_calls is reducer-managed; only forward the new entries.
+            if key in new_state and new_state.get(key) != before.get(key):
+                delta[key] = deepcopy(new_state[key])
+
         new_tool_calls = new_state.get("tool_calls") or []
-        old_tool_calls = state.get("tool_calls") or []
+        old_tool_calls = before.get("tool_calls") or []
         if len(new_tool_calls) > len(old_tool_calls):
-            delta["tool_calls"] = new_tool_calls[len(old_tool_calls):]
+            delta["tool_calls"] = deepcopy(new_tool_calls[len(old_tool_calls):])
+
+        routed_email = new_state.get("email")
+        previous_email = before.get("email")
+        if isinstance(routed_email, dict):
+            previous_email = previous_email if isinstance(previous_email, dict) else {}
+            for field in ("draft_to", "draft_cc"):
+                if (
+                    field in routed_email
+                    and routed_email.get(field) != previous_email.get(field)
+                ):
+                    delta[field] = deepcopy(routed_email[field])
+        fixed_draft = new_state.get("draft")
+        if isinstance(fixed_draft, str) and fixed_draft != before.get("draft"):
+            delta["_draft_content"] = fixed_draft
         return delta
 
     async def _tier3_llm_route(self, state: AgentState, skills: Dict[str, Any] = None) -> List[str]:
@@ -225,13 +237,16 @@ class RoutingEngine:
             
             # 验证返回的 ID 是否真实存在
             valid_ids = [sid for sid in matched_ids if sid in skills]
-            logger.info(f"Tier 3 LLM matched skills: {valid_ids}")
+            logger.info("Tier 3 LLM matched skill count=%d", len(valid_ids))
             return valid_ids
             
         except ModelInputTooLarge:
             raise
-        except Exception as e:
-            logger.error(f"Tier 3 LLM routing error: {e}")
+        except Exception as exc:
+            logger.error(
+                "Tier 3 LLM routing failed: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     async def _apply_skills(self, state: AgentState, skill_ids: List[str]) -> AgentState:
@@ -249,8 +264,10 @@ class RoutingEngine:
         
         ordered_skills = resolve_skill_order(skill_ids, dependency_graph)
         
-        # 创建新的状态副本
-        new_state = dict(state)
+        # Skill handlers historically mutate nested classification/email values.
+        # A deep copy keeps those mutations local and makes before/after projection
+        # deterministic.
+        new_state = deepcopy(dict(state))
         
         for sid in ordered_skills:
             skill = self.skill_manager.get_skill(sid)
@@ -263,9 +280,13 @@ class RoutingEngine:
                             new_state[key] = {**new_state[key], **val}
                         else:
                             new_state[key] = val
-                    logger.info(f"Applied Skill Logic: {sid}")
-                except Exception as e:
-                    logger.error(f"Error executing skill {sid}: {e}")
+                    logger.info("Applied skill logic: skill=%s", sid)
+                except Exception as exc:
+                    logger.error(
+                        "Skill execution failed: skill=%s error_type=%s",
+                        sid,
+                        type(exc).__name__,
+                    )
         return new_state
 
 
@@ -294,4 +315,3 @@ def get_routing_engine() -> RoutingEngine:
     if _routing_engine is None:
         _routing_engine = RoutingEngine()
     return _routing_engine
-

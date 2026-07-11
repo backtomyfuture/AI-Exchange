@@ -51,6 +51,8 @@ def test_get_app_context_wires_one_shared_content_store(tmp_path):
     assert first is second is context
     assert isinstance(context.content_store, EncryptedFileContentStore)
     assert first.content_store is second.content_store
+    assert context.graph_dependencies.content_store is context.content_store
+    assert context.graph_dependencies.drafts is context.db_manager
     exchange_client.assert_called_once_with(settings)
     email_processor.assert_called_once_with()
     db_manager.assert_called_once_with(settings)

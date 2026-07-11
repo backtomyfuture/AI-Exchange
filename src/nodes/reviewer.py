@@ -2,7 +2,9 @@ import json
 import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.config import get_settings
+from src.graph.dependencies import GraphDependencies
 from src.graph.state import AgentState
+from src.graph.state_factory import hydrate_graph_content, sanitize_graph_delta
 from src.safety.model_budget import (
     ModelInputTooLarge,
     enforce_model_input_budget,
@@ -14,11 +16,13 @@ from src.utils.retry_decorator import with_llm_retry
 logger = logging.getLogger(__name__)
 
 
-async def review_draft(state: AgentState) -> AgentState:
+async def review_draft(
+    state: AgentState,
+    dependencies: GraphDependencies,
+) -> AgentState:
     """Review draft quality before human approval. Auto-rewrite once if poor.
     Also runs ContentGuard checks (hallucination + sensitive info)."""
-    draft = state.get("draft", "")
-    email = state.get("email", {})
+    email, draft = await hydrate_graph_content(state, dependencies)
     review_count = (state.get("metadata") or {}).get("review_count", 0)
 
     if not draft or review_count >= 1:
@@ -73,25 +77,48 @@ async def review_draft(state: AgentState) -> AgentState:
             logger.info("Draft review: PASS")
             return await _run_content_guard(state, draft, email)
         else:
-            logger.info("Draft review: FAIL - %s. Requesting rewrite.", result.get("issues"))
+            issues = result.get("issues", "")
+            logger.info(
+                "Draft review failed: issues_present=%s issues_bytes=%d",
+                bool(issues),
+                len(str(issues).encode("utf-8")),
+            )
             metadata = dict(state.get("metadata") or {})
             metadata["review_count"] = review_count + 1
-            metadata["review_issues"] = result.get("issues", "")
+            metadata["review_issues"] = issues
             return {
-                "metadata": metadata,
-                "next_step": "drafter",
+                **sanitize_graph_delta(
+                    state,
+                    {
+                        "metadata": metadata,
+                        "review_result": {
+                            "passed": False,
+                            "issues": result.get("issues", ""),
+                        },
+                        "next_step": "drafter",
+                    },
+                )
             }
     except ModelInputTooLarge:
         raise
-    except Exception as e:
-        logger.warning("Draft review failed, passing through: %s", e)
+    except Exception as exc:
+        logger.warning(
+            "Draft review failed, passing through: error_type=%s",
+            type(exc).__name__,
+        )
         return await _run_content_guard(state, draft, email)
 
 
 async def _run_content_guard(state: AgentState, draft: str, email: dict) -> AgentState:
     """Run ContentGuard checks and store warnings in metadata."""
     if not draft:
-        return state
+        return sanitize_graph_delta(
+            state,
+            {
+                "review_result": {"passed": False, "issues": "empty_draft"},
+                "next_step": "approval",
+            },
+        )
     try:
         from src.utils.content_guard import ContentGuard
         guard = ContentGuard()
@@ -101,11 +128,39 @@ async def _run_content_guard(state: AgentState, draft: str, email: dict) -> Agen
             metadata["content_guard"] = {
                 "passed": False,
                 "summary": result["summary"],
-                "sensitive_issues": result["sensitive_issues"][:5],
-                "hallucination_issues": result["hallucination_issues"][:5],
+                "sensitive_issues": [
+                    issue.get("category", "sensitive")
+                    for issue in result["sensitive_issues"][:5]
+                    if isinstance(issue, dict)
+                ],
+                "hallucination_issues": [
+                    issue.get("type", "unverified")
+                    for issue in result["hallucination_issues"][:5]
+                    if isinstance(issue, dict)
+                ],
             }
-            logger.info("ContentGuard: %s", result["summary"])
-            return {**state, "metadata": metadata}
-    except Exception as e:
-        logger.debug("ContentGuard skipped: %s", e)
-    return state
+            logger.info(
+                "ContentGuard found issues: sensitive_count=%d hallucination_count=%d",
+                len(result["sensitive_issues"]),
+                len(result["hallucination_issues"]),
+            )
+            return sanitize_graph_delta(
+                state,
+                {
+                    "metadata": metadata,
+                    "review_result": {
+                        "passed": False,
+                        "summary": result["summary"],
+                    },
+                    "next_step": "approval",
+                },
+            )
+    except Exception as exc:
+        logger.debug("ContentGuard skipped: error_type=%s", type(exc).__name__)
+    return sanitize_graph_delta(
+        state,
+        {
+            "review_result": {"passed": True, "summary": "检查通过"},
+            "next_step": "approval",
+        },
+    )

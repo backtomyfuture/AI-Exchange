@@ -117,6 +117,31 @@ class TestApprovalCardReplyWithRecipients:
         elements_json = json.dumps(card["elements"], ensure_ascii=False)
         assert "发件人" in elements_json
 
+    def test_card_uses_bounded_context_snippet_when_body_and_summary_are_empty(self):
+        builder = _make_builder()
+        card = builder.build_approval_card(
+            email_id="e1",
+            draft="ok",
+            context=[
+                {
+                    "snippet": "BOUNDED-CONTEXT-SNIPPET",
+                    "chunk_text": "LEGACY-CONTEXT-VALUE",
+                }
+            ],
+            email_data={
+                "subject": "Test",
+                "sender": "alice@example.com",
+                "to": [],
+                "cc": [],
+                "body": "",
+            },
+            classification={},
+        )
+
+        elements_json = json.dumps(card["elements"], ensure_ascii=False)
+        assert "BOUNDED-CONTEXT-SNIPPET" in elements_json
+        assert "LEGACY-CONTEXT-VALUE" not in elements_json
+
 
 # ---------------------------------------------------------------------------
 # build_approval_card — forward mode
@@ -260,6 +285,30 @@ class TestReadOnlyCardWithRecipients:
         )
         assert card["header"]["template"] == "purple"
 
+    def test_read_only_card_uses_bounded_context_snippet(self):
+        builder = _make_builder()
+        card = builder.build_read_only_card(
+            email_id="e1",
+            context=[
+                {
+                    "snippet": "BOUNDED-READONLY-SNIPPET",
+                    "body": "LEGACY-READONLY-VALUE",
+                }
+            ],
+            email_data={
+                "subject": "Notice",
+                "sender": "a@b.com",
+                "to": [],
+                "cc": [],
+                "body": "",
+            },
+            classification={"priority": "P1"},
+        )
+
+        elements_json = json.dumps(card["elements"], ensure_ascii=False)
+        assert "BOUNDED-READONLY-SNIPPET" in elements_json
+        assert "LEGACY-READONLY-VALUE" not in elements_json
+
 
 # ---------------------------------------------------------------------------
 # Forward categorizer enrichment
@@ -268,26 +317,34 @@ class TestReadOnlyCardWithRecipients:
 class TestForwardCategorizerEnrichment:
 
     @pytest.mark.asyncio
-    async def test_forward_gets_summary_and_confidence(self):
+    async def test_forward_gets_summary_and_confidence(self, graph_node_harness):
         from src.nodes.categorizer import categorize_email
 
-        state = {
-            "email": {"subject": "Urgent Report", "sender": "alice@example.com", "body": "content"},
-            "classification": {
+        state = graph_node_harness.state(
+            {
+                "id": "forward-summary",
+                "subject": "Urgent Report",
+                "sender": "alice@example.com",
+                "body": "content",
+            },
+            classification={
                 "priority": "P0",
                 "need_reply": True,
                 "intent": "转发",
                 "action": "forward",
                 "reasoning": "Triggered by skill Forward to Boss",
             },
-        }
+        )
 
         with patch("src.nodes.categorizer.get_routing_engine") as mock_engine:
             engine = MagicMock()
-            engine.execute_router = AsyncMock(return_value=state)
+            engine.execute_router = AsyncMock(side_effect=lambda local: local)
             mock_engine.return_value = engine
 
-            result = await categorize_email(state)
+            result = await categorize_email(
+                state,
+                graph_node_harness.dependencies,
+            )
 
         cls = result["classification"]
         assert cls["confidence"] == 1.0
@@ -295,23 +352,31 @@ class TestForwardCategorizerEnrichment:
         assert cls["reasoning"] == "系统规则自动触发转发"
 
     @pytest.mark.asyncio
-    async def test_forward_preserves_existing_summary(self):
+    async def test_forward_preserves_existing_summary(self, graph_node_harness):
         from src.nodes.categorizer import categorize_email
 
-        state = {
-            "email": {"subject": "Report", "sender": "a@b.com", "body": "x"},
-            "classification": {
+        state = graph_node_harness.state(
+            {
+                "id": "forward-existing",
+                "subject": "Report",
+                "sender": "a@b.com",
+                "body": "x",
+            },
+            classification={
                 "action": "forward",
                 "reasoning": "Triggered by skill test",
                 "summary": "Custom summary from skill",
             },
-        }
+        )
 
         with patch("src.nodes.categorizer.get_routing_engine") as mock_engine:
             engine = MagicMock()
-            engine.execute_router = AsyncMock(return_value=state)
+            engine.execute_router = AsyncMock(side_effect=lambda local: local)
             mock_engine.return_value = engine
 
-            result = await categorize_email(state)
+            result = await categorize_email(
+                state,
+                graph_node_harness.dependencies,
+            )
 
         assert result["classification"]["summary"] == "Custom summary from skill"

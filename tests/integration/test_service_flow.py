@@ -3,11 +3,26 @@ from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from src.domain.email_state import InitialEmailWriteResult, ProcessingOutcome
 from src.domain.errors import DatabaseOperationError
 from src.exchange_service import process_and_archive_email
+from src.storage import ContentRef
+
+
+def _content_ref():
+    from src.exchange_service import get_settings
+
+    return ContentRef(
+        account_id=get_settings().EXCHANGE_ACCOUNT_ID,
+        object_id="00000000-0000-4000-8000-000000000027",
+        key_version="v1",
+        sha256="2" * 64,
+    )
 
 @pytest.fixture
 def mock_context():
     ctx = MagicMock()
     ctx.db_manager = AsyncMock()
+    ctx.db_manager.get_content_ref.return_value = _content_ref()
+    ctx.content_store = AsyncMock()
+    ctx.content_store.put_email.return_value = _content_ref()
     ctx.email_processor = MagicMock()
     ctx.graph = AsyncMock()
     ctx.exchange_client = AsyncMock()
@@ -15,18 +30,29 @@ def mock_context():
 
 
 def configure_completed_graph(mock_context, email_data, *, classification, events=()):
+    mock_context.content_store.load_email.return_value = email_data
+    mock_state = MagicMock()
+    mock_state.values = {}
+    final_values = {
+        "classification": classification,
+        "draft_id": None,
+        "context_summaries": [],
+        "routing_log": [],
+        "active_skills": [],
+        "draft_to": [],
+        "draft_cc": [],
+    }
+
     async def mock_astream(*args, **kwargs):
         for event in events:
             yield event
+        mock_state.values.update(final_values)
+
+    async def update_state(_config, delta, **_kwargs):
+        mock_state.values.update(delta)
 
     mock_context.graph.astream = mock_astream
-    mock_state = MagicMock()
-    mock_state.values = {
-        "classification": classification,
-        "draft": "",
-        "context": [],
-        "email": email_data,
-    }
+    mock_context.graph.aupdate_state.side_effect = update_state
     mock_context.graph.aget_state.return_value = mock_state
 
 
@@ -49,27 +75,42 @@ async def test_process_flow_new_email(mock_context):
     
     # 2. graph.astream yields events
     # We simulate the graph analyzing and drafting
+    mock_state = MagicMock()
+    mock_state.values = {}
+    final_values = {
+        "classification": {"need_reply": True},
+        "draft_id": "msg_1",
+        "context_summaries": [],
+        "routing_log": [],
+        "active_skills": [],
+        "draft_to": [],
+        "draft_cc": [],
+    }
+
     async def mock_astream(*args, **kwargs):
         yield {"categorizer": {"classification": {"need_reply": True}}}
-        yield {"drafter": {"draft": "Reply Draft"}}
+        yield {"drafter": {"draft_id": "msg_1"}}
+        mock_state.values.update(final_values)
+
+    async def update_state(_config, delta, **_kwargs):
+        mock_state.values.update(delta)
     
     mock_context.graph.astream = mock_astream
+    mock_context.graph.aupdate_state.side_effect = update_state
     
     # 3. graph.aget_state returns final state
-    mock_state = MagicMock()
-    mock_state.values = {
-        "classification": {"need_reply": True},
-        "draft": "Reply Draft",
-        "context": [],
-        "email": email_data
-    }
     mock_context.graph.aget_state.return_value = mock_state
+    mock_context.content_store.load_email.return_value = email_data
+    mock_context.db_manager.load_draft.return_value = "Reply Draft"
     
     # 4. exchange_client.mark_as_read returns True
     mock_context.exchange_client.mark_as_read.return_value = True
     
     # Mock lark_app.send_approval_card globally
-    with patch("src.exchange_service.lark_app.send_approval_card") as mock_lark_send:
+    with patch("src.exchange_service.lark_app.send_approval_card") as mock_lark_send, patch(
+        "src.exchange_service.lark_app.generate_and_upload_pdf",
+        new=AsyncMock(return_value=None),
+    ):
         result = await process_and_archive_email(email_data, mock_context)
 
         assert result is ProcessingOutcome.PROCESSED
@@ -81,7 +122,7 @@ async def test_process_flow_new_email(mock_context):
         
         # Analysis updates
         mock_context.db_manager.update_status.assert_any_call("msg_1", "analyzed", classification=ANY)
-        mock_context.db_manager.update_status.assert_any_call("msg_1", "drafted", draft_content="Reply Draft")
+        mock_context.db_manager.update_status.assert_any_call("msg_1", "drafted")
         
         # Lark Card
         mock_lark_send.assert_called_once()

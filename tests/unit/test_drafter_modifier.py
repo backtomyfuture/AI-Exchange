@@ -3,7 +3,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
-async def test_drafter_uses_system_prompt_modifier():
+async def test_drafter_uses_system_prompt_modifier(graph_node_harness):
     """Verify drafter appends system_prompt_modifier to LLM system prompt."""
     captured_messages = []
 
@@ -11,15 +11,16 @@ async def test_drafter_uses_system_prompt_modifier():
     mock_response = MagicMock()
     mock_response.content = "草稿内容"
 
-    state = {
-        "email": {"subject": "季报", "body": "Q1 数据", "sender": "boss@test.com"},
-        "context": [],
-        "classification": {},
-        "draft": "",
-        "feedback": None,
-        "approval_status": "pending",
-        "system_prompt_modifier": "【语气指令】使用 BLUF 原则，结论先行。",
-    }
+    state = graph_node_harness.state(
+        {
+            "id": "modifier-one",
+            "subject": "季报",
+            "body": "Q1 数据",
+            "sender": "boss@test.com",
+        },
+        context=[],
+        system_prompt_modifier="【语气指令】使用 BLUF 原则，结论先行。",
+    )
 
     with patch("src.utils.llm_factory.LLMFactory") as mock_factory:
         mock_factory.create_llm.return_value = mock_llm
@@ -37,7 +38,7 @@ async def test_drafter_uses_system_prompt_modifier():
             mock_prompt_cls.from_messages.side_effect = capture_from_messages
 
             from src.nodes.drafter import generate_draft
-            await generate_draft(state)
+            await generate_draft(state, graph_node_harness.dependencies)
 
     # The system message (first tuple) should contain the modifier text
     assert len(captured_messages) >= 1
@@ -46,7 +47,7 @@ async def test_drafter_uses_system_prompt_modifier():
 
 
 @pytest.mark.asyncio
-async def test_drafter_works_without_modifier():
+async def test_drafter_works_without_modifier(graph_node_harness):
     """Verify drafter works normally when system_prompt_modifier is None."""
     mock_llm = MagicMock()
     mock_response = MagicMock()
@@ -54,15 +55,16 @@ async def test_drafter_works_without_modifier():
     mock_chain = MagicMock()
     mock_chain.ainvoke = AsyncMock(return_value=mock_response)
 
-    state = {
-        "email": {"subject": "普通邮件", "body": "内容", "sender": "user@test.com"},
-        "context": [],
-        "classification": {},
-        "draft": "",
-        "feedback": None,
-        "approval_status": "pending",
-        "system_prompt_modifier": None,
-    }
+    state = graph_node_harness.state(
+        {
+            "id": "modifier-two",
+            "subject": "普通邮件",
+            "body": "内容",
+            "sender": "user@test.com",
+        },
+        context=[],
+        system_prompt_modifier=None,
+    )
 
     with patch("src.utils.llm_factory.LLMFactory") as mock_factory:
         mock_factory.create_llm.return_value = mock_llm
@@ -72,6 +74,6 @@ async def test_drafter_works_without_modifier():
             mock_prompt_cls.from_messages.return_value = mock_template
 
             from src.nodes.drafter import generate_draft
-            result = await generate_draft(state)
+            result = await generate_draft(state, graph_node_harness.dependencies)
 
-    assert result["draft"] == "正常草稿"
+    assert graph_node_harness.drafts[result["draft_id"]] == "正常草稿"

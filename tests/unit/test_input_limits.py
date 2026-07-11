@@ -116,10 +116,20 @@ def test_encoded_content_takes_precedence_over_declared_size():
     validate_email_input(
         {
             "body": "ok",
-            "attachments": [{"content": "!!!!", "size": 10_000}],
+            "attachments": [{"content": "AAAA", "size": 10_000}],
         },
         limits,
     )
+
+
+def test_attachment_base64_syntax_is_validated_after_size_gates():
+    with pytest.raises(InputLimitExceeded) as caught:
+        validate_email_input(
+            {"body": "ok", "attachments": [{"content": "!!!!"}]},
+            InputLimits(),
+        )
+
+    assert caught.value.category == "attachment_format"
 
 
 @pytest.mark.parametrize(

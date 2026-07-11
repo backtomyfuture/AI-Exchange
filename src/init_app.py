@@ -4,6 +4,7 @@ from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.graph.builder import build_graph
+from src.graph.dependencies import GraphDependencies
 from src.utils.exchange_api import ExchangeClient
 from src.utils.email_processor import EmailProcessor
 from src.utils.db_async import AsyncDatabaseManager
@@ -22,6 +23,7 @@ class AppContext:
         self.graph = None
         self.pool = None
         self.content_store = None
+        self.graph_dependencies = None
 
     def initialize(self):
         """
@@ -45,6 +47,10 @@ class AppContext:
         self.email_processor = EmailProcessor()
         # Async DB Manager (initialized in setup_async)
         self.db_manager = AsyncDatabaseManager(settings)
+        self.graph_dependencies = GraphDependencies(
+            content_store=self.content_store,
+            drafts=self.db_manager,
+        )
         
         # 2. Postgres Connection Pool for LangGraph Checkpointer
         dsn = settings.database_url
@@ -93,7 +99,10 @@ class AppContext:
         
         if self.graph is None:
             checkpointer = AsyncPostgresSaver(self.pool)
-            self.graph = build_graph(checkpointer=checkpointer)
+            self.graph = build_graph(
+                checkpointer=checkpointer,
+                dependencies=self.graph_dependencies,
+            )
             logger.info("Graph initialized with AsyncPostgresSaver.")
 
     async def close(self):

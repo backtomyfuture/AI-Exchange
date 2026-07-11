@@ -516,7 +516,12 @@ class LarkCardBuilder:
 
         original_snippet = "无内容摘要"
         if context:
-            text = context[0].get('chunk_text') or context[0].get('body') or ""
+            text = (
+                context[0].get("snippet")
+                or context[0].get("chunk_text")
+                or context[0].get("body")
+                or ""
+            )
             text = text.strip()
             original_snippet = text[:150] + "..." if len(text) > 150 else text
 
@@ -656,7 +661,12 @@ class LarkCardBuilder:
                      original_snippet = raw_body[:200]
              elif context:
                  # Fallback to context if body is missing
-                 text = context[0].get('chunk_text') or context[0].get('body') or ""
+                 text = (
+                     context[0].get("snippet")
+                     or context[0].get("chunk_text")
+                     or context[0].get("body")
+                     or ""
+                 )
                  text = text.strip()
                  # Try to remove Subject/Attachment lines if present in chunk
                  clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
@@ -874,7 +884,12 @@ class LarkCardBuilder:
                 except Exception:
                     original_snippet = raw_body[:300]
             elif context:
-                text = context[0].get('chunk_text') or context[0].get('body') or ""
+                text = (
+                    context[0].get("snippet")
+                    or context[0].get("chunk_text")
+                    or context[0].get("body")
+                    or ""
+                )
                 text = text.strip()
                 clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
                 text = " ".join(clean_lines)

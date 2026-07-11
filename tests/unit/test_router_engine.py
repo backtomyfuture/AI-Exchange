@@ -198,11 +198,11 @@ class TestRoutingEngineTier3:
                 assert len(result) == 1
 
 
-class TestRoutingEngineReducerDelta:
-    """Ensure execute_router returns only the delta for reducer-controlled lists."""
+class TestRoutingEngineReplacementLists:
+    """List fields are explicitly merged now that Graph reducers are removed."""
 
     @pytest.mark.asyncio
-    async def test_execute_router_returns_only_delta_for_routing_log(self, mock_settings):
+    async def test_execute_router_preserves_existing_routing_log(self, mock_settings):
         engine = RoutingEngine()
         state = {
             "email": {"id": "x", "subject": "s", "body": "b", "sender": "u@x.com"},
@@ -216,11 +216,11 @@ class TestRoutingEngineReducerDelta:
              patch.object(engine, "_apply_skills", return_value=state):
             result = await engine.execute_router(state)
 
-        # Delta only - not the merged list
         assert result["routing_log"] == [
+            "existing entry",
             "Tier 1 Match: ['skill_new']"
         ]
-        assert result["active_skills"] == ["skill_new"]
+        assert result["active_skills"] == ["already_active", "skill_new"]
 
     @pytest.mark.asyncio
     async def test_execute_router_filters_already_active_skills(self, mock_settings):
@@ -237,8 +237,7 @@ class TestRoutingEngineReducerDelta:
              patch.object(engine, "_apply_skills", return_value=state):
             result = await engine.execute_router(state)
 
-        # Only the new skill is returned in the delta; reducer would merge with existing.
-        assert result["active_skills"] == ["skill_fresh"]
+        assert result["active_skills"] == ["skill_already", "skill_fresh"]
 
 
 class TestRoutingEngineSkillApplication:

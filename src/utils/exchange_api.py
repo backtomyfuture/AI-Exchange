@@ -376,10 +376,13 @@ class ExchangeClient:
             )
             response.raise_for_status()
             return True
-        except Exception as e:
-            logger.error("保存草稿失败: %s", e)
-            if hasattr(e, 'response') and e.response:
-                logger.error("Server response: %s", e.response.text)
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "保存草稿失败: status=%s error_type=%s",
+                status_code,
+                type(exc).__name__,
+            )
             return False
 
     async def _send_payload(self, to: str, subject: str, body: str, is_draft: bool = False) -> bool:
@@ -418,13 +421,19 @@ class ExchangeClient:
                 timeout=10.0
             )
             if response.status_code == 404 and is_draft:
-                logger.warning("Draft endpoint 404. %s", response.text)
+                logger.warning("Draft endpoint rejected request: status=404")
                 return False
 
             response.raise_for_status()
             return True
-        except Exception as e:
-            logger.error("%s失败: %s", action, e)
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "%s失败: status=%s error_type=%s",
+                action,
+                status_code,
+                type(exc).__name__,
+            )
             return False
 
     async def mark_as_read(self, email_id: str, is_read: bool = True) -> bool:
@@ -448,14 +457,15 @@ class ExchangeClient:
                 return data.get('code') == 200
             else:
                 logger.warning(
-                    "Mark as read failed (ID: %s): %s - %s",
-                    email_id,
+                    "Mark as read failed: status=%s",
                     response.status_code,
-                    response.text,
                 )
                 return False
-        except Exception as e:
-            logger.error("Failed to mark email %s as read: %s", email_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to mark email as read: error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     async def move_email(self, email_id: str, folder_id: str) -> bool:
@@ -551,10 +561,10 @@ class ExchangeClient:
             if response.status_code == 200:
                 return response.json().get("code") == 200
             else:
-                logger.error("Reply failed: %s - %s", response.status_code, response.text)
+                logger.error("Reply failed: status=%s", response.status_code)
                 return False
-        except Exception as e:
-            logger.error("Reply exception: %s", e)
+        except Exception as exc:
+            logger.error("Reply exception: error_type=%s", type(exc).__name__)
             return False
 
     async def resolve_contact(self, query: str) -> Optional[str]:
@@ -622,8 +632,8 @@ class ExchangeClient:
             if response.status_code == 200:
                 return response.json().get("code") == 200
             else:
-                logger.error("Forward failed: %s - %s", response.status_code, response.text)
+                logger.error("Forward failed: status=%s", response.status_code)
                 return False
-        except Exception as e:
-            logger.error("Forward exception: %s", e)
+        except Exception as exc:
+            logger.error("Forward exception: error_type=%s", type(exc).__name__)
             return False

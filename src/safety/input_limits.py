@@ -1,3 +1,5 @@
+import base64
+import binascii
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -101,3 +103,12 @@ def validate_email_input(email: Mapping[str, Any], limits: InputLimits) -> None:
 
     if any(size > limits.attachment_single_bytes for size in sizes):
         raise InputLimitExceeded("attachment_single_bytes")
+
+    for attachment in attachments:
+        encoded = attachment.get("content")
+        if encoded is None:
+            continue
+        try:
+            base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise InputLimitExceeded("attachment_format") from None

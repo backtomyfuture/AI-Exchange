@@ -36,16 +36,19 @@ async def list_stuck_emails(db_manager):
     
     stuck_emails = []
     try:
-        conn = await db_manager.get_connection()
-        async with conn.cursor() as cur:
-            placeholders = ', '.join(['%s'] * len(STUCK_STATUSES))
-            await cur.execute(
-                f"SELECT id, subject, sender, status, updated_at FROM emails_log WHERE status IN ({placeholders}) ORDER BY updated_at DESC",
-                STUCK_STATUSES
-            )
-            stuck_emails = await cur.fetchall()
-    except Exception as e:
-        logger.error(f"Failed to query stuck emails: {e}")
+        async with db_manager.get_connection() as conn:
+            async with conn.cursor() as cur:
+                placeholders = ', '.join(['%s'] * len(STUCK_STATUSES))
+                await cur.execute(
+                    f"SELECT id, subject, sender, status, updated_at FROM emails_log WHERE status IN ({placeholders}) ORDER BY updated_at DESC",
+                    STUCK_STATUSES
+                )
+                stuck_emails = await cur.fetchall()
+    except Exception as exc:
+        logger.error(
+            "Failed to query stuck emails: error_type=%s",
+            type(exc).__name__,
+        )
         return []
     
     if not stuck_emails:
@@ -66,8 +69,11 @@ async def list_stuck_emails(db_manager):
 
 async def reprocess_single(email_id: str, ctx):
     """Reprocess a single email by ID."""
+    from src.domain.email_state import (
+        SAFE_DUPLICATE_READ_STATUSES,
+        ProcessingOutcome,
+    )
     from src.exchange_service import process_and_archive_email
-    from src.utils import lark_app
     
     logger.info(f"Reprocessing email: {email_id}")
     
@@ -80,26 +86,37 @@ async def reprocess_single(email_id: str, ctx):
         
         email_data['id'] = email_id
         logger.info(f"Fetched email: {email_data.get('subject', 'N/A')}")
-    except Exception as e:
-        logger.error(f"Error fetching email {email_id}: {e}")
+    except Exception as exc:
+        logger.error(
+            "Error fetching email: error_type=%s",
+            type(exc).__name__,
+        )
         return False
-    
-    # Step 2: Delete old DB record so process_and_archive_email treats it as new
+
+    # Preserve the row/content_ref/draft and use the production force contract.
     try:
-        conn = await ctx.db_manager.get_connection()
-        async with conn.cursor() as cur:
-            await cur.execute("DELETE FROM emails_log WHERE id = %s", (email_id,))
-        logger.info(f"Cleared old DB record for {email_id}")
-    except Exception as e:
-        logger.warning(f"Could not delete old record (may be fine): {e}")
-    
-    # Step 3: Run the full processing pipeline
-    try:
-        await process_and_archive_email(email_data, ctx)
-        logger.info(f"✅ Successfully reprocessed {email_id}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Reprocessing failed for {email_id}: {e}")
+        outcome = await process_and_archive_email(
+            email_data,
+            ctx,
+            force_reprocess=True,
+        )
+        if outcome is ProcessingOutcome.PROCESSED:
+            final_status = await ctx.db_manager.get_email_status(email_id)
+            if final_status in SAFE_DUPLICATE_READ_STATUSES:
+                logger.info("Email reprocessed successfully")
+                return True
+            logger.error(
+                "Reprocessing did not reach a safe terminal status: status=%s",
+                final_status or "missing",
+            )
+            return False
+        logger.error("Reprocessing returned unexpected outcome: %s", outcome.value)
+        return False
+    except Exception as exc:
+        logger.error(
+            "Reprocessing failed: error_type=%s",
+            type(exc).__name__,
+        )
         return False
 
 
@@ -120,7 +137,13 @@ async def main():
     
     ctx = get_app_context()
     await ctx.setup_async()
-    lark_app.init_lark_app(ctx.db_manager, ctx.graph, ctx.exchange_client, worker_loop_arg=asyncio.get_running_loop())
+    lark_app.init_lark_app(
+        ctx.db_manager,
+        ctx.graph,
+        ctx.exchange_client,
+        worker_loop_arg=asyncio.get_running_loop(),
+        dependencies=ctx.graph_dependencies,
+    )
     logger.info("App context initialized.")
     
     try:
