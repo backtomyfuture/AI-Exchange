@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from src.nodes.retriever_node import retrieve_context
 
 
@@ -26,7 +26,13 @@ async def test_thread_context_fetched_first(graph_node_harness):
         context=[],
     )
 
-    with patch("src.nodes.retriever_node.get_retriever", return_value=mock_retriever):
+    with patch(
+        "src.nodes.retriever_node.get_retriever",
+        return_value=mock_retriever,
+    ), patch(
+        "src.nodes.retriever_node._generate_thread_summary",
+        new=AsyncMock(return_value="deterministic thread summary"),
+    ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
     mock_retriever.search_by_thread.assert_called_once_with(thread_id="conv-123", limit=5)
