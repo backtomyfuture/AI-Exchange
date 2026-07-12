@@ -17,6 +17,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.0.4",
     "lark-oapi>=1.5.3",
     "openai>=2.26.0",
+    "ormsgpack>=1.12.2",
     "psycopg[pool]>=3.3.3",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.13.1",

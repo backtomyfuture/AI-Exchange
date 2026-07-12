@@ -14,6 +14,35 @@ DRAFTS_FOLDER_ALIASES = {"草稿", "drafts", "draft"}
 def _normalize_folder_name(name: str | None) -> str:
     return re.sub(r"[\s_-]+", "", (name or "").strip().casefold())
 
+
+def _resolve_system_folder(
+    folders: list[tuple[str, str]],
+    *,
+    configured_name: str,
+    aliases: set[str],
+) -> tuple[str | None, frozenset[str]]:
+    """Resolve one system folder without depending on response order."""
+    configured_normalized = _normalize_folder_name(configured_name)
+    configured_matches = {
+        folder_id
+        for folder_id, folder_name in folders
+        if _normalize_folder_name(folder_name) == configured_normalized
+    }
+    if len(configured_matches) > 1:
+        return None, frozenset(configured_matches)
+    if len(configured_matches) == 1:
+        return next(iter(configured_matches)), frozenset(configured_matches)
+
+    normalized_aliases = {_normalize_folder_name(alias) for alias in aliases}
+    alias_matches = {
+        folder_id
+        for folder_id, folder_name in folders
+        if _normalize_folder_name(folder_name) in normalized_aliases
+    }
+    if len(alias_matches) == 1:
+        return next(iter(alias_matches)), frozenset(alias_matches)
+    return None, frozenset(alias_matches)
+
 class ExchangeClient:
     """
     Exchange 接口客户端，封装 HTTP 调用逻辑。
@@ -124,6 +153,7 @@ class ExchangeClient:
         self._folder_tree = {}
         self.sentitems_folder_id = None
         self.drafts_folder_id = None
+        system_folder_candidates: list[tuple[str, str]] = []
 
         for folder in folders:
             folder_id = folder.get("id")
@@ -139,11 +169,21 @@ class ExchangeClient:
                 "children": [],
                 "folder_class": folder.get("folder_class", ""),
             }
+            system_folder_candidates.append((folder_id, folder_name))
 
-            if self._is_sentitems_folder(folder_name):
-                self.sentitems_folder_id = folder_id
-            elif self._is_drafts_folder(folder_name):
-                self.drafts_folder_id = folder_id
+        self.sentitems_folder_id, sentitems_candidates = _resolve_system_folder(
+            system_folder_candidates,
+            configured_name=self._sentitems_name,
+            aliases=SENTITEMS_FOLDER_ALIASES,
+        )
+        self.drafts_folder_id, drafts_candidates = _resolve_system_folder(
+            system_folder_candidates,
+            configured_name=self._drafts_name,
+            aliases=DRAFTS_FOLDER_ALIASES,
+        )
+        if sentitems_candidates & drafts_candidates:
+            self.sentitems_folder_id = None
+            self.drafts_folder_id = None
 
         for folder_id, node in self._folder_tree.items():
             parent_id = node["parent_id"]

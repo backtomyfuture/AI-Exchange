@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "email_agent"
     POSTGRES_USER: str = "user"
     POSTGRES_PASSWORD: SecretStr = SecretStr("password")
+    CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64: SecretStr = SecretStr("")
 
     # Exchange
     EXCHANGE_API_URL: str = ""

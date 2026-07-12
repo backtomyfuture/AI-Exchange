@@ -6,6 +6,7 @@ langgraph-checkpoint
 langgraph-checkpoint-postgres
 qdrant-client
 openai
+ormsgpack>=1.12.2
 psycopg[pool]
 python-dotenv
 
