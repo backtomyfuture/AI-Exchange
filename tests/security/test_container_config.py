@@ -16,6 +16,9 @@ ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 RUNTIME_ENV_EXAMPLE = PROJECT_ROOT / ".env.runtime.example"
 DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
 GITIGNORE = PROJECT_ROOT / ".gitignore"
+POSTGRES_PEER_ACL_INIT = (
+    PROJECT_ROOT / "docker" / "postgres" / "010-peer-database-acl.sql"
+)
 
 
 class _ComposeLoader(yaml.SafeLoader):
@@ -146,7 +149,23 @@ def test_production_database_credentials_use_three_distinct_planes():
     assert "${POSTGRES_RUNTIME_USER:" in runtime_environment["POSTGRES_USER"]
     assert "${POSTGRES_RUNTIME_PASSWORD:" in runtime_environment["POSTGRES_PASSWORD"]
     assert postgres_environment["POSTGRES_USER"] != runtime_environment["POSTGRES_USER"]
-    assert postgres_environment["POSTGRES_PASSWORD"] != runtime_environment["POSTGRES_PASSWORD"]
+    assert (
+        postgres_environment["POSTGRES_PASSWORD"]
+        != runtime_environment["POSTGRES_PASSWORD"]
+    )
+
+
+def test_fresh_postgres_volume_revokes_public_peer_database_access():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    postgres_volumes = compose["services"]["postgres"]["volumes"]
+
+    assert (
+        "./docker/postgres/010-peer-database-acl.sql:"
+        "/docker-entrypoint-initdb.d/010-peer-database-acl.sql:ro"
+    ) in postgres_volumes
+    init_sql = POSTGRES_PEER_ACL_INIT.read_text(encoding="utf-8")
+    assert "REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;" in init_sql
+    assert "REVOKE CONNECT, TEMPORARY ON DATABASE template1 FROM PUBLIC;" in init_sql
 
 
 def test_production_application_uses_an_explicit_runtime_allowlist_only():

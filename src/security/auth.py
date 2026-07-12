@@ -35,6 +35,7 @@ _PLACEHOLDER_EXACT = frozenset(
 _PLACEHOLDER_MARKER = re.compile(
     r"(?:^|[._-])(?:dummy|example|placeholder|sample|your)(?:$|[._-])"
 )
+_POSTGRES_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
 _RESERVED_HOST_SUFFIXES = (".example", ".invalid", ".localhost", ".test")
 _PLACEHOLDER_PREFIXES = (
     "change_",
@@ -123,7 +124,9 @@ def _configured_lark_operators(settings: Any) -> tuple[str, ...]:
     raw = _setting(settings, "LARK_ALLOWED_OPEN_IDS", "")
     if not isinstance(raw, str):
         return ()
-    values = tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+    values = tuple(
+        dict.fromkeys(item.strip() for item in raw.split(",") if item.strip())
+    )
     if "*" in values:
         return ()
     return values
@@ -148,7 +151,10 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
     """Reject unsafe production settings without including their values."""
 
     settings = settings or get_settings()
-    if str(_setting(settings, "APP_ENV", "development")).strip().casefold() != "production":
+    if (
+        str(_setting(settings, "APP_ENV", "development")).strip().casefold()
+        != "production"
+    ):
         return settings
 
     invalid: set[str] = set()
@@ -175,6 +181,23 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
             and len(resolve_secret(value).strip()) < _MIN_BOUNDARY_SECRET_LENGTH
         ):
             invalid.add(field_name)
+
+    if _setting(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False) is not True:
+        invalid.add("DATABASE_ROLE_SEPARATION_REQUIRED")
+
+    target_schema = _plain(settings, "POSTGRES_SCHEMA")
+    if not _POSTGRES_IDENTIFIER.fullmatch(target_schema):
+        invalid.add("POSTGRES_SCHEMA")
+
+    migration_role = _plain(settings, "POSTGRES_MIGRATION_OWNER_ROLE")
+    runtime_role = _plain(settings, "POSTGRES_USER")
+    if not _POSTGRES_IDENTIFIER.fullmatch(runtime_role):
+        invalid.add("POSTGRES_USER")
+    if (
+        not _POSTGRES_IDENTIFIER.fullmatch(migration_role)
+        or migration_role == runtime_role
+    ):
+        invalid.add("POSTGRES_MIGRATION_OWNER_ROLE")
 
     exchange_url = _plain(settings, "EXCHANGE_API_URL")
     if _is_placeholder(exchange_url) or not _is_https_url(exchange_url):

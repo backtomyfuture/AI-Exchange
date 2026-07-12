@@ -14,7 +14,7 @@ dependencies = [
     "langchain-text-splitters>=1.1.1",
     "langgraph>=1.0.10",
     "langgraph-checkpoint>=4.0.1",
-    "langgraph-checkpoint-postgres>=3.0.4",
+    "langgraph-checkpoint-postgres==3.0.4",
     "lark-oapi>=1.5.3",
     "openai>=2.26.0",
     "ormsgpack>=1.12.2",

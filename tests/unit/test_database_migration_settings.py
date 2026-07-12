@@ -12,6 +12,7 @@ from pydantic import SecretStr
 
 MIGRATION_DSN = (
     "postgresql://migration_owner:Migration9Q2w7V4m@postgres:5432/email_agent"
+    "?options=-csearch_path%3Dpublic"
 )
 
 
@@ -101,7 +102,9 @@ def test_migration_settings_rejects_metadata_change_during_read(
 
     monkeypatch.setattr(module.os, "fstat", changing_fstat)
 
-    with pytest.raises(module.MigrationSettingsError, match="migration_settings_invalid"):
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ):
         module.load_migration_settings(_environment(secret_path))
 
 
@@ -114,7 +117,9 @@ def test_migration_settings_rejects_non_secret_owner_modes(
     secret_path = _private_secret(tmp_path / "migration-dsn")
     secret_path.chmod(mode)
 
-    with pytest.raises(module.MigrationSettingsError, match="migration_settings_invalid"):
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ):
         module.load_migration_settings(_environment(secret_path))
 
 
@@ -176,7 +181,9 @@ def test_migration_settings_rejects_fifo_without_blocking(tmp_path: Path):
     fifo = tmp_path / "migration-fifo"
     os.mkfifo(fifo, mode=0o600)
 
-    with pytest.raises(module.MigrationSettingsError, match="migration_settings_invalid"):
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ):
         module.load_migration_settings(_environment(fifo))
 
 
@@ -199,7 +206,9 @@ def test_migration_settings_rejects_invalid_identity_contract(
     environment = _environment(secret_path)
     environment[field_name] = value
 
-    with pytest.raises(module.MigrationSettingsError, match="migration_settings_invalid"):
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ):
         module.load_migration_settings(environment)
 
 
@@ -230,17 +239,21 @@ def test_bootstrap_cli_uses_only_the_dedicated_migration_settings(tmp_path: Path
     )
     bootstrap = AsyncMock(return_value={"alembic": "20260710_0002", "checkpoint": 9})
 
-    with patch.object(
-        bootstrap_module,
-        "load_migration_settings",
-        return_value=settings,
-        create=True,
-    ) as loader, patch.object(
-        bootstrap_module,
-        "get_settings",
-        side_effect=AssertionError("runtime settings must not be loaded"),
-        create=True,
-    ), patch.object(bootstrap_module, "bootstrap_database", new=bootstrap):
+    with (
+        patch.object(
+            bootstrap_module,
+            "load_migration_settings",
+            return_value=settings,
+            create=True,
+        ) as loader,
+        patch.object(
+            bootstrap_module,
+            "get_settings",
+            side_effect=AssertionError("runtime settings must not be loaded"),
+            create=True,
+        ),
+        patch.object(bootstrap_module, "bootstrap_database", new=bootstrap),
+    ):
         bootstrap_module.main()
 
     loader.assert_called_once_with()
@@ -266,15 +279,19 @@ def test_bootstrap_cli_cuts_off_downstream_secret_bearing_exception(
     )
     downstream = RuntimeError(f"connection failed: {MIGRATION_DSN}")
 
-    with patch.object(
-        bootstrap_module,
-        "load_migration_settings",
-        return_value=settings,
-    ), patch.object(
-        bootstrap_module,
-        "bootstrap_database",
-        new=AsyncMock(side_effect=downstream),
-    ), pytest.raises(RuntimeError) as caught:
+    with (
+        patch.object(
+            bootstrap_module,
+            "load_migration_settings",
+            return_value=settings,
+        ),
+        patch.object(
+            bootstrap_module,
+            "bootstrap_database",
+            new=AsyncMock(side_effect=downstream),
+        ),
+        pytest.raises(RuntimeError) as caught,
+    ):
         bootstrap_module.main()
 
     assert str(caught.value) == "database_bootstrap_failed"
@@ -311,3 +328,49 @@ def test_migration_settings_does_not_fall_back_to_runtime_environment(
 
     assert "runtime-password-sentinel" not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql://migration_owner:private@postgres/email_agent",
+        (
+            "postgresql://migration_owner:private@postgres/email_agent"
+            "?options=-csearch_path%3Dpg_catalog%2Cpublic"
+        ),
+        (
+            "postgresql://migration_owner:private@postgres/email_agent"
+            "?options=-csearch_path%3Dpublic%2Cpg_catalog"
+        ),
+    ],
+)
+def test_migration_settings_requires_exact_migration_search_path(
+    tmp_path: Path,
+    database_url: str,
+):
+    module = _module()
+    secret_path = _private_secret(tmp_path / "migration-dsn", database_url)
+
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ):
+        module.load_migration_settings(_environment(secret_path))
+
+
+def test_runtime_database_url_fixes_catalog_first_search_path():
+    from psycopg.conninfo import conninfo_to_dict
+
+    from src.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        POSTGRES_HOST="postgres",
+        POSTGRES_DB="email_agent",
+        POSTGRES_USER="runtime_user",
+        POSTGRES_PASSWORD=SecretStr("runtime-password"),
+        POSTGRES_SCHEMA="public",
+    )
+
+    parsed = conninfo_to_dict(settings.database_url)
+
+    assert parsed["options"] == "-csearch_path=pg_catalog,public"

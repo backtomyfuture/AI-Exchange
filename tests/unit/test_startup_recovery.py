@@ -19,6 +19,7 @@ def _install_startup_harness(
     monkeypatch: pytest.MonkeyPatch,
     *,
     recovery_error: Exception | None = None,
+    database_error: Exception | None = None,
     stop_main_at_worker: bool = False,
 ) -> SimpleNamespace:
     from src import main as main_module
@@ -29,6 +30,13 @@ def _install_startup_harness(
         LOG_LEVEL="INFO",
         database_url="postgresql://test/test",
         POLLING_INTERVAL=300,
+        DURABLE_INBOX_ENABLED=False,
+        INGESTION_SHADOW_ENABLED=False,
+        SYNC_RECONCILIATION_ENABLED=False,
+        DATABASE_ROLE_SEPARATION_REQUIRED=True,
+        POSTGRES_USER="runtime_user",
+        POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_SCHEMA="public",
     )
 
     async def setup_async() -> None:
@@ -49,9 +57,7 @@ def _install_startup_harness(
     )
 
     lark = MagicMock()
-    lark.init_lark_app.side_effect = lambda *args, **kwargs: events.append(
-        "lark_init"
-    )
+    lark.init_lark_app.side_effect = lambda *args, **kwargs: events.append("lark_init")
     lark.start_lark_ws.side_effect = lambda: events.append("lark_ws")
 
     async def start_exchange_worker(_context) -> None:
@@ -72,6 +78,8 @@ def _install_startup_harness(
 
     async def check_revision(_database_url: str, **_flags: bool) -> None:
         events.append("revision_check")
+        if database_error is not None:
+            raise database_error
 
     revision_check = AsyncMock(side_effect=check_revision)
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)
@@ -143,6 +151,7 @@ async def test_main_recovers_after_context_setup_before_lark_and_worker(monkeypa
         await harness.main_module.main()
 
     assert harness.events == [
+        "revision_check",
         "context_setup",
         "approval_recovery",
         "lark_init",
@@ -150,6 +159,25 @@ async def test_main_recovers_after_context_setup_before_lark_and_worker(monkeypa
         "exchange_worker",
     ]
     harness.context.db_manager.recover_incomplete_approval_states.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_main_database_preflight_failure_prevents_all_runtime_setup(monkeypatch):
+    failure = RuntimeError("database_role_preflight_failed")
+    harness = _install_startup_harness(
+        monkeypatch,
+        database_error=failure,
+    )
+
+    with pytest.raises(RuntimeError, match="database_role_preflight_failed"):
+        await harness.main_module.main()
+
+    assert harness.events == ["revision_check"]
+    harness.context.setup_async.assert_not_awaited()
+    harness.context.db_manager.recover_incomplete_approval_states.assert_not_awaited()
+    harness.lark.init_lark_app.assert_not_called()
+    harness.lark.start_lark_ws.assert_not_called()
+    harness.exchange_start_worker.assert_not_awaited()
 
 
 @pytest.mark.asyncio

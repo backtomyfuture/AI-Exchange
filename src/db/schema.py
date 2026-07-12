@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import psycopg
 
+from src.db.roles import DatabaseRoleError, require_runtime_database_role
+from src.db.schema_contract import require_database_schema_contract
+
 
 EXPECTED_DATABASE_REVISION = "20260710_0002"
 PHASE_2_DATABASE_REVISION = "20260710_0003"
@@ -19,9 +22,7 @@ class DatabaseRevisionError(RuntimeError):
 async def get_current_database_revision(dsn: str) -> str | None:
     """Read the complete Alembic revision set without changing database state."""
     try:
-        async with await psycopg.AsyncConnection.connect(
-            dsn, autocommit=True
-        ) as conn:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT version_num FROM alembic_version")
                 rows = await cur.fetchall()
@@ -45,6 +46,10 @@ async def require_runtime_database(
     durable_inbox_enabled: bool,
     ingestion_shadow_enabled: bool,
     sync_reconciliation_enabled: bool,
+    role_separation_required: bool = False,
+    expected_runtime_role: str = "",
+    expected_migration_role: str = "",
+    target_schema: str = "public",
 ) -> None:
     """Accept the expand bridge only while all Phase 2 features are disabled."""
     phase_2_enabled = any(
@@ -54,12 +59,27 @@ async def require_runtime_database(
             sync_reconciliation_enabled,
         )
     )
+    if phase_2_enabled and not role_separation_required:
+        raise DatabaseRoleError("database_role_preflight_failed")
+    if role_separation_required:
+        await require_runtime_database_role(
+            dsn,
+            expected_runtime_role=expected_runtime_role,
+            expected_migration_role=expected_migration_role,
+            target_schema=target_schema,
+        )
     allowed = (
         frozenset({PHASE_2_DATABASE_REVISION})
         if phase_2_enabled
         else RUNTIME_COMPATIBLE_DATABASE_REVISIONS
     )
     await _require_database_revision(dsn, allowed)
+    if role_separation_required:
+        await require_database_schema_contract(
+            dsn,
+            target_schema=target_schema,
+            require_complete=True,
+        )
 
 
 async def _require_database_revision(

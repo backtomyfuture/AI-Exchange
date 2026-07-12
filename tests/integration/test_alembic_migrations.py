@@ -146,6 +146,15 @@ def test_empty_database_upgrades_to_head(alembic_runner, empty_schema):
     assert empty_schema.column_exists("emails_log", "version")
     assert empty_schema.table_exists("app_kv_store")
     assert empty_schema.table_exists("processed_emails")
+    assert empty_schema.scalar(
+        "SELECT COALESCE(reloptions, ARRAY[]::text[]) "
+        "       @> ARRAY['security_invoker=true']::text[] "
+        "FROM pg_catalog.pg_class AS relation "
+        "JOIN pg_catalog.pg_namespace AS relation_schema "
+        "  ON relation_schema.oid = relation.relnamespace "
+        "WHERE relation_schema.nspname = current_schema() "
+        "  AND relation.relname = 'processed_emails'"
+    )
 
 
 @pytest.mark.integration
@@ -179,11 +188,14 @@ def test_baseline_refuses_populated_processed_emails_table(
     ):
         alembic_runner.upgrade(empty_schema, "20260710_0001")
 
-    assert empty_schema.scalar(
-        "SELECT relkind::text FROM pg_class AS c "
-        "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
-    ) == "r"
+    assert (
+        empty_schema.scalar(
+            "SELECT relkind::text FROM pg_class AS c "
+            "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
+        )
+        == "r"
+    )
     assert empty_schema.scalar("SELECT count(*) FROM processed_emails") == 1
     assert empty_schema.scalar("SELECT id FROM processed_emails") == "table-sentinel"
 
@@ -205,11 +217,14 @@ def test_baseline_refuses_populated_processed_emails_materialized_view(
     ):
         alembic_runner.upgrade(empty_schema, "20260710_0001")
 
-    assert empty_schema.scalar(
-        "SELECT relkind::text FROM pg_class AS c "
-        "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
-    ) == "m"
+    assert (
+        empty_schema.scalar(
+            "SELECT relkind::text FROM pg_class AS c "
+            "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
+        )
+        == "m"
+    )
     assert empty_schema.scalar("SELECT count(*) FROM processed_emails") == 1
     assert empty_schema.scalar("SELECT id FROM processed_emails") == (
         "materialized-sentinel"
@@ -229,11 +244,23 @@ def test_baseline_replaces_existing_processed_emails_view_idempotently(
     alembic_runner.upgrade(legacy_schema, "20260710_0001")
     alembic_runner.upgrade(legacy_schema, "20260710_0001")
 
+    assert (
+        legacy_schema.scalar(
+            "SELECT relkind::text FROM pg_class AS c "
+            "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
+        )
+        == "v"
+    )
     assert legacy_schema.scalar(
-        "SELECT relkind::text FROM pg_class AS c "
-        "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = current_schema() AND c.relname = 'processed_emails'"
-    ) == "v"
+        "SELECT COALESCE(reloptions, ARRAY[]::text[]) "
+        "       @> ARRAY['security_invoker=true']::text[] "
+        "FROM pg_catalog.pg_class AS relation "
+        "JOIN pg_catalog.pg_namespace AS relation_schema "
+        "  ON relation_schema.oid = relation.relnamespace "
+        "WHERE relation_schema.nspname = current_schema() "
+        "  AND relation.relname = 'processed_emails'"
+    )
     assert legacy_schema.scalar("SELECT count(*) FROM processed_emails") == 2
 
 
@@ -244,9 +271,10 @@ def test_legacy_schema_upgrades_idempotently(alembic_runner, legacy_schema):
 
     assert legacy_schema.scalar("SELECT count(*) FROM alembic_version") == 1
     assert legacy_schema.scalar("SELECT count(*) FROM emails_log") == 2
-    assert legacy_schema.scalar(
-        "SELECT subject FROM emails_log WHERE id = 'legacy-1'"
-    ) == "First legacy email"
+    assert (
+        legacy_schema.scalar("SELECT subject FROM emails_log WHERE id = 'legacy-1'")
+        == "First legacy email"
+    )
     assert legacy_schema.column_exists("emails_log", "error_message")
     assert legacy_schema.column_exists("emails_log", "content_ref")
     assert legacy_schema.column_exists("emails_log", "version")
@@ -331,9 +359,7 @@ async def test_bootstrap_records_existing_correct_checkpoint_index(
 
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert schema.scalar(
-        "SELECT count(*) FROM checkpoint_migrations WHERE v = 6"
-    ) == 1
+    assert schema.scalar("SELECT count(*) FROM checkpoint_migrations WHERE v = 6") == 1
     _assert_expected_checkpoint_indexes(schema)
 
 
@@ -348,15 +374,13 @@ async def test_bootstrap_records_existing_correct_checkpoint_index(
     ("wrong_definition", "wrong_table", "wrong_columns", "has_predicate"),
     [
         (
-            "CREATE INDEX checkpoints_thread_id_idx "
-            "ON checkpoints(checkpoint_id)",
+            "CREATE INDEX checkpoints_thread_id_idx ON checkpoints(checkpoint_id)",
             "checkpoints",
             ["checkpoint_id"],
             False,
         ),
         (
-            "CREATE INDEX checkpoints_thread_id_idx "
-            "ON checkpoint_blobs(thread_id)",
+            "CREATE INDEX checkpoints_thread_id_idx ON checkpoint_blobs(thread_id)",
             "checkpoint_blobs",
             ["thread_id"],
             False,
@@ -412,7 +436,7 @@ async def test_bootstrap_rebuilds_recorded_invalid_expected_checkpoint_index(
 
     schema = postgres_database_factory()
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
-    schema.execute(
+    schema.admin_execute(
         "UPDATE pg_index SET indisvalid = false, indisready = false "
         "WHERE indexrelid = 'checkpoints_thread_id_idx'::regclass"
     )
@@ -424,9 +448,7 @@ async def test_bootstrap_rebuilds_recorded_invalid_expected_checkpoint_index(
 
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert schema.scalar(
-        "SELECT count(*) FROM checkpoint_migrations WHERE v = 6"
-    ) == 1
+    assert schema.scalar("SELECT count(*) FROM checkpoint_migrations WHERE v = 6") == 1
     _assert_expected_checkpoint_indexes(schema)
 
 
@@ -443,7 +465,5 @@ async def test_bootstrap_rebuilds_recorded_missing_checkpoint_index(
 
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert schema.scalar(
-        "SELECT count(*) FROM checkpoint_migrations WHERE v = 7"
-    ) == 1
+    assert schema.scalar("SELECT count(*) FROM checkpoint_migrations WHERE v = 7") == 1
     _assert_expected_checkpoint_indexes(schema)

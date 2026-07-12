@@ -1,10 +1,13 @@
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
+from weakref import WeakKeyDictionary
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -18,6 +21,109 @@ from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
 DEBUG_BODY_MAX_CHARS = 1_048_576
+_READINESS_SUCCESS_TTL_SECONDS = 5.0
+_READINESS_FAILURE_TTL_SECONDS = 1.0
+_READINESS_DATABASE_TIMEOUT_SECONDS = 5.0
+_READINESS_FAILURE_LOG_TTL_SECONDS = 5.0
+
+
+class ReadinessPreflightError(RuntimeError):
+    """Safe cached failure for a recently failed database preflight."""
+
+
+_ReadinessContract = tuple[bytes, bool, bool, bool, bool, str, str, str]
+
+
+@dataclass
+class _ReadinessState:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    contract: _ReadinessContract | None = field(default=None, repr=False)
+    expires_at: float = 0.0
+    ready: bool = False
+    next_failure_log_at: float = 0.0
+
+
+_READINESS_STATES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    _ReadinessState,
+] = WeakKeyDictionary()
+
+
+def _readiness_contract(settings, database_url: str) -> _ReadinessContract:
+    return (
+        hashlib.sha256(database_url.encode()).digest(),
+        bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)),
+        bool(getattr(settings, "INGESTION_SHADOW_ENABLED", False)),
+        bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)),
+        bool(getattr(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False)),
+        str(getattr(settings, "POSTGRES_USER", "")),
+        str(getattr(settings, "POSTGRES_MIGRATION_OWNER_ROLE", "")),
+        str(getattr(settings, "POSTGRES_SCHEMA", "public")),
+    )
+
+
+def _readiness_state(
+    loop: asyncio.AbstractEventLoop,
+) -> _ReadinessState:
+    state = _READINESS_STATES.get(loop)
+    if state is None:
+        state = _ReadinessState()
+        _READINESS_STATES[loop] = state
+    return state
+
+
+def _log_readiness_failure_once(exc: Exception) -> None:
+    loop = asyncio.get_running_loop()
+    state = _readiness_state(loop)
+    now = loop.time()
+    if now < state.next_failure_log_at:
+        return
+    state.next_failure_log_at = now + _READINESS_FAILURE_LOG_TTL_SECONDS
+    logger.warning("Readiness check failed: error_type=%s", type(exc).__name__)
+
+
+async def _require_cached_runtime_database(settings) -> None:
+    """Single-flight the expensive catalog proof and briefly cache its result."""
+
+    loop = asyncio.get_running_loop()
+    state = _readiness_state(loop)
+    database_url = str(settings.database_url)
+    contract = _readiness_contract(settings, database_url)
+
+    def use_cached_result(now: float) -> bool:
+        if state.contract != contract or now >= state.expires_at:
+            return False
+        if not state.ready:
+            raise ReadinessPreflightError("readiness_preflight_failed")
+        return True
+
+    if use_cached_result(loop.time()):
+        return
+
+    async with state.lock:
+        if use_cached_result(loop.time()):
+            return
+        try:
+            async with asyncio.timeout(_READINESS_DATABASE_TIMEOUT_SECONDS):
+                await require_runtime_database(
+                    database_url,
+                    durable_inbox_enabled=contract[1],
+                    ingestion_shadow_enabled=contract[2],
+                    sync_reconciliation_enabled=contract[3],
+                    role_separation_required=contract[4],
+                    expected_runtime_role=contract[5],
+                    expected_migration_role=contract[6],
+                    target_schema=contract[7],
+                )
+        except Exception:
+            state.contract = contract
+            state.ready = False
+            state.expires_at = loop.time() + _READINESS_FAILURE_TTL_SECONDS
+            raise
+        state.contract = contract
+        state.ready = True
+        state.expires_at = loop.time() + _READINESS_SUCCESS_TTL_SECONDS
+
 
 try:
     SERVICE_VERSION = version("ai-exchange")
@@ -83,7 +189,9 @@ async def enqueue_exchange_webhook(
     """
     from src import exchange_service
 
-    return await exchange_service.enqueue_webhook_event(payload, header_event=header_event)
+    return await exchange_service.enqueue_webhook_event(
+        payload, header_event=header_event
+    )
 
 
 @app.get("/health")
@@ -101,21 +209,11 @@ async def readiness_check():
     """Read-only database/schema readiness without leaking failure details."""
     try:
         settings = get_settings()
-        await require_runtime_database(
-            settings.database_url,
-            durable_inbox_enabled=bool(
-                getattr(settings, "DURABLE_INBOX_ENABLED", False)
-            ),
-            ingestion_shadow_enabled=bool(
-                getattr(settings, "INGESTION_SHADOW_ENABLED", False)
-            ),
-            sync_reconciliation_enabled=bool(
-                getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
-            ),
-        )
+        validate_runtime_security(settings)
+        await _require_cached_runtime_database(settings)
         return {"status": "ready"}
     except Exception as exc:
-        logger.warning("Readiness check failed: error_type=%s", type(exc).__name__)
+        _log_readiness_failure_once(exc)
         return JSONResponse(
             status_code=503,
             content={"status": "not_ready"},
@@ -127,6 +225,7 @@ async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint."""
     require_metrics_auth(request, get_settings())
     from src.observability.metrics import render_metrics
+
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
 
@@ -146,7 +245,7 @@ async def exchange_webhook(request: Request):
 
     # Strip the 'sha256=' prefix if present (sent by Exchange server)
     if signature.startswith("sha256="):
-        signature = signature[len("sha256="):]
+        signature = signature[len("sha256=") :]
 
     webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
     if not webhook_secret:
@@ -260,6 +359,7 @@ def _require_debug_endpoint(settings: Any) -> None:
     if not bool(getattr(settings, "DEBUG", False)):
         raise HTTPException(status_code=403, detail="Debug endpoints disabled")
 
+
 @app.post("/debug/inject_email")
 async def inject_test_email(data: MockEmailData):
     """
@@ -277,12 +377,12 @@ async def inject_test_email(data: MockEmailData):
         "Injecting DEBUG mock email: email=%s",
         fingerprint_identifier(data.id, namespace="debug_email"),
     )
-    
+
     # Construct state-like object
     # The view_email function expects state.values.get("email")
     # So we structure it accordingly.
-    
-    mock_state = type('MockState', (), {})()
+
+    mock_state = type("MockState", (), {})()
     email_data = {
         "id": data.id,
         "subject": data.subject,
@@ -299,7 +399,8 @@ async def inject_test_email(data: MockEmailData):
         "email": email_data,
         "draft": data.draft,
         "context": data.context,
-        "classification": data.classification or {
+        "classification": data.classification
+        or {
             "need_reply": True,
             "reasoning": "debug_injection",
         },
@@ -307,7 +408,7 @@ async def inject_test_email(data: MockEmailData):
         "pdf_token": data.pdf_token,
         "recipient_candidates": data.recipient_candidates,
     }
-    
+
     lark_app._mock_store[data.id] = mock_state
     return {"status": "ok", "id": data.id}
 
@@ -329,14 +430,14 @@ async def delete_test_email(email_id: str):
         "removed": removed,
     }
 
+
 @app.get("/email/{email_id:path}", response_class=HTMLResponse)
 async def view_email(email_id: str):
     """Render only an explicitly seeded DEBUG test card until Phase 5."""
     settings = get_settings()
     is_explicit_debug_email = (
         bool(settings.DEBUG)
-        and str(getattr(settings, "APP_ENV", "development")).casefold()
-        != "production"
+        and str(getattr(settings, "APP_ENV", "development")).casefold() != "production"
         and lark_app.is_test_card_id(email_id)
         and email_id in lark_app._mock_store
     )
@@ -345,11 +446,12 @@ async def view_email(email_id: str):
 
     state = lark_app._mock_store[email_id]
     email_data = state.values.get("email", {})
-    
+
     # Use shared renderer
     from src.utils.email_renderer import render_email_html
+
     full_email_html = render_email_html(email_data)
-    
+
     return HTMLResponse(
         content=full_email_html,
         headers={

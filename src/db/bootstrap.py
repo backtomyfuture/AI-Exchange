@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import psycopg
@@ -13,12 +15,41 @@ from alembic.config import Config
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.db.migration_settings import load_migration_settings
+from src.db.roles import require_migration_database_role
 from src.db.schema import get_current_database_revision
+from src.db.schema_contract import require_database_schema_contract
 
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_CONFIG_PATH = PROJECT_ROOT / "alembic.ini"
+_CHECKPOINT_PACKAGE_NAME = "langgraph-checkpoint-postgres"
+_CHECKPOINT_PACKAGE_VERSION = "3.0.4"
+_CHECKPOINT_MIGRATION_COUNT = 10
+_CHECKPOINT_MIGRATION_SHA256 = (
+    "98d38ed91d4a57a2fb066323f26f2902efcb01f483e09f3ff2be31304a799d35"
+)
+
+
+class CheckpointMigrationCompatibilityError(RuntimeError):
+    """Raised before DDL when the pinned third-party migration set drifts."""
+
+
+def _require_checkpoint_migration_manifest() -> None:
+    try:
+        migrations = tuple(AsyncPostgresSaver.MIGRATIONS)
+        digest = sha256("\0".join(migrations).encode()).hexdigest()
+        compatible = (
+            package_version(_CHECKPOINT_PACKAGE_NAME) == _CHECKPOINT_PACKAGE_VERSION
+            and len(migrations) == _CHECKPOINT_MIGRATION_COUNT
+            and digest == _CHECKPOINT_MIGRATION_SHA256
+        )
+    except Exception:
+        compatible = False
+    if not compatible:
+        raise CheckpointMigrationCompatibilityError(
+            "checkpoint_migration_manifest_invalid"
+        )
 
 
 @dataclass(frozen=True)
@@ -58,29 +89,23 @@ _CHECKPOINT_INDEX_SPECS = {
     6: _CheckpointIndexSpec(
         name="checkpoints_thread_id_idx",
         table_name="checkpoints",
-        drop_sql=(
-            "DROP INDEX CONCURRENTLY IF EXISTS checkpoints_thread_id_idx"
-        ),
+        drop_sql=("DROP INDEX CONCURRENTLY IF EXISTS checkpoints_thread_id_idx"),
     ),
     7: _CheckpointIndexSpec(
         name="checkpoint_blobs_thread_id_idx",
         table_name="checkpoint_blobs",
-        drop_sql=(
-            "DROP INDEX CONCURRENTLY IF EXISTS checkpoint_blobs_thread_id_idx"
-        ),
+        drop_sql=("DROP INDEX CONCURRENTLY IF EXISTS checkpoint_blobs_thread_id_idx"),
     ),
     8: _CheckpointIndexSpec(
         name="checkpoint_writes_thread_id_idx",
         table_name="checkpoint_writes",
-        drop_sql=(
-            "DROP INDEX CONCURRENTLY IF EXISTS checkpoint_writes_thread_id_idx"
-        ),
+        drop_sql=("DROP INDEX CONCURRENTLY IF EXISTS checkpoint_writes_thread_id_idx"),
     ),
 }
 
 _CHECKPOINT_INDEX_QUERY = """
     SELECT
-        current_schema(),
+        %s::pg_catalog.text,
         index_namespace.nspname,
         table_namespace.nspname,
         table_relation.relname,
@@ -97,48 +122,48 @@ _CHECKPOINT_INDEX_QUERY = """
         index_metadata.indnkeyatts,
         ARRAY(
             SELECT attribute.attname::text
-            FROM unnest(index_metadata.indkey::smallint[])
+            FROM pg_catalog.unnest(index_metadata.indkey::pg_catalog.int2[])
                  WITH ORDINALITY AS key_column(attnum, position)
-            JOIN pg_attribute AS attribute
+            JOIN pg_catalog.pg_attribute AS attribute
               ON attribute.attrelid = table_relation.oid
              AND attribute.attnum = key_column.attnum
             WHERE key_column.position <= index_metadata.indnkeyatts
             ORDER BY key_column.position
         ),
-        index_metadata.indoption::smallint[],
+        index_metadata.indoption::pg_catalog.int2[],
         ARRAY(
             SELECT operator_class.opcdefault
-            FROM unnest(index_metadata.indclass::oid[])
+            FROM pg_catalog.unnest(index_metadata.indclass::pg_catalog.oid[])
                  WITH ORDINALITY AS indexed_opclass(opclass_oid, position)
-            JOIN pg_opclass AS operator_class
+            JOIN pg_catalog.pg_opclass AS operator_class
               ON operator_class.oid = indexed_opclass.opclass_oid
             WHERE indexed_opclass.position <= index_metadata.indnkeyatts
             ORDER BY indexed_opclass.position
         ),
-        index_metadata.indcollation::oid[],
+        index_metadata.indcollation::pg_catalog.oid[],
         ARRAY(
             SELECT attribute.attcollation
-            FROM unnest(index_metadata.indkey::smallint[])
+            FROM pg_catalog.unnest(index_metadata.indkey::pg_catalog.int2[])
                  WITH ORDINALITY AS key_column(attnum, position)
-            JOIN pg_attribute AS attribute
+            JOIN pg_catalog.pg_attribute AS attribute
               ON attribute.attrelid = table_relation.oid
              AND attribute.attnum = key_column.attnum
             WHERE key_column.position <= index_metadata.indnkeyatts
             ORDER BY key_column.position
         ),
-        pg_get_indexdef(index_relation.oid)
-    FROM pg_class AS index_relation
-    JOIN pg_namespace AS index_namespace
+        pg_catalog.pg_get_indexdef(index_relation.oid)
+    FROM pg_catalog.pg_class AS index_relation
+    JOIN pg_catalog.pg_namespace AS index_namespace
       ON index_namespace.oid = index_relation.relnamespace
-    JOIN pg_index AS index_metadata
+    JOIN pg_catalog.pg_index AS index_metadata
       ON index_metadata.indexrelid = index_relation.oid
-    JOIN pg_class AS table_relation
+    JOIN pg_catalog.pg_class AS table_relation
       ON table_relation.oid = index_metadata.indrelid
-    JOIN pg_namespace AS table_namespace
+    JOIN pg_catalog.pg_namespace AS table_namespace
       ON table_namespace.oid = table_relation.relnamespace
-    JOIN pg_am AS access_method
+    JOIN pg_catalog.pg_am AS access_method
       ON access_method.oid = index_relation.relam
-    WHERE index_namespace.nspname = current_schema()
+    WHERE index_namespace.nspname = %s
       AND index_relation.relname = %s
 """
 
@@ -152,10 +177,21 @@ def _upgrade_business_schema(dsn: str) -> None:
 async def _read_checkpoint_index(
     conn: psycopg.AsyncConnection,
     spec: _CheckpointIndexSpec,
+    target_schema: str,
 ) -> _CheckpointIndexState | None:
     async with conn.cursor() as cur:
-        await cur.execute(_CHECKPOINT_INDEX_QUERY, (spec.name,))
-        row = await cur.fetchone()
+        await cur.execute("SET search_path TO pg_catalog")
+        try:
+            await cur.execute(
+                _CHECKPOINT_INDEX_QUERY,
+                (target_schema, target_schema, spec.name),
+            )
+            row = await cur.fetchone()
+        finally:
+            await cur.execute(
+                "SELECT pg_catalog.set_config('search_path', %s, false)",
+                (target_schema,),
+            )
 
     if row is None:
         return None
@@ -223,8 +259,9 @@ async def _ensure_checkpoint_index(
     conn: psycopg.AsyncConnection,
     spec: _CheckpointIndexSpec,
     migration: str,
+    target_schema: str,
 ) -> None:
-    state = await _read_checkpoint_index(conn, spec)
+    state = await _read_checkpoint_index(conn, spec, target_schema)
 
     if state is not None:
         if not _has_expected_checkpoint_index_definition(state, spec):
@@ -239,7 +276,7 @@ async def _ensure_checkpoint_index(
     async with conn.cursor() as cur:
         await cur.execute(migration)
 
-    rebuilt = await _read_checkpoint_index(conn, spec)
+    rebuilt = await _read_checkpoint_index(conn, spec, target_schema)
     if rebuilt is None:
         raise RuntimeError(
             f"Checkpoint migration did not create expected index {spec.name}"
@@ -252,7 +289,8 @@ async def _ensure_checkpoint_index(
         )
 
 
-async def _apply_checkpoint_migrations(dsn: str) -> int:
+async def _apply_checkpoint_migrations(dsn: str, target_schema: str) -> int:
+    _require_checkpoint_migration_manifest()
     migrations = AsyncPostgresSaver.MIGRATIONS
     async with await psycopg.AsyncConnection.connect(
         dsn,
@@ -271,7 +309,12 @@ async def _apply_checkpoint_migrations(dsn: str) -> int:
 
             index_spec = _CHECKPOINT_INDEX_SPECS.get(version)
             if index_spec is not None:
-                await _ensure_checkpoint_index(conn, index_spec, migration)
+                await _ensure_checkpoint_index(
+                    conn,
+                    index_spec,
+                    migration,
+                    target_schema,
+                )
                 if version in applied:
                     continue
                 async with conn.cursor() as cur:
@@ -309,11 +352,34 @@ async def bootstrap_database(
         raise RuntimeError("Database bootstrap identity contract is incomplete")
     if expected_migration_role == expected_runtime_role:
         raise RuntimeError("Database bootstrap identity contract is invalid")
+    await require_migration_database_role(
+        dsn,
+        expected_migration_role=expected_migration_role,
+        expected_runtime_role=expected_runtime_role,
+        target_schema=target_schema,
+    )
+    await require_database_schema_contract(
+        dsn,
+        target_schema=target_schema,
+        require_complete=False,
+    )
+    _require_checkpoint_migration_manifest()
     await asyncio.to_thread(_upgrade_business_schema, dsn)
     business_revision = await get_current_database_revision(dsn)
     if business_revision is None or "," in business_revision:
         raise RuntimeError("Business schema revision is unavailable after bootstrap")
-    checkpoint_count = await _apply_checkpoint_migrations(dsn)
+    checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)
+    await require_database_schema_contract(
+        dsn,
+        target_schema=target_schema,
+        require_complete=True,
+    )
+    await require_migration_database_role(
+        dsn,
+        expected_migration_role=expected_migration_role,
+        expected_runtime_role=expected_runtime_role,
+        target_schema=target_schema,
+    )
     summary: dict[str, str | int] = {
         "alembic": business_revision,
         "checkpoint": checkpoint_count,

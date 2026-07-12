@@ -1,5 +1,6 @@
 from typing import Literal
 
+from psycopg.conninfo import make_conninfo
 from pydantic import PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
@@ -25,6 +26,9 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "email_agent"
     POSTGRES_USER: str = "user"
     POSTGRES_PASSWORD: SecretStr = SecretStr("password")
+    POSTGRES_SCHEMA: str = "public"
+    POSTGRES_MIGRATION_OWNER_ROLE: str = "ai_exchange_migration_owner"
+    DATABASE_ROLE_SEPARATION_REQUIRED: bool = False
     CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64: SecretStr = SecretStr("")
 
     # Durable ingestion rollout. The compatibility bridge accepts the current
@@ -116,9 +120,13 @@ class Settings(BaseSettings):
     @property
     def database_url(self) -> str:
         """Compute PostgreSQL DSN from individual fields."""
-        return (
-            f"postgresql://{self.POSTGRES_USER}:{resolve_secret(self.POSTGRES_PASSWORD)}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        return make_conninfo(
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            dbname=self.POSTGRES_DB,
+            user=self.POSTGRES_USER,
+            password=resolve_secret(self.POSTGRES_PASSWORD),
+            options=f"-csearch_path=pg_catalog,{self.POSTGRES_SCHEMA}",
         )
 
 

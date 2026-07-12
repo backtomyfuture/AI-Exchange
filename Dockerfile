@@ -21,14 +21,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-# 复制依赖文件
-COPY requirements.txt .
+# 复制锁定的依赖清单
+COPY pyproject.toml uv.lock ./
 
-# 使用清华大学 PyPI 镜像源安装依赖（这是提速最核心的部分，通常不会受网络校验干扰）
+# 从 uv.lock 导出带哈希的完整依赖集，再交给 pip 安装到系统环境。
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    --upgrade pip setuptools wheel Cython && \
+    --upgrade pip setuptools wheel Cython uv==0.11.28 && \
+    uv export --frozen --no-dev --no-emit-project \
+    --format requirements-txt --output-file /tmp/requirements.lock && \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    -r requirements.txt
+    --require-hashes -r /tmp/requirements.lock && \
+    rm -f /tmp/requirements.lock
 
 # 复制字体文件
 COPY fonts /usr/share/fonts/truetype/custom

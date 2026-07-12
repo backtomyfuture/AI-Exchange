@@ -35,15 +35,18 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+uv sync --frozen
 ```
 
 ### 2. 配置环境变量
 
 直接在本机运行 Python 时，复制 `.env.runtime.example` 到 `.env.runtime`；
 使用生产 Compose 时，复制 `.env.example` 到 `.env`，并将 migration-owner
-完整 DSN 单独写入 `MIGRATION_DATABASE_URL_FILE` 指向的 0600 文件。不要把
-admin 或 migration 凭据放入运行时配置。随后填入：
+完整 DSN 单独写入 `MIGRATION_DATABASE_URL_FILE` 指向的 0600 文件；DSN 的
+`options` 必须精确设置为 `-csearch_path=<目标 schema>`。不要显式把
+`pg_catalog` 放到目标 schema 后面：当它未显式列出时，PostgreSQL 会先解析
+系统目录，同时仍把未限定的新对象创建到目标 schema，从而避免同名类型劫持
+DDL。不要把 admin 或 migration 凭据放入运行时配置。随后填入：
 -   Exchange API 认证信息
 -   飞书 App ID & Secret
 -   Gemini API Key & Base URL
@@ -53,11 +56,42 @@ admin 或 migration 凭据放入运行时配置。随后填入：
 
 使用 Docker Compose 启动完整环境：
 ```bash
-# 禁止在 catalog role verifier（Task 1B0-B）完成前执行下一行。
-# 角色创建和 ownership 转移也必须先由独立 DBA checkpoint 完成。
+# 仅在独立 DBA checkpoint 已完成备份、角色创建、ownership 转移和权限复核，
+# 且 disposable PostgreSQL 验证通过后执行；当前 live 数据库尚不满足该条件。
 docker compose --profile migration run --rm database-bootstrap
 docker compose up -d
 ```
+
+数据库门禁会在任何 DDL、应用上下文或外部 worker 启动前验证 migration/runtime
+均为独立 `LOGIN NOINHERIT` 非特权角色、双方没有任何授予型 membership，目标
+database/schema/对象均由 migration role 持有，且除 migration owner 外无人拥有
+目标 schema 的 `CREATE`。runtime 还必须没有 database `CREATE/TEMP` 和 schema
+`CREATE`。当前 database、目标 schema 与目标对象的显式 ACL 只能出现 migration
+和 runtime 两个角色；`PUBLIC` 或第三方角色不能读取目标数据，也不能借助其他用户
+schema、large object、FDW/server、系统目录新增 ACL 或 `SECURITY DEFINER` 间接
+提权。两个受管角色和当前 database 不允许任何 `ALTER ROLE/DATABASE SET` 覆盖，
+会话必须保持触发器、row security 与 large-object 权限语义的安全默认值。
+
+migration role 的默认权限必须显式撤销 `PUBLIC` 对新函数的 `EXECUTE` 和对新类型的
+`USAGE`；当前 database 还必须撤销 `PUBLIC` 对 `lo_creat`、`lo_create` 与
+`lo_from_bytea` 的 `EXECUTE`，使 runtime 不能在两次门禁之间创建 large object。
+同一 PostgreSQL cluster 内所有其他可连接 database 也必须撤销 `PUBLIC` 的
+`CONNECT/TEMPORARY`，确保 migration/runtime 两个受管角色对其他
+`datallowconn` database 均无有效 `CONNECT`，再只向各自应用角色显式授权；新
+Compose volume 会通过
+init SQL 处理 `postgres/template1`，已有 volume 必须由 DBA 在 cutover checkpoint
+中执行等价操作。
+bootstrap 在 DDL 前后都会验证已知业务/Checkpointer 列确实绑定
+`pg_catalog` 类型，并校验锁定的 `langgraph-checkpoint-postgres==3.0.4` migration
+manifest；依赖内容漂移会在第一条 DDL 前失败。所有校验失败只会返回通用错误，
+不会回退 admin 凭据或自动修改权限。
+
+在 0003 建立精确清单前，目标 schema 不允许用户 trigger、非安全 view 标准
+`_RETURN` 之外的 rewrite rule、`SECURITY DEFINER` routine 或启用的 event
+trigger，也不允许 foreign key 或表继承/分区关系，避免内部 constraint trigger、
+级联动作和子表权限绕过对象级 ACL。runtime 可访问的 ordinary view 必须设置
+`security_invoker=true`；历史 owner-rights view 只有在 runtime 完全没有表级/列级
+权限时才作为只读迁移桥保留，避免隐式执行路径获得 migration-owner 权限。
 
 或者本地分进程启动：
 -   运行主同步服务: `python -m src.exchange_service`

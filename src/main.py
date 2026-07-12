@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import uvicorn
@@ -21,6 +20,29 @@ from src.server import app
 
 logger = logging.getLogger("MainService")
 
+
+async def _require_runtime_database_boundary(settings) -> None:
+    """Apply the same read-only database boundary to every runtime entrypoint."""
+    await require_runtime_database(
+        settings.database_url,
+        durable_inbox_enabled=bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)),
+        ingestion_shadow_enabled=bool(
+            getattr(settings, "INGESTION_SHADOW_ENABLED", False)
+        ),
+        sync_reconciliation_enabled=bool(
+            getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
+        ),
+        role_separation_required=bool(
+            getattr(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False)
+        ),
+        expected_runtime_role=str(getattr(settings, "POSTGRES_USER", "")),
+        expected_migration_role=str(
+            getattr(settings, "POSTGRES_MIGRATION_OWNER_ROLE", "")
+        ),
+        target_schema=str(getattr(settings, "POSTGRES_SCHEMA", "public")),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -36,21 +58,10 @@ async def lifespan(app: FastAPI):
     # 0. Runtime startup is read-only. Deployment must run the explicit
     # bootstrap command before the service can become ready.
     try:
-        await require_runtime_database(
-            settings.database_url,
-            durable_inbox_enabled=bool(
-                getattr(settings, "DURABLE_INBOX_ENABLED", False)
-            ),
-            ingestion_shadow_enabled=bool(
-                getattr(settings, "INGESTION_SHADOW_ENABLED", False)
-            ),
-            sync_reconciliation_enabled=bool(
-                getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
-            ),
-        )
+        await _require_runtime_database_boundary(settings)
     except Exception as exc:
         logger.error(
-            "Database revision check failed at startup: error_type=%s",
+            "Database preflight failed at startup: error_type=%s",
             type(exc).__name__,
         )
         raise
@@ -58,15 +69,13 @@ async def lifespan(app: FastAPI):
     # 1. Initialize Shared Context
     ctx = get_app_context()
     await ctx.setup_async()
-    recovered_actions = (
-        await ctx.db_manager.recover_incomplete_approval_states()
-    )
+    recovered_actions = await ctx.db_manager.recover_incomplete_approval_states()
     if recovered_actions:
         logger.warning(
             "Moved incomplete approval/send actions to manual review: count=%d",
             recovered_actions,
         )
-    
+
     # 2. Initialize Lark App (API & WS)
     # We pass the current running loop (uvicorn's loop)
     worker_loop = asyncio.get_running_loop()
@@ -77,10 +86,10 @@ async def lifespan(app: FastAPI):
         worker_loop_arg=worker_loop,
         dependencies=ctx.graph_dependencies,
     )
-    
+
     # Start Lark WS in a background thread
     lark_app.start_lark_ws()
-    
+
     # 3. Start webhook-driven Exchange worker
     await exchange_start_worker(ctx)
 
@@ -94,6 +103,7 @@ async def lifespan(app: FastAPI):
 
     # 5b. Start Memory Consolidation (runs alongside daily summary)
     from src.memory.consolidator import MemoryConsolidator
+
     consolidator = MemoryConsolidator(
         db_manager=ctx.db_manager,
         email_processor=ctx.email_processor,
@@ -123,11 +133,11 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info("Service is fully operational (Web Server running).")
-    
-    yield # Server runs here
-    
+
+    yield  # Server runs here
+
     logger.info("Stopping services...")
-    
+
     # Shutdown logic
     self_healer.stop()
     healing_task.cancel()
@@ -135,23 +145,31 @@ async def lifespan(app: FastAPI):
     consolidation_task.cancel()
     polling_task.cancel()
     try:
-        await asyncio.gather(healing_task, summary_task, consolidation_task, polling_task, return_exceptions=True)
+        await asyncio.gather(
+            healing_task,
+            summary_task,
+            consolidation_task,
+            polling_task,
+            return_exceptions=True,
+        )
     except asyncio.CancelledError:
         pass
     await exchange_stop_worker()
     await ctx.close()
     logger.info("Shutdown complete.")
 
+
 app.router.lifespan_context = lifespan
+
 
 async def main():
     """Entrypoint for tests: init components and run background loop."""
-    validate_runtime_security(get_settings())
+    settings = get_settings()
+    validate_runtime_security(settings)
+    await _require_runtime_database_boundary(settings)
     ctx = get_app_context()
     await ctx.setup_async()
-    recovered_actions = (
-        await ctx.db_manager.recover_incomplete_approval_states()
-    )
+    recovered_actions = await ctx.db_manager.recover_incomplete_approval_states()
     if recovered_actions:
         logger.warning(
             "Moved incomplete approval/send actions to manual review: count=%d",
@@ -182,6 +200,7 @@ def run_server():
     validate_runtime_security(settings)
     setup_logging(settings.LOG_LEVEL)
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
+
 
 if __name__ == "__main__":
     run_server()

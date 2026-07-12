@@ -64,11 +64,7 @@ def _read_secret_file(raw_path: str) -> str:
     if not raw_path or raw_path != raw_path.strip() or "\x00" in raw_path:
         raise _reject()
 
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow == 0:
         raise _reject()
@@ -92,10 +88,9 @@ def _read_secret_file(raw_path: str) -> str:
         os.lseek(fd, 0, os.SEEK_SET)
         repeated_payload = _read_bounded(fd)
         after = os.fstat(fd)
-        if (
-            payload != repeated_payload
-            or _metadata_snapshot(before) != _metadata_snapshot(after)
-        ):
+        if payload != repeated_payload or _metadata_snapshot(
+            before
+        ) != _metadata_snapshot(after):
             raise _reject()
         if payload.endswith(b"\n"):
             payload = payload[:-1]
@@ -130,12 +125,8 @@ def load_migration_settings(
 
     values = os.environ if environment is None else environment
     try:
-        database_url = _read_secret_file(
-            values.get("MIGRATION_DATABASE_URL_FILE", "")
-        )
-        migration_role = _read_identifier(
-            values, "POSTGRES_MIGRATION_OWNER_ROLE"
-        )
+        database_url = _read_secret_file(values.get("MIGRATION_DATABASE_URL_FILE", ""))
+        migration_role = _read_identifier(values, "POSTGRES_MIGRATION_OWNER_ROLE")
         runtime_role = _read_identifier(values, "POSTGRES_RUNTIME_ROLE")
         target_schema = _read_identifier(values, "POSTGRES_SCHEMA")
         if migration_role == runtime_role:
@@ -147,6 +138,7 @@ def load_migration_settings(
             or not parsed.get("password")
             or not parsed.get("host")
             or not parsed.get("dbname")
+            or parsed.get("options") != f"-csearch_path={target_schema}"
         ):
             raise _reject()
     except MigrationSettingsError:

@@ -48,6 +48,9 @@ def _secure_production_settings(**overrides: Any) -> Settings:
         "POSTGRES_DB": "email_agent",
         "POSTGRES_USER": "email_agent_runtime",
         "POSTGRES_PASSWORD": SecretStr(_SAFE_SECRET_VALUES["POSTGRES_PASSWORD"]),
+        "POSTGRES_SCHEMA": "public",
+        "POSTGRES_MIGRATION_OWNER_ROLE": "ai_exchange_migration_owner",
+        "DATABASE_ROLE_SEPARATION_REQUIRED": True,
         "EXCHANGE_API_URL": "https://exchange.internal.company/api/v1/exchange/emails",
         "EXCHANGE_API_KEY": SecretStr(_SAFE_SECRET_VALUES["EXCHANGE_API_KEY"]),
         "EXCHANGE_ACCOUNT_ID": 8,
@@ -104,6 +107,32 @@ def test_secure_production_baseline_is_accepted():
     result = validate_runtime_security(settings)
 
     assert result is settings
+
+
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_value"),
+    [
+        ("DATABASE_ROLE_SEPARATION_REQUIRED", False),
+        ("POSTGRES_SCHEMA", "Public"),
+        ("POSTGRES_SCHEMA", "public;drop_schema"),
+        ("POSTGRES_USER", "Runtime-User"),
+        ("POSTGRES_MIGRATION_OWNER_ROLE", "Migration-Owner"),
+        ("POSTGRES_MIGRATION_OWNER_ROLE", "email_agent_runtime"),
+    ],
+)
+def test_production_rejects_unsafe_database_role_boundary(
+    field_name: str,
+    unsafe_value: object,
+):
+    validate_runtime_security = _load_runtime_validator()
+    settings = _secure_production_settings(**{field_name: unsafe_value})
+
+    with pytest.raises(RuntimeError) as caught:
+        validate_runtime_security(settings)
+
+    message = str(caught.value)
+    assert field_name in message
+    assert str(unsafe_value) not in message
 
 
 @pytest.mark.parametrize(
@@ -196,9 +225,7 @@ def test_production_rejects_structured_placeholder_values(
 )
 def test_production_rejects_weak_boundary_secrets(field_name: str):
     validate_runtime_security = _load_runtime_validator()
-    settings = _secure_production_settings(
-        **{field_name: SecretStr("short-secret")}
-    )
+    settings = _secure_production_settings(**{field_name: SecretStr("short-secret")})
 
     with pytest.raises(RuntimeError) as caught:
         validate_runtime_security(settings)
@@ -391,20 +418,25 @@ async def test_lifespan_validates_runtime_before_database_or_context():
     legacy_database_check = AsyncMock(
         side_effect=AssertionError("legacy_database_gate_reached")
     )
-    with patch.object(main_module, "get_settings", return_value=settings), patch.object(
-        main_module,
-        "require_runtime_database",
-        new=runtime_database_check,
-        create=True,
-    ) as database_check, patch.object(
-        main_module,
-        "require_current_database",
-        new=legacy_database_check,
-        create=True,
-    ), patch.object(
-        main_module,
-        "get_app_context",
-        side_effect=AssertionError("context_reached_before_security_validation"),
+    with (
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(
+            main_module,
+            "require_runtime_database",
+            new=runtime_database_check,
+            create=True,
+        ) as database_check,
+        patch.object(
+            main_module,
+            "require_current_database",
+            new=legacy_database_check,
+            create=True,
+        ),
+        patch.object(
+            main_module,
+            "get_app_context",
+            side_effect=AssertionError("context_reached_before_security_validation"),
+        ),
     ):
         with pytest.raises(RuntimeError, match="EXCHANGE_SSL_VERIFY"):
             async with main_module.lifespan(main_module.app):
@@ -419,11 +451,14 @@ async def test_direct_main_validates_runtime_before_context():
     from src import main as main_module
 
     settings = _secure_production_settings(LARK_ALLOWED_OPEN_IDS="")
-    with patch.object(main_module, "get_settings", return_value=settings), patch.object(
-        main_module,
-        "get_app_context",
-        side_effect=AssertionError("context_reached_before_security_validation"),
-    ) as get_context:
+    with (
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(
+            main_module,
+            "get_app_context",
+            side_effect=AssertionError("context_reached_before_security_validation"),
+        ) as get_context,
+    ):
         with pytest.raises(RuntimeError, match="LARK_ALLOWED_OPEN_IDS"):
             await main_module.main()
 
@@ -434,11 +469,15 @@ def test_run_server_validates_runtime_before_uvicorn_bind():
     from src import main as main_module
 
     settings = _secure_production_settings(POSTGRES_PASSWORD=SecretStr("password"))
-    with patch.object(main_module, "get_settings", return_value=settings), patch.object(
-        main_module.uvicorn,
-        "run",
-        side_effect=AssertionError("uvicorn_bound_before_security_validation"),
-    ) as uvicorn_run, pytest.raises(RuntimeError, match="POSTGRES_PASSWORD"):
+    with (
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(
+            main_module.uvicorn,
+            "run",
+            side_effect=AssertionError("uvicorn_bound_before_security_validation"),
+        ) as uvicorn_run,
+        pytest.raises(RuntimeError, match="POSTGRES_PASSWORD"),
+    ):
         main_module.run_server()
 
     uvicorn_run.assert_not_called()
@@ -448,10 +487,14 @@ def test_run_server_disables_unsanitized_uvicorn_access_log():
     from src import main as main_module
 
     settings = Settings(_env_file=None, APP_ENV="development")
-    with patch.object(main_module, "get_settings", return_value=settings), patch.object(
-        main_module,
-        "setup_logging",
-    ), patch.object(main_module.uvicorn, "run") as uvicorn_run:
+    with (
+        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(
+            main_module,
+            "setup_logging",
+        ),
+        patch.object(main_module.uvicorn, "run") as uvicorn_run,
+    ):
         main_module.run_server()
 
     uvicorn_run.assert_called_once_with(

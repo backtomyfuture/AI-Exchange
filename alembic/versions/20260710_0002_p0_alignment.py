@@ -12,11 +12,15 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("ALTER TABLE emails_log ADD COLUMN IF NOT EXISTS error_message TEXT")
-    op.execute("ALTER TABLE emails_log ADD COLUMN IF NOT EXISTS content_ref JSONB")
+    op.execute(
+        "ALTER TABLE emails_log ADD COLUMN IF NOT EXISTS error_message pg_catalog.text"
+    )
+    op.execute(
+        "ALTER TABLE emails_log ADD COLUMN IF NOT EXISTS content_ref pg_catalog.jsonb"
+    )
     op.execute(
         "ALTER TABLE emails_log ADD COLUMN IF NOT EXISTS "
-        "version BIGINT NOT NULL DEFAULT 0"
+        "version pg_catalog.int8 NOT NULL DEFAULT 0"
     )
     op.execute(
         "CREATE INDEX IF NOT EXISTS idx_emails_log_status_processed "
