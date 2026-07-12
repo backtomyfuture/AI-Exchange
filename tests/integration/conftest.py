@@ -31,6 +31,14 @@ class SchemaProbe:
 
     dsn: str
 
+    @property
+    def bootstrap_identity(self) -> dict[str, str]:
+        return {
+            "expected_migration_role": str(self.scalar("SELECT current_user")),
+            "expected_runtime_role": "ai_exchange_test_runtime",
+            "target_schema": str(self.scalar("SELECT current_schema()")),
+        }
+
     def execute(self, statement: str, params=None) -> None:
         with psycopg.connect(self.dsn, autocommit=True) as conn:
             conn.execute(statement, params)

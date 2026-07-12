@@ -260,8 +260,8 @@ async def test_bootstrap_applies_checkpoint_migrations_with_autocommit(
     from src.db.bootstrap import bootstrap_database
 
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert schema.scalar("SELECT count(*) FROM alembic_version") == 1
     assert schema.scalar("SELECT count(*) FROM checkpoint_migrations") == (
@@ -292,7 +292,9 @@ async def test_bootstrap_reports_the_revision_read_from_the_isolated_database(
     )
     schema = postgres_database_factory()
 
-    summary = await bootstrap_module.bootstrap_database(schema.dsn)
+    summary = await bootstrap_module.bootstrap_database(
+        schema.dsn, **schema.bootstrap_identity
+    )
     actual_revision = schema.scalar("SELECT version_num FROM alembic_version")
 
     assert actual_revision
@@ -309,7 +311,7 @@ async def test_bootstrap_reports_the_actual_isolated_database_head(
 
     schema = postgres_database_factory()
 
-    summary = await bootstrap_database(schema.dsn)
+    summary = await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert summary["alembic"] == schema.scalar(
         "SELECT version_num FROM alembic_version"
@@ -324,10 +326,10 @@ async def test_bootstrap_records_existing_correct_checkpoint_index(
     from src.db.bootstrap import bootstrap_database
 
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     schema.execute("DELETE FROM checkpoint_migrations WHERE v = 6")
 
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert schema.scalar(
         "SELECT count(*) FROM checkpoint_migrations WHERE v = 6"
@@ -380,14 +382,14 @@ async def test_bootstrap_rejects_wrong_valid_checkpoint_index(
     from src.db.bootstrap import bootstrap_database
 
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     if not version_recorded:
         schema.execute("DELETE FROM checkpoint_migrations WHERE v = 6")
     schema.execute("DROP INDEX CONCURRENTLY checkpoints_thread_id_idx")
     schema.execute(wrong_definition)
 
     with pytest.raises(RuntimeError, match="checkpoints_thread_id_idx"):
-        await bootstrap_database(schema.dsn)
+        await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert schema.scalar(
         "SELECT count(*) FROM checkpoint_migrations WHERE v = 6"
@@ -409,7 +411,7 @@ async def test_bootstrap_rebuilds_recorded_invalid_expected_checkpoint_index(
     from src.db.bootstrap import bootstrap_database
 
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     schema.execute(
         "UPDATE pg_index SET indisvalid = false, indisready = false "
         "WHERE indexrelid = 'checkpoints_thread_id_idx'::regclass"
@@ -420,7 +422,7 @@ async def test_bootstrap_rebuilds_recorded_invalid_expected_checkpoint_index(
     assert invalid_index["is_valid"] is False
     assert invalid_index["is_ready"] is False
 
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert schema.scalar(
         "SELECT count(*) FROM checkpoint_migrations WHERE v = 6"
@@ -436,10 +438,10 @@ async def test_bootstrap_rebuilds_recorded_missing_checkpoint_index(
     from src.db.bootstrap import bootstrap_database
 
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     schema.execute("DROP INDEX CONCURRENTLY checkpoint_blobs_thread_id_idx")
 
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
     assert schema.scalar(
         "SELECT count(*) FROM checkpoint_migrations WHERE v = 7"

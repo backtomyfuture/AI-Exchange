@@ -13,6 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
+RUNTIME_ENV_EXAMPLE = PROJECT_ROOT / ".env.runtime.example"
+DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
+GITIGNORE = PROJECT_ROOT / ".gitignore"
 
 
 class _ComposeLoader(yaml.SafeLoader):
@@ -64,20 +67,25 @@ def test_production_data_services_do_not_publish_host_ports(service_name: str):
 
 
 @pytest.mark.parametrize(
-    ("service_name", "field_name"),
+    ("service_name", "field_name", "source_name"),
     [
-        ("postgres", "POSTGRES_USER"),
-        ("postgres", "POSTGRES_PASSWORD"),
-        ("postgres", "POSTGRES_DB"),
-        ("ai-assistant-service", "POSTGRES_USER"),
-        ("ai-assistant-service", "POSTGRES_PASSWORD"),
-        ("ai-assistant-service", "POSTGRES_DB"),
-        ("ai-assistant-service", "EXTERNAL_URL"),
+        ("postgres", "POSTGRES_USER", "POSTGRES_ADMIN_USER"),
+        ("postgres", "POSTGRES_PASSWORD", "POSTGRES_ADMIN_PASSWORD"),
+        ("postgres", "POSTGRES_DB", "POSTGRES_DB"),
+        ("ai-assistant-service", "POSTGRES_USER", "POSTGRES_RUNTIME_USER"),
+        (
+            "ai-assistant-service",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_RUNTIME_PASSWORD",
+        ),
+        ("ai-assistant-service", "POSTGRES_DB", "POSTGRES_DB"),
+        ("ai-assistant-service", "EXTERNAL_URL", "EXTERNAL_URL"),
     ],
 )
 def test_production_boundary_values_are_required_from_environment(
     service_name: str,
     field_name: str,
+    source_name: str,
 ):
     compose = _load_yaml(PRODUCTION_COMPOSE)
     environment = compose["services"][service_name]["environment"]
@@ -85,7 +93,7 @@ def test_production_boundary_values_are_required_from_environment(
     assert isinstance(environment, dict)
     configured = environment[field_name]
     assert isinstance(configured, str)
-    assert f"${{{field_name}:?" in configured
+    assert f"${{{source_name}:?" in configured
 
 
 def test_production_backend_network_is_internal_and_contains_only_data_services():
@@ -126,6 +134,94 @@ def test_production_application_has_no_source_or_test_bind_mounts():
 
     assert all(not str(volume).startswith("./src:") for volume in volumes)
     assert all(not str(volume).startswith("./tests:") for volume in volumes)
+
+
+def test_production_database_credentials_use_three_distinct_planes():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    postgres_environment = compose["services"]["postgres"]["environment"]
+    runtime_environment = compose["services"]["ai-assistant-service"]["environment"]
+
+    assert "${POSTGRES_ADMIN_USER:" in postgres_environment["POSTGRES_USER"]
+    assert "${POSTGRES_ADMIN_PASSWORD:" in postgres_environment["POSTGRES_PASSWORD"]
+    assert "${POSTGRES_RUNTIME_USER:" in runtime_environment["POSTGRES_USER"]
+    assert "${POSTGRES_RUNTIME_PASSWORD:" in runtime_environment["POSTGRES_PASSWORD"]
+    assert postgres_environment["POSTGRES_USER"] != runtime_environment["POSTGRES_USER"]
+    assert postgres_environment["POSTGRES_PASSWORD"] != runtime_environment["POSTGRES_PASSWORD"]
+
+
+def test_production_application_uses_an_explicit_runtime_allowlist_only():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["ai-assistant-service"]
+
+    assert "env_file" not in service
+    assert "secrets" not in service
+    forbidden_fragments = ("MIGRATION_DATABASE", "POSTGRES_ADMIN", "MIGRATION_PASSWORD")
+    for key, value in service["environment"].items():
+        rendered = f"{key}={value}"
+        assert not any(fragment in rendered for fragment in forbidden_fragments)
+
+
+def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["database-bootstrap"]
+
+    assert service["profiles"] == ["migration"]
+    assert service["restart"] == "no"
+    assert "ports" not in service
+    assert _network_names(service) == {"backend"}
+    assert service["command"] == ["python", "-m", "src.db.bootstrap"]
+    assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["cap_add"] == ["DAC_READ_SEARCH"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["secrets"] == [
+        {
+            "source": "migration_database_url",
+            "target": "migration_database_url",
+        }
+    ]
+    assert service["environment"]["MIGRATION_DATABASE_URL_FILE"] == (
+        "/run/secrets/migration_database_url"
+    )
+    assert "env_file" not in service
+    assert not {
+        "POSTGRES_ADMIN_PASSWORD",
+        "POSTGRES_RUNTIME_PASSWORD",
+        "POSTGRES_PASSWORD",
+    }.intersection(service["environment"])
+    assert set(compose["secrets"]) == {"migration_database_url"}
+
+
+def test_build_and_vcs_ignore_all_environment_and_local_secret_files():
+    dockerignore = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+    gitignore = GITIGNORE.read_text(encoding="utf-8").splitlines()
+
+    assert ".env*" in dockerignore
+    assert "secrets/" in dockerignore
+    assert ".env*" in gitignore
+    assert "secrets/" in gitignore
+    assert "!.env.example" in gitignore
+    assert "!.env.runtime.example" in gitignore
+
+
+def test_runtime_environment_template_excludes_control_plane_credentials():
+    values: dict[str, str] = {}
+    for raw_line in RUNTIME_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+
+    assert {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"} <= values.keys()
+    assert not {
+        "MIGRATION_DATABASE_URL",
+        "MIGRATION_DATABASE_URL_FILE",
+        "POSTGRES_ADMIN_USER",
+        "POSTGRES_ADMIN_PASSWORD",
+        "POSTGRES_MIGRATION_USER",
+        "POSTGRES_MIGRATION_PASSWORD",
+    }.intersection(values)
 
 
 @pytest.mark.parametrize(

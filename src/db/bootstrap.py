@@ -12,7 +12,7 @@ from alembic import command
 from alembic.config import Config
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from src.config import get_settings
+from src.db.migration_settings import load_migration_settings
 from src.db.schema import get_current_database_revision
 
 
@@ -297,8 +297,18 @@ async def _apply_checkpoint_migrations(dsn: str) -> int:
     return applied_count
 
 
-async def bootstrap_database(dsn: str) -> dict[str, str | int]:
+async def bootstrap_database(
+    dsn: str,
+    *,
+    expected_migration_role: str,
+    expected_runtime_role: str,
+    target_schema: str,
+) -> dict[str, str | int]:
     """Upgrade both schemas; this is the only supported schema-writing entrypoint."""
+    if not expected_migration_role or not expected_runtime_role or not target_schema:
+        raise RuntimeError("Database bootstrap identity contract is incomplete")
+    if expected_migration_role == expected_runtime_role:
+        raise RuntimeError("Database bootstrap identity contract is invalid")
     await asyncio.to_thread(_upgrade_business_schema, dsn)
     business_revision = await get_current_database_revision(dsn)
     if business_revision is None or "," in business_revision:
@@ -313,8 +323,18 @@ async def bootstrap_database(dsn: str) -> dict[str, str | int]:
 
 
 def main() -> None:
-    settings = get_settings()
-    asyncio.run(bootstrap_database(settings.database_url))
+    try:
+        settings = load_migration_settings()
+        asyncio.run(
+            bootstrap_database(
+                settings.database_url.get_secret_value(),
+                expected_migration_role=settings.expected_migration_role,
+                expected_runtime_role=settings.expected_runtime_role,
+                target_schema=settings.target_schema,
+            )
+        )
+    except Exception:
+        raise RuntimeError("database_bootstrap_failed") from None
 
 
 if __name__ == "__main__":

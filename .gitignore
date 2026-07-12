@@ -1,5 +1,8 @@
-# Environment variables
-.env
+# Environment variables and local credential files
+.env*
+!.env.example
+!.env.runtime.example
+secrets/
 
 # Python
 __pycache__/

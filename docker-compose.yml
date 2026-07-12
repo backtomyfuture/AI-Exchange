@@ -13,8 +13,8 @@ services:
     image: postgres:15
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
     expose:
       - "5432"
@@ -28,24 +28,115 @@ services:
     networks:
       - backend
 
+  database-bootstrap:
+    profiles: ["migration"]
+    build: .
+    restart: "no"
+    command: ["python", "-m", "src.db.bootstrap"]
+    # Compose file-backed secrets cannot remap uid/gid/mode. The host source
+    # must be 0600; this isolated one-shot retains only read-DAC override so
+    # native Linux can read a deployment-user-owned bind source.
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      TZ: Asia/Shanghai
+    secrets:
+      - source: migration_database_url
+        target: migration_database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
   ai-assistant-service:
     build: .
     restart: always
     command: python -m src.main
-    env_file:
-      - path: .env
-        required: false
     environment:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       APP_ENV: production
+      DEBUG: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EXTERNAL_URL: ${EXTERNAL_URL:?EXTERNAL_URL is required}
       QDRANT_URL: http://qdrant:6333
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?POSTGRES_RUNTIME_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
-      EXTERNAL_URL: ${EXTERNAL_URL:?EXTERNAL_URL is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      DATABASE_ROLE_SEPARATION_REQUIRED: "true"
+      DURABLE_INBOX_ENABLED: ${DURABLE_INBOX_ENABLED:-false}
+      INGESTION_SHADOW_ENABLED: ${INGESTION_SHADOW_ENABLED:-false}
+      SYNC_RECONCILIATION_ENABLED: ${SYNC_RECONCILIATION_ENABLED:-false}
+      EXCHANGE_API_URL: ${EXCHANGE_API_URL:-}
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
+      EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:-8}
+      EXCHANGE_ACCOUNT_EMAIL: ${EXCHANGE_ACCOUNT_EMAIL:-}
+      EXCHANGE_WEBHOOK_SECRET: ${EXCHANGE_WEBHOOK_SECRET:-}
+      EXCHANGE_SSL_VERIFY: ${EXCHANGE_SSL_VERIFY:-true}
+      EXCHANGE_CA_FILE: ${EXCHANGE_CA_FILE:-}
+      EXCHANGE_FOLDERS_FULL: ${EXCHANGE_FOLDERS_FULL:-Inbox}
+      EXCHANGE_FOLDERS_ARCHIVE: ${EXCHANGE_FOLDERS_ARCHIVE:-}
+      EXCHANGE_FOLDER_SENTITEMS: ${EXCHANGE_FOLDER_SENTITEMS:-Sent Items}
+      EXCHANGE_FOLDER_DRAFTS: ${EXCHANGE_FOLDER_DRAFTS:-Drafts}
+      LEADER_SENDERS: ${LEADER_SENDERS:-}
+      WEBHOOK_MAX_BYTES: ${WEBHOOK_MAX_BYTES:-1048576}
+      EXCHANGE_RESPONSE_MAX_BYTES: ${EXCHANGE_RESPONSE_MAX_BYTES:-67108864}
+      EMAIL_BODY_MAX_BYTES: ${EMAIL_BODY_MAX_BYTES:-10485760}
+      EMAIL_ATTACHMENT_MAX_COUNT: ${EMAIL_ATTACHMENT_MAX_COUNT:-20}
+      EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: ${EMAIL_ATTACHMENT_SINGLE_MAX_BYTES:-26214400}
+      EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: ${EMAIL_ATTACHMENT_TOTAL_MAX_BYTES:-52428800}
+      LARK_APP_ID: ${LARK_APP_ID:-}
+      LARK_APP_SECRET: ${LARK_APP_SECRET:-}
+      LARK_ENCRYPT_KEY: ${LARK_ENCRYPT_KEY:-}
+      LARK_CHAT_ID: ${LARK_CHAT_ID:-}
+      LARK_DRIVE_FOLDER_TOKEN: ${LARK_DRIVE_FOLDER_TOKEN:-}
+      LARK_ALLOWED_OPEN_IDS: ${LARK_ALLOWED_OPEN_IDS:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      CONTENT_STORE_ROOT: /app/data/content
+      CONTENT_STORE_KEY: ${CONTENT_STORE_KEY:-}
+      CONTENT_STORE_KEY_VERSION: ${CONTENT_STORE_KEY_VERSION:-v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      LLM_MODEL: ${LLM_MODEL:-gemini-3-flash}
+      LLM_MAX_RPM: ${LLM_MAX_RPM:-15}
+      LLM_MAX_INPUT_TOKENS: ${LLM_MAX_INPUT_TOKENS:-122880}
+      LLM_MAX_OUTPUT_TOKENS: ${LLM_MAX_OUTPUT_TOKENS:-8192}
+      LLM_MAX_TOTAL_TOKENS: ${LLM_MAX_TOTAL_TOKENS:-131072}
+      LLM_CATEGORIZER_MODEL: ${LLM_CATEGORIZER_MODEL:-}
+      LLM_DRAFTER_MODEL: ${LLM_DRAFTER_MODEL:-}
+      LLM_REVIEWER_MODEL: ${LLM_REVIEWER_MODEL:-}
+      LLM_ROUTER_MODEL: ${LLM_ROUTER_MODEL:-}
+      LLM_SUMMARY_MODEL: ${LLM_SUMMARY_MODEL:-}
+      LLM_CONSOLIDATOR_MODEL: ${LLM_CONSOLIDATOR_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      ZHIPUAI_API_KEY: ${ZHIPUAI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      POLLING_INTERVAL: ${POLLING_INTERVAL:-3600}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}
       TZ: Asia/Shanghai
     ports:
       - "${APP_PORT:-8000}:8000"
@@ -81,3 +172,7 @@ volumes:
   content_data:
   postgres_data:
   qdrant_data:
+
+secrets:
+  migration_database_url:
+    file: ${MIGRATION_DATABASE_URL_FILE:-./secrets/migration_database_url}

@@ -33,7 +33,7 @@ RECEIPT_KEY = b"task10-isolated-test-receipt-key" * 2
 @pytest.fixture
 async def checkpoint_schema(postgres_database_factory):
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     return schema
 
 

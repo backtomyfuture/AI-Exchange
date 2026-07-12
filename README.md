@@ -40,7 +40,10 @@ pip install -r requirements.txt
 
 ### 2. 配置环境变量
 
-复制 `.env.example` 到 `.env` 并填入必要信息：
+直接在本机运行 Python 时，复制 `.env.runtime.example` 到 `.env.runtime`；
+使用生产 Compose 时，复制 `.env.example` 到 `.env`，并将 migration-owner
+完整 DSN 单独写入 `MIGRATION_DATABASE_URL_FILE` 指向的 0600 文件。不要把
+admin 或 migration 凭据放入运行时配置。随后填入：
 -   Exchange API 认证信息
 -   飞书 App ID & Secret
 -   Gemini API Key & Base URL
@@ -50,7 +53,10 @@ pip install -r requirements.txt
 
 使用 Docker Compose 启动完整环境：
 ```bash
-docker-compose up -d
+# 禁止在 catalog role verifier（Task 1B0-B）完成前执行下一行。
+# 角色创建和 ownership 转移也必须先由独立 DBA checkpoint 完成。
+docker compose --profile migration run --rm database-bootstrap
+docker compose up -d
 ```
 
 或者本地分进程启动：

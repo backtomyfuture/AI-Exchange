@@ -14,7 +14,7 @@ def resolve_secret(value) -> str:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env.runtime",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: PositiveInt = 26_214_400
     EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: PositiveInt = 52_428_800
     # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
-    LEADER_SENDERS: str = "lanjuan@tianjin-air.com,xt_zong@tianjin-air.com"
+    LEADER_SENDERS: str = ""
 
     # Lark
     LARK_APP_ID: str = ""

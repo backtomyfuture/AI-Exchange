@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .git/
-.env
+.env*
+secrets/
 qdrant_data/
 postgres_data/
 processed_emails.json

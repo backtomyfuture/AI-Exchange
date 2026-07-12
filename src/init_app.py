@@ -1,5 +1,4 @@
 import logging
-from dotenv import load_dotenv
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -12,8 +11,6 @@ from src.config import get_settings, resolve_secret
 from src.storage import EncryptedFileContentStore
 
 logger = logging.getLogger(__name__)
-
-load_dotenv()
 
 class AppContext:
     def __init__(self):

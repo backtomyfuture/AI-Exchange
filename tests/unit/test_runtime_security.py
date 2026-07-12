@@ -293,6 +293,43 @@ def test_development_mode_does_not_apply_production_only_rejections():
     assert result is settings
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "MIGRATION_DATABASE_URL",
+        "MIGRATION_DATABASE_URL_FILE",
+        "POSTGRES_ADMIN_USER",
+        "POSTGRES_ADMIN_PASSWORD",
+        "POSTGRES_MIGRATION_USER",
+        "POSTGRES_MIGRATION_PASSWORD",
+    ],
+)
+def test_production_rejects_admin_or_migration_credentials_in_runtime_process(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+):
+    validate_runtime_security = _load_runtime_validator()
+    secret = f"private-{field_name.casefold()}-sentinel"
+    monkeypatch.setenv(field_name, secret)
+
+    with pytest.raises(RuntimeError) as caught:
+        validate_runtime_security(_secure_production_settings())
+
+    message = str(caught.value)
+    assert field_name in message
+    assert secret not in message
+
+
+def test_development_does_not_require_production_credential_plane_guard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    validate_runtime_security = _load_runtime_validator()
+    monkeypatch.setenv("MIGRATION_DATABASE_URL_FILE", "/private/migration-sentinel")
+    settings = Settings(_env_file=None, APP_ENV="development")
+
+    assert validate_runtime_security(settings) is settings
+
+
 def test_direct_server_app_rejects_unsafe_production_lifespan():
     env = os.environ.copy()
     env["APP_ENV"] = "production"

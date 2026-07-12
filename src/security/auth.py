@@ -59,6 +59,16 @@ _BOUNDARY_SECRET_FIELDS = frozenset(
         "METRICS_TOKEN",
     }
 )
+_FORBIDDEN_PRODUCTION_RUNTIME_ENVIRONMENT = frozenset(
+    {
+        "MIGRATION_DATABASE_URL",
+        "MIGRATION_DATABASE_URL_FILE",
+        "POSTGRES_ADMIN_USER",
+        "POSTGRES_ADMIN_PASSWORD",
+        "POSTGRES_MIGRATION_USER",
+        "POSTGRES_MIGRATION_PASSWORD",
+    }
+)
 
 
 def _setting(settings: Any, name: str, default: Any = "") -> Any:
@@ -142,6 +152,10 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
         return settings
 
     invalid: set[str] = set()
+
+    for field_name in _FORBIDDEN_PRODUCTION_RUNTIME_ENVIRONMENT:
+        if field_name in os.environ:
+            invalid.add(field_name)
 
     placeholder_fields = (
         "POSTGRES_USER",
