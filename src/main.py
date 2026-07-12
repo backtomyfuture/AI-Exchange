@@ -9,7 +9,7 @@ from src.config import get_settings
 from src.security.auth import validate_runtime_security
 from src.utils.logging_setup import setup_logging
 
-from src.db.schema import require_current_database
+from src.db.schema import require_runtime_database
 from src.init_app import get_app_context
 from src.utils import lark_app
 from src.exchange_service import start_worker as exchange_start_worker
@@ -36,7 +36,18 @@ async def lifespan(app: FastAPI):
     # 0. Runtime startup is read-only. Deployment must run the explicit
     # bootstrap command before the service can become ready.
     try:
-        await require_current_database(settings.database_url)
+        await require_runtime_database(
+            settings.database_url,
+            durable_inbox_enabled=bool(
+                getattr(settings, "DURABLE_INBOX_ENABLED", False)
+            ),
+            ingestion_shadow_enabled=bool(
+                getattr(settings, "INGESTION_SHADOW_ENABLED", False)
+            ),
+            sync_reconciliation_enabled=bool(
+                getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
+            ),
+        )
     except Exception as exc:
         logger.error(
             "Database revision check failed at startup: error_type=%s",

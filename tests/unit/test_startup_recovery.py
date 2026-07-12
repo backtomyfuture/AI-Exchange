@@ -70,14 +70,22 @@ def _install_startup_harness(
         events.append("self_healer_init")
         return healer
 
-    async def check_revision(_database_url: str) -> None:
+    async def check_revision(_database_url: str, **_flags: bool) -> None:
         events.append("revision_check")
 
+    revision_check = AsyncMock(side_effect=check_revision)
     monkeypatch.setattr(main_module, "get_settings", lambda: settings)
     monkeypatch.setattr(
         main_module,
+        "require_runtime_database",
+        revision_check,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_module,
         "require_current_database",
-        AsyncMock(side_effect=check_revision),
+        revision_check,
+        raising=False,
     )
     monkeypatch.setattr(main_module, "get_app_context", lambda: context)
     monkeypatch.setattr(main_module, "lark_app", lark)

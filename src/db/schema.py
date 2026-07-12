@@ -6,6 +6,10 @@ import psycopg
 
 
 EXPECTED_DATABASE_REVISION = "20260710_0002"
+PHASE_2_DATABASE_REVISION = "20260710_0003"
+RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset(
+    {EXPECTED_DATABASE_REVISION, PHASE_2_DATABASE_REVISION}
+)
 
 
 class DatabaseRevisionError(RuntimeError):
@@ -32,13 +36,45 @@ async def get_current_database_revision(dsn: str) -> str | None:
 
 async def require_current_database(dsn: str) -> None:
     """Fail readiness unless the database has exactly the expected revision."""
+    await _require_database_revision(dsn, frozenset({EXPECTED_DATABASE_REVISION}))
+
+
+async def require_runtime_database(
+    dsn: str,
+    *,
+    durable_inbox_enabled: bool,
+    ingestion_shadow_enabled: bool,
+    sync_reconciliation_enabled: bool,
+) -> None:
+    """Accept the expand bridge only while all Phase 2 features are disabled."""
+    phase_2_enabled = any(
+        (
+            durable_inbox_enabled,
+            ingestion_shadow_enabled,
+            sync_reconciliation_enabled,
+        )
+    )
+    allowed = (
+        frozenset({PHASE_2_DATABASE_REVISION})
+        if phase_2_enabled
+        else RUNTIME_COMPATIBLE_DATABASE_REVISIONS
+    )
+    await _require_database_revision(dsn, allowed)
+
+
+async def _require_database_revision(
+    dsn: str,
+    allowed_revisions: frozenset[str],
+) -> None:
+    """Fail closed unless the database has one exact allowed Alembic head."""
     current_revision = await get_current_database_revision(dsn)
-    if current_revision == EXPECTED_DATABASE_REVISION:
+    if current_revision in allowed_revisions:
         return
 
     found = current_revision or "unversioned"
+    expected = ", ".join(sorted(allowed_revisions))
     raise DatabaseRevisionError(
         "Database schema revision mismatch: "
-        f"expected {EXPECTED_DATABASE_REVISION}, found {found}. "
+        f"expected one of [{expected}], found {found}. "
         "Run `python -m src.db.bootstrap` before starting the service."
     )

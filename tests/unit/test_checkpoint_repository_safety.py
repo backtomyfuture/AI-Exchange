@@ -1,15 +1,29 @@
+import inspect
 from unittest.mock import AsyncMock
 
 import psycopg
 import pytest
 
 from src.maintenance.checkpoint_repository import (
+    CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS,
     _ELIGIBLE_THREAD_STATS_SQL,
     _LATEST_CHECKPOINT_SHAPE_SQL,
     CheckpointRepositoryError,
     _database_fingerprint,
     _read_database_metadata,
 )
+
+
+def test_cleanup_revision_allowlist_is_fixed_and_independent_from_runtime_bridge():
+    from src.maintenance import checkpoint_repository
+
+    assert CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS == frozenset(
+        {"20260710_0002", "20260710_0003"}
+    )
+    assert (
+        "RUNTIME_COMPATIBLE_DATABASE_REVISIONS"
+        not in inspect.getsource(checkpoint_repository)
+    )
 
 
 def test_candidate_limit_is_applied_before_checkpoint_lateral_aggregates():

@@ -147,6 +147,44 @@ def _receipt(plan, *, backup_id: str, completed_at: datetime) -> str:
     )
 
 
+@pytest.mark.parametrize(
+    "revision",
+    ["20260710_0002", "20260710_0003"],
+    ids=["code-first", "migration-first"],
+)
+async def test_cleanup_plan_preserves_the_actual_compatible_business_revision(
+    checkpoint_schema,
+    tmp_path: Path,
+    revision: str,
+) -> None:
+    checkpoint_schema.execute(
+        "UPDATE alembic_version SET version_num = %s",
+        (revision,),
+    )
+    await _insert_proven_thread(
+        checkpoint_schema.dsn,
+        f"actual-revision-{revision}",
+    )
+    cleaner, _ = _cleaner(
+        checkpoint_schema.dsn,
+        tmp_path / "artifacts",
+        clock=[NOW],
+    )
+
+    plan = await cleaner.plan(older_than=CUTOFF, limit=1)
+    report = await cleaner.run(
+        plan.plan_id,
+        dry_run=True,
+        backup_id=None,
+        limit=plan.limit,
+    )
+
+    assert plan.alembic_revision == revision
+    assert report.dry_run is True
+    assert report.deleted_thread_count == 0
+    assert report.processed_count == 1
+
+
 async def test_live_style_dry_run_preserves_all_checkpoint_rows_and_hashes(
     checkpoint_schema,
     tmp_path: Path,

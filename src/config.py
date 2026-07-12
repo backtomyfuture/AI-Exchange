@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: SecretStr = SecretStr("password")
     CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64: SecretStr = SecretStr("")
 
+    # Durable ingestion rollout. The compatibility bridge accepts the current
+    # and expand revisions only while every Phase 2 feature remains disabled.
+    DURABLE_INBOX_ENABLED: bool = False
+    INGESTION_SHADOW_ENABLED: bool = False
+    SYNC_RECONCILIATION_ENABLED: bool = False
+
     # Exchange
     EXCHANGE_API_URL: str = ""
     EXCHANGE_API_KEY: SecretStr = SecretStr("")

@@ -225,6 +225,54 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
     assert _excluded(snapshot)["too_recent"] == 2
 
 
+@pytest.mark.parametrize(
+    "revision",
+    ["20260710_0002", "20260710_0003"],
+    ids=["code-first", "migration-first"],
+)
+async def test_scan_accepts_compatible_business_revision_and_reports_actual_value(
+    checkpoint_schema,
+    revision,
+):
+    checkpoint_schema.execute(
+        "UPDATE alembic_version SET version_num = %s",
+        (revision,),
+    )
+    await _valid_thread(checkpoint_schema.dsn, f"compatible-{revision}")
+
+    snapshot = await _scan(checkpoint_schema.dsn)
+
+    assert snapshot.alembic_revision == revision
+
+
+@pytest.mark.parametrize(
+    "revisions",
+    [
+        ("20260710_0001",),
+        ("20260710_0004",),
+        ("20260710_9999",),
+        ("20260710_0002", "20260710_0003"),
+    ],
+    ids=["incompatible", "future-unaudited", "unknown", "multiple-heads"],
+)
+async def test_scan_rejects_incompatible_unknown_and_multiple_business_revisions(
+    checkpoint_schema,
+    revisions,
+):
+    checkpoint_schema.execute("DELETE FROM alembic_version")
+    for revision in revisions:
+        checkpoint_schema.execute(
+            "INSERT INTO alembic_version (version_num) VALUES (%s)",
+            (revision,),
+        )
+
+    with pytest.raises(CheckpointRepositoryError) as error:
+        await _scan(checkpoint_schema.dsn)
+
+    assert error.value.code == "cleanup_schema_revision_mismatch"
+    assert str(error.value) == "cleanup_schema_revision_mismatch"
+
+
 async def test_scan_accepts_langgraph_standard_zero_migration_marker(
     checkpoint_schema,
 ):

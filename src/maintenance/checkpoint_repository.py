@@ -20,13 +20,17 @@ import ormsgpack
 import psycopg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from src.db.schema import EXPECTED_DATABASE_REVISION
 from src.maintenance.cleanup_models import (
     EXCLUSION_REASONS,
     MINIMUM_CLEANUP_AGE,
     TERMINAL_CHECKPOINT_STATUSES,
     CleanupCandidate,
     ExclusionBucket,
+)
+
+
+CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS: Final = frozenset(
+    {"20260710_0002", "20260710_0003"}
 )
 MAX_PLAN_THREADS: Final = 100
 MAX_PHYSICAL_ROWS: Final = 500
@@ -491,10 +495,15 @@ async def _read_database_metadata(
     except psycopg.Error:
         raise CheckpointRepositoryError("cleanup_schema_revision_mismatch") from None
 
-    if row is None or [str(item[0]) for item in revision_rows] != [
-        EXPECTED_DATABASE_REVISION
-    ]:
+    actual_revisions = [str(item[0]) for item in revision_rows]
+    if (
+        row is None
+        or len(actual_revisions) != 1
+        or actual_revisions[0]
+        not in CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS
+    ):
         raise CheckpointRepositoryError("cleanup_schema_revision_mismatch")
+    actual_revision = actual_revisions[0]
 
     expected_migrations = list(range(1, len(AsyncPostgresSaver.MIGRATIONS)))
     actual_migrations = [int(item[0]) for item in migration_rows]
@@ -516,7 +525,7 @@ async def _read_database_metadata(
     return _DatabaseMetadata(
         database_fingerprint=fingerprint,
         database_timezone=str(row[5]),
-        alembic_revision=EXPECTED_DATABASE_REVISION,
+        alembic_revision=actual_revision,
         checkpoint_revision=expected_migrations[-1],
     )
 

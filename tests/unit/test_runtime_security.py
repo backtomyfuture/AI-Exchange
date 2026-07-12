@@ -80,6 +80,23 @@ def test_exchange_tls_verification_defaults_to_true(monkeypatch: pytest.MonkeyPa
     assert settings.EXCHANGE_SSL_VERIFY is True
 
 
+def test_phase_2_ingestion_flags_default_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for field_name in (
+        "DURABLE_INBOX_ENABLED",
+        "INGESTION_SHADOW_ENABLED",
+        "SYNC_RECONCILIATION_ENABLED",
+    ):
+        monkeypatch.delenv(field_name, raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.DURABLE_INBOX_ENABLED is False
+    assert settings.INGESTION_SHADOW_ENABLED is False
+    assert settings.SYNC_RECONCILIATION_ENABLED is False
+
+
 def test_secure_production_baseline_is_accepted():
     validate_runtime_security = _load_runtime_validator()
     settings = _secure_production_settings()
@@ -331,12 +348,23 @@ async def test_lifespan_validates_runtime_before_database_or_context():
     from src import main as main_module
 
     settings = _secure_production_settings(EXCHANGE_SSL_VERIFY=False)
+    runtime_database_check = AsyncMock(
+        side_effect=AssertionError("database_reached_before_security_validation")
+    )
+    legacy_database_check = AsyncMock(
+        side_effect=AssertionError("legacy_database_gate_reached")
+    )
     with patch.object(main_module, "get_settings", return_value=settings), patch.object(
         main_module,
-        "require_current_database",
-        new_callable=AsyncMock,
-        side_effect=AssertionError("database_reached_before_security_validation"),
+        "require_runtime_database",
+        new=runtime_database_check,
+        create=True,
     ) as database_check, patch.object(
+        main_module,
+        "require_current_database",
+        new=legacy_database_check,
+        create=True,
+    ), patch.object(
         main_module,
         "get_app_context",
         side_effect=AssertionError("context_reached_before_security_validation"),
@@ -346,6 +374,7 @@ async def test_lifespan_validates_runtime_before_database_or_context():
                 pass
 
     database_check.assert_not_awaited()
+    legacy_database_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio

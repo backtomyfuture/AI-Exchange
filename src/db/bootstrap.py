@@ -13,7 +13,7 @@ from alembic.config import Config
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.config import get_settings
-from src.db.schema import EXPECTED_DATABASE_REVISION
+from src.db.schema import get_current_database_revision
 
 
 logger = logging.getLogger(__name__)
@@ -300,9 +300,12 @@ async def _apply_checkpoint_migrations(dsn: str) -> int:
 async def bootstrap_database(dsn: str) -> dict[str, str | int]:
     """Upgrade both schemas; this is the only supported schema-writing entrypoint."""
     await asyncio.to_thread(_upgrade_business_schema, dsn)
+    business_revision = await get_current_database_revision(dsn)
+    if business_revision is None or "," in business_revision:
+        raise RuntimeError("Business schema revision is unavailable after bootstrap")
     checkpoint_count = await _apply_checkpoint_migrations(dsn)
     summary: dict[str, str | int] = {
-        "alembic": EXPECTED_DATABASE_REVISION,
+        "alembic": business_revision,
         "checkpoint": checkpoint_count,
     }
     logger.info("Database bootstrap complete: %s", summary)

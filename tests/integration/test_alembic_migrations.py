@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import psycopg
 import pytest
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -272,6 +274,46 @@ async def test_bootstrap_applies_checkpoint_migrations_with_autocommit(
     assert schema.table_exists("checkpoint_blobs")
     assert schema.table_exists("checkpoint_writes")
     _assert_expected_checkpoint_indexes(schema)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_reports_the_revision_read_from_the_isolated_database(
+    postgres_database_factory,
+    monkeypatch,
+):
+    from src.db import bootstrap as bootstrap_module
+
+    sentinel = "revision-reader-result"
+    monkeypatch.setattr(
+        bootstrap_module,
+        "get_current_database_revision",
+        AsyncMock(return_value=sentinel),
+    )
+    schema = postgres_database_factory()
+
+    summary = await bootstrap_module.bootstrap_database(schema.dsn)
+    actual_revision = schema.scalar("SELECT version_num FROM alembic_version")
+
+    assert actual_revision
+    assert actual_revision != sentinel
+    assert summary["alembic"] == sentinel
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_reports_the_actual_isolated_database_head(
+    postgres_database_factory,
+):
+    from src.db.bootstrap import bootstrap_database
+
+    schema = postgres_database_factory()
+
+    summary = await bootstrap_database(schema.dsn)
+
+    assert summary["alembic"] == schema.scalar(
+        "SELECT version_num FROM alembic_version"
+    )
 
 
 @pytest.mark.integration

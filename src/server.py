@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
-from src.db.schema import require_current_database
+from src.db.schema import require_runtime_database
 from src.safety.input_limits import input_limits_from_settings
 from src.security.auth import require_metrics_auth, validate_runtime_security
 from src.security.redaction import fingerprint_identifier, safe_log_metadata
@@ -100,7 +100,19 @@ async def health_check():
 async def readiness_check():
     """Read-only database/schema readiness without leaking failure details."""
     try:
-        await require_current_database(get_settings().database_url)
+        settings = get_settings()
+        await require_runtime_database(
+            settings.database_url,
+            durable_inbox_enabled=bool(
+                getattr(settings, "DURABLE_INBOX_ENABLED", False)
+            ),
+            ingestion_shadow_enabled=bool(
+                getattr(settings, "INGESTION_SHADOW_ENABLED", False)
+            ),
+            sync_reconciliation_enabled=bool(
+                getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
+            ),
+        )
         return {"status": "ready"}
     except Exception as exc:
         logger.warning("Readiness check failed: error_type=%s", type(exc).__name__)
