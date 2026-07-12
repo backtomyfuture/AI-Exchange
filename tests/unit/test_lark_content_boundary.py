@@ -10,6 +10,14 @@ from src.storage import ContentRef
 from src.utils import lark_app
 
 
+def _lark_settings(*, debug: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        DEBUG=debug,
+        EXTERNAL_URL="https://example.test",
+        LARK_ALLOWED_OPEN_IDS="user-1",
+    )
+
+
 class FakeContentStore:
     def __init__(self, email):
         self.email = deepcopy(email)
@@ -98,6 +106,7 @@ def production_lark_boundary(monkeypatch):
         "src.graph.state_factory.get_settings",
         lambda: SimpleNamespace(EXCHANGE_ACCOUNT_ID=8),
     )
+    monkeypatch.setattr(lark_app, "get_settings", lambda: _lark_settings(debug=False))
     state = _slim_state()
     graph = SimpleNamespace(
         aget_state=AsyncMock(return_value=state),
@@ -209,7 +218,7 @@ def test_test_push_card_is_resolved_before_graph_or_content_stores(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     graph.aget_state.reset_mock()
     try:
@@ -235,7 +244,7 @@ def test_test_push_prefix_without_explicit_mock_uses_production_boundary(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
 
     result = lark_app.handle_card_action(_event("edit_draft", email_id=email_id))
@@ -256,7 +265,7 @@ def test_seeded_mock_with_debug_disabled_uses_production_boundary(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=False, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=False),
     )
     try:
         result = lark_app.handle_card_action(
@@ -281,7 +290,7 @@ def test_debug_true_non_test_seed_uses_production_action_boundary(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     try:
         result = lark_app.handle_card_action(
@@ -327,7 +336,7 @@ def test_explicit_test_actions_are_in_memory_only(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     exchange = SimpleNamespace(create_draft=AsyncMock())
     monkeypatch.setattr(lark_app, "exchange_client", exchange)
@@ -367,7 +376,7 @@ def test_explicit_test_pdf_uses_dedicated_in_memory_flow(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     production_pdf = AsyncMock()
     test_pdf = AsyncMock()
@@ -407,7 +416,7 @@ def test_explicit_test_recipient_search_uses_seeded_candidates_only(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     lark_app.card_builder.search_person_picker_candidates.return_value = [
         "production-user"
@@ -480,7 +489,7 @@ def test_explicit_test_ui_and_recipient_actions_never_touch_production_state(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     monkeypatch.setattr(
         lark_app,
@@ -530,7 +539,7 @@ async def test_dedicated_test_pdf_flow_uses_only_seeded_email_and_lark(
     monkeypatch.setattr(
         lark_app,
         "get_settings",
-        lambda: SimpleNamespace(DEBUG=True, EXTERNAL_URL="https://example.test"),
+        lambda: _lark_settings(debug=True),
     )
     monkeypatch.setattr(
         lark_app,

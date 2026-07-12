@@ -68,6 +68,7 @@ class TestViewOriginal(unittest.TestCase):
             return_value=SimpleNamespace(
                 DEBUG=True,
                 EXTERNAL_URL="https://example.test",
+                LARK_ALLOWED_OPEN_IDS="user_123",
             ),
         ):
             handle_card_action(mock_event)

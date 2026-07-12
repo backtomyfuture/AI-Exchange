@@ -131,6 +131,14 @@ def action_runtime(monkeypatch):
     monkeypatch.setattr(lark_app, "db_manager", db)
     monkeypatch.setattr(lark_app, "graph", graph)
     monkeypatch.setattr(lark_app, "graph_dependencies", dependencies)
+    monkeypatch.setattr(
+        lark_app,
+        "get_settings",
+        lambda: SimpleNamespace(
+            DEBUG=False,
+            LARK_ALLOWED_OPEN_IDS="user-action",
+        ),
+    )
     return db, drafts, state, graph
 
 

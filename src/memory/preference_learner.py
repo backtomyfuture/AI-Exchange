@@ -165,8 +165,11 @@ class UserPreferenceLearner:
             )
             return [hit.payload for hit in result.points]
 
-        except Exception as e:
-            logger.debug("Preference search failed (non-critical): %s", e)
+        except Exception as exc:
+            logger.debug(
+                "Preference search failed: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     # ------------------------------------------------------------------
@@ -192,8 +195,11 @@ class UserPreferenceLearner:
                         (days,),
                     )
                     return await cur.fetchall()
-        except Exception as e:
-            logger.error("Failed to fetch modified drafts: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch modified drafts: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     async def _fetch_rejections(self, days: int) -> list[dict]:
@@ -213,8 +219,11 @@ class UserPreferenceLearner:
                         (days,),
                     )
                     return await cur.fetchall()
-        except Exception as e:
-            logger.error("Failed to fetch rejection records: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch rejection records: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     async def _analyze_with_llm(
@@ -295,8 +304,11 @@ class UserPreferenceLearner:
             logger.warning("Preference learning: LLM did not call save_preferences")
             return None
 
-        except Exception as e:
-            logger.error("Preference learning LLM analysis failed: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Preference learning LLM analysis failed: error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     async def _store_preferences(self, preferences: list[dict]) -> bool:
@@ -370,6 +382,9 @@ class UserPreferenceLearner:
 
             return False
 
-        except Exception as e:
-            logger.error("Failed to store user preferences: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to store user preferences: error_type=%s",
+                type(exc).__name__,
+            )
             return False

@@ -30,6 +30,7 @@ from src.graph.state_factory import (
     hydrate_email_for_rendering,
     sanitize_graph_delta,
 )
+from src.security.redaction import fingerprint_identifier
 from src.utils.email_renderer import render_email_html
 from src.utils.pdf_generator import convert_html_to_pdf
 
@@ -271,7 +272,10 @@ async def generate_and_upload_pdf(
         caller must reconcile.
     """
     try:
-        logger.info("Starting PDF generation for %s", email_id)
+        logger.info(
+            "Starting PDF generation: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
         loop = asyncio.get_running_loop()
         values = state.values if hasattr(state, "values") else state
         email_data = await hydrate_email_for_rendering(values, dependencies)
@@ -296,7 +300,7 @@ async def generate_and_upload_pdf(
             return None
 
         filename = f"Email_Export_{email_id}.pdf"
-        logger.info("Uploading PDF: %s (size=%d)", filename, len(pdf_bytes))
+        logger.info("Uploading PDF: size=%d", len(pdf_bytes))
 
         try:
             upload_resp = await loop.run_in_executor(
@@ -751,7 +755,10 @@ async def _process_pdf_generation_and_reply_locked(
                         else ()
                     ),
                 )
-        logger.info("PDF reply sent successfully for %s.", email_id)
+        logger.info(
+            "PDF reply sent successfully: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
         return PdfFlowOutcome(status="reply_sent", reply_sent=True)
     except Exception as exc:
         logger.error(

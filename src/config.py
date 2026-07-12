@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
@@ -29,7 +31,8 @@ class Settings(BaseSettings):
     EXCHANGE_API_KEY: SecretStr = SecretStr("")
     EXCHANGE_ACCOUNT_ID: int = 8
     EXCHANGE_ACCOUNT_EMAIL: str = ""
-    EXCHANGE_SSL_VERIFY: bool = False
+    EXCHANGE_SSL_VERIFY: bool = True
+    EXCHANGE_CA_FILE: str = ""
     EXCHANGE_WEBHOOK_SECRET: SecretStr = SecretStr("")
     EXCHANGE_FOLDERS_FULL: str = "收件箱"
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
@@ -50,9 +53,11 @@ class Settings(BaseSettings):
     LARK_ENCRYPT_KEY: SecretStr = SecretStr("")
     LARK_CHAT_ID: str = ""
     LARK_DRIVE_FOLDER_TOKEN: str = ""
+    LARK_ALLOWED_OPEN_IDS: str = ""
 
     # Server
     EXTERNAL_URL: str = "http://localhost:8000"
+    METRICS_TOKEN: SecretStr = SecretStr("")
 
     # Encrypted content storage. Empty key is an intentional fail-closed default.
     CONTENT_STORE_ROOT: str = "/app/data/content"
@@ -97,6 +102,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"
 
     # App
+    APP_ENV: Literal["development", "test", "production"] = "development"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 

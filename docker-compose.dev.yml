@@ -1,0 +1,21 @@
+services:
+  qdrant:
+    ports:
+      - "127.0.0.1:6333:6333"
+
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  ai-assistant-service:
+    environment:
+      APP_ENV: development
+    ports: !override
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./skills_registry:/app/skills_registry
+      - content_data:/app/data/content
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

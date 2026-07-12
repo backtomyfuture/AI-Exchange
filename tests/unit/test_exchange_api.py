@@ -1,5 +1,8 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from pydantic import SecretStr
+
+from src.config import Settings
 from src.utils.exchange_api import ExchangeClient
 
 
@@ -275,3 +278,37 @@ async def test_close_closes_shared_async_client(mock_settings):
 
     assert http_client.is_closed
     assert client._http_client is None
+
+
+def test_exchange_tls_verification_defaults_to_true():
+    settings = Settings(_env_file=None)
+
+    assert settings.EXCHANGE_SSL_VERIFY is True
+
+
+def test_exchange_client_uses_configured_ca_bundle(mock_settings, tmp_path):
+    ca_bundle = tmp_path / "exchange-ca.pem"
+    ca_bundle.write_text("test-ca", encoding="utf-8")
+    mock_settings.EXCHANGE_SSL_VERIFY = True
+    mock_settings.EXCHANGE_CA_FILE = str(ca_bundle)
+    mock_settings.EXCHANGE_API_KEY = SecretStr("api-key-sentinel")
+    client = ExchangeClient(settings=mock_settings)
+
+    with patch("src.utils.exchange_api.httpx.AsyncClient") as async_client:
+        _ = client.http_client
+
+    assert async_client.call_args.kwargs["verify"] == str(ca_bundle)
+    assert async_client.call_args.kwargs["headers"] == {
+        "X-API-KEY": "api-key-sentinel"
+    }
+
+
+def test_exchange_client_uses_system_ca_when_no_bundle(mock_settings):
+    mock_settings.EXCHANGE_SSL_VERIFY = True
+    mock_settings.EXCHANGE_CA_FILE = ""
+    client = ExchangeClient(settings=mock_settings)
+
+    with patch("src.utils.exchange_api.httpx.AsyncClient") as async_client:
+        _ = client.http_client
+
+    assert async_client.call_args.kwargs["verify"] is True

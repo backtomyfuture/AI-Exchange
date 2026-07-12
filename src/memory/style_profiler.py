@@ -228,8 +228,11 @@ class StyleProfiler:
             if points:
                 return points[0].payload
             return None
-        except Exception as e:
-            logger.debug("Failed to load stored style profile: %s", e)
+        except Exception as exc:
+            logger.debug(
+                "Failed to load stored style profile: error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     async def _fetch_sent_replies(self) -> list[dict]:
@@ -265,8 +268,11 @@ class StyleProfiler:
             )
             return [p.payload for p in points] if points else []
 
-        except Exception as e:
-            logger.warning("Failed to fetch sent replies for style profiling: %s", e)
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch sent replies for style profiling: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     @staticmethod
@@ -345,8 +351,11 @@ class StyleProfiler:
             logger.warning("Style profiling: LLM did not call save_style_profile")
             return None
 
-        except Exception as e:
-            logger.error("Style profiling LLM analysis failed: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Style profiling LLM analysis failed: error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     async def _store_profile(self, profile: dict) -> bool:
@@ -407,8 +416,11 @@ class StyleProfiler:
             logger.info("Stored style profile to Qdrant (consolidated_at=%s).", timestamp)
             return True
 
-        except Exception as e:
-            logger.error("Failed to store style profile: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to store style profile: error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     @staticmethod

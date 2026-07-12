@@ -91,8 +91,8 @@ def _compress_image(base64_content: str, max_size: int = COMPRESS_SIZE) -> str:
     except ImportError:
         logger.warning("Pillow not installed, skipping image compression")
         return base64_content
-    except Exception as e:
-        logger.warning(f"Image compression failed, using original: {e}")
+    except Exception as exc:
+        logger.warning("Image compression failed: error_type=%s", type(exc).__name__)
         return base64_content
 
 
@@ -171,15 +171,15 @@ async def analyze_images(image_attachments: List[Dict]) -> str:
         logger.info(f"Image analysis completed: {total_count} images → {len(result)} chars description")
         return result
 
-    except RateLimitError as e:
-        logger.warning(f"Image analysis rate limited: {e}")
+    except RateLimitError as exc:
+        logger.warning("Image analysis rate limited: error_type=%s", type(exc).__name__)
         return f"[图片分析失败: 请求限制，邮件包含 {total_count} 张图片]"
-    except APIConnectionError as e:
-        logger.error(f"Image analysis connection failed: {e}")
+    except APIConnectionError as exc:
+        logger.error("Image analysis connection failed: error_type=%s", type(exc).__name__)
         return f"[图片分析失败: 连接错误，邮件包含 {total_count} 张图片]"
-    except APIError as e:
-        logger.error(f"Image analysis API error: {e}")
+    except APIError as exc:
+        logger.error("Image analysis API failed: error_type=%s", type(exc).__name__)
         return f"[图片分析失败: API 错误，邮件包含 {total_count} 张图片]"
-    except Exception as e:
-        logger.error(f"Image analysis unexpected error: {e}")
-        return f"[图片分析失败: {str(e)[:100]}]"
+    except Exception as exc:
+        logger.error("Image analysis failed: error_type=%s", type(exc).__name__)
+        return "[图片分析失败: 未知错误]"

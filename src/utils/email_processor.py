@@ -12,6 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from langchain_core.messages import HumanMessage
 
 from src.config import get_settings
+from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,17 @@ class EmailProcessor:
             dim = len(test_resp.data[0].embedding)
             logger.info(f"Detected embedding dimension: {dim}")
             return dim
-        except APIConnectionError as e:
-            logger.error(f"Failed to connect to embedding service: {e}")
+        except APIConnectionError as exc:
+            logger.error(
+                "Failed to connect to embedding service: error_type=%s",
+                type(exc).__name__,
+            )
             raise
-        except APIError as e:
-            logger.error(f"API error retrieving embedding dimension: {e}")
+        except APIError as exc:
+            logger.error(
+                "Embedding dimension API failed: error_type=%s",
+                type(exc).__name__,
+            )
             raise
 
     def init_collection(self):
@@ -96,8 +103,8 @@ class EmailProcessor:
                 input=text, model=self.embedding_model,
             )
             return response.data[0].embedding
-        except Exception as e:
-            logger.error("Embedding failed: %s", e)
+        except Exception as exc:
+            logger.error("Embedding failed: error_type=%s", type(exc).__name__)
             return []
 
     def process_email(self, email: Dict[str, Any]) -> bool:
@@ -137,14 +144,14 @@ class EmailProcessor:
 
             response = invoke_with_retry(message)
             return response.content
-        except RateLimitError as e:
-            logger.warning(f"Image analysis rate limited: {e}")
+        except RateLimitError as exc:
+            logger.warning("Image analysis rate limited: error_type=%s", type(exc).__name__)
             return "[图片解析失败: 请求限制]"
-        except APIConnectionError as e:
-            logger.error(f"Image analysis connection failed: {e}")
+        except APIConnectionError as exc:
+            logger.error("Image analysis connection failed: error_type=%s", type(exc).__name__)
             return "[图片解析失败: 连接错误]"
-        except APIError as e:
-            logger.error(f"Image analysis API error: {e}")
+        except APIError as exc:
+            logger.error("Image analysis API failed: error_type=%s", type(exc).__name__)
             return "[图片解析失败]"
 
     @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=1, max=10))
@@ -243,14 +250,26 @@ class EmailProcessor:
                         vector=vector,
                         payload=payload
                     ))
-            except RateLimitError as e:
-                logger.warning(f"Rate limited while embedding email {base_id}: {e}")
+            except RateLimitError as exc:
+                logger.warning(
+                    "Email embedding rate limited: email=%s error_type=%s",
+                    fingerprint_identifier(base_id, namespace="email"),
+                    type(exc).__name__,
+                )
                 continue
-            except APIConnectionError as e:
-                logger.error(f"Connection error embedding email {base_id}: {e}")
+            except APIConnectionError as exc:
+                logger.error(
+                    "Email embedding connection failed: email=%s error_type=%s",
+                    fingerprint_identifier(base_id, namespace="email"),
+                    type(exc).__name__,
+                )
                 continue
-            except APIError as e:
-                logger.error(f"API error embedding email {base_id}: {e}")
+            except APIError as exc:
+                logger.error(
+                    "Email embedding API failed: email=%s error_type=%s",
+                    fingerprint_identifier(base_id, namespace="email"),
+                    type(exc).__name__,
+                )
                 continue
 
         if points:
@@ -268,11 +287,11 @@ class EmailProcessor:
                     total_upserted += len(batch_points)
                 logger.info(f"Successfully upserted {total_upserted} points to Qdrant.")
                 return total_upserted
-            except UnexpectedResponse as e:
-                logger.error(f"Qdrant upsert failed (unexpected response): {e}")
+            except UnexpectedResponse as exc:
+                logger.error("Qdrant upsert failed: error_type=%s", type(exc).__name__)
                 return 0
-            except ConnectionError as e:
-                logger.error(f"Qdrant connection error during upsert: {e}")
+            except ConnectionError as exc:
+                logger.error("Qdrant upsert connection failed: error_type=%s", type(exc).__name__)
                 return 0
         return 0
 
@@ -315,16 +334,32 @@ class EmailProcessor:
                 points=point_filter,
                 wait=False,
             )
-            logger.info("Updated Qdrant labels for %s: %s", email_id, payload_update)
+            logger.info(
+                "Updated Qdrant labels: email=%s field_count=%d",
+                fingerprint_identifier(email_id, namespace="email"),
+                len(payload_update),
+            )
             return True
-        except UnexpectedResponse as e:
-            logger.error(f"Qdrant set_payload failed (unexpected response) for {email_id}: {e}")
+        except UnexpectedResponse as exc:
+            logger.error(
+                "Qdrant set-payload failed: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
             return False
-        except ConnectionError as e:
-            logger.error(f"Qdrant connection error during set_payload for {email_id}: {e}")
+        except ConnectionError as exc:
+            logger.error(
+                "Qdrant set-payload connection failed: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
             return False
-        except Exception as e:
-            logger.error(f"Qdrant set_payload failed for {email_id}: {e}")
+        except Exception as exc:
+            logger.error(
+                "Qdrant set-payload failed: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
             return False
 
     def process_sent_email(self, original_email_data: dict, reply_content: str, reply_id: str = None) -> bool:
@@ -348,5 +383,8 @@ class EmailProcessor:
             "attachments": []
         }
         
-        logger.info(f"Indexing sent reply: {reply_id} (Subject: {subject})")
+        logger.info(
+            "Indexing sent reply: email=%s",
+            fingerprint_identifier(reply_id, namespace="email"),
+        )
         return self.process_email(sent_email)

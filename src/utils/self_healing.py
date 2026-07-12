@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import List, Dict, Any
 from src.domain.email_state import ProcessingOutcome
+from src.security.redaction import fingerprint_identifier
 from src.safety.input_limits import InputLimitExceeded
 from src.utils.circuit_breaker import circuit_breaker
 from src.exchange_service import process_and_archive_email
@@ -55,8 +56,8 @@ class SelfHealer:
             )
         except Exception as exc:
             logger.error(
-                "Self-healing claim release failed: email_id=%s error_type=%s",
-                email_id,
+                "Self-healing claim release failed: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
                 type(exc).__name__,
             )
 
@@ -64,7 +65,10 @@ class SelfHealer:
         """
         Reprocess a single email. Re-uses logic from recovery script but integrated.
         """
-        logger.info("Self-healing: Attempting to reprocess email %s", email_id)
+        logger.info(
+            "Self-healing attempting email: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
 
         claimed = False
         try:
@@ -76,8 +80,8 @@ class SelfHealer:
             )
             if not claimed:
                 logger.info(
-                    "Self-healing claim skipped: email_id=%s",
-                    email_id,
+                    "Self-healing claim skipped: email=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
                 )
                 return False
 
@@ -85,8 +89,8 @@ class SelfHealer:
             email_data = await self.ctx.exchange_client.get_email(email_id)
             if not email_data:
                 logger.error(
-                    "Self-healing could not fetch email: email_id=%s",
-                    email_id,
+                    "Self-healing could not fetch email: email=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
                 )
                 await self._release_claim(email_id)
                 return False
@@ -105,18 +109,21 @@ class SelfHealer:
                 ProcessingOutcome.ARCHIVED,
             }:
                 logger.warning(
-                    "Self-healing did not recover email: email_id=%s outcome=%s",
-                    email_id,
+                    "Self-healing did not recover email: email=%s outcome=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
                     outcome.value if isinstance(outcome, ProcessingOutcome) else "invalid",
                 )
                 await self._release_claim(email_id)
                 return False
-            logger.info("Self-healing successfully recovered email %s", email_id)
+            logger.info(
+                "Self-healing recovered email: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
             return True
         except InputLimitExceeded as exc:
             logger.error(
-                "Self-healing input rejected: email_id=%s category=%s",
-                email_id,
+                "Self-healing input rejected: email=%s category=%s",
+                fingerprint_identifier(email_id, namespace="email"),
                 exc.category,
             )
             if claimed:
@@ -124,8 +131,8 @@ class SelfHealer:
             return False
         except Exception as exc:
             logger.error(
-                "Self-healing recovery failed: email_id=%s error_type=%s",
-                email_id,
+                "Self-healing recovery failed: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
                 type(exc).__name__,
             )
             if claimed:

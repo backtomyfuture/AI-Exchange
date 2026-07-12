@@ -573,8 +573,11 @@ class PatternAnalyzer:
             raw_patterns = json.loads(json_match.group())
             return self._parse_llm_patterns(raw_patterns)
 
-        except Exception as e:
-            logger.warning("LLM 分析失败 (%s)，回退到启发式分析", e)
+        except Exception as exc:
+            logger.warning(
+                "LLM 分析失败，回退到启发式分析: error_type=%s",
+                type(exc).__name__,
+            )
             return self._discover_heuristic()
 
     def _parse_llm_patterns(self, raw: list[dict]) -> list[DiscoveredPattern]:

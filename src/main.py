@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.config import get_settings
+from src.security.auth import validate_runtime_security
 from src.utils.logging_setup import setup_logging
 
 from src.db.schema import require_current_database
@@ -27,16 +28,20 @@ async def lifespan(app: FastAPI):
     Startup: Initialize Context, Start Lark WS, Start Exchange Loop.
     Shutdown: Stop Exchange Loop, Cleanup Context.
     """
-    setup_logging(get_settings().LOG_LEVEL)
+    settings = get_settings()
+    validate_runtime_security(settings)
+    setup_logging(settings.LOG_LEVEL)
     logger.info("Starting AI Assistant Unified Service (Web + Worker)...")
 
     # 0. Runtime startup is read-only. Deployment must run the explicit
     # bootstrap command before the service can become ready.
-    settings = get_settings()
     try:
         await require_current_database(settings.database_url)
     except Exception as exc:
-        logger.exception("Database revision check failed at startup: %s", exc)
+        logger.error(
+            "Database revision check failed at startup: error_type=%s",
+            type(exc).__name__,
+        )
         raise
 
     # 1. Initialize Shared Context
@@ -87,12 +92,15 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(7200)
         while True:
             try:
-                result = await consolidator.consolidate(days=7, min_records=10)
-                logger.info("Memory consolidation result: %s", result)
+                await consolidator.consolidate(days=7, min_records=10)
+                logger.info("Memory consolidation completed")
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error("Memory consolidation failed: %s", e)
+            except Exception as exc:
+                logger.error(
+                    "Memory consolidation failed: error_type=%s",
+                    type(exc).__name__,
+                )
             await asyncio.sleep(86400)
 
     consolidation_task = asyncio.create_task(_consolidation_loop())
@@ -127,6 +135,7 @@ app.router.lifespan_context = lifespan
 
 async def main():
     """Entrypoint for tests: init components and run background loop."""
+    validate_runtime_security(get_settings())
     ctx = get_app_context()
     await ctx.setup_async()
     recovered_actions = (
@@ -158,8 +167,10 @@ async def main():
 
 def run_server():
     """Entrypoint for CLI runtime."""
-    setup_logging(get_settings().LOG_LEVEL)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    settings = get_settings()
+    validate_runtime_security(settings)
+    setup_logging(settings.LOG_LEVEL)
+    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
 
 if __name__ == "__main__":
     run_server()

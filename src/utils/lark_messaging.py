@@ -9,6 +9,7 @@ from typing import List
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
 from src.config import get_settings
+from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,11 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
     if not response.success():
         logger.error("Lark approval card rejected: code=%s", response.code)
         return False
-    logger.info(f"Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
+    logger.info(
+        "Lark approval card sent: email=%s message=%s",
+        fingerprint_identifier(email_id, namespace="email"),
+        fingerprint_identifier(response.data.message_id, namespace="lark_message"),
+    )
     return True
 
 
@@ -109,7 +114,11 @@ def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
     if not response.success():
         logger.error("Lark read-only card rejected: code=%s", response.code)
         return False
-    logger.info(f"Read-only Lark card sent for email {email_id}. Msg ID: {response.data.message_id}")
+    logger.info(
+        "Lark read-only card sent: email=%s message=%s",
+        fingerprint_identifier(email_id, namespace="email"),
+        fingerprint_identifier(response.data.message_id, namespace="lark_message"),
+    )
     return True
 
 
@@ -161,5 +170,5 @@ def send_system_notification(title: str, content: str, template: str = "red",
     if not response.success():
         logger.error("Lark system notification rejected: code=%s", response.code)
         return False
-    logger.info(f"System notification sent: {title}")
+    logger.info("Lark system notification sent")
     return True

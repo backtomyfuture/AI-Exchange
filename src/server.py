@@ -1,22 +1,63 @@
 import hashlib
 import hmac
-import html
 import json
 import logging
-import re
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
+from src.db.schema import require_current_database
 from src.safety.input_limits import input_limits_from_settings
-from src.graph.state_factory import require_owned_content_ref
-from src.storage import ContentStoreError, ContentStoreReferenceError
+from src.security.auth import require_metrics_auth, validate_runtime_security
+from src.security.redaction import fingerprint_identifier, safe_log_metadata
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
+DEBUG_BODY_MAX_CHARS = 1_048_576
 
-app = FastAPI()
+try:
+    SERVICE_VERSION = version("ai-exchange")
+except PackageNotFoundError:
+    SERVICE_VERSION = "0.1.0"
+
+_initial_app_env = str(getattr(get_settings(), "APP_ENV", "development")).casefold()
+_docs_enabled = _initial_app_env != "production"
+
+
+@asynccontextmanager
+async def secure_service_lifespan(application: FastAPI):
+    """Make the exported server app use the same guarded unified runtime."""
+
+    validate_runtime_security(get_settings())
+    from src.main import lifespan as unified_lifespan
+
+    async with unified_lifespan(application):
+        yield
+
+
+app = FastAPI(
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+    lifespan=secure_service_lifespan,
+)
+
+
+@app.middleware("http")
+async def hide_production_only_surfaces(request: Request, call_next):
+    """Hide DEBUG/preview routes before request-body parsing in production."""
+
+    app_env = str(getattr(get_settings(), "APP_ENV", "development")).casefold()
+    path = request.url.path
+    if app_env == "production" and (
+        path.startswith("/debug/") or path.startswith("/email/")
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+    return await call_next(request)
 
 
 def _get_app_context():
@@ -47,71 +88,32 @@ async def enqueue_exchange_webhook(
 
 @app.get("/health")
 async def health_check():
-    """
-    服务健康检查 endpoint，用于 Docker healthcheck 和外部监控。
-    """
+    """Dependency-free liveness endpoint used by Docker and supervisors."""
+    return {
+        "status": "ok",
+        "version": SERVICE_VERSION,
+        "time": datetime.now(UTC).isoformat(),
+    }
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Read-only database/schema readiness without leaking failure details."""
     try:
-        ctx = get_app_context()
-
-        # DB ping
-        db_ok = False
-        try:
-            async with ctx.db_manager.get_connection() as conn:
-                await conn.execute("SELECT 1")
-                db_ok = True
-        except Exception:
-            pass
-
-        # Queue depth
-        from src.exchange_service import _webhook_queue, WEBHOOK_QUEUE_MAXSIZE
-        queue_depth = _webhook_queue.qsize() if _webhook_queue else 0
-        queue_capacity = (
-            _webhook_queue.maxsize if _webhook_queue and _webhook_queue.maxsize
-            else WEBHOOK_QUEUE_MAXSIZE
-        )
-
-        # Circuit breaker
-        from src.utils.circuit_breaker import circuit_breaker
-        cb_open = circuit_breaker.is_open
-
-        checks = {
-            "db_ping": db_ok,
-            "graph": ctx.graph is not None,
-            "lark_client": lark_app.lark_api_client is not None,
-            "circuit_breaker_open": cb_open,
-        }
-
-        circuit_breaker_state = {
-            "open": cb_open,
-            "failure_count": circuit_breaker.failure_count,
-            "failure_threshold": circuit_breaker.failure_threshold,
-            "window_seconds": circuit_breaker.window_seconds,
-            "last_error": circuit_breaker.last_error,
-        }
-
-        healthy = db_ok and ctx.graph is not None and not cb_open
-
-        return JSONResponse(
-            status_code=200 if healthy else 503,
-            content={
-                "status": "healthy" if healthy else "degraded",
-                "checks": checks,
-                "queue_depth": queue_depth,
-                "queue_capacity": queue_capacity,
-                "circuit_breaker": circuit_breaker_state,
-            }
-        )
+        await require_current_database(get_settings().database_url)
+        return {"status": "ready"}
     except Exception as exc:
-        logger.error("Health check failed: error_type=%s", type(exc).__name__)
+        logger.warning("Readiness check failed: error_type=%s", type(exc).__name__)
         return JSONResponse(
             status_code=503,
-            content={"status": "error", "message": "health_check_failed"},
+            content={"status": "not_ready"},
         )
 
 
 @app.get("/metrics")
-async def metrics_endpoint() -> Response:
+async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint."""
+    require_metrics_auth(request, get_settings())
     from src.observability.metrics import render_metrics
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
@@ -137,6 +139,13 @@ async def exchange_webhook(request: Request):
     webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
     if not webhook_secret:
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
+
+    media_type = request.headers.get("Content-Type", "").partition(";")[0]
+    if media_type.strip().casefold() != "application/json":
+        raise HTTPException(
+            status_code=415,
+            detail="Content-Type must be application/json",
+        )
 
     max_bytes = input_limits_from_settings(settings).webhook_bytes
     body_parts: list[bytes] = []
@@ -168,72 +177,76 @@ async def exchange_webhook(request: Request):
         logger.warning("Exchange webhook payload root is not an object")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
+    payload_event = payload.get("event_type") or payload.get("event")
+    if header_event and (
+        not isinstance(payload_event, str)
+        or not hmac.compare_digest(header_event, payload_event)
+    ):
+        logger.warning("Rejected Exchange webhook event-header mismatch")
+        raise HTTPException(status_code=400, detail="Webhook event mismatch")
+
     try:
         result = await enqueue_exchange_webhook(payload, header_event=header_event)
-        logger.info(
-            "Exchange webhook routed: event_header=%s event_payload=%s queued=%s reason=%s route=%s folder=%s",
-            header_event,
-            payload.get("event_type") or payload.get("event"),
-            result.get("queued"),
-            result.get("reason"),
-            result.get("route"),
-            result.get("folder"),
+        if not isinstance(result, dict):
+            raise RuntimeError("invalid_webhook_enqueue_result")
+        outcome = safe_log_metadata(
+            "queue_full" if result.get("reason") == "queue_full" else "accepted",
+            allowed_values={"accepted", "queue_full"},
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
+        logger.info(
+            "Exchange webhook routed: queued=%s outcome=%s",
+            bool(result.get("queued")),
+            outcome,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Rejected invalid Exchange webhook event: error_type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=400, detail="Invalid webhook event") from None
+    except Exception as exc:
         logger.error(
             "Failed to process Exchange webhook: error_type=%s",
-            type(e).__name__,
+            type(exc).__name__,
         )
-        raise HTTPException(status_code=502, detail="Failed to process webhook event")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to process webhook event",
+        ) from None
 
     if result.get("reason") == "queue_full":
         raise HTTPException(
             status_code=503,
-            detail={"status": "queue_full", **result},
+            detail={"status": "queue_full", "reason": "queue_full"},
         )
 
-    return {"status": "ok", **result}
+    return {"status": "ok", "queued": bool(result.get("queued"))}
 
-
-def _format_address_str(raw_str: str) -> str:
-    """Format address string like 'name=..., email=...' to 'Name <email>'"""
-    if not raw_str:
-        return ""
-    try:
-        # Check for our project's specific string format
-        m = re.search(r"name=['\"](.*?)['\"],?\s*email_address=['\"](.*?)['\"]", str(raw_str))
-        if m:
-            name, email = m.groups()
-            return f"{html.escape(name)} &lt;{html.escape(email)}&gt;"
-        
-        # Check for standard "Name <email>" format
-        m2 = re.search(r"(.*?) <(.*?)>", str(raw_str))
-        if m2:
-            return f"{html.escape(m2.group(1).strip())} &lt;{html.escape(m2.group(2).strip())}&gt;"
-
-        return html.escape(str(raw_str))
-    except Exception:
-        return html.escape(str(raw_str))
 
 class MockEmailData(BaseModel):
-    id: str
-    subject: str
-    sender: str
-    to: List[str]
-    cc: List[str] = Field(default_factory=list)
-    body: str
-    received_at: str
-    attachments: List[Dict[str, Any]] = Field(default_factory=list)
-    draft: str = ""
-    context: List[Dict[str, Any]] = Field(default_factory=list)
+    id: str = Field(min_length=1, max_length=512)
+    subject: str = Field(max_length=998)
+    sender: str = Field(max_length=1_024)
+    to: List[str] = Field(min_length=1, max_length=100)
+    cc: List[str] = Field(default_factory=list, max_length=100)
+    body: str = Field(max_length=DEBUG_BODY_MAX_CHARS)
+    received_at: str = Field(max_length=128)
+    attachments: List[Dict[str, Any]] = Field(default_factory=list, max_length=20)
+    draft: str = Field(default="", max_length=DEBUG_BODY_MAX_CHARS)
+    context: List[Dict[str, Any]] = Field(default_factory=list, max_length=20)
     classification: Dict[str, Any] = Field(default_factory=dict)
-    attachment_tokens: List[str] = Field(default_factory=list)
-    pdf_token: Optional[str] = None
+    attachment_tokens: List[str] = Field(default_factory=list, max_length=20)
+    pdf_token: Optional[str] = Field(default=None, max_length=512)
     recipient_candidates: Dict[str, List[Any]] = Field(
         default_factory=lambda: {"to": [], "cc": []}
     )
+
+
+def _require_debug_endpoint(settings: Any) -> None:
+    if str(getattr(settings, "APP_ENV", "development")).casefold() == "production":
+        raise HTTPException(status_code=404, detail="Not found")
+    if not bool(getattr(settings, "DEBUG", False)):
+        raise HTTPException(status_code=403, detail="Debug endpoints disabled")
 
 @app.post("/debug/inject_email")
 async def inject_test_email(data: MockEmailData):
@@ -241,15 +254,17 @@ async def inject_test_email(data: MockEmailData):
     Inject a test email into the in-memory mock store for viewing.
     """
     settings = get_settings()
-    if not settings.DEBUG:
-        raise HTTPException(status_code=403, detail="Debug endpoints disabled in production")
+    _require_debug_endpoint(settings)
     if not lark_app.is_test_card_id(data.id):
         raise HTTPException(
             status_code=400,
             detail="Debug email id must use the test_push_ namespace",
         )
 
-    logger.info(f"Injecting mock email: {data.id}")
+    logger.info(
+        "Injecting DEBUG mock email: email=%s",
+        fingerprint_identifier(data.id, namespace="debug_email"),
+    )
     
     # Construct state-like object
     # The view_email function expects state.values.get("email")
@@ -289,11 +304,7 @@ async def inject_test_email(data: MockEmailData):
 async def delete_test_email(email_id: str):
     """Remove only an explicitly namespaced DEBUG test-card state."""
     settings = get_settings()
-    if not settings.DEBUG:
-        raise HTTPException(
-            status_code=403,
-            detail="Debug endpoints disabled in production",
-        )
+    _require_debug_endpoint(settings)
     if not lark_app.is_test_card_id(email_id):
         raise HTTPException(
             status_code=400,
@@ -308,52 +319,30 @@ async def delete_test_email(email_id: str):
 
 @app.get("/email/{email_id:path}", response_class=HTMLResponse)
 async def view_email(email_id: str):
-    """
-    Serve the email content as Outlook-style HTML.
-    """
+    """Render only an explicitly seeded DEBUG test card until Phase 5."""
     settings = get_settings()
     is_explicit_debug_email = (
         bool(settings.DEBUG)
+        and str(getattr(settings, "APP_ENV", "development")).casefold()
+        != "production"
         and lark_app.is_test_card_id(email_id)
         and email_id in lark_app._mock_store
     )
-    if is_explicit_debug_email:
-        state = lark_app._mock_store[email_id]
-        email_data = state.values.get("email", {})
-    else:
-        app_ctx = get_app_context()
-        try:
-            ref = await app_ctx.db_manager.get_content_ref(email_id)
-            if ref is None:
-                raise HTTPException(status_code=404, detail="Email content not found")
-            owned_ref = require_owned_content_ref(
-                ref,
-                expected_account_id=settings.EXCHANGE_ACCOUNT_ID,
-            )
-            email_data = await app_ctx.content_store.load_email(
-                owned_ref,
-                include_attachments=True,
-            )
-            loaded_id = email_data.get("id")
-            if loaded_id not in (None, "", email_id):
-                raise ContentStoreReferenceError("content_email_mismatch")
-        except HTTPException:
-            raise
-        except (ContentStoreError, ContentStoreReferenceError) as exc:
-            logger.warning(
-                "Original email content unavailable: error_type=%s",
-                type(exc).__name__,
-            )
-            raise HTTPException(status_code=404, detail="Email content unavailable")
-        except Exception as exc:
-            logger.error(
-                "Original email load failed: error_type=%s",
-                type(exc).__name__,
-            )
-            raise HTTPException(status_code=500, detail="Internal Error")
+    if not is_explicit_debug_email:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    state = lark_app._mock_store[email_id]
+    email_data = state.values.get("email", {})
     
     # Use shared renderer
     from src.utils.email_renderer import render_email_html
     full_email_html = render_email_html(email_data)
     
-    return full_email_html
+    return HTMLResponse(
+        content=full_email_html,
+        headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

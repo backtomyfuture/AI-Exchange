@@ -142,8 +142,11 @@ class MemoryConsolidator:
                         (days,),
                     )
                     return await cur.fetchall()
-        except Exception as e:
-            logger.error("Failed to fetch records for consolidation: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch records for consolidation: error_type=%s",
+                type(exc).__name__,
+            )
             return []
 
     async def _load_existing_experience(self) -> str:
@@ -174,8 +177,11 @@ class MemoryConsolidator:
                 confidence = p.payload.get("confidence", 0)
                 lines.append(f"- [{category}] (conf={confidence:.1f}) {pattern}")
             return "\n".join(lines)
-        except Exception as e:
-            logger.warning("Failed to load existing experience: %s", e)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load existing experience: error_type=%s",
+                type(exc).__name__,
+            )
             return ""
 
     async def _analyze_with_llm(
@@ -252,8 +258,11 @@ Call the save_experience tool with your analysis.
             logger.warning("Memory consolidation: LLM did not call save_experience")
             return None
 
-        except Exception as e:
-            logger.error("Memory consolidation LLM analysis failed: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Memory consolidation LLM analysis failed: error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     async def _store_insights(self, insights: list[dict], summary: str) -> bool:
@@ -328,8 +337,11 @@ Call the save_experience tool with your analysis.
 
             return False
 
-        except Exception as e:
-            logger.error("Failed to store experience insights: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Failed to store experience insights: error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
 
@@ -381,6 +393,9 @@ async def search_experience(
 
         return [hit.payload for hit in result.points]
 
-    except Exception as e:
-        logger.debug("Experience search failed (non-critical): %s", e)
+    except Exception as exc:
+        logger.debug(
+            "Experience search failed: error_type=%s",
+            type(exc).__name__,
+        )
         return []

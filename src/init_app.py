@@ -91,10 +91,10 @@ class AppContext:
             }
             self.exchange_client.init_folder_policies(folders_full, folders_archive)
             logger.info("Exchange folder cache and routing policies initialized.")
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                "Failed to initialize folder cache (will use safe defaults): %s",
-                e,
+                "Failed to initialize folder cache; using safe defaults: error_type=%s",
+                type(exc).__name__,
             )
         
         if self.graph is None:

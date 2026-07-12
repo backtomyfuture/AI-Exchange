@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Any, Optional
 from src.safety.http_response import read_json_limited
 from src.safety.input_limits import input_limits_from_settings
+from src.security.redaction import fingerprint_identifier
 logger = logging.getLogger("ExchangeClient")
 
 SENTITEMS_FOLDER_ALIASES = {"已发送邮件", "已发送", "sent items", "sentitems", "sent"}
@@ -27,7 +28,9 @@ class ExchangeClient:
         from src.config import resolve_secret
         self.api_key = resolve_secret(settings.EXCHANGE_API_KEY)
         self.account_id = settings.EXCHANGE_ACCOUNT_ID
-        self.ssl_verify = settings.EXCHANGE_SSL_VERIFY
+        ssl_verify = bool(settings.EXCHANGE_SSL_VERIFY)
+        ca_file = str(getattr(settings, "EXCHANGE_CA_FILE", "") or "").strip()
+        self.ssl_verify: bool | str = ca_file if ssl_verify and ca_file else ssl_verify
         self._input_limits = input_limits_from_settings(settings)
 
         if not self.api_url:
@@ -91,24 +94,25 @@ class ExchangeClient:
                     folders = response.json().get("data", {}).get("folders", [])
                     self._build_folder_cache(folders)
                     logger.info(
-                        "Folder cache loaded from %s: %s folders. sentitems=%s, drafts=%s",
-                        endpoint,
+                        "Folder cache loaded: count=%d sentitems=%s drafts=%s",
                         len(self._folder_cache),
-                        self.sentitems_folder_id,
-                        self.drafts_folder_id,
+                        bool(self.sentitems_folder_id),
+                        bool(self.drafts_folder_id),
                     )
                     return self._folder_cache
                 logger.warning(
-                    "Folder endpoint returned %s: %s",
+                    "Folder endpoint returned non-success: status=%s",
                     response.status_code,
-                    endpoint,
                 )
             logger.warning(
                 "Failed to get folders from all candidate endpoints. "
                 "Routing will use safe fallback mode."
             )
-        except Exception as e:
-            logger.error("Exception getting folders: %s", e)
+        except Exception as exc:
+            logger.error(
+                "Exception getting folders: error_type=%s",
+                type(exc).__name__,
+            )
 
         self._folder_cache = {}
         self._folder_tree = {}
@@ -249,7 +253,7 @@ class ExchangeClient:
         try:
             # 1. 获取列表
             list_url = f"{self.api_url}/list"
-            logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
+            logger.info("Fetching Exchange email list")
 
             async with client.stream(
                 "GET",
@@ -265,11 +269,7 @@ class ExchangeClient:
                     max_bytes=self._input_limits.exchange_response_bytes,
                 )
             # 打印原始数据结构以供调试
-            logger.info(
-                "列表接口返回数据状态: %s, 消息: %s",
-                data.get("code"),
-                data.get("message"),
-            )
+            logger.info("Exchange email list returned: code=%s", data.get("code"))
 
             list_data = data.get("data")
             if not isinstance(list_data, dict):
@@ -304,7 +304,10 @@ class ExchangeClient:
                 detail_url = f"{self.api_url}/{encoded_id}"
 
                 try:
-                    logger.info("正在请求详情: %s", detail_url)
+                    logger.info(
+                        "Fetching Exchange email detail: email=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
+                    )
                     async with client.stream(
                         "GET",
                         detail_url,
@@ -323,17 +326,20 @@ class ExchangeClient:
                                     detail_data["id"] = email_id
                                 full_emails.append(detail_data)
                             else:
-                                logger.warning("邮件详情为空 (ID: %s)", email_id)
+                                logger.warning(
+                                    "Exchange email detail was empty: email=%s",
+                                    fingerprint_identifier(email_id, namespace="email"),
+                                )
                         else:
                             logger.error(
-                                "详情获取失败 (ID: %s): status=%s",
-                                email_id,
+                                "Exchange email detail failed: email=%s status=%s",
+                                fingerprint_identifier(email_id, namespace="email"),
                                 detail_resp.status_code,
                             )
                 except Exception as detail_err:
                     logger.error(
-                        "请求详情异常 (ID: %s): error_type=%s",
-                        email_id,
+                        "Exchange email detail raised: email=%s error_type=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
                         type(detail_err).__name__,
                     )
 
@@ -368,7 +374,7 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            logger.info("正在请求保存草稿接口: %s", endpoint)
+            logger.info("Calling Exchange create-draft endpoint")
             response = await client.post(
                 endpoint,
                 json=payload,
@@ -414,7 +420,7 @@ class ExchangeClient:
         client = self.http_client
         try:
             action = "保存草稿" if is_draft else "发送邮件"
-            logger.info("正在请求%s接口: %s", action, endpoint)
+            logger.info("Calling Exchange draft endpoint: action=%s", action)
             response = await client.post(
                 endpoint,
                 json=payload,
@@ -479,8 +485,13 @@ class ExchangeClient:
         try:
             response = await client.post(endpoint, json=payload, timeout=5.0)
             return response.status_code == 200
-        except Exception as e:
-            logger.error("Failed to move email %s to %s: %s", email_id, folder_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to move Exchange email: email=%s folder=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                fingerprint_identifier(folder_id, namespace="exchange_folder"),
+                type(exc).__name__,
+            )
             return False
 
     async def delete_email(self, email_id: str) -> bool:
@@ -493,8 +504,12 @@ class ExchangeClient:
         try:
             response = await client.delete(endpoint, timeout=5.0)
             return response.status_code == 200
-        except Exception as e:
-            logger.error("Failed to delete email %s: %s", email_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to delete Exchange email: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
             return False
 
     async def get_email(
@@ -525,15 +540,15 @@ class ExchangeClient:
                     email_data = payload.get("data")
                     return email_data if isinstance(email_data, dict) and email_data else None
                 logger.error(
-                    "Failed to get email details for %s: status=%s",
-                    email_id,
+                    "Failed to get Exchange email details: email=%s status=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
                     response.status_code,
                 )
-        except Exception as e:
+        except Exception as exc:
             logger.error(
-                "Exception getting email %s: error_type=%s",
-                email_id,
-                type(e).__name__,
+                "Exception getting Exchange email: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
             )
         return None
 
@@ -556,7 +571,7 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            logger.info("正在请求回复接口: %s", endpoint)
+            logger.info("Calling Exchange reply endpoint")
             response = await client.post(endpoint, json=payload, timeout=15.0)
             if response.status_code == 200:
                 return response.json().get("code") == 200
@@ -602,12 +617,16 @@ class ExchangeClient:
                     return data["data"][0].get("name")
             else:
                 logger.warning(
-                    "Contact resolve failed for '%s': %s",
-                    query,
+                    "Exchange contact resolution failed: query=%s status=%s",
+                    fingerprint_identifier(query, namespace="contact_query"),
                     response.status_code,
                 )
-        except Exception as e:
-            logger.error("Contact resolve exception for '%s': %s", query, e)
+        except Exception as exc:
+            logger.error(
+                "Exchange contact resolution raised: query=%s error_type=%s",
+                fingerprint_identifier(query, namespace="contact_query"),
+                type(exc).__name__,
+            )
         
         return None
 
@@ -627,7 +646,7 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            logger.info("正在请求转发接口: %s", endpoint)
+            logger.info("Calling Exchange forward endpoint")
             response = await client.post(endpoint, json=payload, timeout=15.0)
             if response.status_code == 200:
                 return response.json().get("code") == 200

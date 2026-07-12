@@ -27,6 +27,7 @@ from src.safety.manual_review import (
     build_manual_review_delta,
     normalize_manual_review_code,
 )
+from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.utils.notification_policy import decide_notification_kind
@@ -135,7 +136,10 @@ async def _ingest_to_qdrant(email_id: str, email_data: dict, ctx) -> None:
     """Ingest email into Qdrant vector store (sync call wrapped in thread)."""
     try:
         await asyncio.to_thread(ctx.email_processor.process_email, email_data)
-        logger.info(f"Email {email_id} ingested to Qdrant.")
+        logger.info(
+            "Email ingested to Qdrant: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
         await ctx.db_manager.update_status(email_id, "ingested")
     except DatabaseOperationError:
         raise
@@ -662,7 +666,10 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         )
 
     if kind == "approval":
-        logger.info(f"Email requires reply. Sending Lark approval request: {email_id}")
+        logger.info(
+            "Sending Lark approval request: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
         pdf_result = await lark_app.generate_and_upload_pdf(email_id)
         pdf_stage = await _stage_notification_pdf(
             email_id,
@@ -711,7 +718,10 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                     cause=exc,
                 ) from None
         else:
-            logger.error("Approval card delivery failed for %s; leaving on Exchange unread.", email_id)
+            logger.error(
+                "Approval card delivery failed; leaving Exchange unread: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
             await ctx.db_manager.update_status(
                 email_id, "delivery_failed",
                 error_message="Approval card send returned failure",
@@ -724,7 +734,12 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
         return {"delivered": delivered, "kind": "approval"}
 
     if kind == "read_only":
-        logger.info(f"Email is read-worthy ({priority}/{intent}) but no reply needed. Sending Read-Only card: {email_id}")
+        logger.info(
+            "Sending read-only Lark card: email=%s priority=%s intent=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+            priority,
+            intent,
+        )
         pdf_result = await lark_app.generate_and_upload_pdf(email_id)
         pdf_stage = await _stage_notification_pdf(
             email_id,
@@ -772,7 +787,10 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                     cause=exc,
                 ) from None
         else:
-            logger.error("Read-only card delivery failed for %s; leaving on Exchange unread.", email_id)
+            logger.error(
+                "Read-only card delivery failed; leaving Exchange unread: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
             await ctx.db_manager.update_status(
                 email_id, "delivery_failed",
                 error_message="Read-only card send returned failure",
@@ -784,7 +802,10 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             pass
         return {"delivered": delivered, "kind": "read_only"}
 
-    logger.info(f"No reply needed for email: {email_id}")
+    logger.info(
+        "Email requires no notification: email=%s",
+        fingerprint_identifier(email_id, namespace="email"),
+    )
     await ctx.db_manager.update_status(email_id, "skipped")
     try:
         from src.observability.metrics import record_card_dispatch
@@ -800,9 +821,15 @@ async def _mark_email_read(email_id: str, ctx) -> None:
     try:
         success = await ctx.exchange_client.mark_as_read(email_id, is_read=True)
         if success:
-            logger.info(f"Email {email_id} marked as read on server.")
+            logger.info(
+                "Email marked read on Exchange: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
         else:
-            logger.warning(f"Failed to mark {email_id} as read.")
+            logger.warning(
+                "Exchange mark-read returned failure: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
     except Exception as exc:
         logger.error("Mark-as-read failed: error_type=%s", type(exc).__name__)
 
@@ -839,13 +866,10 @@ async def _process_and_archive_email_inner(
     email_data, ctx, skip_analysis, force_reprocess, thread_id, config
 ) -> ProcessingOutcome:
     event_type = email_data.get("_event_type", "unknown")
-    folder_name = email_data.get("_parent_folder_name", "unknown")
     logger.info(
-        "Starting processing for email: %s - %s (event=%s, folder=%s, skip_analysis=%s, force=%s)",
-        thread_id,
-        email_data.get("subject"),
+        "Starting email processing: email=%s event=%s skip_analysis=%s force=%s",
+        fingerprint_identifier(thread_id, namespace="email"),
         event_type,
-        folder_name,
         skip_analysis,
         force_reprocess,
     )
@@ -859,7 +883,10 @@ async def _process_and_archive_email_inner(
 
     initial_write = await ctx.db_manager.log_initial_email(email_data)
     if initial_write is InitialEmailWriteResult.DUPLICATE and not force_reprocess:
-        logger.info("Email %s already exists in DB.", thread_id)
+        logger.info(
+            "Email already exists in database: email=%s",
+            fingerprint_identifier(thread_id, namespace="email"),
+        )
         if not skip_analysis:
             status = await ctx.db_manager.get_email_status(thread_id)
             if status in SAFE_DUPLICATE_READ_STATUSES:
@@ -875,7 +902,10 @@ async def _process_and_archive_email_inner(
         ),
     )
 
-    logger.info("Email %s logged to DB as 'pending'.", thread_id)
+    logger.info(
+        "Email logged as pending: email=%s",
+        fingerprint_identifier(thread_id, namespace="email"),
+    )
 
     if skip_analysis:
         await _archive_only(thread_id, email_data, ctx, event_type)
@@ -1074,7 +1104,11 @@ async def _archive_only(thread_id: str, email_data: dict, ctx, event_type: str) 
     """Archive-folder route: ingest into Qdrant only; never touch mark_as_read."""
     await _ingest_to_qdrant(thread_id, email_data, ctx)
     await ctx.db_manager.update_status(thread_id, "archived")
-    logger.info("Email %s archived (Qdrant only, event=%s).", thread_id, event_type)
+    logger.info(
+        "Email archived to Qdrant: email=%s event=%s",
+        fingerprint_identifier(thread_id, namespace="email"),
+        event_type,
+    )
 
 
 async def _snapshot_cleanup_handles(
@@ -1496,8 +1530,8 @@ async def _run_ai_path(
             await _mark_email_read(thread_id, ctx)
         else:
             logger.warning(
-                "Skipping mark_as_read for %s: delivery_failed (kind=%s).",
-                thread_id,
+                "Skipping mark-read after delivery failure: email=%s kind=%s",
+                fingerprint_identifier(thread_id, namespace="email"),
                 dispatch_result.get("kind"),
             )
             return ProcessingOutcome.FAILED
@@ -1593,7 +1627,10 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
             policy = exchange_client.get_folder_policy(parent_folder_id)
         else:
             policy = "full"
-            logger.warning("Folder policies not loaded; defaulting %s to full pipeline", email_id)
+            logger.warning(
+                "Folder policies not loaded; defaulting to full pipeline: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
 
         if policy == "full":
             route = "full"
@@ -1638,10 +1675,10 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
             pass
     except asyncio.QueueFull:
         logger.error(
-            "Webhook queue full (max=%s); rejecting %s id=%s. Sender should retry.",
+            "Webhook queue full: max=%s event=%s email=%s",
             getattr(queue, "maxsize", "?"),
             event_type,
-            email_id,
+            fingerprint_identifier(email_id, namespace="email"),
         )
         return {
             "queued": False,
@@ -1650,11 +1687,10 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
             "queue_size": queue.qsize(),
         }
     logger.info(
-        "Enqueued %s [%s]: %s (folder=%s, skip_analysis=%s)",
+        "Enqueued webhook event: event=%s route=%s email=%s skip_analysis=%s",
         event_type,
         route,
-        email_id,
-        folder_name or "unknown",
+        fingerprint_identifier(email_id, namespace="email"),
         skip_analysis,
     )
     return {
@@ -1806,14 +1842,17 @@ class WebhookWorker:
         try:
             if "body" not in email_data:
                 email_id = email_data.get("id")
-                logger.info(f"Fetching details for {email_id}...")
+                logger.info(
+                    "Fetching webhook email details: email=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
+                )
                 full_details = await self._ctx.exchange_client.get_email(email_id)
                 if full_details:
                     email_data.update(full_details)
                 else:
                     logger.warning(
-                        "Skip webhook event because detail fetch failed (id=%s, event=%s).",
-                        email_id,
+                        "Skipping webhook after detail fetch failure: email=%s event=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
                         email_data.get("_event_type", "unknown"),
                     )
                     return

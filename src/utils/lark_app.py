@@ -42,6 +42,8 @@ from src.safety.approval_claim import (
 from src.safety.input_limits import input_limits_from_settings
 from src.safety.manual_review import build_manual_review_delta
 from src.safety.recipients import normalize_recipient_address
+from src.security.auth import is_lark_operator_allowed
+from src.security.redaction import fingerprint_identifier
 from src.utils.lark_recipient_editor import (
     build_recipient_field,
     clear_recipient_edit_temp,
@@ -70,6 +72,35 @@ from src.commands.handlers import (
 logger = logging.getLogger(__name__)
 TEST_CARD_ID_PREFIX = "test_push_"
 ACTION_WAIT_TIMEOUT_SECONDS = 30
+LARK_IDENTIFIER_MAX_LENGTH = 512
+ALLOWED_CARD_ACTIONS = frozenset(
+    {
+        "approve",
+        "reject",
+        "reject_with_reason",
+        "save_draft_only",
+        "view_original",
+        "view_original_pdf",
+        "mark_read",
+        "edit_to",
+        "edit_cc",
+        "edit_draft",
+        "select_to",
+        "select_cc",
+        "save_to",
+        "search_to",
+        "search_cc",
+        "save_cc",
+        "save_draft",
+        "submit",
+        "Button_submit",
+        "form_submit_draft",
+        "cancel_edit",
+        "modify",
+        "save_modification",
+        "cancel_modification",
+    }
+)
 
 # Global instances
 lark_ws_client: Optional[WsClient] = None
@@ -110,6 +141,20 @@ def _read_nested(obj: Any, *path: str) -> Any:
     return current
 
 
+def _valid_lark_identifier(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= LARK_IDENTIFIER_MAX_LENGTH
+        and not any(character in value for character in "\r\n\0")
+    )
+
+
+def _rejected_card_action(content: str = "无权执行该操作") -> dict[str, Any]:
+    return {"toast": {"type": "error", "content": content}}
+
+
 def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str) -> bool:
     """
     验证飞书事件签名，确保请求来源合法。
@@ -127,8 +172,8 @@ def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str)
     encrypt_key = resolve_secret(settings.LARK_ENCRYPT_KEY)
     
     if not encrypt_key:
-        logger.warning("LARK_ENCRYPT_KEY not configured, skipping signature verification.")
-        return True
+        logger.warning("LARK_ENCRYPT_KEY not configured; signature rejected.")
+        return False
     
     content = f"{timestamp}{nonce}{encrypt_key}{body}"
     expected_signature = hashlib.sha256(content.encode('utf-8')).hexdigest()
@@ -193,7 +238,7 @@ def init_lark_app(
         lark_api_client = lark_oapi.Client.builder() \
             .app_id(app_id) \
             .app_secret(app_secret) \
-            .log_level(lark_oapi.LogLevel.INFO) \
+            .log_level(lark_oapi.LogLevel.CRITICAL) \
             .build()
             
         if settings.LARK_CHAT_ID:
@@ -491,7 +536,10 @@ def _resolve_current_user_email(chat_id: str):
         from lark_oapi.api.im.v1.model.get_chat_request import GetChatRequest
         from lark_oapi.api.contact.v3.model.get_user_request import GetUserRequest
         
-        logger.info(f"Resolving identity for Chat ID: {chat_id}")
+        logger.info(
+            "Resolving Lark chat identity: chat=%s",
+            fingerprint_identifier(chat_id, namespace="lark_chat"),
+        )
         
         # 1. Get Chat Owner (P2P Owner = User)
         req = GetChatRequest.builder().chat_id(chat_id).build()
@@ -517,7 +565,10 @@ def _resolve_current_user_email(chat_id: str):
              return
              
         user = user_resp.data.user
-        logger.info(f"Identity Resolved: {user.name} ({user.email})")
+        logger.info(
+            "Lark identity resolved: actor=%s",
+            fingerprint_identifier(owner_id, namespace="lark_actor"),
+        )
         
         # 3. Derive Exchange Email
         # Strategy: Use local part of Lark email, or full email if matches user preference
@@ -535,7 +586,10 @@ def _resolve_current_user_email(chat_id: str):
         if effective_email:
             settings = get_settings()
             settings.EXCHANGE_ACCOUNT_EMAIL = effective_email
-            logger.info(f"Global Identity Configured: EXCHANGE_ACCOUNT_EMAIL = {effective_email}")
+            logger.info(
+                "Exchange account identity configured: account=%s",
+                fingerprint_identifier(effective_email, namespace="exchange_account"),
+            )
             
     except Exception as exc:
         logger.error("Identity resolution failed: error_type=%s", type(exc).__name__)
@@ -592,7 +646,10 @@ def update_card_ui(message_id, card_content):
         if not resp.success():
              logger.error("Failed to patch card: code=%s", resp.code)
         else:
-             logger.info(f"Patch Success for {message_id}")
+             logger.info(
+                 "Interactive card patch succeeded: message=%s",
+                 fingerprint_identifier(message_id, namespace="lark_message"),
+             )
     except Exception as exc:
         logger.error("Card patch failed: error_type=%s", type(exc).__name__)
 
@@ -605,7 +662,15 @@ def handle_card_action(event):
     try:
         if not hasattr(event, "event") or not event.event.action:
              logger.warning("Invalid event structure: missing event.action")
-             return
+             return _rejected_card_action("无效的操作请求")
+
+        user_id = _read_nested(event, "event", "operator", "open_id")
+        if not is_lark_operator_allowed(user_id, get_settings()):
+            logger.warning(
+                "Rejected unauthorized Lark card action: actor=%s",
+                fingerprint_identifier(user_id, namespace="lark_actor"),
+            )
+            return _rejected_card_action()
 
         action_value = event.event.action.value
         # Parse Value
@@ -613,24 +678,39 @@ def handle_card_action(event):
             try:
                 data = json.loads(action_value)
             except Exception:
-                return
+                return _rejected_card_action("无效的操作请求")
         else:
             data = action_value
 
+        if not isinstance(data, dict):
+            return _rejected_card_action("无效的操作请求")
+
         action_type = data.get("action")
         email_id = data.get("id")
-        user_id = event.event.operator.open_id
         # open_message_id is likely nested in context for card triggers, checking both
         if hasattr(event.event, "context") and hasattr(event.event.context, "open_message_id"):
              message_id = event.event.context.open_message_id
         else:
              message_id = getattr(event.event, "open_message_id", None)
         
-        if not message_id:
-             logger.warning("Could not find open_message_id in event. Cannot patch.")
-        
-        logger.info(f">>> RAW ACTION DATA: {action_type}, id={email_id}, msg_id={message_id}")
-        logger.info(f"User ID: {user_id}")
+        if (
+            action_type not in ALLOWED_CARD_ACTIONS
+            or not _valid_lark_identifier(email_id)
+            or not _valid_lark_identifier(message_id)
+        ):
+            logger.warning(
+                "Rejected malformed Lark card action: action=%s",
+                action_type if action_type in ALLOWED_CARD_ACTIONS else "unknown",
+            )
+            return _rejected_card_action("无效的操作请求")
+
+        logger.info(
+            "Accepted Lark card action: action=%s email=%s message=%s actor=%s",
+            action_type,
+            fingerprint_identifier(email_id, namespace="email"),
+            fingerprint_identifier(message_id, namespace="lark_message"),
+            fingerprint_identifier(user_id, namespace="lark_actor"),
+        )
         
         def get_current_state(eid):
             config = {"configurable": {"thread_id": eid}}
@@ -645,9 +725,21 @@ def handle_card_action(event):
             state = get_current_state(email_id)
 
         if not state or not state.values:
-             logger.warning(f"No state found for {email_id}. Action: {action_type}")
+             logger.warning(
+                 "No state found for card action: email=%s action=%s",
+                 fingerprint_identifier(email_id, namespace="email"),
+                 action_type,
+             )
              # Ensure we return a properly formatted error response
              return {"toast": {"type": "error", "content": "找不到任务状态或已失效"}}
+
+        if action_type == "view_original" and not is_test_card:
+            return {
+                "toast": {
+                    "type": "warning",
+                    "content": "Web 原文预览暂未开放，请使用 PDF",
+                }
+            }
 
         slim_email = state.values.get("email") or {}
         slim_subject = (
@@ -793,7 +885,11 @@ def handle_card_action(event):
         subject = email_data.get("subject", "Email")
         action_card_builder = _test_card_builder() if is_test_card else card_builder
 
-        logger.info(f"State fetched for {email_id}. Action: {action_type}")
+        logger.info(
+            "State fetched for card action: email=%s action=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+            action_type,
+        )
 
         if action_type == "view_original":
             logger.info("Executing Request: View Original (H5 Strategy)")
@@ -876,7 +972,11 @@ def handle_card_action(event):
 
         # 只读卡片 - 标记已阅
         elif action_type == "mark_read":
-            logger.info(f"Mark as read for email {email_id} by {user_id}")
+            logger.info(
+                "Mark-read card action: email=%s actor=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                fingerprint_identifier(user_id, namespace="lark_actor"),
+            )
             if is_test_card:
                 state.values["status"] = "read"
             else:
@@ -1380,10 +1480,18 @@ def _handle_p2_im_message_receive(event):
         message_type = _read_nested(message, "message_type")
         chat_type = _read_nested(message, "chat_type")
         sender_open_id = _read_nested(event, "event", "sender", "sender_id", "open_id")
-        raw_content = _read_nested(message, "content") or ""
 
         if message_type != "text" or chat_type != "p2p" or not sender_open_id:
             return
+
+        if not is_lark_operator_allowed(sender_open_id, get_settings()):
+            logger.warning(
+                "Rejected unauthorized Lark command: actor=%s",
+                fingerprint_identifier(sender_open_id, namespace="lark_actor"),
+            )
+            return
+
+        raw_content = _read_nested(message, "content") or ""
 
         try:
             content = json.loads(raw_content).get("text", "")
@@ -2142,7 +2250,7 @@ def start_lark_ws():
         app_id, 
         app_secret, 
         event_handler=event_handler,
-        log_level=lark_oapi.LogLevel.INFO
+        log_level=lark_oapi.LogLevel.CRITICAL
     )
 
     import threading

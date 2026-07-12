@@ -147,8 +147,11 @@ def render_email_html(email_data: Dict[str, Any]) -> str:
         
         full_body_html = str(soup)
             
-    except Exception as e:
-        logger.error(f"Error processing HTML body/images: {e}")
+    except Exception as exc:
+        logger.error(
+            "Email HTML processing failed: error_type=%s",
+            type(exc).__name__,
+        )
 
     # Build CC row if exists
     cc_row = f'<div style="margin-bottom:4px;"><b>抄送:</b> {cc_str}</div>' if cc_str else ''

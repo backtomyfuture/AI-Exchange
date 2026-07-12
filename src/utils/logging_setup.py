@@ -4,6 +4,16 @@ from typing import Iterator
 
 import structlog
 
+from src.security.redaction import fingerprint_identifier
+
+
+def harden_third_party_loggers() -> None:
+    """Suppress third-party request/SDK logs that can contain URLs or tokens."""
+
+    for logger_name in ("httpx", "httpcore", "urllib3", "websockets"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    logging.getLogger("Lark").setLevel(logging.CRITICAL + 1)
+
 
 def setup_logging(log_level: str = "INFO"):
     """Configure structured logging for the entire application."""
@@ -36,6 +46,7 @@ def setup_logging(log_level: str = "INFO"):
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    harden_third_party_loggers()
 
 
 @contextmanager
@@ -50,5 +61,7 @@ def log_email_context(email_id: str | None) -> Iterator[None]:
     if not email_id:
         yield
         return
-    with structlog.contextvars.bound_contextvars(email_id=email_id):
+    with structlog.contextvars.bound_contextvars(
+        email_id=fingerprint_identifier(email_id, namespace="email")
+    ):
         yield

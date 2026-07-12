@@ -144,7 +144,10 @@ async def test_exchange_webhook_aborts_stream_before_hmac_or_later_chunks():
             "type": "http",
             "method": "POST",
             "path": "/webhooks/exchange",
-            "headers": [(b"x-exchange-signature", b"not-used")],
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"x-exchange-signature", b"not-used"),
+            ],
         },
         receive,
     )
@@ -238,7 +241,10 @@ def test_exchange_webhook_allows_exact_limit_and_hashes_exact_raw_bytes():
         response = client.post(
             "/webhooks/exchange",
             content=body,
-            headers={"X-Exchange-Signature": signature},
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Exchange-Signature": signature,
+            },
         )
 
     assert response.status_code == 200
@@ -269,6 +275,7 @@ def test_exchange_webhook_does_not_log_headers_signature_or_raw_body(caplog):
             "/webhooks/exchange",
             content=body,
             headers={
+                "Content-Type": "application/json",
                 "X-Exchange-Signature": signature,
                 "X-Private-Header": "header-secret",
             },
@@ -279,6 +286,98 @@ def test_exchange_webhook_does_not_log_headers_signature_or_raw_body(caplog):
     assert signature not in rendered_logs
     assert "header-secret" not in rendered_logs
     assert "raw-body-secret" not in rendered_logs
+
+
+def test_exchange_webhook_rejects_non_json_media_type_before_body_consumption():
+    client = TestClient(app)
+
+    with patch("src.server.get_settings") as mock_settings, patch(
+        "src.server.hmac.new"
+    ) as mock_hmac:
+        mock_settings.return_value = SimpleNamespace(
+            EXCHANGE_WEBHOOK_SECRET="test-secret",
+            WEBHOOK_MAX_BYTES=1_048_576,
+        )
+        response = client.post(
+            "/webhooks/exchange",
+            content=b"private-body-must-not-be-parsed",
+            headers={
+                "Content-Type": "text/plain",
+                "X-Exchange-Signature": "present",
+            },
+        )
+
+    assert response.status_code == 415
+    mock_hmac.assert_not_called()
+
+
+def test_unsigned_event_header_cannot_override_signed_body_event():
+    client = TestClient(app)
+    payload = {
+        "event_type": "NewMailEvent",
+        "item_id": {"id": "AAMkAGQ"},
+    }
+    body, signature = _build_signed_body(payload, "test-secret")
+
+    with patch("src.server.get_settings") as mock_settings, patch(
+        "src.server.enqueue_exchange_webhook",
+        new_callable=AsyncMock,
+    ) as mock_enqueue:
+        mock_settings.return_value = SimpleNamespace(
+            EXCHANGE_WEBHOOK_SECRET="test-secret",
+            WEBHOOK_MAX_BYTES=1_048_576,
+        )
+        response = client.post(
+            "/webhooks/exchange",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Exchange-Signature": signature,
+                "X-Exchange-Event": "CreatedEvent",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Webhook event mismatch"}
+    mock_enqueue.assert_not_awaited()
+
+
+def test_webhook_response_and_logs_omit_internal_result_metadata(caplog):
+    client = TestClient(app)
+    payload = {
+        "event_type": "NewMailEvent",
+        "item_id": {"id": "private-email-id-sentinel"},
+    }
+    body, signature = _build_signed_body(payload, "test-secret")
+    private_folder = "private-folder-sentinel"
+
+    with patch("src.server.get_settings") as mock_settings, patch(
+        "src.server.enqueue_exchange_webhook",
+        new_callable=AsyncMock,
+    ) as mock_enqueue, caplog.at_level(logging.INFO, logger="WebServer"):
+        mock_settings.return_value = SimpleNamespace(
+            EXCHANGE_WEBHOOK_SECRET="test-secret",
+            WEBHOOK_MAX_BYTES=1_048_576,
+        )
+        mock_enqueue.return_value = {
+            "queued": True,
+            "email_id": "private-email-id-sentinel",
+            "folder": private_folder,
+            "queue_size": 12,
+        }
+        response = client.post(
+            "/webhooks/exchange",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Exchange-Signature": signature,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "queued": True}
+    assert "private-email-id-sentinel" not in caplog.text
+    assert private_folder not in caplog.text
 
 
 def test_exchange_webhook_invalid_json_with_valid_signature_is_redacted(caplog):
@@ -295,7 +394,10 @@ def test_exchange_webhook_invalid_json_with_valid_signature_is_redacted(caplog):
         response = client.post(
             "/webhooks/exchange",
             content=body,
-            headers={"X-Exchange-Signature": signature},
+            headers={
+                "Content-Type": "application/json",
+                "X-Exchange-Signature": signature,
+            },
         )
 
     assert response.status_code == 400
