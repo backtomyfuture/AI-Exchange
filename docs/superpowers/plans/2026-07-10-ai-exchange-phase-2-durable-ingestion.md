@@ -21,6 +21,8 @@
 - 当前 Exchange extension 已确认分页上界与 `read_flag_change` 均不满足 `exchange_sync_contract_v2`。AI 仓库仍须完成并测试全部 dormant/fail-closed 实现，但 readiness 状态必须是 `blocked_external_exchange_sync_contract`；只有后续独立修复 extension 并生成真实 v2 证据后才可解除。
 - Phase 3 激活后的回滚仍由 Durable Inbox 排空已返回 202 的数据，不能退回当前内存队列。
 - 所有 Inbox claim/complete 都比较租约 owner、generation 和 fencing token；任何 Outbox 继承相同所有权规则。
+- 共享账户锁下，任何会触碰邮件的数据面路径固定为 email -> runtime authority（存在时）-> 按 generation 升序的 ownership/reservation -> exact Inbox/card -> Notification -> Mailbox -> Send/effect -> audit/receipt；只处理 lease 的路径可以 ownership -> Inbox，但之后不得再锁 email。freeze/switch/control 使用互斥账户锁后 authority -> ownership，因此不与两类数据面并发。多账户操作始终按 account_id 升序。
+- `emails.version` 是业务/副作用授权版本，不是 folder/read 投影计数器；仅投影变化在 email 行锁下更新且不提升 version，不能让合法 Worker、effect token 或审批卡仅因已读标记变化而失效。
 
 ---
 
@@ -605,7 +607,7 @@ Expired leases are durable work, not permanent `leased` rows. A bounded reaper r
 
 Before the effect marker, only `ErrorKind.TRANSIENT_DEPENDENCY` and `RATE_LIMITED`, plus an explicitly retryable `DatabaseOperationError`, may retry. `SEND_UNKNOWN` and the existing `ManualReviewRequired` go directly to `manual_review`; authentication, validation, policy, permanent-dependency, internal-invariant and unknown/untyped exceptions dead-letter. Classification uses this closed type/kind matrix and fixed repository-owned safe codes/summaries; it never persists exception text, URLs, IDs, response bodies or arbitrary `safe_code` attributes. If reading an ordinary exception's `kind` property raises any `Exception`, classification fails closed to the fixed unknown/internal disposition; exception text is not exposed and the row cannot remain leased. `CancelledError`, `SystemExit`, `KeyboardInterrupt`, and other `BaseException` control flow are never swallowed.
 
-`attempts` is exactly the count of already committed failed or expired lease dispositions before the current claim. Insert starts at zero; claim and renew never increment it; every successful `fail()` or expiry-reaper disposition increments it exactly once, including terminal/manual dispositions, while a stale/lost CAS increments nothing. Let `new_attempts = min(old_attempts + 1, POSTGRES_BIGINT_MAX)`. With `MAX_RETRIES=5`, a retryable pre-effect failure enters `retry_wait` only when `new_attempts <= 5`; otherwise it enters `dead_letter`. Thus initial execution plus at most five retries gives six executions. Backoff is based on `new_attempts`, starts at five seconds, doubles, and caps at 900 seconds. An already-maximal counter remains maximal without PostgreSQL overflow. Administrator requeue is a later authenticated operation and must increment the token generation before making work claimable; it may never resurrect an old lease token.
+`attempts` is exactly the count of already committed failed or expired lease dispositions before the current claim. Insert starts at zero; claim and renew never increment it; every successful `fail()` or expiry-reaper disposition increments it exactly once, including terminal/manual dispositions, while a stale/lost CAS increments nothing. Let `new_attempts = min(old_attempts + 1, POSTGRES_BIGINT_MAX)`. With `MAX_RETRIES=5`, a retryable pre-effect failure enters `retry_wait` only when `new_attempts <= 5`; otherwise it enters `dead_letter`. Thus initial execution plus at most five retries gives six executions. Backoff is based on `new_attempts`, starts at five seconds, doubles, and caps at 900 seconds. An already-maximal counter remains maximal without PostgreSQL overflow. Task 10/`0007` adds a distinct monotonic `execution_epoch` to the lease token before any authenticated administrator requeue exists. Recovery increments that epoch, resets attempts only through its governed audited function, and can never resurrect an old `(execution_epoch,attempts,lease_until)` token; either BIGINT counter at maximum blocks recovery.
 
 Every terminal state transition and suppression audit is in the same transaction as its Inbox mutation. Audit rows use `email_id=NULL`, `object_type='event_inbox'`, a SHA-256 fingerprint of the Inbox UUID, a fixed actor/result/reason, and bounded safe metadata containing no payload, exception text, URL, external email/folder ID, or lease owner. The deterministic event key includes Inbox UUID, action and resulting attempts. `ON CONFLICT(event_key) DO NOTHING` is followed by a read-and-compare of action, object fingerprint, result, actor, reason and canonical safe metadata; any mismatch raises a fixed invariant and rolls back the Inbox transition. Concurrent/replayed suppression, completion, dead-letter and manual-review tests prove exactly one matching audit, and an injected audit failure proves atomic rollback.
 
@@ -632,9 +634,13 @@ git commit -m "feat: add leased durable inbox repository"
 - Create: `tests/architecture/test_email_state_repository_boundary.py`
 - Create: `tests/architecture/test_phase2_delete_has_no_outbox_mutation.py`
 - Modify: `src/ingestion/repository.py`
+- Modify: `src/ingestion/__init__.py`
 
 **Interfaces:**
-- Produces: immutable `EmailEventDecision(should_process, should_cancel, new_status, cancel_pending_side_effects, reason)` and the sole repository CAS for email status
+- Consumes: a complete, unexpired `InboxLease`; a naked `NormalizedIngressEvent` is not sufficient authority to mutate an email aggregate
+- Produces: immutable `EmailEventDecision(should_process, should_cancel, new_status, cancel_pending_side_effects, create_seen, reason)`; immutable `EmailEventApplication(decision, email_id, persisted_status, version, disposition, may_complete_without_processing)`; `InboxRepository.apply_email_event(lease) -> EmailEventApplication`; and `InboxRepository.transaction(connection).apply_email_event(lease) -> EmailEventApplication`
+
+The transaction-bound form never acquires or commits a connection. It binds itself to the current top-level transaction identity and is the Phase-3 composition point for atomically applying a source deletion with approval/Outbox cancellation. The convenience wrapper opens one short `READ COMMITTED` transaction and delegates to the same primitive. Processing authorization additionally requires a first-write-wins append-only `audit_events` receipt for the exact `(inbox_id, execution_epoch, attempts)` processing attempt; `processing_inbox_id` equality alone is never execution authority. The current `0004` schema uses an explicit fixed epoch `0`; Task 10/`0007` materializes and governs epoch changes before administrator requeue exists. Task 5 adds no migration and never writes an Outbox/card relation or calls Lark/Exchange.
 
 - [ ] **Step 1: Write ordered and out-of-order tests**
 
@@ -642,8 +648,8 @@ git commit -m "feat: add leased durable inbox repository"
 @pytest.mark.parametrize(
     ("current", "event", "expected", "should_process"),
     [
-        (None, "create", "ingested", True),
-        ("ingested", "create", "ingested", False),
+        (None, "create", "processing", True),
+        ("processing", "create", "processing", False),
         ("sent", "update", "sent", False),
         ("cancelled", "create", "cancelled", False),
         ("waiting_approval", "delete", "cancelled", False),
@@ -692,12 +698,13 @@ def test_delete_only_emits_phase3_cancellation_intent():
 
 def test_delete_after_external_effect_start_only_records_source_deletion():
     decision = decide_email_event(
-        current_status="sending",
+        current_status="waiting_approval",
         create_seen=True,
         kind=ChangeKind.DELETE,
         source_is_read=False,
+        external_effects_started=True,
     )
-    assert decision.new_status == "sending"
+    assert decision.new_status == "waiting_approval"
     assert decision.cancel_pending_side_effects is False
 
 
@@ -734,10 +741,25 @@ def test_unknown_update_or_read_creates_metadata_shell_without_effect(kind):
     assert decision.create_seen is False
 
 
+def test_first_create_after_metadata_shell_atomically_elects_processing():
+    decision = decide_email_event(
+        current_status="ingested",
+        create_seen=False,
+        kind=ChangeKind.CREATE,
+        source_is_read=False,
+    )
+    assert (decision.new_status, decision.should_process) == ("processing", True)
+    assert decision.create_seen is True
+
+
 @pytest.mark.integration
 async def test_webhook_and_sync_create_elect_exactly_one_processor(repo):
-    webhook = event(source="webhook", external_email_id="m1", dedupe_key="a" * 64)
-    sync = event(source="sync", external_email_id="m1", dedupe_key="b" * 64)
+    webhook = await claimed_lease(
+        event(source="webhook", external_email_id="m1", dedupe_key="a" * 64)
+    )
+    sync = await claimed_lease(
+        event(source="sync", external_email_id="m1", dedupe_key="b" * 64)
+    )
     first, second = await asyncio.gather(
         repo.apply_email_event(webhook),
         repo.apply_email_event(sync),
@@ -754,10 +776,14 @@ async def test_webhook_and_sync_create_elect_exactly_one_processor(repo):
 
 @pytest.mark.integration
 async def test_delete_before_create_persists_tombstone(repo):
-    await repo.apply_email_event(event(source="sync", kind="delete", external_email_id="m2"))
-    late = await repo.apply_email_event(
+    deleted = await claimed_lease(
+        event(source="sync", kind="delete", external_email_id="m2")
+    )
+    await repo.apply_email_event(deleted)
+    created = await claimed_lease(
         event(source="webhook", kind="create", external_email_id="m2")
     )
+    late = await repo.apply_email_event(created)
     row = await repo.email(account_id=8, external_email_id="m2")
     assert row.status == "cancelled"
     assert row.source_deleted_at is not None
@@ -766,45 +792,38 @@ async def test_delete_before_create_persists_tombstone(repo):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("winner", ["delete", "effect_begin"])
-async def test_delete_and_worker_effect_begin_have_one_serialized_winner(
-    repo, worker, legacy_effects, legacy_external, winner
+async def test_reclaimed_processing_owner_resumes_but_an_unrelated_create_does_not(
+    repo, claimed_create
 ):
-    lease = await repo.seed_create_elected()
-    legacy_effects.install_begin_barrier(winner=winner)
-    processing = asyncio.create_task(worker.process_lease(lease))
-    await legacy_effects.begin_barrier_reached.wait()
-    deleting = asyncio.create_task(
-        repo.apply_email_event(event(
-            source="sync", kind="delete", external_email_id=lease.external_email_id
-        ))
+    first = await repo.apply_email_event(claimed_create)
+    reclaimed = await repo.reclaim_same_inbox(claimed_create)
+    retry = await repo.apply_email_event(reclaimed)
+    duplicate_retry = await repo.apply_email_event(reclaimed)
+    unrelated = await repo.apply_email_event(
+        await repo.claim_distinct_create_for_same_aggregate(claimed_create)
     )
-    if winner == "delete":
-        deleted = await deleting
-        legacy_effects.release_begin_barrier.set()
-    else:
-        legacy_effects.release_begin_barrier.set()
-        await legacy_effects.execute_token_committed.wait()
-        deleted = await deleting
-    await processing
-    if winner == "delete":
-        assert deleted.cancel_pending_side_effects is True
-        legacy_external.assert_no_calls()
-    else:
-        assert deleted.cancel_pending_side_effects is False
-        assert legacy_external.completed_effect_count == 1
-        assert await legacy_effects.try_begin_for_lease(
-            lease, "lark_notification", 1, "next-target"
-        ) is None
+    assert first.disposition == "creator_elected"
+    assert retry.disposition == "processing_resumed"
+    assert retry.should_process is True
+    assert duplicate_retry.disposition == "processing_already_elected"
+    assert duplicate_retry.should_process is False
+    assert duplicate_retry.may_complete_without_processing is False
+    assert unrelated.disposition == "aggregate_noop"
+    assert unrelated.should_process is False
+    assert unrelated.may_complete_without_processing is True
 ```
 
 - [ ] **Step 2: Implement pure transition function and repository CAS**
 
-Define the complete allowed-transition table for the exact database vocabulary: `ingested`, `processing`, `retry_wait`, `manual_review`, `waiting_approval`, `notified_readonly`, `send_queued`, `sending`, `accepted`, `sent`, `send_failed`, `delivery_failed`, `send_unknown`, `no_action`, `archived`, `rejected`, `draft_saved`, `expired`, `cancelled` and `dead_letter`. A manifest test fails if either the schema CHECK or transition table gains/loses a status independently. The decision takes explicit `create_seen`; only the first create sets `create_seen_at` and wins processing. An unknown update/read creates or updates an `ingested` metadata shell with `create_seen_at=NULL` and no effect, so a later first create may still process. An unknown delete atomically creates `status='cancelled'` plus `source_deleted_at` tombstone with no effect; every later create/update/read preserves that tombstone.
+Define the complete allowed-transition table for the exact database vocabulary: `ingested`, `processing`, `retry_wait`, `manual_review`, `waiting_approval`, `notified_readonly`, `send_queued`, `sending`, `accepted`, `sent`, `send_failed`, `delivery_failed`, `send_unknown`, `no_action`, `archived`, `rejected`, `draft_saved`, `expired`, `cancelled` and `dead_letter`. A manifest test fails if either the schema CHECK or transition table gains/loses a status independently. The decision takes explicit `create_seen`, `processing_owner_matches` and the locked row's `external_effects_started_at IS NOT NULL`; caller/event defaults never supply effect authority. Only the first create sets `create_seen_at`, atomically enters `processing`, and binds the exact CREATE Inbox as `processing_inbox_id`. A retry-wait row owned by that Inbox may return to processing; manual-review/dead-letter never recover from an ordinary event. Actual `should_process=True` additionally requires the transaction to insert the unique append-only `audit_events` authorization receipt for that Inbox's exact `(execution_epoch, attempts)`. Task 5 uses fixed epoch zero. The same active lease, a renewed lease with unchanged attempt identity, or a repeat of the same reclaimed attempt cannot authorize twice; a reaper-incremented attempt may return `processing_resumed` exactly once. A same-attempt receipt hit returns `processing_already_elected` with `may_complete_without_processing=False`, so the duplicate caller cannot complete/fail/renew/begin-effect and fence the elected executor. A different CREATE Inbox is a side-effect-free `aggregate_noop` with `may_complete_without_processing=True`, because it owns a separate loser Inbox that is safe to complete. Processing election requires current `emails.version <= BIGINT_MAX-2`, reserving one increment for entering processing and one for Task 8's mandatory terminal/failure CAS. At `MAX-1`/`MAX`, an independently harmless duplicate/projection event can still no-op, but an event that would require a fresh processing election raises fixed non-retryable `email.processing_version_exhausted`; it never returns a safely completable no-op and never mints a receipt. This closes both the crash window between recording `create_seen_at` and starting work and the commit-ack/concurrent re-entry window. The application DTO validates the exact disposition/reason/processing/completion combination rather than trusting its caller. An unknown update/read creates or updates an `ingested` metadata shell with `create_seen_at=NULL` and no effect, so a later first create may still process. A CREATE on a brand-new row uses its own validated folder/read projection. A delayed CREATE winning over a pre-existing shell cannot assume it is newer: it fills unknown read data, but preserves conflicting known read/folder data and sets the existing `is_read_refresh_required` projection-refresh bit for Task 11. Task 5 may set but never clear a persisted refresh bit—even a later known READ/UPDATE or exact CREATE agreement preserves it. An unknown CREATE read value also preserves the shell and requires refresh. An unknown delete atomically creates `status='cancelled'` plus `source_deleted_at` tombstone with no effect; every later create/update/read preserves that tombstone.
 
-Webhook and Sync use transport-specific Inbox dedupe keys, so aggregate election must not rely on Inbox dedupe. In one short transaction, `apply_email_event()` executes `INSERT INTO emails ... ON CONFLICT (account_id,external_email_id) DO NOTHING RETURNING ...` (or an equivalent non-throwing election), then locks the elected/existing email row and CASes its version/create marker. The conflict loser waits for/reloads the committed row and returns a normal `aggregate_noop`; it never exposes `UniqueViolation`, retries the business event or runs a second effect. Create/update/read/delete all use this same aggregate identity and row-lock order. A real PostgreSQL `asyncio.gather` test with distinct Webhook/Sync dedupe keys proves one email, one `create_seen_at`, one `should_process`/processing election and a side-effect-free loser.
+Webhook and Sync use transport-specific Inbox dedupe keys, so aggregate election must not rely on Inbox dedupe. In one short transaction, `apply_email_event()` takes the shared account advisory lock, inserts only a neutral `ingested/create_seen_at=NULL/processing_inbox_id=NULL` shell with validated initial projection through `ON CONFLICT (account_id,external_email_id) DO NOTHING RETURNING ...`, then uses a second `READ COMMITTED` statement to lock/reload the elected or existing email row. A data-modifying CTE is forbidden because its old statement snapshot can miss a concurrent conflict winner; `ON CONFLICT DO UPDATE` and `SKIP LOCKED` are also forbidden. Under the email lock it locks the incoming and sticky ownership rows in generation order, then the exact Inbox lease, before running the authority-version CAS and inserting/validating the processing-attempt receipt. At this schema head that receipt has a SHA-256 event key over the literal `email-processing-attempt-v1`, Inbox ID, fixed execution epoch `0`, and attempts; it is FK-bound to the locked account/email, exact-compares epoch/generation/fence/attempts plus all fixed fields, deliberately excludes mutable `lease_until`, random surrogate ID and automatic creation timestamp, and uses insert-on-conflict followed by immutable equality comparison. Task 10 replaces the fixed zero with the governed lease epoch. The conflict loser waits for/reloads the committed row and returns a normal typed no-op; it never exposes `UniqueViolation`, retries the business event or runs a second effect. Status/create/delete/processing changes bump the business version; folder/read-only projection and a one-way external-effect marker are row-locked but leave version unchanged unless the same transaction also changes business authority, so neither can self-fence a valid effect/card. An ordinary changing authority path at `BIGINT_MAX` fails deterministically; processing election fails already at `BIGINT_MAX-1` so its terminal CAS budget is never exhausted. Real PostgreSQL concurrency tests with distinct Webhook/Sync dedupe keys and repeated identical active/reclaimed leases prove one email, one immutable `create_seen_at`, one processing authorization per attempt, a non-finalizing same-attempt duplicate and side-effect-free distinct losers. Transaction tests additionally prove top-level XID binding/reuse, non-`READ COMMITTED` rejection, outer rollback, full persisted-lease comparison, collision drift rejection and lost-commit-ack replay.
 
-Phase 2 owns only the monotonic email decision and CAS: a delete sets `source_deleted_at` exactly once and returns `cancel_pending_side_effects=True` only when the current aggregate is still cancellable. It must not update a Notification/Mailbox/Send Outbox, mutate a card resource or call Lark—those relations and their race-safe cancellation transaction do not exist until Phase 3. Once external effects have started, delete preserves the current status, sets only `source_deleted_at` and returns `cancel_pending_side_effects=False`. `tests/architecture/test_phase2_delete_has_no_outbox_mutation.py` scans Phase 2 production code and forbids Outbox/card cancellation SQL or Lark invalidation calls. Phase 3 consumes the decision under the email/outbox row locks and owns the delete-versus-send-start race.
+The incoming lease generation/fence is always validated in an executable state. If it differs from the sticky email owner, CREATE may process only when `create_seen_at` is already non-null and therefore becomes a no-op; a late first CREATE fails to manual review instead of transferring ownership. Cross-generation UPDATE/READ may change only folder/read projection without advancing the business version. Cross-generation DELETE may cancel an unresolved sticky owner only while that owner is current/quiescing/draining, and Phase 3 later cancels resources with the sticky generation/fence. A retired sticky owner may receive only terminal projection/deletion history; any unresolved retired row is an invariant failure. Required real-PostgreSQL tests cover the full A-draining/B-current and A-retired/B-current 2x4 CREATE/UPDATE/READ/DELETE matrix, including late-first-CREATE failure, duplicate/terminal CREATE no-op, projection-only version stability, retired-unresolved DELETE failure and terminal retired deletion-marker preservation.
+
+The first event fixes `owner_generation` and `owner_fencing_token`. An UPDATE/READ shell created by generation A cannot later bind generation B's CREATE Inbox as processing owner: that late-first-CREATE fails closed into manual review rather than mutating sticky ownership or bypassing the processing-Inbox FK. Duplicate/terminal cross-generation CREATE events may return a no-op. Read projection never coerces transport values, never regresses known `True` to `False` under ambiguous ordering, and sets `is_read_refresh_required=True` when the schema lacks enough source-version evidence.
+
+Phase 2 owns only the monotonic email decision and CAS: a delete sets `source_deleted_at` exactly once and returns `cancel_pending_side_effects=True` only when the current aggregate is still cancellable. It must not update a Notification/Mailbox/Send Outbox, mutate a card resource or call Lark—those relations and their race-safe cancellation transaction do not exist until Phase 3. Once external effects have started, delete preserves the current status, sets only `source_deleted_at` and returns `cancel_pending_side_effects=False`. `tests/architecture/test_phase2_delete_has_no_outbox_mutation.py` scans only the Task-5 email-event call graph; it must not flag the guarded legacy Lark/Exchange path that remains required until Phase 6. Phase 3 consumes the transaction-bound decision under the same email-first lock order and owns the real delete-versus-send-start race. Task 5 proves the cancellation intent and absence of Phase-3 mutations; the deterministic external-effect race remains a mandatory Task-10/Phase-3 integration gate, not a fake Task-5 fixture.
 
 `manual_review`/`dead_letter` recovery requires an authenticated administrator reason and creates audit. Architecture test scans nodes/handlers and fails on direct `UPDATE emails SET status`; all mutations call the repository CAS.
 
@@ -812,7 +831,7 @@ Phase 2 owns only the monotonic email decision and CAS: a delete sets `source_de
 
 ```bash
 .venv/bin/python -m pytest tests/unit/ingestion/test_email_events.py tests/integration/ingestion/test_email_event_concurrency.py -q
-git add src/ingestion/email_events.py src/ingestion/repository.py tests/unit/ingestion/test_email_events.py tests/integration/ingestion/test_email_event_concurrency.py tests/architecture/test_email_state_repository_boundary.py tests/architecture/test_phase2_delete_has_no_outbox_mutation.py
+git add src/ingestion/email_events.py src/ingestion/repository.py src/ingestion/__init__.py tests/unit/ingestion/test_email_events.py tests/integration/ingestion/test_email_event_concurrency.py tests/architecture/test_email_state_repository_boundary.py tests/architecture/test_phase2_delete_has_no_outbox_mutation.py
 git commit -m "feat: enforce monotonic email event transitions"
 ```
 
@@ -1303,12 +1322,14 @@ git commit -m "feat: add atomic sync reconciliation and cold start"
 - Create: `src/ingestion/worker.py`
 - Create: `tests/unit/ingestion/test_worker.py`
 - Create: `tests/integration/ingestion/test_webhook_crash_recovery.py`
+- Create: `tests/integration/ingestion/test_email_processing_completion.py`
+- Modify: `src/ingestion/repository.py`
 - Modify: `src/exchange_service.py`
 - Modify: `tests/unit/test_exchange_service_refactor.py`
 
 **Interfaces:**
-- Consumes: `ProcessingOutcome`, Inbox leases, Phase 1 ContentStore
-- Produces: `ProcessingAdapter`, `ProcessingAdapterRouter.select(stamped_lease, authority)`; `DurableInboxWorker.start()`, `run_once()`, `stop(grace_seconds)`
+- Consumes: `ProcessingOutcome`, Task-5 `EmailEventApplication`, Inbox leases, Phase 1 ContentStore
+- Produces: immutable `ProcessingCompletion(target_status, legacy_outcome, safe_error_code, safe_error_summary)`; invocation-scoped `LeaseAuthority.current()`/`run_with_current()`/`stop_and_freeze()`; transaction-bound/public `finish_email_processing(lease, email_id, expected_authority_version, completion)` and `finish_email_processing_failure(lease, email_id, expected_authority_version, error)`; `ProcessingAdapter`; `ProcessingAdapterRouter.select(stamped_lease, authority)`; `DurableInboxWorker.start()`, `run_once()`, `stop(grace_seconds)`
 
 - [ ] **Step 1: Write fixed-count and recovery tests**
 
@@ -1373,14 +1394,57 @@ async def test_heartbeat_keeps_long_marked_effect_leased(
     worker, inbox, legacy_adapter, clock
 ):
     lease = await inbox.seed_lease()
+    authority = LeaseAuthority(lease)
     legacy_adapter.block_after_first_effect = True
-    task = asyncio.create_task(worker.process_lease(lease))
+    task = asyncio.create_task(worker.process_invocation(authority))
     await legacy_adapter.first_effect_started.wait()
     clock.advance(seconds=61)
-    await worker.heartbeat_once(lease)
+    await worker.heartbeat_once(authority)
     assert await inbox.recover_expired_leases(limit=10) == 0
     legacy_adapter.release_first_effect.set()
     await task
+
+
+@pytest.mark.integration
+async def test_renewed_token_is_used_for_effect_and_finish(
+    worker, inbox, legacy_adapter
+):
+    original = await inbox.seed_lease()
+    authority = LeaseAuthority(original)
+    renewed = await worker.heartbeat_once(authority)
+    await worker.process_invocation(authority)
+    assert await inbox.begin_effect(original) is False
+    assert authority.current() == renewed
+    assert (await inbox.get(original.id)).status == "completed"
+
+
+@pytest.mark.integration
+async def test_renew_and_finalize_have_one_latest_token_winner(worker, inbox, barrier):
+    lease = await inbox.seed_lease()
+    authority = LeaseAuthority(lease)
+    barrier.pause_renew_after_cas()
+    task = asyncio.create_task(worker.process_invocation(authority))
+    await barrier.renew_cas_committed.wait()
+    barrier.release_renew.set()
+    await task
+    assert (await inbox.get(lease.id)).status == "completed"
+    assert await inbox.active_lease_count(lease.id) == 0
+
+
+@pytest.mark.integration
+async def test_effect_begin_holds_authority_across_token_bound_cas(
+    worker, inbox, barrier
+):
+    authority = LeaseAuthority(await inbox.seed_lease())
+    barrier.pause_effect_after_token_read_before_cas()
+    effect = asyncio.create_task(worker.begin_effect_for_test(authority))
+    await barrier.effect_token_read.wait()
+    renew = asyncio.create_task(worker.heartbeat_once(authority))
+    await asyncio.sleep(0)
+    assert renew.done() is False
+    barrier.release_effect_cas.set()
+    assert await effect is True
+    await renew
 
 
 @pytest.mark.integration
@@ -1408,6 +1472,162 @@ async def test_timeout_after_effect_marker_goes_manual_and_stops_chain(
     await worker.process_lease(lease)
     assert (await inbox.get(lease.id)).status == "manual_review"
     legacy_adapter.second_external_effect.assert_not_awaited()
+
+
+@pytest.mark.integration
+async def test_success_atomically_finishes_email_and_inbox(repo, elected_lease):
+    applied = await repo.apply_email_event(elected_lease)
+    completed = await repo.finish_email_processing(
+        elected_lease,
+        applied.email_id,
+        applied.version,
+        ProcessingCompletion.waiting_approval(),
+    )
+    assert completed.email_status == "waiting_approval"
+    assert completed.inbox_status == "completed"
+
+
+@pytest.mark.integration
+async def test_failure_atomically_moves_email_and_inbox_to_same_disposition(
+    repo, elected_lease, transient_error
+):
+    applied = await repo.apply_email_event(elected_lease)
+    failed = await repo.finish_email_processing_failure(
+        elected_lease,
+        applied.email_id,
+        applied.version,
+        transient_error,
+    )
+    assert failed.email_status == failed.inbox_status == "retry_wait"
+
+
+@pytest.mark.integration
+async def test_commit_unknown_replays_processing_completion_receipt(
+    repo, elected_lease, fault
+):
+    applied = await repo.apply_email_event(elected_lease)
+    fault.lose_ack_after_processing_commit = True
+    with pytest.raises(SimulatedCommitUnknown):
+        await repo.finish_email_processing(
+            elected_lease,
+            applied.email_id,
+            applied.version,
+            ProcessingCompletion.no_action(),
+        )
+    replay = await repo.finish_email_processing(
+        elected_lease,
+        applied.email_id,
+        applied.version,
+        ProcessingCompletion.no_action(),
+    )
+    assert replay.replayed is True
+    assert await repo.processing_completion_receipt_count(elected_lease.id) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("blocker", ["stale_version", "source_deleted"])
+async def test_completion_rejects_stale_version_or_source_delete_atomically(
+    repo, elected_lease, blocker
+):
+    applied = await repo.apply_email_event(elected_lease)
+    await repo.arrange_completion_blocker(applied.email_id, blocker)
+    with pytest.raises(ProcessingCompletionRejected):
+        await repo.finish_email_processing(
+            elected_lease,
+            applied.email_id,
+            applied.version,
+            ProcessingCompletion.no_action(),
+        )
+    assert await repo.processing_pair(applied.email_id) == (
+        "processing",
+        "leased",
+    )
+
+
+@pytest.mark.integration
+async def test_completion_receipt_rejects_changed_result(repo, elected_lease):
+    applied = await repo.apply_email_event(elected_lease)
+    await repo.finish_email_processing(
+        elected_lease,
+        applied.email_id,
+        applied.version,
+        ProcessingCompletion.no_action(),
+    )
+    with pytest.raises(IdempotencyConflict):
+        await repo.finish_email_processing(
+            elected_lease,
+            applied.email_id,
+            applied.version,
+            ProcessingCompletion.archived(),
+        )
+
+
+@pytest.mark.integration
+async def test_nonterminal_completion_never_lands_at_bigint_max(repo):
+    lease, applied = await repo.elect_create_from_version(BIGINT_MAX - 2)
+    result = await repo.finish_email_processing(
+        lease,
+        applied.email_id,
+        applied.version,
+        ProcessingCompletion.waiting_approval(),
+    )
+    assert (result.email_status, result.inbox_status) == (
+        "dead_letter",
+        "dead_letter",
+    )
+    assert await repo.approval_authority_count(applied.email_id) == 0
+
+
+@pytest.mark.integration
+async def test_expiry_reaper_updates_email_and_inbox_without_lock_inversion(
+    repo, elected_lease, clock
+):
+    applied = await repo.apply_email_event(elected_lease)
+    clock.advance(seconds=61)
+    reap, late_apply = await asyncio.gather(
+        repo.recover_expired_processing(limit=10),
+        repo.apply_email_event(elected_lease),
+        return_exceptions=True,
+    )
+    assert not any(
+        isinstance(value, psycopg.errors.DeadlockDetected)
+        for value in (reap, late_apply)
+    )
+    assert await repo.processing_pair(applied.email_id) in {
+        ("retry_wait", "retry_wait"),
+        ("manual_review", "manual_review"),
+        ("dead_letter", "dead_letter"),
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("effect_started", "expected"),
+    [(False, "retry_wait"), (True, "manual_review")],
+)
+async def test_reaper_projects_pre_and_post_effect_to_both_rows(
+    repo, elected_lease, clock, effect_started, expected
+):
+    applied = await repo.apply_email_event(elected_lease)
+    if effect_started:
+        assert await repo.begin_effect(elected_lease) is True
+    clock.advance(seconds=61)
+    await repo.recover_expired_processing(limit=10)
+    assert await repo.processing_pair(applied.email_id) == (expected, expected)
+
+
+@pytest.mark.integration
+async def test_expired_max_minus_one_processing_dead_letters_both_rows(
+    repo, clock
+):
+    lease, applied = await repo.elect_create_from_version(BIGINT_MAX - 2)
+    assert applied.version == BIGINT_MAX - 1
+    clock.advance(seconds=61)
+    await repo.recover_expired_processing(limit=10)
+    assert await repo.processing_pair(applied.email_id) == (
+        "dead_letter",
+        "dead_letter",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1450,13 +1670,23 @@ Define a typed `ProcessingAdapter` protocol and make `DurableInboxWorker` resolv
 
 Before constructing or invoking the compatibility adapter, the worker applies an explicit five-policy matrix. `FULL` may fetch detail, persist governed content, run the model, write Qdrant, notify through Feishu and mutate Exchange only as allowed by the event decision. `ARCHIVE` fetches detail and governed content, then calls `process_and_archive_email(..., skip_analysis=True)` so Qdrant is its only external mutation: no model, Feishu or Exchange mutation. `METADATA_ONLY` applies only the durable email projection/status/audit from the normalized envelope; it never fetches detail, stores body/attachments, invokes the legacy monolith, or calls model, Feishu, Exchange or Qdrant. `IGNORED` and `HISTORICAL_SUPPRESSED` are idempotent terminal no-ops with the same zero-effect ceiling; an anomalous pre-leased row is completed safely and uses the same unique suppression-audit identity rather than appending a duplicate. Parameterized tests drive a success branch for each policy and assert both required calls and every prohibited call.
 
-For executable work, the adapter applies the event state decision and invokes the legacy path only when `should_process=True`. A dedicated heartbeat task starts with the lease and continues at a bounded interval through pre-effect work, `effect_started_at`, all in-flight outbound calls and the terminal repository CAS. Losing `renew()` authority sets a cancellation signal immediately; an already in-flight call is treated as outcome-unknown, and no later call may begin. Immediately before every outbound dependency/effect boundary, the adapter must win the repeatable repository `begin_effect(lease)` guard; a false result stops execution. Because the existing `process_and_archive_email()` is a monolith, this task must either split its outbound boundaries or inject and await a typed `before_external_effect(kind)` guard immediately before ContentStore, model, Feishu, Exchange and Qdrant calls—the worker may not wrap only the outer function. A real process crash is recovered only after lease expiry: before-marker work retries boundedly, while after-marker work becomes `manual_review`, never blind retry. An in-process timeout or transport error after the marker follows the same `manual_review` path immediately and must not call the normal retry branch or start a later effect. A healthy heartbeat prevents a long marked operation from being reaped; a lost heartbeat permits the reaper to move it to `manual_review` and the guard prevents every subsequent side effect.
+`ProcessingCompletion.target_status` is exact and may be only `waiting_approval`, `notified_readonly`, `no_action` or `archived`; `ProcessingOutcome.PROCESSED` is never blindly mapped without the adapter's persisted legacy-result projection, `ARCHIVED` maps only to `archived`, and an unexpected `DUPLICATE` while the new aggregate is `processing` fails to manual review. Success locks in the global data-plane order, revalidates the exact processing attempt receipt, email ID/version/status/processing Inbox, lease, authority/ownership and absence of source deletion, then atomically moves the email to the target status, clears processing owner/error fields, completes the Inbox, appends audit and a unique canonical completion receipt. Same-key/same-result commit-unknown retries replay that receipt; changed results conflict. A nonterminal completion may never consume the final BIGINT version: `waiting_approval` requires its resulting version to remain strictly below `BIGINT_MAX`. If the only remaining CAS would produce `waiting_approval@BIGINT_MAX`, the same transaction instead uses that last CAS to put both email and Inbox in `dead_letter` with fixed safe code `email.version_exhausted_before_nonterminal_completion`, writes the canonical failure receipt/audit, and creates no approval/card/Outbox authority. Terminal `notified_readonly`, `no_action` and `archived` may use the final version because they require no later business CAS.
+
+The failure form reuses Task 4's closed failure classifier and performs the email plus Inbox transition in the same transaction. `retry_wait`, `manual_review` and `dead_letter` retain the exact processing Inbox and write the same fixed safe error facts required by both schema matrices; Inbox attempts/backoff and email authority version advance together. A retry disposition is allowed only when the resulting email version remains `<= BIGINT_MAX-2`; otherwise that failure becomes terminal `dead_letter` in the same last available CAS. A later reclaimed `retry_wait` lease uses Task 5's exact `(inbox_id,execution_epoch,attempts)` receipt to return to `processing`; epoch is zero before `0007`, while authenticated administrative recovery later increments it before resetting attempts. Manual-review/dead-letter never recover through an ordinary event. Completion tests cover stale expected version, source deletion, changed-result receipt conflict and commit-unknown replay. No path may complete/fail the Inbox first and leave `emails.status='processing'`, or commit an email terminal state while the Inbox remains leased. Phase 3 extends the same transaction to enqueue business Outboxes.
+
+Before Task 8 can activate a Worker, it replaces the Task-4 Inbox-only expiry mutation for processing-linked rows; it must never extend the old `Inbox FOR UPDATE -> email` path. The aggregate-aware reaper first performs a bounded no-row-lock candidate scan, acquires shared account locks in ascending order, and for each candidate takes email -> runtime authority when present -> required ownership rows -> exact Inbox. Only then does it recheck the complete expired lease token and atomically move both email and Inbox to the same `retry_wait`/`manual_review`/`dead_letter` disposition with version/attempt/audit facts. Its pre-effect retry uses the same capacity rule as explicit failure: `retry_wait` is legal only when the resulting email version remains `<= BIGINT_MAX-2`; otherwise the last available CAS atomically moves both rows to `dead_letter`, so no `retry_wait@BIGINT_MAX` can become permanently unelectable. Each candidate retains Task 4's savepoint poison isolation. A lease with no processing-linked email may remain on the lease-only account -> ownership -> Inbox path, but that branch can never acquire an email later. Real PostgreSQL tests repeatedly race aggregate apply/failure/reap, include expired `processing@BIGINT_MAX-1`, and require matching email/Inbox dispositions, bounded progress and zero deadlocks.
+
+For executable work, the adapter applies the event state decision and invokes the legacy path only when `should_process=True`. A result with `may_complete_without_processing=True` is an owned metadata/tombstone/distinct-CREATE no-op and may be completed immediately. `processing_already_elected` has `may_complete_without_processing=False`: the duplicate caller returns without complete/fail/renew/begin-effect, leaving the elected invocation or reaper as the sole lease-lifecycle owner.
+
+Each elected invocation owns one `LeaseAuthority`, not a captured immutable lease forever. The heartbeat accepts that authority, serializes renewal through it and atomically replaces its current token with the returned `InboxLease`; production code has no `heartbeat_once(immutable_lease)` shortcut. An old token becomes unreachable immediately. Every token-bound effect guard uses `run_with_current()` and holds the authority mutex continuously from reading the latest token through commit/rollback of the complete repository `begin_effect()` CAS; it releases the mutex before the remote network call. Heartbeat therefore cannot renew in the snapshot-to-CAS window and make the effect self-fence. Before terminal success/failure, the worker signals heartbeat stop, awaits any in-flight renewal, freezes the final latest token, and uses exactly it for the email+Inbox CAS. A renewal loss sets cancellation immediately; no later effect or finalize may begin. This protocol gives renew-vs-effect and renew-vs-finalize one current-token winner and prevents a successful renewal from making either path use its stale predecessor. Tests prove old-token rejection, renew->effect->finish success, mutex coverage across the token-bound effect CAS, renewal/finalize serialization and no leased orphan.
+
+The dedicated heartbeat continues at a bounded interval through pre-effect work, `effect_started_at` and all in-flight outbound calls until that stop-and-freeze boundary. Immediately before every outbound dependency/effect boundary, the adapter must win the repeatable repository `begin_effect(latest_lease)` guard; a false result stops execution. Because the existing `process_and_archive_email()` is a monolith, this task must either split its outbound boundaries or inject and await a typed `before_external_effect(kind)` guard immediately before ContentStore, model, Feishu, Exchange and Qdrant calls—the worker may not wrap only the outer function. A real process crash is recovered only after lease expiry: before-marker work retries boundedly, while after-marker work becomes `manual_review`, never blind retry. An in-process timeout or transport error after the marker follows the same `manual_review` path immediately and must not call the normal retry branch or start a later effect. A healthy heartbeat prevents a long marked operation from being reaped; a lost heartbeat permits the aggregate-aware reaper to move both linked rows to `manual_review` and the latest-token guard prevents every subsequent side effect.
 
 - [ ] **Step 3: Verify and commit**
 
 ```bash
-TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/unit/test_exchange_service_refactor.py -q
-git add src/ingestion/processing.py src/ingestion/legacy_adapter.py src/ingestion/worker.py src/exchange_service.py tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/unit/test_exchange_service_refactor.py
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/integration/ingestion/test_email_processing_completion.py tests/unit/test_exchange_service_refactor.py -q
+git add src/ingestion/processing.py src/ingestion/legacy_adapter.py src/ingestion/worker.py src/ingestion/repository.py src/exchange_service.py tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/integration/ingestion/test_email_processing_completion.py tests/unit/test_exchange_service_refactor.py
 git commit -m "feat: add recoverable durable inbox workers"
 ```
 
@@ -1686,14 +1916,14 @@ def test_shadow_decision_v1_hash_is_literal_and_versioned():
         change_kind=ChangeKind.CREATE,
         processing_policy=ProcessingPolicy.FULL,
         should_process=True,
-        target_email_status="ingested",
+        target_email_status="processing",
         cancel_pending_side_effects=False,
         reason_code="first_create",
         normalizer_contract_hash="b" * 64,
         policy_config_hash="c" * 64,
     )
     assert canonical_shadow_decision_hash(decision) == (
-        "0bac2b7c1b745d8607e4a28000ad512000548ac515bb45dc3d545983771199eb"
+        "50d215b241c34df75546ae83db7ef7131421291190a37e29f39df3a3d5a49261"
     )
 
 
@@ -1976,24 +2206,28 @@ async def test_quiesce_commit_unknown_replays_same_command_receipt(
 
 - [ ] **Step 2: Add the linear runtime-authority migration**
 
-Migration `20260713_0007` is linear from `20260713_0006`; Phase 3 therefore starts at `0008`. It creates seven governed control tables and adds `sync_cold_start_plans.target_reservation_id`:
+Migration `20260713_0007` is linear from `20260713_0006`; Phase 3 therefore starts at `0008`. It creates seven governed control tables, adds `sync_cold_start_plans.target_reservation_id`, and adds `event_inbox.execution_epoch BIGINT NOT NULL DEFAULT 0` with an explicit nonnegative/bounded check. `execution_epoch` becomes part of every exact `InboxLease` token and processing-attempt/completion receipt. The only administrator requeue function atomically transitions the linked Inbox and `emails` aggregate from `manual_review`/`dead_letter` to `retry_wait`, increments the Inbox epoch, resets attempts to zero, clears stale lease ownership/deadline, advances email authority version, and records the authenticated reason/command receipt/audit. It requires the locked current `emails.version <= BIGINT_MAX-3`, reserving one increment for recovery, one for re-entering processing and one for terminal completion. If any external marker exists, it additionally requires completed reconciliation evidence and zero unreconciled `started/unknown` effect identities. It refuses recovery when the epoch or attempts is already `BIGINT_MAX` or the email version lacks that three-CAS budget; ordinary claim, renew, fail and reap never reset the epoch.
 
 - `pipeline_runtime_authority`: one versioned row per account with mode (`legacy_authoritative/shadow/quiescing/durable_active`), monotonic `authority_epoch`, ownership generation/fence/pipeline FK, policy readiness/config hash, minimum numeric build, minimum protocol, actor/reason and CAS version.
 - `pipeline_runtime_instances`: per-account process lease with instance/workload/deployment IDs, numeric build plus display build ID, protocol/config/profile, lifecycle (`standby/active/draining`), observed epoch, legacy queue/in-flight/effect counts, heartbeat and lease deadline. Build ordering uses a CI-produced integer; Git SHA is never ordered lexically.
 - `pipeline_target_reservations`: one active reservation per account/live barrier with an immutable target pipeline name, preallocated generation/fencing token, build/protocol/config hash, zero-work standby roster hash, expiry, state (`reserved/promoted/cancelled/expired`) and its reserved `pipeline_ownership` FK. Migration `0007` extends the ownership state contract with an explicit non-executable `reserved` state; it must never overload `quiescing`. `prepare_target()` takes the account advisory lock, creates exactly one `reserved` ownership row and allocates the final generation/fence exactly once. The only ownership exits are `reserved -> current_ingress` during the atomic promotion or `reserved -> retired` during cancellation/expiry; direct `reserved -> quiescing|draining` is rejected. Folder plans and the live barrier reference this row by FK. Promotion never rotates the fence. Cancel/expiry under the same lock retires the unused ownership row and releases only the active-reservation slot; generation/fence are never reused.
 - `pipeline_legacy_effects`: account/event-key/authority-epoch/generation/fence/instance/effect-kind/deterministic-ordinal/target-hash registrations with immutable identity, state (`started/completed/unknown/reconciled`), reconciliation disposition, idempotency/evidence hashes and timestamps. A UNIQUE constraint covers `(account_id,event_key,authority_epoch,effect_kind,ordinal,target_hash)`; ordinal identifies an intended distinct effect in the deterministic pipeline, never a retry attempt. The only transitions are `started -> completed|unknown` and maintenance-only `unknown -> reconciled`; completed/reconciled are terminal. UPDATE of identity/effect kind/ordinal/target/initial token, DELETE and TRUNCATE are rejected. A crash never deletes or auto-expires a started/unknown outcome.
-- `pipeline_cutover_barriers` and `pipeline_cutover_barrier_members`: immutable predecessor barrier, target mode/config/build/protocol, exact external deployment roster and revision/hash, expected instance count, exact completed backfill-plan and sealed Shadow-evidence FKs plus their source/cutoff/high-water/build/config/count/hash facts, legacy nonterminal/quarantine counts and hash, versioned `exchange_sync_contract_v2` build/profile/page/continuation/read-flag probe hash, the complete configured `FolderScope` manifest plus one exact target-bound active cursor or unexpired approved cold-start boundary per folder and its rolling hash, expiring LB isolation, effect-secret rotation and legacy-DB-connection isolation proof hashes, and nullable Phase-3 approval/outbox/legacy-card/adapter-manifest evidence hashes that are mandatory for a `durable_active` target row. Barrier state is the strict sequence `planned -> fence_verified -> quiesced -> drained -> evidence_frozen -> target_standby -> legacy_isolated -> proof_fresh -> ready -> consumed`, with only pre-ready cancellation allowed.
+- `pipeline_cutover_barriers` and `pipeline_cutover_barrier_members`: immutable predecessor barrier, target mode/config/build/protocol, exact external deployment roster and revision/hash, expected instance count, exact completed backfill-plan and sealed Shadow-evidence FKs plus their source/cutoff/high-water/build/config/count/hash facts, legacy nonterminal/quarantine counts and hash, versioned `exchange_sync_contract_v2` build/profile/page/continuation/read-flag probe hash, the complete configured `FolderScope` manifest plus one exact target-bound active cursor or unexpired approved cold-start boundary per folder and its rolling hash, a fresh terminal projection-refresh cycle hash proving zero unresolved read/folder refresh rows at those cursor high-waters, expiring LB isolation, effect-secret rotation and legacy-DB-connection isolation proof hashes, and nullable Phase-3 approval/outbox/legacy-card/adapter-manifest evidence hashes that are mandatory for a `durable_active` target row. Barrier state is the strict sequence `planned -> fence_verified -> quiesced -> drained -> evidence_frozen -> target_standby -> legacy_isolated -> proof_fresh -> ready -> consumed`, with only pre-ready cancellation allowed.
 - `legacy_backfill_plans`: account, ownership generation/fence, mapping/config versions, source count/high-water/rolling hash, legacy-nonterminal count, exact quarantine count/hash, target count/reconciliation hash, applied cursor/hash/counts, status, actor/reason and timestamps; it stores no email body, draft, response or raw identifier sample. Idempotency lives in the shared append-only command receipts, not a mutable key column on the plan.
 
-All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Before any activation API exists, `0007` revokes runtime's direct `INSERT`/`UPDATE` authority over both `pipeline_ownership` and `event_inbox`. Bootstrap, quiesce, target preparation/promotion/cancellation, evidence-backed retirement, Inbox insert/claim/renew/begin/complete/fail/reap, and authenticated administrator recovery then use only source-digest-locked, fixed-`search_path`, narrowly granted database functions. `PipelineOwnershipRepository` and `InboxRepository` are updated in this task to call those governed entry points; their Phase-2 direct DML implementations cannot remain reachable after the revoke. Inbox functions enforce the Task-4 transition matrix, exact lease token, expiry boundary, attempts delta/overflow rule, processing-policy whitelist, ownership state/fence, immutable identity, audit equality and advisory-lock order inside the database. Each ownership/control function takes the account advisory lock and revalidates the exact caller-visible authority epoch where applicable, barrier, reservation, generation/fence, state and append-only command receipt inside one transaction. General runtime DML, ad-hoc SQL, or a Python-only service cannot create a second current row, forge/reopen/steal Inbox work, promote an unreserved target, rotate a reserved fence, skip an audit/receipt, or retire without evidence. If a separate control credential is introduced instead, it must be explicit in the ACL/bootstrap contract and no broader than those same operations; it cannot inherit migration/maintenance power.
+All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Before any activation API exists, `0007` revokes runtime's direct `INSERT`/`UPDATE` authority over `pipeline_ownership`, `event_inbox`, and `emails`. It also revokes **all** direct table- and column-level `INSERT` privileges on `audit_events` from runtime and maintenance; PostgreSQL ACL cannot safely grant by `action` namespace. Every legal runtime or maintenance audit append—including Task-5 processing authorization—must occur only inside a source-digest-locked, fixed-`search_path`, narrowly granted `SECURITY DEFINER` state-transition function that constructs the fixed action/result/actor/reason/metadata itself. No general `append_audit` entry point accepts caller-selected namespaces.
 
-Runtime otherwise receives SELECT on authority/barriers/Inbox, EXECUTE only on the exact Inbox and ownership functions needed by its role, INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations, INSERT on `pipeline_legacy_effects`, and only `state/evidence_hash/completed_at` UPDATE needed to close its own `started -> completed|unknown`; it has no raw Inbox/ownership mutation, reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance receives only separately named recovery/reaper functions plus the control transitions it owns; it cannot use runtime claim/effect functions, rewrite identity or reopen a terminal row without the authenticated recovery contract. Auditor has SELECT only; migration owns DDL. Real-role tests prove raw runtime and maintenance Inbox `INSERT`, `UPDATE`, `MERGE`, `DELETE`, `TRUNCATE`, and `COPY FROM` are rejected, every allowed and forbidden governed Inbox transition, every allowed and forbidden ownership/control operation, concurrent promotion/replay/reclaim, stale lease/reservation/fence, wrong barrier/epoch, audit mismatch and rollback. Architecture scans are supplementary and cannot substitute for database ACL/behavior tests. The same task updates exact schema/function-source digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
+Bootstrap, quiesce, target preparation/promotion/cancellation, evidence-backed retirement, Inbox insert/claim/renew/begin/complete/fail/reap, monotonic email-event apply/status CAS with its exact `(inbox_id,execution_epoch,attempts)` receipt, and authenticated administrator recovery all use those governed functions. `PipelineOwnershipRepository` and `InboxRepository` are updated in this task to call the governed entry points; their Phase-2 direct DML implementations cannot remain reachable after the revoke. Inbox and email functions enforce the Task-4/Task-5 transition matrices, exact epoch-bearing lease token, expiry boundary, attempts delta/overflow rule, processing-policy whitelist, ownership state/fence, immutable identity, audit equality and advisory-lock order inside the database. The global partial order is: shared account advisory lock -> email -> runtime authority -> required ownership/reservation rows in ascending generation order -> exact Inbox/card -> Notification -> Mailbox -> Send/effect -> audit/receipt. A lease-only function may use shared account -> ownership -> Inbox only if it never locks an email later. Freeze/switch/control takes the exclusive account lock and then authority -> ownership, so it cannot overlap either data-plane class; multi-account operations acquire account locks in ascending account order. General runtime DML, ad-hoc SQL, or a Python-only service cannot create a second current row, forge/reopen/steal Inbox work, mint a processing authorization, reopen terminal mail, promote an unreserved target, rotate a reserved fence, skip an audit/receipt, or retire without evidence. If a separate control credential is introduced instead, it must be explicit in the ACL/bootstrap contract and no broader than those same operations; it cannot inherit migration/maintenance power.
+
+Runtime otherwise receives SELECT on authority/barriers/Inbox/effect facts, EXECUTE only on the exact Inbox, email, effect and ownership functions needed by its role, and INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations. It has no direct `pipeline_legacy_effects` INSERT/UPDATE: narrowly separated begin/finish functions create a fixed identity and close only the caller's exact started token. It has no raw Inbox/email/ownership/audit mutation, reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance receives only separately named recovery/reaper/reconciliation functions plus the control transitions it owns; it cannot use runtime claim/effect functions, directly insert audit/effect rows, rewrite identity or reopen a terminal row without the authenticated recovery contract. Auditor has SELECT only; migration owns DDL. Real-role tests prove raw runtime and maintenance Inbox/email/audit/effect `INSERT`, `UPDATE`, `MERGE`, `DELETE`, `TRUNCATE`, and `COPY FROM` are rejected—including `audit_events` table and column INSERT—while each narrow function can append only its fixed audit/effect. They also prove every allowed and forbidden governed transition, concurrent promotion/replay/reclaim, stale lease/reservation/fence/epoch, changed-payload recovery conflict, audit mismatch and rollback. Real PostgreSQL deadlock gates run apply-vs-reap, delete-vs-effect, approval-vs-delete, resolution-vs-delete and switch-vs-data-plane races repeatedly with bounded lock timeouts and require zero deadlocks plus one legal serialized outcome. Architecture scans are supplementary and cannot substitute for database ACL/behavior tests. The same task updates exact schema/function-source digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
 
 - [ ] **Step 3: Implement the authority state machine and mandatory legacy fence**
 
 Environment flags are never authority; they become only a requested runtime profile in Task 11. Phase 2 implements and exposes only `legacy_authoritative -> quiescing -> shadow` plus a pre-switch cancellation back to the prior legacy/Shadow mode. The schema reserves `durable_active`, but `RuntimeAuthorityRepository`, Phase-2 CLI and runtime must reject every Phase-2 attempt to enter it with `phase3_activation_required`. Phase 3 alone adds the transition `shadow -> quiescing -> durable_active` after fenced approval/send readiness; later rollback is `durable_active -> quiescing -> durable_active` with a new `legacy_compat` generation and can never resurrect the old in-memory queue or Shadow as authority.
 
-Every legacy Webhook/poller/self-healer item is stamped at intake with account, event key, email ID and expected email version, authority epoch, generation and fence. `process_and_archive_email()` keeps the Task 8 typed `before_external_effect(kind, ordinal, target_hash)` hook mandatory in production. That hook cannot be a read-only authorize-then-call check: `try_begin_effect()` takes the same per-account transaction advisory lock later used by Phase 3 switch, then uses the fixed row-lock order email -> authority/ownership -> exact effect identity. Under the email lock it re-reads version, `create_seen_at`, status and `source_deleted_at`; a deleted/tombstoned aggregate or version that no longer authorizes work rejects before inserting an effect. Only an absent identity for a still-authorized aggregate inserts `state='started'` and returns an execute token. If effect-begin wins the delete race, that one registered call may finish outcome-known/unknown, but delete records `source_deleted_at` and every later effect begin re-locks/rechecks the email and is rejected. If delete wins, no remote call begins. A completed identity returns `already_completed` and the caller skips the remote call; `started` or `unknown` fails closed with `ManualReconciliationRequired` and can never call remotely again. A reconciled-completed identity also skips; a reconciled-not-executed outcome requires a separate maintenance-authorized new ordinal rather than reopening the old row. ContentStore, model, Feishu, Exchange and Qdrant boundaries each begin and finish their own registration. Runtime may close its own started row as completed/unknown but cannot reconcile; stale started rows become unknown only through maintenance, and unknown requires explicit maintenance reconciliation evidence. A crash after the remote effect but before `finish()` therefore leaves a durable started row; Webhook retry/restart sees it and never repeats the effect. Phase 3 switch takes the same lock and requires zero started/unknown registrations, giving effect-begin versus delete and epoch-switch one serialized winner with no authorization-to-call TOCTOU window.
+Every legacy Webhook/poller/self-healer item is stamped at intake with account, event key, email ID and expected email version, authority epoch, generation and fence. `process_and_archive_email()` keeps the Task 8 typed `before_external_effect(kind, ordinal, target_hash)` hook mandatory in production. That hook cannot be a read-only authorize-then-call check: `try_begin_effect()` takes the shared per-account transaction advisory lock later taken exclusively by Phase 3 switch, then uses the fixed row-lock order email -> authority/ownership -> exact effect identity. Under the email lock it re-reads version, `create_seen_at`, status and `source_deleted_at`; a deleted/tombstoned aggregate or version that no longer authorizes work rejects before inserting an effect. Only an absent identity for a still-authorized aggregate may insert `state='started'`; in that same transaction it writes `emails.external_effects_started_at = COALESCE(external_effects_started_at, clock_timestamp())`, then returns an execute token only after commit. Setting that one-way marker alone does not advance the business version or invalidate the effect it just authorized. Every later Phase-3 Notification/Mailbox/Send begin guard has the same email-first responsibility. DELETE derives `external_effects_started` only from this locked persisted marker.
+
+If effect-begin wins the delete race, that one registered call may finish outcome-known/unknown, but delete records `source_deleted_at` and every later effect begin re-locks/rechecks the email and is rejected. If delete wins, no remote call begins. A completed identity returns `already_completed` and the caller skips the remote call; `started` or `unknown` fails closed with `ManualReconciliationRequired` and can never call remotely again. A reconciled-completed identity also skips; a reconciled-not-executed outcome requires a separate maintenance-authorized new ordinal rather than reopening the old row. ContentStore, model, Feishu, Exchange and Qdrant boundaries each begin and finish their own registration. Runtime may close its own started row as completed/unknown but cannot reconcile; stale started rows become unknown only through maintenance, and unknown requires explicit maintenance reconciliation evidence. A crash after the remote effect but before `finish()` therefore leaves a durable started row; Webhook retry/restart sees it and never repeats the effect. Real PostgreSQL begin-vs-delete tests assert that a committed execute token always has both the effect row and email marker, while a winning delete yields zero token/remote calls. Phase 3 switch takes the exclusive account lock and requires zero started/unknown registrations, giving effect-begin versus delete and epoch-switch one serialized winner with no authorization-to-call TOCTOU window.
 
 The Worker additionally re-runs the Task-8 stamped adapter selection before each lease and each later effect boundary. `legacy_compat` may execute only for the matching legacy-authoritative/Shadow stamp or an explicitly draining old generation, always through the exact effect registration above. A target/durable stamp can never select that adapter; until Phase 3 registers an exact build/config `DurableProcessingAdapter`, it remains standby and claim-ineligible.
 
@@ -2023,6 +2257,7 @@ git commit -m "feat: add database-authoritative ingestion readiness"
 - Create: `src/ingestion/cutover.py`
 - Create: `src/ingestion/sync_resources.py`
 - Create: `src/ingestion/sync_contract_probe.py`
+- Create: `src/ingestion/read_refresh.py`
 - Create: `src/scheduler/sync_reconciliation.py`
 - Create: `scripts/backfill_durable_ingestion.py`
 - Create: `scripts/manage_pipeline.py`
@@ -2031,11 +2266,13 @@ git commit -m "feat: add database-authoritative ingestion readiness"
 - Create: `tests/unit/ingestion/test_backfill.py`
 - Create: `tests/integration/ingestion/test_sync_resource_isolation.py`
 - Create: `tests/integration/ingestion/test_sync_contract_probe.py`
+- Create: `tests/integration/ingestion/test_read_refresh.py`
 - Create: `tests/architecture/test_phase2_runtime_stays_standby.py`
 - Modify: `src/config.py`
 - Modify: `src/init_app.py`
 - Modify: `src/main.py`
 - Modify: `src/commands/handlers.py`
+- Modify: `src/ingestion/repository.py`
 - Modify: `src/observability/metrics.py`
 - Modify: `.env.example`
 - Modify: `tests/unit/test_metrics.py`
@@ -2044,7 +2281,7 @@ git commit -m "feat: add database-authoritative ingestion readiness"
 - Replace: `tests/unit/test_polling_scheduler.py`
 
 **Interfaces:**
-- Produces: one Phase-2 `IngestionRuntime`; DB-backed `/queue`/metrics including manual review; `BackfillService.plan/execute`; versioned read-only `SyncContractProbe`; `CutoverReadinessService.plan/quiesce/shadow_switch/ready/drain_status`; CLI exit codes 0 success, 2 blocked, 3 invariant failure
+- Produces: one Phase-2 `IngestionRuntime`; DB-backed `/queue`/metrics including manual review; `BackfillService.plan/execute`; versioned read-only `SyncContractProbe`; bounded `ProjectionRefreshService` plus transaction-bound `apply_projection_refresh`; `CutoverReadinessService.plan/quiesce/shadow_switch/ready/drain_status`; CLI exit codes 0 success, 2 blocked, 3 invariant failure
 
 - [ ] **Step 1: Write profile, lifecycle, backfill, and rollback tests**
 
@@ -2191,6 +2428,40 @@ async def test_v2_probe_requires_bounded_continuation_and_mapped_read_flag(
     assert all(page.count <= 500 for page in evidence.pages)
     assert evidence.pages[-1].includes_last is True
     assert evidence.read_flag_profile == "map_to_update_v1"
+
+
+@pytest.mark.integration
+async def test_authoritative_refresh_can_clear_true_and_move_folder_without_version_bump(
+    projection_refresh, db, fixed_v2_extension_fixture
+):
+    row = await db.seed_email(
+        is_read=True,
+        is_read_refresh_required=True,
+        source_folder_key="INBOX",
+        version=7,
+    )
+    fixed_v2_extension_fixture.detail_current.return_value = {
+        "is_read": False,
+        "folder": "ARCHIVE",
+    }
+    evidence = await projection_refresh.run_account(row.account_id)
+    refreshed = await db.email(row.id)
+    assert (refreshed.is_read, refreshed.source_folder_key) == (False, "ARCHIVE")
+    assert refreshed.is_read_refresh_required is False
+    assert refreshed.version == 7
+    assert evidence.final_sync_terminal is True
+    assert evidence.unresolved_count == 0
+
+
+@pytest.mark.integration
+async def test_change_during_refresh_is_reconciled_before_evidence_seals(
+    projection_refresh, db, fixed_v2_extension_fixture
+):
+    row = await db.seed_refresh_required_email(is_read=True)
+    fixed_v2_extension_fixture.change_after_detail(row.external_email_id, is_read=False)
+    evidence = await projection_refresh.run_account(row.account_id)
+    assert evidence.sealed is False
+    assert (await db.email(row.id)).is_read_refresh_required is True
 ```
 
 - [ ] **Step 2: Lock requested profiles and lifecycle**
@@ -2202,6 +2473,10 @@ The only valid requested flag tuples are the four tests above, but in Phase 2 `d
 DB mode is authoritative: legacy permits only old guarded Webhook/poller; Shadow keeps legacy authoritative and allows side-effect-free candidate comparisons; quiescing permits no new intake/claim; the schema's durable mode is unavailable to Phase-2 production code. Durable candidate processes register only as standby with zero intake, claim, Sync, scheduler and effect work. `tests/architecture/test_phase2_runtime_stays_standby.py` scans `main.py`, `server.py`, runtime and CLI wiring and fails if Phase 2 can expose Durable 202, start Durable Worker claims or execute Sync writes. Phase 3 later authorizes those paths only after the latest complete `production_ready` successor.
 
 Startup may probe Sync permission for every FolderScope, not only Inbox, but the probe never writes cursor/Inbox and does not start the five-minute scheduler in Phase 2. `AppContext` owns one runtime; shutdown stops Shadow schedules, drains boundedly, heartbeats the draining state, then closes dedicated Sync and main clients. The former `/list` loop cannot process directly; any compatibility import delegates to the authority-guarded legacy or dormant coordinator and cannot bypass the Phase-2 activation boundary.
+
+Ambiguous event ordering deliberately leaves `emails.is_read_refresh_required=True`; Task 11 supplies the only authoritative clearing path. `ProjectionRefreshService.run_account()` loads the immutable configured `FolderScope` manifest and acquires **every** corresponding Sync session advisory lock in ascending canonical-key order on one dedicated connection before it may clear a flag. It first reaches an authenticated terminal Sync high-water for every scope, freezes the full folder->cursor manifest/hash, fetches a bounded batch of current message detail using read-only Exchange calls outside every database transaction, then calls transaction-bound `apply_projection_refresh(account_id, external_email_id, observed_source_folder_key, observed_is_read, base_cursor_manifest_hash, observation_hash)`. The repository takes shared account -> email -> authority/ownership, revalidates the exact all-scope cursor manifest and a strict boolean/current canonical folder, may authoritatively change `True` back to `False`, clears the refresh flag, and updates only projection/`updated_at`; it never increments the business version, changes status/owner/content, inserts an Inbox effect, or calls an external mutation. A single-folder background pass may detect/set ambiguity but cannot clear it or seal evidence.
+
+Before sealing evidence, the service performs a final bounded Sync catch-up for **every configured scope** while retaining the complete canonical lock set. Any source or destination-folder change that occurred during the detail window is therefore applied after the refresh; if that event makes ordering ambiguous again, the flag remains set and the cycle cannot seal. It re-reads and hashes the final all-scope cursor manifest before releasing locks. Deleted/not-found messages use the ordinary source-delete Inbox path rather than a projection shortcut. Timeout, malformed detail, cursor/manifest drift, ownership drift, lock loss or partial coverage preserves the flag and blocks evidence. Activation readiness requires a fresh hash over the exact folder cursor high-waters, bounded candidate/result counts and `unresolved_count=0` across every configured scope; folder projection is explicitly best-effort during normal ingestion but fully reconciled at this gate. Tests prove canonical all-lock acquisition/release, INBOX->ARCHIVE concurrency, true-to-false refresh, folder correction, unchanged authority version, outer rollback, concurrent approval/effect non-fencing, change-during-refresh repetition and zero external mutation. The currently read-only extension remains an external blocker until its future v2/detail contract passes this probe; Task 11 does not modify that repository.
 
 Before any live activation gate can pass, Task 11 runs high-cardinality load tests against the exact single-pass `InboxStats` aggregate used by `/queue`, metrics, and drain reporting, including concurrent claim/reaper traffic and the configured statement-timeout budget. If exact aggregation does not meet the documented latency and database-load SLO at the approved retention cardinality, activation remains blocked until a bounded-staleness cache or transactionally maintained incremental summary is implemented with restart/reconciliation, drift detection, and exact fallback tests. No unmeasured full-table stats scan is accepted merely because it is correct on an empty development database.
 
