@@ -4,19 +4,20 @@
 
 **Goal:** 完成轻量 LangGraph、正确的 T1→T2→T3 分类顺序、真正生效的 Reviewer 重写循环、统一模型网关和可重建 Qdrant 投影。
 
-**Architecture:** Graph 只编排确定性状态和不可变 ID，依赖通过 `GraphDependencies` 注入。T1 规则先短路，T2 检索旧邮件并产生经验提示，只有仍不确定时进入 T3 LLM。人工暂停只存在于 `await_human` 节点；Qdrant 写入由 Projection Outbox 异步完成。
+**Architecture:** 新 Durable Graph 只编排确定性状态和不可变 ID，依赖通过 `GraphDependencies` 注入。T1 规则先短路，T2 检索旧邮件并产生经验提示，只有仍不确定时进入 T3 LLM。人工暂停只存在于 `await_human` 节点；Qdrant 写入由 Projection Outbox 异步完成。它在 legacy/Shadow 下保持 dormant，只有 stamped current Durable generation 才由 `ProcessingAdapterRouter` 选中；现网 legacy Graph/副作用在切换前继续经 `LegacyEffectGuard` 提供业务连续性。
 
 **Tech Stack:** Python 3.12、LangGraph 1.x、Pydantic 2、LangChain、Qdrant、OpenAI-compatible providers、psycopg 3、pytest。
 
 ## Global Constraints
 
-- Phase 3 已移除 Graph 直接发送；Graph 不得重新获得 Exchange/Lark 副作用权限。
+- Phase 3 已从 **Durable Graph** 移除直接发送；新 Graph 不得重新获得 Exchange/Lark 副作用权限。legacy-authoritative/Shadow 仍选择 guarded legacy Graph，切换后新代次选择新 Graph，旧代次只排已 stamped guarded work。
 - Graph State 单次序列化必须小于 16 KiB，正文和检索完整对象不得写入 checkpoint。
 - Provider SDK `max_retries=0`；只有 ModelGateway 执行一个重试层。
 - 每个角色输入最多 131072 Token，角色可配置更低值。
 - 模型或 Schema 失败进入 `manual_review`，不得生成 no-action 默认值。
 - 当前邮件在检索时必须通过 `exclude_email_id` 排除；只有终态旧邮件可被检索。
 - Qdrant 使用稳定 UUIDv5 Point ID、`wait=True`，失败不回滚主业务状态。
+- 当前 extension 仍 external-blocked 时，部署本阶段不得切断 legacy cards/审批/发送/mark-read/Qdrant；Dormant Durable candidate creates/claims zero business Outbox.
 
 ---
 
@@ -41,15 +42,18 @@
 - Create: `tests/unit/graph/test_dependencies.py`
 - Create: `tests/unit/graph/conftest.py`
 - Modify: `src/graph/builder.py`
+- Modify: `src/ingestion/durable_adapter.py`
+- Modify: `src/ingestion/processing.py`
 - Modify: `src/init_app.py`
 - Modify: `src/nodes/categorizer.py`
 - Modify: `src/nodes/retriever_node.py`
 - Modify: `src/nodes/drafter.py`
 - Modify: `src/nodes/reviewer.py`
+- Create: `tests/integration/graph/test_authority_graph_selection.py`
 
 **Interfaces:**
 - Consumes: Phase 1 minimal `GraphDependencies`; `ContentStore`, `DraftRepositoryPort`, `RoutingPort`, `ModelGatewayPort`, `WorkflowPort`, `RetrieverPort`
-- Produces: immutable `GraphDependencies`; callable node objects with no dynamic AppContext imports
+- Produces: immutable `GraphDependencies`; callable node objects with no dynamic AppContext imports; authority-selected dormant/current Graph binding for `DurableProcessingAdapter` and `DurableLegacyCompatAdapter`
 
 - [ ] **Step 1: Write dependency tests**
 
@@ -64,6 +68,20 @@ def test_node_modules_do_not_import_app_context():
         source = inspect.getsource(module)
         assert "src.init_app" not in source
         assert "get_app_context" not in source
+
+
+@pytest.mark.integration
+async def test_graph_selection_preserves_shadow_and_switch_boundaries(
+    selector, authority, legacy_graph, durable_graph
+):
+    await authority.seed(mode="shadow", pipeline_name="legacy_compat", generation=4)
+    assert await selector.graph_for_current_stamp() is legacy_graph
+    assert legacy_graph.every_external_effect_is_guarded is True
+    await authority.seed_for_test(
+        mode="durable_active", pipeline_name="durable_candidate", generation=5
+    )
+    assert await selector.graph_for_current_stamp() is durable_graph
+    assert durable_graph.direct_external_clients == set()
 ```
 
 - [ ] **Step 2: Define GraphDependencies**
@@ -133,13 +151,13 @@ class GraphDependencies:
 
 - [ ] **Step 3: Bind node callables**
 
-Create callable node classes that hydrate content locally, invoke one dependency, and return a delta. `build_graph(checkpointer, dependencies)` constructs these callables. Delete dynamic imports and global singleton access from nodes.
+Create callable node classes that hydrate content locally, invoke one dependency, and return a delta. `build_graph(checkpointer, dependencies)` constructs the Durable candidate. Inject it into `DurableProcessingAdapter` and `DurableLegacyCompatAdapter`; the latter keeps compatibility policy but still has no direct external clients. `ProcessingAdapterRouter` selects it only for the matching stamped current `durable_active` generation. Under legacy-authoritative/Shadow it selects the existing guarded legacy Graph; the new Graph remains dormant, and an old draining stamp cannot cross into it. Delete dynamic imports and global singleton access from new nodes without deleting the legacy Graph before Phase-6 contraction.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
 .venv/bin/python -m pytest tests/unit/graph/test_dependencies.py tests/unit/test_nodes.py tests/unit/test_rag_nodes.py -q
-git add src/graph/ports.py src/graph/dependencies.py src/graph/nodes.py src/graph/builder.py src/init_app.py src/nodes tests/unit/graph/conftest.py tests/unit/graph/test_dependencies.py tests/unit/test_nodes.py tests/unit/test_rag_nodes.py
+git add src/graph/ports.py src/graph/dependencies.py src/graph/nodes.py src/graph/builder.py src/ingestion/durable_adapter.py src/ingestion/processing.py src/init_app.py src/nodes tests/unit/graph/conftest.py tests/unit/graph/test_dependencies.py tests/unit/test_nodes.py tests/unit/test_rag_nodes.py tests/integration/graph/test_authority_graph_selection.py
 git commit -m "refactor: inject graph dependencies explicitly"
 ```
 
@@ -432,7 +450,7 @@ async def test_nonapproval_paths_never_interrupt(graph_runner, terminal):
 
 - [ ] **Step 2: Implement explicit human boundary**
 
-After Reviewer pass, create notification Outbox and enter `await_human`, which calls LangGraph `interrupt()` with only email ID, draft version/hash and approval version. Reject/no-action/manual paths end without an approval interrupt.
+On the authority-selected Durable Graph, Reviewer pass creates Notification Outbox and enters `await_human`, which calls LangGraph `interrupt()` with only email ID, draft version/hash and approval version. Reject/no-action/manual paths end without an approval interrupt. This does not rewrite the guarded legacy Graph: under legacy-authoritative/Shadow its existing notification/human behavior remains available through `LegacyProcessingAdapter` and `LegacyEffectGuard`, while the Durable candidate creates/claims no row.
 
 - [ ] **Step 3: Verify and commit**
 
@@ -447,7 +465,7 @@ git commit -m "fix: interrupt only at reviewed human approval"
 ### Task 7: Mature ContentStore Lifecycle, Migration, and Key Rotation
 
 **Files:**
-- Create: `alembic/versions/20260710_0005_content_lifecycle.py`
+- Create: `alembic/versions/20260713_0009_content_lifecycle.py`
 - Create: `src/storage/backend.py`
 - Create: `src/storage/repository.py`
 - Create: `src/storage/migration.py`
@@ -463,10 +481,24 @@ git commit -m "fix: interrupt only at reviewed human approval"
 - Modify: `src/storage/encrypted_files.py`
 - Modify: `src/config.py`
 - Modify: `.env.example`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0008_to_0009.py`
 
 **Interfaces:**
 - Consumes: Phase 1 `ContentStore`, `ContentRef`, encrypted file layout and immutable email facts
 - Produces: `ContentBackend` Port; account-scoped content/artifact repository; `LegacyContentMigrator`; `KeyRotator`; hold-aware `ContentGarbageCollector`
+
+Migration revision is exactly `20260713_0009` with linear `down_revision = "20260713_0008"`.
 
 - [ ] **Step 1: Write cross-account, reference, hold, migration, and rotation tests**
 
@@ -511,6 +543,8 @@ Extend the Phase 1 storage conftest with in-memory backend, `repo`, `gc` and `ro
 
 Migration creates `email_contents(id UUID PRIMARY KEY, account_id BIGINT, content_hash CHAR(64), backend TEXT, object_key TEXT, key_version TEXT, media_type TEXT, byte_size BIGINT, ref_count BIGINT DEFAULT 0 CHECK(ref_count>=0), expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ, UNIQUE(account_id, content_hash))`; `email_artifacts(id UUID PRIMARY KEY, email_id TEXT, content_id UUID REFERENCES email_contents, filename_hash TEXT, detected_type TEXT, byte_size BIGINT, disposition TEXT, created_at TIMESTAMPTZ)`; `content_references(owner_type, owner_id, content_id, created_at, PRIMARY KEY(owner_type, owner_id, content_id))`; `content_holds(content_id, hold_type, owner_id, expires_at, created_at, PRIMARY KEY(content_id, hold_type, owner_id))`; and migration/rotation job tables with idempotency keys and cursors.
 
+`0009` is a complete revision-contract change in this same task: advance the single exact application head and schema digest; update bootstrap pre/post checks, all four ACL manifests, checkpoint revision allowlist and offline SQL; grant runtime/maintenance only their required content/reference/job columns, auditor SELECT-only and DDL only to migration. `tests/integration/migrations/test_0008_to_0009.py` creates real PostgreSQL at `0008`, seeds representative approval/Outbox/content references with all Phase-4 profiles disabled, runs the code-first `0008 -> 0009` bridge, verifies row preservation/roles/schema/startup and a second no-op upgrade, and proves an old `0008` binary rejects a database-first `0009` head. Empty-DB and downgrade-refusal paths remain single-head.
+
 - [ ] **Step 3: Split metadata from backend bytes**
 
 ```python
@@ -537,8 +571,9 @@ class ContentBackend(Protocol):
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/storage tests/integration/storage -q
-git add alembic/versions/20260710_0005_content_lifecycle.py src/storage src/config.py .env.example tests/unit/storage tests/integration/storage
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/storage tests/integration/storage tests/integration/migrations/test_0008_to_0009.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+git add alembic/versions/20260713_0009_content_lifecycle.py src/storage src/config.py .env.example src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/storage tests/integration/storage tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0008_to_0009.py
 git commit -m "feat: complete encrypted content lifecycle"
 ```
 
@@ -549,12 +584,13 @@ Expected: restart, dedupe, account isolation, migration re-run, rotation, refere
 ### Task 8: Move Qdrant Writes to Projection Outbox
 
 **Files:**
-- Create: `alembic/versions/20260710_0006_projection_outbox.py`
+- Create: `alembic/versions/20260713_0010_projection_outbox.py`
 - Create: `src/projections/__init__.py`
 - Create: `src/projections/qdrant.py`
 - Create: `src/outbox/projection.py`
 - Create: `tests/unit/projections/test_qdrant_projection.py`
 - Create: `tests/integration/projections/test_projection_outbox.py`
+- Create: `tests/integration/projections/test_authority_dual_path.py`
 - Create: `tests/unit/projections/conftest.py`
 - Modify: `src/exchange_service.py`
 - Modify: `src/utils/email_processor.py`
@@ -564,9 +600,26 @@ Expected: restart, dedupe, account isolation, migration re-run, rotation, refere
 - Modify: `src/approval/service.py`
 - Modify: `src/approval/send_resolution.py`
 - Modify: `src/ingestion/repository.py`
+- Modify: `src/ingestion/durable_adapter.py`
+- Modify: `src/ingestion/processing.py`
+- Modify: `src/ingestion/cutover_barrier.py`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0009_to_0010.py`
 
 **Interfaces:**
 - Produces: `EmailProjection`, stable point ID, idempotent fenced `ProjectionWorker`, no direct pre-classification write
+
+Migration revision is exactly `20260713_0010` with linear `down_revision = "20260713_0009"`.
 
 - [ ] **Step 1: Write ordering and wait tests**
 
@@ -601,6 +654,24 @@ async def test_projection_completion_rejects_rotated_fence(worker, repo, qdrant)
     with pytest.raises(StaleFence):
         await worker.deliver(job)
     assert await repo.status(job.id) == "leased"
+
+
+@pytest.mark.integration
+async def test_shadow_legacy_qdrant_continuity_is_exactly_guarded(
+    selector, legacy_event, legacy_effects, qdrant
+):
+    await selector.process(legacy_event, authority="shadow")
+    assert qdrant.upsert.call_count == 1
+    assert await legacy_effects.completed_kind("qdrant") == 1
+
+
+@pytest.mark.integration
+async def test_durable_projection_uses_outbox_and_never_direct_qdrant(
+    selector, durable_terminal_event, repo, qdrant
+):
+    await selector.process(durable_terminal_event, authority="durable_active")
+    assert await repo.projection_outbox_count(durable_terminal_event.email_id) == 1
+    qdrant.upsert.assert_not_called()
 ```
 
 ```python
@@ -619,13 +690,18 @@ class EmailProjection:
 
 - [ ] **Step 2: Implement projection migration and Worker**
 
-Projection rows use unique business key and stable UUIDv5 of account/email/projection type. Every row freezes `generation` and `fencing_token`; claim and completion verify both. Only terminal transitions in ingestion, approval, send/manual resolution and mailbox services create rows. Qdrant errors retry independently and never roll back email state. Remove `_ingest_to_qdrant()` and direct `process_sent_email()` writes.
+Projection rows use unique business key and stable UUIDv5 of account/email/projection type. Every row freezes `generation` and `fencing_token`; claim and completion verify both. Only terminal transitions in the authority-selected Durable ingestion, approval, send/manual resolution and mailbox services create rows. Qdrant errors retry independently and never roll back email state. Remove `_ingest_to_qdrant()` and direct `process_sent_email()` only from `DurableProcessingAdapter`/`DurableLegacyCompatAdapter`; while authority is legacy-authoritative/Shadow, retain the existing direct Qdrant implementation exclusively behind `LegacyProcessingAdapter` plus exact `LegacyEffectGuard`, and allow an old generation only to finish an already-stamped guarded effect. Phase-6 post-activation contraction deletes it after the stability gate.
+
+Bind the real `ProjectionOutboxPort` into both Durable adapters and add `ProjectionWorker` to `OutboxRuntime` only when current authority/generation/fence and the installed capability manifest match. Append an immutable `phase4_graph_projection` activation-barrier successor that references the Phase-3 base and freezes the new Graph hash, adapter routing contract, all four business Outbox fencing contracts and exact `0010` schema/build/config manifest. It remains non-consumable and cannot become `production_ready`.
+
+`0010` is another complete revision-contract change: advance the exact single head/schema digest, bootstrap checks, four ACL manifests, checkpoint allowlist and offline SQL. Runtime receives only projection enqueue/lease/complete privileges; maintenance gets bounded rebuild/inspection rights; auditor is SELECT-only; migration alone owns DDL. `tests/integration/migrations/test_0009_to_0010.py` uses real PostgreSQL with all projection/Durable profiles disabled to prove code-first `0009 -> 0010`, seed preservation, role behavior, startup, second no-op upgrade, old-binary head rejection and no split head.
 
 - [ ] **Step 3: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/projections/test_qdrant_projection.py tests/integration/projections/test_projection_outbox.py -q
-git add alembic/versions/20260710_0006_projection_outbox.py src/projections src/outbox/projection.py src/outbox/runtime.py src/outbox/send.py src/outbox/mailbox.py src/approval/service.py src/approval/send_resolution.py src/ingestion/repository.py src/exchange_service.py src/utils/email_processor.py tests/unit/projections/conftest.py tests/unit/projections/test_qdrant_projection.py tests/integration/projections/test_projection_outbox.py
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/projections/test_qdrant_projection.py tests/integration/projections/test_projection_outbox.py tests/integration/projections/test_authority_dual_path.py tests/integration/migrations/test_0009_to_0010.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+git add alembic/versions/20260713_0010_projection_outbox.py src/projections src/outbox/projection.py src/outbox/runtime.py src/outbox/send.py src/outbox/mailbox.py src/approval/service.py src/approval/send_resolution.py src/ingestion/repository.py src/ingestion/durable_adapter.py src/ingestion/processing.py src/ingestion/cutover_barrier.py src/exchange_service.py src/utils/email_processor.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/projections/conftest.py tests/unit/projections/test_qdrant_projection.py tests/integration/projections/test_projection_outbox.py tests/integration/projections/test_authority_dual_path.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0009_to_0010.py
 git commit -m "feat: project terminal mail through durable outbox"
 ```
 

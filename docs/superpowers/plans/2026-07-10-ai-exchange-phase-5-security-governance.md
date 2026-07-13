@@ -191,6 +191,14 @@ async def test_valid_replay_returns_same_202_receipt(app, signed_webhook_headers
     assert first.json()["inbox_id"] == second.json()["inbox_id"]
 
 
+def test_unsigned_header_timestamp_cannot_override_signed_body_time(
+    signed_body, signed_headers
+):
+    signed_headers["X-Webhook-Timestamp"] = "2099-01-01T00:00:00Z"
+    event = verify_and_parse_webhook(signed_body, signed_headers)
+    assert event.source_event_at == event.signed_body_timestamp
+
+
 @pytest.mark.asyncio
 async def test_recovery_routes_require_admin_identity_and_idempotency_key(app):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -201,7 +209,7 @@ async def test_recovery_routes_require_admin_identity_and_idempotency_key(app):
 
 - [ ] **Step 2: Implement raw-byte HMAC and strict request shape**
 
-Accept only POST and `application/json`; read at most the Phase 1 body limit, validate a 64-character lowercase hex signature using `hmac.compare_digest`, and parse JSON only after verification. The current Exchange timestamp remains informational because it is not signed. Valid replay is accepted through the durable Inbox dedupe key and returns the original receipt; malformed/invalid signatures never reach JSON parsing or `IngressService`.
+Accept only POST and `application/json`; read at most the Phase 1 body limit, validate a 64-character lowercase hex signature using `hmac.compare_digest`, and parse JSON only after verification. The extension inserts `timestamp` into the event JSON before HMACing the complete raw body, so the validated **body** timestamp is signed and may remain Task 2's trusted `source_event_at`/dedupe fact. `X-Webhook-Timestamp` is generated separately and is not covered by that HMAC; it is informational only, cannot override the body or authorize freshness, and a mismatch is a bounded audit signal. Valid replay is accepted through the durable Inbox dedupe key and returns the original receipt; malformed/invalid signatures never reach JSON parsing or `IngressService`. A future anti-replay contract may version a signature over an explicit timestamp/body/nonce tuple and enforce a freshness window, but it must not misclassify today's signed body timestamp as unsigned.
 
 - [ ] **Step 3: Protect observability and management routes**
 
@@ -326,7 +334,7 @@ Expected: unauthorized, stale and expired actions return a generic denial, while
 ### Task 4: Add One-time Preview Exchange and an Isolated Session
 
 **Files:**
-- Create: `alembic/versions/20260710_0007_preview_nonce.py`
+- Create: `alembic/versions/20260713_0011_preview_nonce.py`
 - Create: `src/security/preview.py`
 - Create: `src/api/__init__.py`
 - Create: `src/api/preview.py`
@@ -338,10 +346,24 @@ Expected: unauthorized, stale and expired actions return a generic denial, while
 - Modify: `.env.example`
 - Modify: `pyproject.toml`
 - Modify: `uv.lock`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0010_to_0011.py`
 
 **Interfaces:**
 - Consumes: authenticated Lark `open_id`, owner-filtered email lookup and ContentStore
 - Produces: `PreviewTokenService.issue(claims: PreviewTokenClaims) -> str`; `PreviewTokenService.consume(token: str) -> PreviewSession`; `/preview/exchange`; `/preview/email/{email_id}`
+
+Migration revision is exactly `20260713_0011` with linear `down_revision = "20260713_0010"`.
 
 - [ ] **Step 1: Write failing single-use and redirect tests**
 
@@ -384,7 +406,9 @@ async def test_exchange_redirect_removes_token_and_sets_secure_cookie(app, valid
 
 - [ ] **Step 2: Add nonce storage and atomic consumption**
 
-Migration `20260710_0007` creates `preview_nonces(nonce_hash PRIMARY KEY, subject_hash, email_id, expires_at, consumed_at, created_at)` and `preview_sessions(session_hash PRIMARY KEY, subject_hash, email_id, expires_at, last_seen_at, revoked_at, created_at)`; neither table stores raw token/session values. `consume()` validates the JWT signature, algorithm, `aud`, `sub`, `nonce`, `exp` and email ID, then performs `UPDATE preview_nonces SET consumed_at=now() WHERE nonce_hash=%s AND consumed_at IS NULL AND expires_at>now() RETURNING subject_hash, email_id, expires_at`; zero rows means expired, unknown or replayed. Session creation inserts only SHA-256 of a 256-bit random cookie value.
+Migration `20260713_0011` creates `preview_nonces(nonce_hash PRIMARY KEY, subject_hash, email_id, expires_at, consumed_at, created_at)` and `preview_sessions(session_hash PRIMARY KEY, subject_hash, email_id, expires_at, last_seen_at, revoked_at, created_at)`; neither table stores raw token/session values. `consume()` validates the JWT signature, algorithm, `aud`, `sub`, `nonce`, `exp` and email ID, then performs `UPDATE preview_nonces SET consumed_at=now() WHERE nonce_hash=%s AND consumed_at IS NULL AND expires_at>now() RETURNING subject_hash, email_id, expires_at`; zero rows means expired, unknown or replayed. Session creation inserts only SHA-256 of a 256-bit random cookie value.
+
+Treat `0011` as a complete revision-contract change: advance the single exact app head/schema digest, bootstrap pre/post checks, four ACL manifests, checkpoint revision allowlist and offline SQL. Runtime receives only issue/consume/session columns, maintenance only bounded revoke/expiry cleanup, auditor SELECT-only, and DDL remains migration-only. `tests/integration/migrations/test_0010_to_0011.py` starts real PostgreSQL at `0010` with preview/security profiles disabled, seeds all four Outboxes and projection/content rows, performs the code-first bridge, verifies preservation/roles/startup and a second no-op upgrade, and proves old-head binary rejection plus single-head empty-DB behavior.
 
 ```python
 @dataclass(frozen=True)
@@ -408,8 +432,9 @@ Add `PREVIEW_ORIGIN`. Production startup rejects it when its normalized origin e
 ```bash
 uv add "PyJWT==2.10.1"
 uv lock --check
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/security/test_preview_tokens.py tests/integration/security/test_preview_nonce.py tests/integration/security/test_preview_routes.py -q
-git add alembic/versions/20260710_0007_preview_nonce.py src/security/preview.py src/api/__init__.py src/api/preview.py src/server.py src/config.py .env.example pyproject.toml uv.lock tests/unit/security/test_preview_tokens.py tests/integration/security/test_preview_nonce.py tests/integration/security/test_preview_routes.py
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/security/test_preview_tokens.py tests/integration/security/test_preview_nonce.py tests/integration/security/test_preview_routes.py tests/integration/migrations/test_0010_to_0011.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+git add alembic/versions/20260713_0011_preview_nonce.py src/security/preview.py src/api/__init__.py src/api/preview.py src/server.py src/config.py .env.example pyproject.toml uv.lock src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/security/test_preview_tokens.py tests/integration/security/test_preview_nonce.py tests/integration/security/test_preview_routes.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0010_to_0011.py
 git commit -m "feat: add isolated single-use email preview"
 ```
 
@@ -860,6 +885,7 @@ Expected: runtime reports UID/GID 10001, both Compose configurations validate, a
 ### Task 11: Implement the Retention Policy and Guarded Cleanup Engine
 
 **Files:**
+- Create: `alembic/versions/20260713_0012_retention_control.py`
 - Create: `src/maintenance/retention.py`
 - Create: `tests/unit/maintenance/test_retention_policy.py`
 - Create: `tests/integration/maintenance/test_retention_engine.py`
@@ -867,10 +893,24 @@ Expected: runtime reports UID/GID 10001, both Compose configurations validate, a
 - Create: `tests/integration/maintenance/conftest.py`
 - Modify: `src/config.py`
 - Modify: `.env.example`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0011_to_0012.py`
 
 **Interfaces:**
 - Consumes: ContentStore references/holds, Inbox/Outbox/audit facts and Projection Outbox
 - Produces: `RetentionPolicy.production_defaults()`; `RetentionPlanner.plan(now, limit) -> RetentionPlan`; resumable `RetentionExecutor.execute(plan_id, authorization) -> RetentionReport`
+
+Migration revision is exactly `20260713_0012` with linear `down_revision = "20260713_0011"`.
 
 - [ ] **Step 1: Write exact policy and preservation tests**
 
@@ -911,15 +951,20 @@ Waiting approval is held until completion/expiry. Unresolved `accepted`/`send_un
 
 - [ ] **Step 3: Implement dry-run, bounded execution, and recovery**
 
-Planner writes an immutable row list and safety counts without deleting. Executor requires a signed `RetentionExecutionAuthorization(plan_hash, actor_id, expires_at)`, claims at most 500 rows, clears sensitive payload before optional metadata deletion, decrements account-scoped references, enqueues one stable Qdrant delete per removed projection, records cursor/statistics and resumes after failure. It rejects stale/changed plans and any row that acquired a hold or reference after planning.
+Migration `0012` creates `retention_plans` (policy/config/schema hashes, immutable source high-water, counts, plan hash, state, actor/reason, created/expiry), `retention_plan_items` (plan ID, deterministic ordinal, object type/ID hash, expected version/hold/reference facts, action, status; append-only identity), and `retention_executions` (plan ID, authorization hash/expiry, cursor, bounded counters, last safe error, started/completed timestamps). Triggers forbid plan/item identity rewrite, reopen of completed work, DELETE and TRUNCATE outside the later policy-authorized cleanup path.
+
+Planner writes the immutable row list and safety counts without deleting. Executor requires a signed `RetentionExecutionAuthorization(plan_hash, actor_id, expires_at)`, claims at most 500 rows, clears sensitive payload before optional metadata deletion, decrements account-scoped references, enqueues one stable Qdrant delete per removed projection, records cursor/statistics and resumes after failure. It rejects stale/changed plans and any row that acquired a hold or reference after planning.
+
+`0012` advances the exact single head/schema digest, bootstrap checks, all four ACL manifests, checkpoint allowlist and offline SQL in this task. Runtime can enqueue stable projection deletion only; maintenance owns bounded plan/item/execution transitions but no DDL or protected-row bypass; auditor is SELECT-only; migration owns DDL. `tests/integration/migrations/test_0011_to_0012.py` proves a disabled-profile code-first real-PostgreSQL bridge, preservation of preview/business rows, role behavior, second no-op upgrade, old-head rejection and single-head empty-DB startup.
 
 `tests/unit/maintenance/conftest.py` provides a fixed clock and policy; `tests/integration/maintenance/conftest.py` provides migrated `db`, `planner`, `executor`, reference/hold seed methods and a fake Projection Outbox that records stable business keys.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/maintenance/test_retention_policy.py tests/integration/maintenance/test_retention_engine.py -q
-git add src/maintenance/retention.py src/config.py .env.example tests/unit/maintenance/conftest.py tests/integration/maintenance/conftest.py tests/unit/maintenance/test_retention_policy.py tests/integration/maintenance/test_retention_engine.py
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/maintenance/test_retention_policy.py tests/integration/maintenance/test_retention_engine.py tests/integration/migrations/test_0011_to_0012.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+git add alembic/versions/20260713_0012_retention_control.py src/maintenance/retention.py src/config.py .env.example src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/maintenance/conftest.py tests/integration/maintenance/conftest.py tests/unit/maintenance/test_retention_policy.py tests/integration/maintenance/test_retention_engine.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0011_to_0012.py
 git commit -m "feat: enforce guarded data retention"
 ```
 
@@ -936,6 +981,8 @@ Expected: every design retention period has a test, protected content never ente
 - Create: `docs/security/threat-model.md`
 - Create: `docs/security/data-flow.md`
 - Create: `docs/superpowers/reports/2026-07-10-phase-5-security-acceptance.md`
+- Create: `tests/integration/security/test_phase5_activation_successor.py`
+- Modify: `src/ingestion/cutover_barrier.py`
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
@@ -967,10 +1014,10 @@ Expected: every command exits 0; security tests contain no skip markers; securit
 
 - [ ] **Step 4: Record evidence and commit**
 
-Write the exact commit SHA, command/exit-code table, dependency versions, image ID, tested negative cases and any accepted residual risk to the Phase 5 report. Do not include secrets, internal URLs, raw addresses, mail bodies or card payloads.
+Write the exact commit SHA, command/exit-code table, dependency versions, image ID, tested negative cases and any accepted residual risk to the Phase 5 report. Do not include secrets, internal URLs, raw addresses, mail bodies or card payloads. After every Phase-5 gate passes, append exactly one immutable `phase5_security_governance` activation successor to the latest `phase4_graph_projection` row. It freezes exact head `20260713_0012`, schema/build/capability-config, security/RBAC/preview/TLS/model-policy/retention evidence hashes and the predecessor manifest; its target generation/fence and live-barrier FK remain null because this is not cutover. Same evidence replays idempotently, drift conflicts, and this stage remains non-consumable. A real-PostgreSQL test proves the self-predecessor link, current-leaf uniqueness, null live fields and that `ActivationService` rejects it as not yet `production_ready`.
 
 ```bash
-git add tests/security docs/security docs/superpowers/reports/2026-07-10-phase-5-security-acceptance.md README.md CLAUDE.md
+git add tests/security tests/integration/security/test_phase5_activation_successor.py src/ingestion/cutover_barrier.py docs/security docs/superpowers/reports/2026-07-10-phase-5-security-acceptance.md README.md CLAUDE.md
 git commit -m "test: establish production security regression gate"
 ```
 

@@ -12,6 +12,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -22,6 +23,7 @@ from src.domain.email_state import PipelineGenerationState
 
 
 MAX_INBOX_PAYLOAD_BYTES: Final = 256 * 1024
+POSTGRES_BIGINT_MAX: Final = 2**63 - 1
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
@@ -45,6 +47,7 @@ class ProcessingPolicy(StrEnum):
     ARCHIVE = "archive"
     METADATA_ONLY = "metadata_only"
     HISTORICAL_SUPPRESSED = "historical_suppressed"
+    IGNORED = "ignored"
 
 
 class InboxStatus(StrEnum):
@@ -59,6 +62,7 @@ class InboxStatus(StrEnum):
 class InboxDispositionStatus(StrEnum):
     RETRY_WAIT = "retry_wait"
     DEAD_LETTER = "dead_letter"
+    MANUAL_REVIEW = "manual_review"
 
 
 class SyncCursorStatus(StrEnum):
@@ -81,8 +85,15 @@ def _require_enum(name: str, value: object, enum_type: type[_EnumT]) -> _EnumT:
 
 
 def _require_int(name: str, value: object, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > POSTGRES_BIGINT_MAX
+    ):
+        raise ValueError(
+            f"{name} must be an integer between {minimum} and {POSTGRES_BIGINT_MAX}"
+        )
     return value
 
 
@@ -97,6 +108,10 @@ def _require_text(name: str, value: object, *, max_length: int) -> str:
         raise ValueError(f"{name} must be a non-empty string <= {max_length} chars")
     if any(character in value for character in ("\x00", "\r", "\n")):
         raise ValueError(f"{name} contains forbidden control characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{name} must contain valid UTF-8 text") from None
     return value
 
 
@@ -130,9 +145,14 @@ def _require_uuid(name: str, value: object) -> str:
 def _as_utc(name: str, value: object) -> datetime:
     if not isinstance(value, datetime):
         raise ValueError(f"{name} must be a datetime")
-    if value.tzinfo is None or value.utcoffset() is None:
+    if value.tzinfo is None:
         raise ValueError(f"{name} must include timezone information")
-    return value.astimezone(UTC)
+    try:
+        if value.utcoffset() is None:
+            raise ValueError
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must include valid timezone information") from None
 
 
 def _as_optional_utc(name: str, value: object) -> datetime | None:
@@ -149,7 +169,11 @@ def _freeze_json_value(
 ) -> tuple[object, object]:
     """Return an immutable value and a plain value for canonical sizing."""
 
-    if value is None or isinstance(value, (bool, str, int)):
+    if value is None or isinstance(value, (bool, int)):
+        return value, value
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise ValueError(f"{name} must not contain NUL characters")
         return value, value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -165,7 +189,7 @@ def _freeze_json_value(
             frozen: dict[str, object] = {}
             plain: dict[str, object] = {}
             for key, item in value.items():
-                if not isinstance(key, str):
+                if not isinstance(key, str) or "\x00" in key:
                     raise ValueError(f"{name} must contain only string object keys")
                 frozen_item, plain_item = _freeze_json_value(
                     name,
@@ -207,11 +231,14 @@ def _freeze_json_object(
 ) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a JSON object")
-    frozen, plain = _freeze_json_value(
-        name,
-        value,
-        active_container_ids=set(),
-    )
+    try:
+        frozen, plain = _freeze_json_value(
+            name,
+            value,
+            active_container_ids=set(),
+        )
+    except RecursionError:
+        raise ValueError(f"{name} must contain valid UTF-8 JSON") from None
     try:
         encoded = json.dumps(
             plain,
@@ -222,13 +249,48 @@ def _freeze_json_object(
             separators=(", ", ": "),
             allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError):
+        encoded_size = len(encoded) + _postgres_jsonb_numeric_expansion_bytes(plain)
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
         raise ValueError(f"{name} must contain valid UTF-8 JSON") from None
-    if len(encoded) > max_bytes:
+    if encoded_size > max_bytes:
         raise ValueError(f"{name} exceeds the {max_bytes}-byte limit")
     if not isinstance(frozen, Mapping):  # Defensive assertion for type checkers.
         raise ValueError(f"{name} must be a JSON object")
     return frozen
+
+
+def _postgres_jsonb_numeric_expansion_bytes(value: object) -> int:
+    """Return a conservative delta from Python JSON to ``jsonb::text``.
+
+    PostgreSQL stores JSON numbers as ``numeric``.  Its text representation
+    expands exponent notation (for example ``1e-300``) into fixed-point form,
+    while Python's JSON encoder keeps the compact exponent.  The database
+    payload CHECK measures that expanded representation, so the DTO must add
+    the same expansion before accepting an event.
+    """
+
+    if isinstance(value, float):
+        python_token = json.dumps(value, allow_nan=False)
+        try:
+            postgres_token = format(Decimal(python_token), "f")
+        except (InvalidOperation, ValueError):
+            raise ValueError("invalid JSON number") from None
+        return max(0, len(postgres_token) - len(python_token))
+    if isinstance(value, Mapping):
+        return sum(
+            _postgres_jsonb_numeric_expansion_bytes(item) for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_postgres_jsonb_numeric_expansion_bytes(item) for item in value)
+    return 0
+
+
+def _materialize_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _materialize_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_materialize_json_value(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,8 +304,8 @@ class NormalizedIngressEvent:
     source_version: str | None
     dedupe_key: str
     payload: Mapping[str, Any]
+    processing_policy: ProcessingPolicy
     source_event_at: datetime | None = None
-    processing_policy: ProcessingPolicy = ProcessingPolicy.FULL
 
     def __post_init__(self) -> None:
         _require_int("account_id", self.account_id, minimum=1)
@@ -289,6 +351,14 @@ class NormalizedIngressEvent:
                 ProcessingPolicy,
             ),
         )
+
+    def payload_for_storage(self) -> dict[str, Any]:
+        """Return a detached built-in JSON object suitable for psycopg Jsonb."""
+
+        materialized = _materialize_json_value(self.payload)
+        if not isinstance(materialized, dict):  # Defensive: payload is validated above.
+            raise ValueError("payload must be a JSON object")
+        return materialized
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +419,9 @@ class SyncBatch:
     is_full: bool
 
     def __post_init__(self) -> None:
-        _require_text("cursor", self.cursor, max_length=8192)
+        cursor = _require_text("cursor", self.cursor, max_length=8192)
+        if cursor != cursor.strip():
+            raise ValueError("cursor must not contain leading or trailing whitespace")
         if isinstance(self.changes, (str, bytes, bytearray)):
             raise ValueError("changes must be a sequence of SyncChange")
         try:
@@ -399,10 +471,17 @@ class InboxStats:
     retry_wait: int
     leased: int
     dead_letter: int
+    manual_review: int
     oldest_pending_seconds: float
 
     def __post_init__(self) -> None:
-        for name in ("pending", "retry_wait", "leased", "dead_letter"):
+        for name in (
+            "pending",
+            "retry_wait",
+            "leased",
+            "dead_letter",
+            "manual_review",
+        ):
             _require_int(name, getattr(self, name), minimum=0)
         value = self.oldest_pending_seconds
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -436,8 +515,8 @@ class InboxDisposition:
         available_at = _as_optional_utc("available_at", self.available_at)
         if status is InboxDispositionStatus.RETRY_WAIT and available_at is None:
             raise ValueError("retry_wait requires available_at")
-        if status is InboxDispositionStatus.DEAD_LETTER and available_at is not None:
-            raise ValueError("dead_letter must not retain available_at")
+        if status is not InboxDispositionStatus.RETRY_WAIT and available_at is not None:
+            raise ValueError(f"{status.value} must not retain available_at")
         object.__setattr__(self, "available_at", available_at)
         if (
             not isinstance(self.safe_error_code, str)

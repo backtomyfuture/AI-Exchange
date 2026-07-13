@@ -35,7 +35,7 @@ from src.maintenance.cleanup_models import (
 
 
 CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS: Final = frozenset(
-    {"20260710_0002", "20260710_0003"}
+    {"20260710_0002", "20260710_0003", "20260713_0004"}
 )
 MAX_PLAN_THREADS: Final = 100
 MAX_PHYSICAL_ROWS: Final = 500

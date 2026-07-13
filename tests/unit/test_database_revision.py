@@ -127,8 +127,11 @@ async def test_require_current_database_rejects_missing_or_stale_revision(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("current_revision", ["20260710_0002", "20260710_0003"])
-async def test_runtime_gate_accepts_code_first_and_migration_first_when_flags_disabled(
+@pytest.mark.parametrize(
+    "current_revision",
+    ["20260710_0002", "20260710_0003", "20260713_0004"],
+)
+async def test_runtime_gate_accepts_compatible_revisions_when_phase2_flags_disabled(
     current_revision,
 ):
     with patch(
@@ -163,7 +166,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         ),
         patch(
             "src.db.schema.get_current_database_revision",
-            new=AsyncMock(return_value="20260710_0003"),
+            new=AsyncMock(return_value="20260713_0004"),
         ),
         patch.object(
             database_schema,
@@ -180,7 +183,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
-        expected_revision="20260710_0003",
+        expected_revision="20260713_0004",
     )
 
     with (

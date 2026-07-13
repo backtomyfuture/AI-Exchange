@@ -8,13 +8,19 @@ import pytest
 from psycopg import sql
 from sqlalchemy.exc import DBAPIError
 
-from src.db.bootstrap import bootstrap_database
+from src.db.auditor import require_checkpoint_auditor_database_role
+from src.db.bootstrap import (
+    _apply_checkpoint_migrations,
+    _apply_database_access_contract,
+    bootstrap_database,
+)
 from src.db.roles import (
     DatabaseRoleError,
     require_maintenance_database_role,
     require_migration_database_role,
     require_runtime_database_role,
 )
+from src.db.schema import require_runtime_database
 from src.db.schema_contract import (
     DatabaseSchemaContractError,
     require_database_schema_contract,
@@ -335,7 +341,7 @@ EXPECTED_PHASE2_CHECKS = {
         "e5e43f686cf6aca5560d22d5bfa18bd0e5cba8341a5f26e09eff5a37b6bba9c6"
     ),
     ("event_inbox", "ck_event_inbox_processing_policy"): (
-        "f2c35a7d5a10689cc78f15a3d83cf656c89dc26578f2390519a7679012f1d9bb"
+        "d8fa97e98d89b2275a29c6899ce83136be195423cfdb907070a06074a4d7ab7c"
     ),
     ("event_inbox", "ck_event_inbox_raw_event_type"): (
         "d18bc1df47462aa76d502b521bfb7195468040b95103992c63b6470f073a9375"
@@ -846,6 +852,7 @@ def _insert_inbox(
     effect_started_at: str | None = None,
     processing_started_at: str | None = None,
     change_kind: str = "create",
+    processing_policy: str = "full",
 ) -> str:
     resolved_id = inbox_id or str(uuid4())
     db.execute(
@@ -856,7 +863,7 @@ def _insert_inbox(
         "status, lease_owner, lease_until, attempts, safe_error_code, "
         "safe_error_summary, effect_started_at, processing_started_at) "
         "VALUES (%s, 8, %s, 'inbox', 'webhook', 'NewMailEvent', %s, %s, "
-        "'{}'::pg_catalog.jsonb, 'full', %s, %s, %s, %s, %s, "
+        "'{}'::pg_catalog.jsonb, %s, %s, %s, %s, %s, %s, "
         "%s::pg_catalog.timestamptz, %s, %s, %s, "
         "%s::pg_catalog.timestamptz, %s::pg_catalog.timestamptz)",
         (
@@ -864,6 +871,7 @@ def _insert_inbox(
             external_email_id,
             change_kind,
             dedupe_key,
+            processing_policy,
             pipeline_name,
             generation,
             fencing_token,
@@ -882,7 +890,7 @@ def _insert_inbox(
 
 @pytest.mark.integration
 def test_durable_ingestion_head_creates_exact_relation_set(db):
-    assert db.scalar("SELECT version_num FROM alembic_version") == "20260710_0003"
+    assert db.scalar("SELECT version_num FROM alembic_version") == "20260713_0004"
     relations = set(
         db.scalar(
             "SELECT COALESCE("
@@ -1279,6 +1287,280 @@ def test_0002_to_0003_is_expand_only_and_leaves_all_new_tables_empty(
 
 
 @pytest.mark.integration
+def test_0003_to_0004_refuses_nonempty_inbox_without_mutation(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    _insert_generation(schema)
+    existing_id = _insert_inbox(
+        schema,
+        external_email_id="pre-policy-migration",
+        dedupe_key="3" * 64,
+        processing_policy="historical_suppressed",
+    )
+
+    with pytest.raises(DBAPIError, match="event_inbox_not_empty_for_0004_migration"):
+        alembic_runner.upgrade(schema, "20260713_0004")
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+    assert (
+        schema.scalar(
+            "SELECT processing_policy FROM event_inbox WHERE id = %s",
+            (existing_id,),
+        )
+        == "historical_suppressed"
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        _insert_inbox(
+            schema,
+            external_email_id="ignored-before-policy-migration",
+            dedupe_key="4" * 64,
+            processing_policy="ignored",
+        )
+
+
+@pytest.mark.integration
+def test_empty_0003_to_0004_adds_only_ignored_policy(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+
+    alembic_runner.upgrade(schema, "20260713_0004")
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
+    _insert_generation(schema)
+    ignored_id = _insert_inbox(
+        schema,
+        external_email_id="ignored-policy",
+        dedupe_key="5" * 64,
+        processing_policy="ignored",
+    )
+    assert (
+        schema.scalar(
+            "SELECT processing_policy FROM event_inbox WHERE id = %s",
+            (ignored_id,),
+        )
+        == "ignored"
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        _insert_inbox(
+            schema,
+            external_email_id="unknown-policy",
+            dedupe_key="6" * 64,
+            processing_policy="unknown",
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_0003_keeps_its_exact_schema_contract(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    # Build the ACL/checkpoint state of an already-deployed 0003 database. The
+    # rollout itself still performs the only forward write through bootstrap.
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+
+    await require_database_schema_contract(
+        schema.dsn,
+        target_schema="public",
+        require_complete=True,
+        expected_revision="20260710_0003",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_current_code_bridges_exact_0003_to_0004_with_all_gates(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+
+    flags_off = {
+        "durable_inbox_enabled": False,
+        "ingestion_shadow_enabled": False,
+        "sync_reconciliation_enabled": False,
+    }
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+    assert schema.scalar("SELECT pg_catalog.count(*) FROM event_inbox") == 0
+    await require_runtime_database(
+        schema.runtime_dsn,
+        **flags_off,
+        role_separation_required=True,
+        **schema.runtime_identity,
+    )
+
+    summary = await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+
+    assert summary["alembic"] == "20260713_0004"
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
+    await require_runtime_database(
+        schema.runtime_dsn,
+        **flags_off,
+        role_separation_required=True,
+        **schema.runtime_identity,
+    )
+    await require_database_schema_contract(
+        schema.runtime_dsn,
+        target_schema="public",
+        require_complete=True,
+        expected_revision="20260713_0004",
+    )
+    await require_migration_database_role(
+        schema.dsn,
+        **schema.bootstrap_identity,
+    )
+    await require_runtime_database_role(
+        schema.runtime_dsn,
+        **schema.runtime_identity,
+    )
+    await require_maintenance_database_role(
+        schema.maintenance_dsn,
+        **schema.maintenance_identity,
+    )
+    await require_checkpoint_auditor_database_role(
+        schema.auditor_dsn,
+        expected_auditor_role=schema.auditor_role,
+        expected_runtime_role=schema.runtime_role,
+        expected_migration_role=schema.migration_role,
+        expected_maintenance_role=schema.maintenance_role,
+        target_schema="public",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_incomplete_0003_before_forward_migration(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+    schema.execute("ALTER TABLE emails_log DROP COLUMN processed_at CASCADE")
+
+    with pytest.raises(
+        DatabaseSchemaContractError,
+        match="database_schema_contract_invalid",
+    ):
+        await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+    policy_constraint = schema.scalar(
+        "SELECT pg_catalog.pg_get_constraintdef(oid) "
+        "FROM pg_catalog.pg_constraint "
+        "WHERE conrelid = 'event_inbox'::pg_catalog.regclass "
+        "AND conname = 'ck_event_inbox_processing_policy'"
+    )
+    assert "ignored" not in policy_constraint
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_corrupt_checkpoint_before_forward_migration(
+    postgres_database_factory,
+    alembic_runner,
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    from src.db import bootstrap as bootstrap_module
+
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+    schema.execute("ALTER TABLE checkpoints DROP COLUMN metadata")
+    monkeypatch.setattr(
+        bootstrap_module,
+        "require_migration_database_role",
+        AsyncMock(),
+    )
+
+    with pytest.raises(
+        DatabaseSchemaContractError,
+        match="database_schema_contract_invalid",
+    ):
+        await bootstrap_module.bootstrap_database(
+            schema.dsn,
+            **schema.bootstrap_identity,
+        )
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_refuses_nonempty_0003_inbox_before_policy_migration(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260710_0003")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+    _insert_generation(schema)
+    existing_id = _insert_inbox(
+        schema,
+        external_email_id="unsafe-policy-migration",
+        dedupe_key="6" * 64,
+        processing_policy="historical_suppressed",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="event_inbox_not_empty_for_0004_migration",
+    ):
+        await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+    assert (
+        schema.scalar(
+            "SELECT processing_policy FROM event_inbox WHERE id = %s",
+            (existing_id,),
+        )
+        == "historical_suppressed"
+    )
+
+
+@pytest.mark.integration
 def test_0003_conflicting_relation_fails_and_rolls_back_entire_revision(
     postgres_database_factory,
     alembic_runner,
@@ -1451,6 +1733,7 @@ def test_dto_payload_at_database_limit_round_trips(db):
         source_version=None,
         dedupe_key="9" * 64,
         payload=payload,
+        processing_policy="full",
     )
     encoded = json.dumps(
         dict(event.payload),
@@ -1816,14 +2099,14 @@ def test_shadow_identity_and_decisions_are_immutable(db):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_fresh_bootstrap_reaches_0003_and_passes_both_role_gates(
+async def test_fresh_bootstrap_reaches_0004_and_passes_both_role_gates(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()
 
     summary = await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert summary["alembic"] == "20260710_0003"
+    assert summary["alembic"] == "20260713_0004"
     await require_migration_database_role(
         schema.dsn,
         **schema.bootstrap_identity,
@@ -1840,7 +2123,7 @@ async def test_fresh_bootstrap_reaches_0003_and_passes_both_role_gates(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_bootstrap_recovers_after_0003_commits_before_acl_reconciliation(
+async def test_bootstrap_recovers_after_0004_commits_before_acl_reconciliation(
     postgres_database_factory,
     monkeypatch,
 ):
@@ -1862,7 +2145,7 @@ async def test_bootstrap_recovers_after_0003_commits_before_acl_reconciliation(
             schema.dsn,
             **schema.bootstrap_identity,
         )
-    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260710_0003")
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
     assert not schema.table_exists("checkpoints")
 
     monkeypatch.setattr(
@@ -1875,7 +2158,7 @@ async def test_bootstrap_recovers_after_0003_commits_before_acl_reconciliation(
         **schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260710_0003"
+    assert summary["alembic"] == "20260713_0004"
     await require_runtime_database_role(
         schema.runtime_dsn,
         **schema.runtime_identity,
@@ -2048,7 +2331,7 @@ async def test_schema_contract_rejects_phase2_constraint_index_or_default_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
@@ -2083,13 +2366,13 @@ async def test_schema_contract_rejects_same_key_unique_physical_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_fresh_0003_passes_runtime_schema_contract(
+async def test_fresh_0004_passes_runtime_schema_contract(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()
@@ -2099,7 +2382,7 @@ async def test_fresh_0003_passes_runtime_schema_contract(
         schema.runtime_dsn,
         target_schema="public",
         require_complete=True,
-        expected_revision="20260710_0003",
+        expected_revision="20260713_0004",
     )
 
 
@@ -2124,7 +2407,7 @@ async def test_schema_contract_rejects_unexpected_exclusion_constraint(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
@@ -2155,7 +2438,7 @@ async def test_schema_contract_rejects_phase2_relation_security_or_durability_dr
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
@@ -2196,7 +2479,7 @@ async def test_schema_contract_rejects_phase2_column_catalog_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 

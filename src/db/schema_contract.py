@@ -8,6 +8,7 @@ import psycopg
 
 from src.db.access_contract import (
     PHASE2_CHECK_CONSTRAINT_SHA256,
+    PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION,
     PHASE2_DEFAULT_EXPRESSIONS,
     PHASE2_INDEX_SPECS,
     PHASE2_RELATIONS,
@@ -17,6 +18,16 @@ from src.db.access_contract import (
 
 class DatabaseSchemaContractError(RuntimeError):
     """Raised when deployed columns do not match the trusted type contract."""
+
+
+_CHECKPOINT_RELATIONS: Final = frozenset(
+    {
+        "checkpoint_migrations",
+        "checkpoints",
+        "checkpoint_blobs",
+        "checkpoint_writes",
+    }
+)
 
 
 _EXPECTED_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
@@ -506,9 +517,10 @@ async def require_database_schema_contract(
     *,
     target_schema: str,
     require_complete: bool,
+    require_business_complete: bool = False,
     expected_revision: str | None = None,
 ) -> None:
-    """Reject shadowed built-in types and, after DDL, missing known columns."""
+    """Reject physical drift while allowing bootstrap to repair checkpoints."""
 
     relation_names = sorted({key[0] for key in _EXPECTED_COLUMN_TYPES})
     try:
@@ -583,7 +595,7 @@ async def require_database_schema_contract(
     }
     if expected_revision == "20260710_0002":
         expected_phase2_relations: set[str] = set()
-    elif expected_revision == "20260710_0003":
+    elif expected_revision in {"20260710_0003", "20260713_0004"}:
         expected_phase2_relations = set(PHASE2_RELATIONS)
     elif expected_revision is None:
         if deployed_phase2_relations not in (set(), set(PHASE2_RELATIONS)):
@@ -629,6 +641,24 @@ async def require_database_schema_contract(
     if require_complete:
         if actual_relation_contract != expected_relation_contract:
             raise _invalid_contract()
+    elif require_business_complete:
+        expected_business_relations = {
+            name: contract
+            for name, contract in expected_relation_contract.items()
+            if name not in _CHECKPOINT_RELATIONS
+        }
+        actual_business_relations = {
+            name: contract
+            for name, contract in actual_relation_contract.items()
+            if name not in _CHECKPOINT_RELATIONS
+        }
+        if actual_business_relations != expected_business_relations:
+            raise _invalid_contract()
+        if any(
+            expected_relation_contract.get(name) != relation_contract
+            for name, relation_contract in actual_relation_contract.items()
+        ):
+            raise _invalid_contract()
     elif any(
         expected_relation_contract.get(name) != relation_contract
         for name, relation_contract in actual_relation_contract.items()
@@ -639,14 +669,28 @@ async def require_database_schema_contract(
         for column in _EXPECTED_COLUMN_TYPES
         if expected_phase2_relations or column[0] not in PHASE2_RELATIONS
     }
-    if require_complete and set(actual) != expected_columns:
-        raise _invalid_contract()
+    if require_complete:
+        if set(actual) != expected_columns:
+            raise _invalid_contract()
+    elif require_business_complete:
+        expected_business_columns = {
+            column
+            for column in expected_columns
+            if column[0] not in _CHECKPOINT_RELATIONS
+        }
+        actual_business_columns = {
+            column for column in actual if column[0] not in _CHECKPOINT_RELATIONS
+        }
+        if actual_business_columns != expected_business_columns:
+            raise _invalid_contract()
     for column, expected_type in _EXPECTED_COLUMN_TYPES.items():
         if column not in expected_columns:
             continue
         deployed_type = actual.get(column)
         if deployed_type is None:
-            if require_complete:
+            if require_complete or (
+                require_business_complete and column[0] not in _CHECKPOINT_RELATIONS
+            ):
                 raise _invalid_contract()
             continue
         if deployed_type[:2] != ("pg_catalog", expected_type):
@@ -684,9 +728,15 @@ async def require_database_schema_contract(
         if expected_type == "bpchar" and type_modifier != 68:
             raise _invalid_contract()
 
-    expected_checks = (
-        PHASE2_CHECK_CONSTRAINT_SHA256 if expected_phase2_relations else {}
+    expected_checks = dict(PHASE2_CHECK_CONSTRAINT_SHA256)
+    expected_checks.update(
+        PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION.get(
+            expected_revision or "",
+            {},
+        )
     )
+    if not expected_phase2_relations:
+        expected_checks = {}
     actual_checks = {
         (relation_name, constraint_name): (
             source_sha256,

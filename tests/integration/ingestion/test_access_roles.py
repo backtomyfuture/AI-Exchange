@@ -331,10 +331,10 @@ _EXPECTED_AUDITOR_ACL = {
 
 
 async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
-    if revision == "20260710_0003":
+    if revision == "20260713_0004":
         await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
         return
-    if revision != "20260710_0002":
+    if revision not in {"20260710_0002", "20260710_0003"}:
         raise AssertionError("unsupported test revision")
     alembic_runner.upgrade(schema, revision)
     await _apply_checkpoint_migrations(schema.dsn, "public")
@@ -389,7 +389,7 @@ def _direct_relation_acl(schema, role_name: str):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_0003_managed_role_acls_match_independent_manifests(
+async def test_0004_managed_role_acls_match_independent_manifests(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()
@@ -494,7 +494,10 @@ async def test_runtime_checkpointer_crud_works_without_delete_capability(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revision", ["20260710_0002", "20260710_0003"])
+@pytest.mark.parametrize(
+    "revision",
+    ["20260710_0002", "20260710_0003", "20260713_0004"],
+)
 async def test_maintenance_role_can_execute_cleanup_but_not_access_durable_data(
     postgres_database_factory,
     alembic_runner,
@@ -589,6 +592,17 @@ async def test_maintenance_role_can_execute_cleanup_but_not_access_durable_data(
             ),
             (
                 "20260710_0003",
+                (
+                    "missing_checkpoint_select",
+                    "missing_checkpoint_delete",
+                    "unexpected_event_inbox_select",
+                    "unexpected_event_inbox_update",
+                    "unexpected_event_inbox_delete",
+                    "select_grant_option",
+                ),
+            ),
+            (
+                "20260713_0004",
                 (
                     "missing_checkpoint_select",
                     "missing_checkpoint_delete",

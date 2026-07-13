@@ -1179,7 +1179,7 @@ async def test_bootstrap_resolves_builtin_types_before_target_domains(empty_sche
         **empty_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260710_0003"
+    assert summary["alembic"] == "20260713_0004"
     shadowed_columns = empty_schema.scalar(
         "SELECT count(*) "
         "FROM pg_catalog.pg_attribute AS attribute "
@@ -1695,7 +1695,7 @@ async def test_bootstrap_accepts_inaccessible_legacy_processed_view(
         **separated_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260710_0003"
+    assert summary["alembic"] == "20260713_0004"
     await require_runtime_database_role(
         separated_schema.runtime_dsn,
         **separated_schema.runtime_identity,

@@ -232,7 +232,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
     assert [candidate.thread_id for candidate in snapshot.candidates] == ["old-sent"]
     assert snapshot.candidates[0].updated_at.tzinfo is not None
-    assert snapshot.alembic_revision == "20260710_0003"
+    assert snapshot.alembic_revision == "20260713_0004"
     assert snapshot.checkpoint_revision == len(AsyncPostgresSaver.MIGRATIONS) - 1
     assert len(snapshot.database_fingerprint) == 64
     assert snapshot.database_timezone
@@ -243,8 +243,8 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
 @pytest.mark.parametrize(
     "revision",
-    ["20260710_0002", "20260710_0003"],
-    ids=["0002-metadata", "0003-metadata"],
+    ["20260710_0002", "20260710_0003", "20260713_0004"],
+    ids=["0002-metadata", "0003-metadata", "0004-metadata"],
 )
 async def test_scan_metadata_allowlist_reports_stored_revision_value(
     checkpoint_schema,
@@ -265,7 +265,7 @@ async def test_scan_metadata_allowlist_reports_stored_revision_value(
     "revisions",
     [
         ("20260710_0001",),
-        ("20260710_0004",),
+        ("20260713_0005",),
         ("20260710_9999",),
         ("20260710_0002", "20260710_0003"),
     ],

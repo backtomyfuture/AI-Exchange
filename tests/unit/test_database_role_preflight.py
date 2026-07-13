@@ -748,6 +748,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
     role_gate = AsyncMock(side_effect=[None, postflight_error])
     schema_contract = AsyncMock()
     access_contract = AsyncMock()
+    empty_inbox_gate = AsyncMock()
 
     with (
         patch.object(
@@ -759,7 +760,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         patch.object(
             bootstrap_module,
             "get_current_database_revision",
-            new=AsyncMock(return_value="20260710_0003"),
+            new=AsyncMock(side_effect=["20260710_0003", "20260713_0004"]),
         ),
         patch.object(
             bootstrap_module,
@@ -776,6 +777,11 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             "require_database_schema_contract",
             new=schema_contract,
         ),
+        patch.object(
+            bootstrap_module,
+            "_require_empty_event_inbox_for_0004",
+            new=empty_inbox_gate,
+        ),
         pytest.raises(module.DatabaseRoleError, match="database_role_preflight_failed"),
     ):
         await bootstrap_module.bootstrap_database(
@@ -788,6 +794,10 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         )
 
     assert role_gate.await_count == 2
+    empty_inbox_gate.assert_awaited_once_with(
+        MIGRATION_DSN,
+        target_schema="public",
+    )
     checkpoint_migrations.assert_awaited_once_with(MIGRATION_DSN, "public")
     access_contract.assert_awaited_once_with(
         MIGRATION_DSN,
@@ -802,6 +812,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             {
                 "target_schema": "public",
                 "require_complete": False,
+                "require_business_complete": True,
                 "expected_revision": "20260710_0003",
             },
         ),
@@ -811,6 +822,14 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
                 "target_schema": "public",
                 "require_complete": True,
                 "expected_revision": "20260710_0003",
+            },
+        ),
+        (
+            (MIGRATION_DSN,),
+            {
+                "target_schema": "public",
+                "require_complete": True,
+                "expected_revision": "20260713_0004",
             },
         ),
     ]

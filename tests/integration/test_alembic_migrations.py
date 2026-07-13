@@ -326,7 +326,7 @@ async def test_bootstrap_reports_the_revision_read_from_the_isolated_database(
     )
     actual_revision = schema.scalar("SELECT version_num FROM alembic_version")
 
-    assert actual_revision == "20260710_0003"
+    assert actual_revision == "20260713_0004"
     assert summary["alembic"] == actual_revision
     assert revision_reader.await_count == 2
 

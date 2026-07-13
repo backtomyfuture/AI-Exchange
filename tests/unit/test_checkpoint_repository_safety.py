@@ -20,7 +20,7 @@ def test_cleanup_revision_allowlist_is_fixed_and_independent_from_runtime_bridge
     from src.maintenance import checkpoint_repository
 
     assert CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS == frozenset(
-        {"20260710_0002", "20260710_0003"}
+        {"20260710_0002", "20260710_0003", "20260713_0004"}
     )
     assert "RUNTIME_COMPATIBLE_DATABASE_REVISIONS" not in inspect.getsource(
         checkpoint_repository

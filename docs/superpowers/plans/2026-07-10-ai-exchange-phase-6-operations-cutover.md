@@ -4,7 +4,7 @@
 
 **Goal:** 交付无异步阻塞、指标真实、告警可恢复、构建可复现、数据有保留期限且能够按账户安全切换和收缩旧路径的最终生产版本。
 
-**Architecture:** 运行指标从真实数据库和执行点产生，告警通过持久化 Notification Outbox 投递并链接 Runbook。保留、备份、切换和历史清理都采用 dry-run、批量上限、代次 fencing 和高水位对账；CI 复现同一套迁移、故障注入、安全、性能与镜像门禁。旧路径只在完整观察窗与 21 条验收标准全部有证据后移除。
+**Architecture:** 运行指标从真实数据库和执行点产生，告警通过持久化 Notification Outbox 投递并链接 Runbook。保留、备份、切换和历史清理都采用 dry-run、批量上限、代次 fencing 和高水位对账；CI 复现同一套迁移、故障注入、安全、性能与镜像门禁。当前轮只准备并验证旧路径收缩能力；真实删除必须等 extension v2、Phase-3 production activation 和完整观察窗之后。
 
 **Tech Stack:** Python 3.12、asyncio、FastAPI、psycopg 3、Prometheus、OpenTelemetry、PostgreSQL 15、Qdrant、pytest、Ruff、Pyright、uv、GitHub Actions、Docker BuildKit、CycloneDX、Trivy、Gitleaks。
 
@@ -18,7 +18,7 @@
 - 所有清理先 dry-run，再验证加密备份/快照，最后以有界批次执行；`waiting_approval`、`accepted`、`send_unknown` 和审计保全对象默认不可删。
 - 每次 CI 都验证空数据库、现有结构快照升级和迁移重复运行；禁止永久 skip、空断言或全 Mock 集成测试充当发布证据。
 - 全局覆盖率采用只升不降 ratchet，最终至少 80%；可靠性关键模块至少 90%。
-- 只有 21 条最终验收标准和稳定性负载证据全部通过后，才允许开始 Exchange 服务端新设计。
+- 两级验收不可混淆：21 条 AI 实现/稳定性证据通过且外部阻塞被精确记录后，可标记 `implementation_complete_external_blocked` 并开始独立 Exchange v2 设计；只有真实 v2 proof、Phase-3 switch 和生产观察窗通过后，才可标记 `production_activated` 并执行旧路径删除。
 
 ---
 
@@ -30,7 +30,7 @@
 | Observability | `src/observability/catalog.py`, `src/observability/db_collector.py`, `src/observability/runtime_collector.py`, `src/observability/tracing.py` | Produce metrics from real execution points and PostgreSQL facts with safe correlation |
 | Operations | `src/operations/alerts.py`, `src/operations/runbooks.py`, `docs/runbooks/` | Stateful low-noise alerts linked to executable recovery procedures |
 | Lifecycle | `src/maintenance/retention.py`, `src/maintenance/backup.py`, `src/maintenance/legacy_cleanup.py` | Schedule guarded retention, verify restore, and contract historical data safely |
-| Cutover | `src/maintenance/cutover.py`, `src/maintenance/reconcile.py`, `src/maintenance/cli.py` | Plan/quiesce/switch/retire/rollback per account with fencing and high-water proof |
+| Cutover | `src/maintenance/cutover.py`, `src/maintenance/reconcile.py`, `src/maintenance/cli.py` | Post-activation plan/quiesce/rotate/retire/rollback wrappers with fencing, v2 and high-water proof; no initial switch authority |
 | Quality | `tests/reliability/`, `tests/fault_injection/`, `tests/contracts/`, `tests/performance/`, `scripts/check_coverage_ratchet.py` | Non-skippable reliability, contract, performance and coverage release gates |
 | Supply chain | `.github/workflows/ci.yml`, `Dockerfile`, `uv.lock`, `scripts/check_migrations.py`, `scripts/generate_sbom.sh` | Reproducible checks, migrations, locked image, SBOM and vulnerability/secret gates |
 | Contracts/evidence | `docs/architecture/`, `docs/operations/`, `docs/api/openapi.json`, `docs/superpowers/reports/` | Operator/API contract, final evidence and service-repository boundary |
@@ -202,11 +202,13 @@ Expected: seeded row counts/ages exactly match exported values, no forbidden hig
 
 ---
 
-### Task 3: Deliver Actionable Alerts Through the Notification Outbox
+### Task 3: Deliver Actionable Alerts Through a Dedicated Operations Outbox
 
 **Files:**
+- Create: `alembic/versions/20260713_0013_operations_control.py`
 - Create: `src/operations/__init__.py`
 - Create: `src/operations/alerts.py`
+- Create: `src/operations/outbox.py`
 - Create: `src/operations/runbooks.py`
 - Create: `tests/unit/operations/test_alert_rules.py`
 - Create: `tests/integration/operations/test_alert_outbox.py`
@@ -226,10 +228,24 @@ Expected: seeded row counts/ages exactly match exported values, no forbidden hig
 - Modify: `src/outbox/runtime.py`
 - Modify: `src/config.py`
 - Modify: `.env.example`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0012_to_0013.py`
 
 **Interfaces:**
-- Consumes: Phase 6 `MetricSnapshot`, runtime snapshot and Notification Outbox
-- Produces: idempotent `AlertEvaluator.evaluate(snapshot, now) -> list[AlertTransition]`; runbook-linked safe alert payload
+- Consumes: Phase 6 `MetricSnapshot` and runtime snapshot
+- Produces: idempotent `AlertEvaluator.evaluate(snapshot, now) -> list[AlertTransition]`; runbook-linked `OperationsNotificationWorker`; backup/restore evidence repository
+
+Migration revision is exactly `20260713_0013` with linear `down_revision = "20260713_0012"`.
 
 - [ ] **Step 1: Write exact threshold and dedupe tests**
 
@@ -273,21 +289,26 @@ def test_same_firing_state_creates_one_notification(evaluator, outbox):
     assert second.created_notifications == 0
 ```
 
-- [ ] **Step 2: Implement stateful alert transitions**
+- [ ] **Step 2: Add operations-control schema and stateful alert transitions**
 
-Rules include every design threshold: Inbox >5m; Sync misses 2 five-minute cycles; any `send_unknown`; accepted older than `ACCEPTED_CONFIRMATION_SLA_SECONDS`; new dead letter; approval expiration; any Outbox >5m; abnormal checkpoint/table growth; memory >80% for 10m and >90% for 2m escalation; model failure streak/breaker open; Exchange/Lark authentication failure. Store `pending/firing/resolved`, first/last seen, severity and dedupe key in PostgreSQL; only state changes create Notification Outbox rows.
+Migration `0013` creates `operations_alert_states`, `operations_notification_outbox`, `backup_snapshots` and `restore_verifications`. The operations Outbox has its own stable rule/transition business key, account category, state/severity, redacted payload hash/ref, lease/attempt/available/error/delivery evidence and operations build/config epoch; it deliberately has **no email, draft, card, business generation or `pipeline_ownership` foreign key**. Backup/restore rows store snapshot ID, scope/high-water/schema/build/config hashes, encryption/integrity status, verifier, immutable evidence hash and timestamps, never credentials or content.
+
+Rules include every design threshold: Inbox >5m; Sync misses 2 five-minute cycles; any `send_unknown`; accepted older than `ACCEPTED_CONFIRMATION_SLA_SECONDS`; new dead letter; approval expiration; any Outbox >5m; abnormal checkpoint/table growth; memory >80% for 10m and >90% for 2m escalation; model failure streak/breaker open; Exchange/Lark authentication failure. Store `pending/firing/resolved`, first/last seen, severity and dedupe key in PostgreSQL; only state changes create `operations_notification_outbox` rows. `OperationsNotificationWorker` is lifecycle- and credential-fenced independently from business Card Outbox authority and may deliver in legacy-authoritative, Shadow, quiescing or Durable modes; it cannot create/consume card actions, mark mail, send mail or claim any business Outbox. Thus external-blocked implementation still has operational alert delivery without waking dormant Durable business workers.
+
+`0013` advances the exact single head/schema digest, bootstrap checks, four ACL manifests, checkpoint allowlist and offline SQL. The operations runtime gets only alert evaluation/lease/complete columns; maintenance owns backup/restore evidence transitions but no DDL; auditor is SELECT-only; migration owns DDL. `tests/integration/migrations/test_0012_to_0013.py` proves the disabled-business-profile code-first real-PostgreSQL bridge, row preservation, exact role isolation between operations and business Outboxes, startup, second no-op upgrade, old-head rejection and a single empty-DB head.
 
 - [ ] **Step 3: Make every Runbook operational**
 
 Each Markdown Runbook contains: symptom and threshold; safe SQL/metric queries; diagnosis tree; actions that are safe automatically; actions requiring administrator confirmation; rollback/cutover constraints; verification; escalation owner; forbidden action. `send-unknown.md` explicitly forbids retry and describes only remote verification, mark-sent, mark-not-sent, or new authorization. Alert payloads contain rule ID, count/age bucket, account category, correlation ID and Runbook path, never mail/body/address/token.
 
-The operations conftests define `evaluator`, fixed time, PostgreSQL alert state and fake Notification Outbox used by both rule and dedupe tests.
+The operations conftests define `evaluator`, fixed time, PostgreSQL alert state and fake Operations Notification Outbox used by both rule and dedupe tests.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/operations/test_alert_rules.py tests/integration/operations/test_alert_outbox.py -q
-git add src/operations src/outbox/runtime.py src/config.py .env.example tests/unit/operations tests/integration/operations docs/runbooks
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/operations/test_alert_rules.py tests/integration/operations/test_alert_outbox.py tests/integration/migrations/test_0012_to_0013.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+git add alembic/versions/20260713_0013_operations_control.py src/operations src/outbox/runtime.py src/config.py .env.example src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/operations tests/integration/operations tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0012_to_0013.py docs/runbooks
 git commit -m "feat: add actionable durable operational alerts"
 ```
 
@@ -348,7 +369,7 @@ Use Phase 5 policy values: terminal content/artifacts 30d; waiting approval unti
 
 - [ ] **Step 3: Implement plan, guarded execute, and recovery**
 
-Planner writes immutable candidate IDs and counts without deleting. Executor requires a verified encrypted snapshot newer than the plan, claims at most 500 rows with resumable checkpoints, clears payload columns before deleting audit metadata, decrements account-scoped content references, respects legal/send holds, and enqueues stable Qdrant delete operations. Partial failure records cursor/error and resumes without repeating completed operations.
+Planner writes immutable candidate IDs and counts without deleting. Executor requires a verified encrypted snapshot newer than the plan, claims at most 500 rows with resumable checkpoints, clears payload columns before deleting audit metadata, decrements account-scoped content references, respects legal/send holds, and enqueues stable Qdrant delete operations. Partial failure records cursor/error and resumes without repeating completed operations. Snapshot creation and verification write the `backup_snapshots`/`restore_verifications` tables introduced by `0013`; an in-memory flag, filename or unsigned CLI output is never backup evidence.
 
 - [ ] **Step 4: Prove encrypted backup restore**
 
@@ -558,7 +579,7 @@ Expected: OpenAPI matches runtime, every production setting and alert is documen
 
 ---
 
-### Task 8: Implement Per-account Cutover, Reconciliation, and Rollback
+### Task 8: Operationalize Post-activation Rotation, Reconciliation, and Rollback
 
 **Files:**
 - Create: `src/maintenance/cutover.py`
@@ -575,7 +596,7 @@ Expected: OpenAPI matches runtime, every production setting and alert is documen
 
 **Interfaces:**
 - Consumes: six per-account feature flags, `pipeline_ownership`, generation/fencing repositories and all Inbox/Outbox counts
-- Produces: dry-run `CutoverPlan`; transactional `quiesce`, `switch`, `retire`, and forward-only `rollback`
+- Produces: dry-run post-activation `RotationPlan`; reconciliation/retirement orchestration and CLI wrappers that delegate every authority/ownership mutation to Phase 3 `ActivationService`
 
 - [ ] **Step 1: Write state-machine and stale-worker tests**
 
@@ -584,34 +605,44 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_cutover_requires_quiescence_and_high_water_match(service, account):
-    plan = await service.plan(account.id, target_pipeline="durable-v2")
+async def test_rotation_requires_existing_durable_authority_and_high_water(
+    service, account
+):
+    await account.seed_authority(mode="durable_active")
+    plan = await service.plan_rotation(account.id, target_pipeline="durable-v2")
     await service.quiesce(plan.id)
     await account.seed_sending_attempt()
     with pytest.raises(CutoverBlocked, match="sending_attempts"):
-        await service.switch(plan.id)
+        await service.rotate(plan.id)
+
+
+@pytest.mark.asyncio
+async def test_operations_cli_cannot_perform_initial_activation(service, account):
+    await account.seed_authority(mode="shadow")
+    with pytest.raises(CutoverBlocked, match="phase3_activation_required"):
+        await service.plan_rotation(account.id, target_pipeline="durable-v2")
 
 
 @pytest.mark.asyncio
 async def test_stale_generation_cannot_claim_or_complete_any_outbox(service, stale_worker):
-    await service.switch(await service.ready_plan())
+    await service.rotate(await service.ready_rotation_plan())
     for outbox_kind in ("notification", "mailbox", "send", "projection"):
         assert await stale_worker.claim(outbox_kind) == []
         with pytest.raises(StaleFence):
             await stale_worker.complete_existing(outbox_kind)
 ```
 
-- [ ] **Step 2: Implement the seven-step cutover protocol**
+- [ ] **Step 2: Implement the post-activation rotation protocol**
 
-Plan snapshots old/new Webhook and Sync high water, Inbox/Outbox by state/generation, email state and in-flight sending. `quiesce` stops old new claims; all `sending` attempts must reach a clear result or `send_unknown`. A serializable transaction sets old generation to `draining`, increments token and creates the sole `current_ingress`. New events bind only to it; old generation may claim only already-owned tasks. Observe Webhook/Sync reconciliation, then retire only after zero owned work and matching high water.
+This task is operational tooling for an account that Phase 3 has already activated; it cannot perform the first `shadow/quiescing -> durable_active` transition. A rotation plan snapshots the current authority receipt/barrier, old/new Webhook and Sync high water, Inbox/Outbox by state/generation, email state, in-flight sending and the currently deployed `exchange_sync_contract_v2` build/profile evidence. The wrapper requests quiesce, evidence sealing and generation rotation through Phase 3 `ActivationService`; it contains no direct SQL that mutates `pipeline_runtime_authority`, `pipeline_ownership` or consumes a cutover barrier. Contract-version drift blocks rotation/rollback activation rather than silently falling back to the legacy extension. All `sending` attempts must reach a clear result or `send_unknown`. After the delegated atomic rotation, new events bind only to the new generation and the old generation drains already-owned work. Observe Webhook/Sync reconciliation, then request retirement only after zero owned work and matching high water. An architecture scan keeps `src/ingestion/activation.py` as the sole production authority/ownership mutation site.
 
 - [ ] **Step 3: Bind all six flags without granting ownership**
 
-Add per-account desired settings for `DURABLE_INBOX_ENABLED`, `SYNC_RECONCILIATION_ENABLED`, `NEW_APPROVAL_FLOW_ENABLED`, `SEND_OUTBOX_ENABLED`, `LIGHTWEIGHT_GRAPH_STATE_ENABLED`, and `QDRANT_OUTBOX_ENABLED`. Routers use flags only to select the target pipeline when creating a generation; every actual claim/complete still checks `pipeline_ownership`. Email ownership becomes sticky at approval/send-intent creation.
+Add per-account desired settings for `DURABLE_INBOX_ENABLED`, `SYNC_RECONCILIATION_ENABLED`, `NEW_APPROVAL_FLOW_ENABLED`, `SEND_OUTBOX_ENABLED`, `LIGHTWEIGHT_GRAPH_STATE_ENABLED`, and `QDRANT_OUTBOX_ENABLED`. Flags describe a requested rotation profile only; they neither select nor create a generation and never grant execution. Phase 3 `ActivationService` validates the requested profile against current database authority and its new immutable barrier. Every actual claim/complete still checks authority plus `pipeline_ownership`; email ownership remains sticky at approval/send-intent creation.
 
 - [ ] **Step 4: Implement forward-only rollback**
 
-Rollback creates a new `current_ingress` pointing to the stable pipeline and moves the problem generation to `draining`; it never rewrites ownership of existing Inbox/Outbox or replays `send_unknown`. Optional migration of a pending item requires a separate audited command that proves no remote request started, updates ownership/fencing atomically and records the old/new causal ID.
+The operations CLI delegates rollback to Phase 3 `ActivationService.rollback()` with a new append-only command receipt; it never recreates that transaction. The service creates a fresh current `legacy_compat` Durable generation and moves the problem generation to draining without rewriting existing Inbox/Outbox ownership or replaying `send_unknown`. Because authority remains `durable_active`, the selector maps that new current generation only to `DurableLegacyCompatAdapter`: PostgreSQL Inbox plus four business Outboxes, zero legacy direct effects. It must never resolve to `LegacyProcessingAdapter`, which remains limited to pre-switch legacy/Shadow or already-stamped old draining work. Optional migration of a pending item requires a separate audited command that proves no remote request started, updates ownership/fencing atomically through the same service and records the old/new causal ID.
 
 Extend the maintenance conftests with `service`, `account`, `stale_worker`, `cleaner` and verified snapshot/high-water builders. The stale Worker fake attempts Notification, Mailbox, Send and Projection claim/complete through production repositories.
 
@@ -620,17 +651,18 @@ Extend the maintenance conftests with `service`, `account`, `stale_worker`, `cle
 ```bash
 TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/maintenance/test_cutover_protocol.py tests/integration/maintenance/test_cutover_fencing.py tests/integration/maintenance/test_rollback_drain.py tests/fault_injection/test_cutover_fencing.py tests/fault_injection/test_rollback_drain.py -q
 git add src/maintenance/cutover.py src/maintenance/reconcile.py src/maintenance/cli.py src/config.py .env.example tests/unit/maintenance/conftest.py tests/integration/maintenance/conftest.py tests/unit/maintenance/test_cutover_protocol.py tests/integration/maintenance/test_cutover_fencing.py tests/integration/maintenance/test_rollback_drain.py docs/runbooks/pipeline-cutover.md
-git commit -m "feat: add fenced per-account cutover and rollback"
+git commit -m "feat: operationalize fenced generation rotation and rollback"
 ```
 
-Expected: stale generations fail every side-effect path, 202 Inbox and all Outboxes remain owned/drainable during rollback, and no switch occurs with unresolved sending.
+Expected: stale generations fail every side-effect path, 202 Inbox and all Outboxes remain owned/drainable during rollback, no rotation occurs with unresolved sending, and Phase 6 cannot perform an initial Durable activation or mutate authority outside Phase 3 `ActivationService`.
 
 ---
 
-### Task 9: Govern Historical Cleanup and Contract the Legacy Paths
+### Task 9: Govern Historical Cleanup and Prepare Legacy-path Contraction
 
 **Files:**
-- Create: `alembic/versions/20260710_0008_legacy_compatibility_views.py`
+- Create: `alembic/versions/20260713_0014_legacy_contraction_control.py`
+- Create after sealed post-activation authorization: `alembic/versions/20260713_0015_legacy_contract_ddl.py`
 - Create: `src/maintenance/legacy_cleanup.py`
 - Create: `tests/integration/maintenance/test_legacy_cleanup.py`
 - Create: `tests/architecture/test_no_legacy_side_effects.py`
@@ -641,10 +673,26 @@ Expected: stale generations fail every side-effect path, 202 Inbox and all Outbo
 - Modify: `src/nodes/sender.py`
 - Modify: `src/utils/lark_app.py`
 - Modify: `src/exchange_service.py`
+- Modify: `src/db/access_contract.py`
+- Modify: `src/db/bootstrap.py`
+- Modify: `src/db/schema.py`
+- Modify: `src/db/schema_contract.py`
+- Modify: `src/maintenance/checkpoint_repository.py`
+- Modify: `tests/unit/test_database_revision.py`
+- Modify: `tests/unit/test_database_schema_contract.py`
+- Modify: `tests/unit/test_checkpoint_repository_safety.py`
+- Modify: `tests/unit/test_alembic_offline.py`
+- Modify: `tests/integration/ingestion/test_schema.py`
+- Modify: `tests/integration/ingestion/test_access_roles.py`
+- Create: `tests/integration/migrations/test_0013_to_0014.py`
+- Create after sealed post-activation authorization: `tests/integration/migrations/test_0014_to_0015.py`
 
 **Interfaces:**
-- Consumes: verified backup, retention planner, per-generation high-water reconciliation and stability-window record
-- Produces: compatibility read views; stopped legacy writes; removal gate for old sender/poller/direct side effects
+- Consumes: current DB authority, real v2 proof, consumed Phase-3 activation barrier/receipt, verified backup, retention planner, per-generation high-water reconciliation and target-generation production stability record
+- Produces: non-destructive contraction plans and sealed DDL authorization; removal gate for a later migration-role-only contraction revision
+
+Migration revision is exactly `20260713_0014` with linear `down_revision = "20260713_0013"`.
+The pre-activation implementation head stops at `0014`. The separately reviewed post-activation contraction revision is exactly `20260713_0015` with linear `down_revision = "20260713_0014"`; it is created/applied only after the authorization and hard production window below.
 
 - [ ] **Step 1: Write cleanup eligibility and architecture tests**
 
@@ -664,18 +712,60 @@ async def test_cleanup_refuses_unresolved_or_unmigrated_rows(cleaner, db, verifi
     assert plan.blocked_by_state == {"waiting_approval": 1, "accepted": 1, "send_unknown": 1}
 
 
-def test_legacy_modules_cannot_call_external_side_effects():
+def test_legacy_modules_have_no_unguarded_external_side_effects():
     for module in (sender, polling, exchange_service):
-        source = inspect.getsource(module)
-        assert "send_reply(" not in source
-        assert "send_forward(" not in source
-        assert "send_approval_card(" not in source
-        assert "qdrant_client.upsert(" not in source
+        findings = find_external_calls_without_legacy_effect_guard(
+            inspect.getsource(module)
+        )
+        assert findings == []
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "missing",
+    ["durable_authority", "real_v2_proof", "consumed_barrier", "activation_receipt", "production_window"],
+)
+async def test_contract_refuses_every_missing_production_gate(
+    cleaner, ready_contraction_plan, missing, db
+):
+    plan = ready_contraction_plan.without(missing)
+    with pytest.raises(LegacyContractionBlocked, match=missing):
+        await cleaner.authorize(
+            plan.id,
+            actor="operator",
+            reason="contract",
+            idempotency_key=f"contract-missing-{missing}",
+        )
+    assert await db.legacy_table_is_writable() is True
+
+
+@pytest.mark.integration
+async def test_zero_or_short_stability_window_can_never_authorize_contract(cleaner):
+    plan = await cleaner.ready_plan(window=timedelta(0), event_count=100_000)
+    with pytest.raises(LegacyContractionBlocked, match="minimum_production_window"):
+        await cleaner.authorize(plan.id, actor="operator", reason="contract", idempotency_key="short")
+
+
+@pytest.mark.integration
+async def test_build_or_contract_drift_resets_stability_window(cleaner, ready_contraction_plan):
+    await cleaner.observe(ready_contraction_plan.id, days=7, events=1_000)
+    await cleaner.rotate_build_for_test()
+    status = await cleaner.status(ready_contraction_plan.id)
+    assert status.observed_seconds == status.observed_events == 0
+    assert status.authorization_id is None
 ```
 
-- [ ] **Step 2: Add non-destructive contraction metadata, then stop writes through an authorized command**
+- [ ] **Step 2: Add non-destructive contraction metadata and seal migration authorization**
 
-Migration `20260710_0008` is safe on every deployment: it creates `legacy_contraction_plans`, the write-observation counters and new-schema compatibility view definitions under nonconflicting names; it never renames/drops a live table. After no legacy writes for the configured 14-day stability window, verified backup and high-water match, `legacy_cleanup contract --plan-id --snapshot-id` takes a short exclusive lock, rechecks counts, renames the legacy table, installs the old name as a read-only view backed by new facts and revokes INSERT/UPDATE/DELETE. `src/db/migrate.py` and `src/utils/db_async.py` lose application-schema mutation responsibilities but retain an explicit legacy inspection command until final deletion.
+Migration `20260713_0014` is safe on every deployment: it creates `legacy_contraction_plans`, immutable evidence members, write-observation counters, sealed authorizations and completion-evidence tables under nonconflicting names; it never renames/drops a live table, creates a replacement view or changes legacy privileges. It also performs the complete revision-contract update: exact single head/schema digest, bootstrap checks, four ACL manifests, checkpoint allowlist and offline SQL. Maintenance may plan/observe/seal but has no DDL or GRANT/REVOKE privilege; auditor is SELECT-only; migration owns DDL. `tests/integration/migrations/test_0013_to_0014.py` proves a disabled-contraction code-first real-PostgreSQL bridge, preservation/roles/startup, second no-op, old-head rejection and single-head empty DB.
+
+Implementation mode may create plans/dry-runs only. `legacy_cleanup authorize --plan-id --snapshot-id --actor --reason --idempotency-key` atomically re-reads and requires: current authority `durable_active`; a real build-matching v2 proof; consumed `production_ready` barrier and `pipeline.switch` receipt; exact target generation/fence; completed reconciliation; **at least seven continuous production days and at least 1,000 target-generation events** (configuration may raise but never lower either minimum); zero legacy writes; verified backup; and high-water/count equality. Any build/config/fence/v2/profile/high-water drift resets both observation counters to zero and invalidates prior authorization. The command writes only an immutable authorization/evidence hash, receipt and audit; it performs no `ALTER`, `RENAME`, `CREATE VIEW`, `GRANT` or `REVOKE`.
+
+`20260713_0015_legacy_contract_ddl.py` has exactly two fail-closed branches. The **fresh-install branch** needs no authorization only when one transaction proves there are zero account/authority/ownership/business/legacy rows, zero legacy sequence/high-water/history markers, zero command/switch receipts, zero activation consumptions/audits and zero contraction plans/authorizations; it creates the final schema/view/ACL directly. Any single trace selects the **existing-production branch**, where the migration role takes the account plus relation locks and revalidates the sealed authorization and every bound fact in the same migration transaction before rename/view/revoke/completion evidence. There is no “empty-looking” fallback for a previously used database.
+
+The production authorization binds authority, real v2 proof, consumed successor/live barrier/switch receipt, target generation/fence, reconcile result, seven-day/1,000-event window, zero legacy writes, backup, high-water and build/config/schema. Parameterized tests mutate each fact after sealing and assert the migration fails atomically: original relation remains writable with identical data, and no view, ACL change or completion row exists. A controlled lock race proves either a legacy write/fact drift commits first and the final recheck aborts DDL, or the migration lock wins and the writer/drift is rejected after contraction; no write is lost and no half-schema is visible.
+
+The same `0015` commit advances exact head/schema digest, bootstrap pre/post checks, all four post-contraction ACL manifests, checkpoint allowlist and offline SQL. `tests/integration/migrations/test_0014_to_0015.py` covers baseline-to-`0015` empty install, pristine `0014 -> 0015`, every history trace without authorization, sealed production success, all bound-fact drifts, lock races, data/high-water preservation, read-only role denials, completion evidence, second no-op and old-binary/database-first rejection. `src/db/migrate.py`/`src/utils/db_async.py` never perform runtime DDL and retain only inspection compatibility until final code deletion.
 
 - [ ] **Step 3: Clean historical checkpoints in guarded batches**
 
@@ -683,35 +773,104 @@ Require backup ID and dry-run plan; exclude waiting approval, accepted, send_unk
 
 - [ ] **Step 4: Remove legacy business responsibility**
 
-Delete old direct sender logic, polling ownership, direct Lark card sends, direct Exchange mark/send calls, direct Qdrant writes, old migration startup hooks and obsolete state fields only after architecture tests and production stability evidence pass. Keep thin import adapters only when a deployed client still needs the name; adapters delegate to new services and cannot produce side effects by themselves.
+During implementation acceptance, add authority/effect guards, compatibility adapters, contraction manifests and architecture tests, but retain the legacy-authoritative/Shadow code needed by the currently deployed system. Under `durable_active`, a normal current generation uses `DurableProcessingAdapter` and a rollback current generation uses `DurableLegacyCompatAdapter`; neither may invoke direct effects. `LegacyProcessingAdapter` is restricted to legacy/Shadow or already-stamped old draining work. Do **not** delete old direct sender/poller/Lark/Exchange/Qdrant/migration code while `blocked_external_exchange_sync_contract` is present. After the separate extension v2 release, real Phase-3 activation, hard minimum stability window/event count and the migration-role `0015` contraction, execute a distinct reviewed code-removal commit; thin import adapters may remain only when a deployed client needs the name and can no longer produce direct side effects.
 
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/maintenance/test_legacy_cleanup.py tests/architecture/test_no_legacy_side_effects.py tests/migration -q
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/maintenance/test_legacy_cleanup.py tests/architecture/test_no_legacy_side_effects.py tests/integration/migrations/test_0013_to_0014.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
 .venv/bin/python -m pytest -q
-git add alembic/versions/20260710_0008_legacy_compatibility_views.py src/maintenance/legacy_cleanup.py src/db/migrate.py src/utils/db_async.py src/scheduler/polling.py src/nodes/sender.py src/utils/lark_app.py src/exchange_service.py tests/integration/maintenance/test_legacy_cleanup.py tests/architecture/test_no_legacy_side_effects.py docs/runbooks/legacy-contraction.md
-git commit -m "refactor: contract verified legacy execution paths"
+git add alembic/versions/20260713_0014_legacy_contraction_control.py src/maintenance/legacy_cleanup.py src/db/migrate.py src/utils/db_async.py src/scheduler/polling.py src/nodes/sender.py src/utils/lark_app.py src/exchange_service.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/integration/maintenance/test_legacy_cleanup.py tests/architecture/test_no_legacy_side_effects.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/migrations/test_0013_to_0014.py docs/runbooks/legacy-contraction.md
+git commit -m "refactor: prepare guarded legacy path contraction"
 ```
 
-Expected: legacy reads remain compatible, legacy writes and direct side effects are impossible, and protected/nonterminal history is untouched.
+Expected: in implementation mode legacy/Shadow remains functional only through the exact effect guard, Durable mode cannot invoke a legacy side effect, protected/nonterminal history is untouched, and no deletion is claimed before production activation/stability evidence.
+
+- [ ] **Step 6: After real activation and the hard stability gate, ship the separate `0015` contraction commit**
+
+For an existing deployment this step is forbidden during `implementation_complete_external_blocked` and requires the sealed post-stability authorization; only the strictly pristine fresh-install branch may reach `0015` without it. Run the bridge/ACL/offline tests plus the full suite, apply Alembic as the migration role, verify completion evidence and zero writable legacy path, then remove obsolete direct business code in a second code commit whose architecture scan permits no remaining external call from the compatibility names.
+
+```python
+@pytest.mark.integration
+@pytest.mark.parametrize("start", ["baseline_empty", "0014_pristine"])
+async def test_0015_fresh_install_needs_no_contraction_authorization(migrator, start):
+    db = await migrator.pristine(start)
+    await migrator.upgrade(db, "20260713_0015")
+    assert await db.head() == "20260713_0015"
+    assert await db.legacy_compatibility_is_read_only() is True
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "trace",
+    ["account", "authority", "business", "legacy_row", "legacy_high_water", "switch_receipt", "activation_consumption", "audit_history"],
+)
+async def test_any_history_trace_without_sealed_authorization_blocks_atomically(
+    migrator, trace
+):
+    db = await migrator.at_0014_with_trace(trace)
+    before = await db.legacy_snapshot()
+    with pytest.raises(MigrationAuthorizationRequired):
+        await migrator.upgrade(db, "20260713_0015")
+    assert await db.legacy_snapshot() == before
+    assert await db.no_view_acl_or_completion_partial() is True
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "drift",
+    ["authority", "v2", "consumed_successor_receipt", "generation_fence", "reconcile", "window_events", "legacy_write", "backup", "high_water", "build_config_schema"],
+)
+async def test_every_sealed_fact_drift_aborts_0015_without_partial_ddl(
+    migrator, sealed_production_db, drift
+):
+    await sealed_production_db.mutate_bound_fact(drift)
+    before = await sealed_production_db.legacy_snapshot()
+    with pytest.raises(ContractionEvidenceDrift):
+        await migrator.upgrade(sealed_production_db, "20260713_0015")
+    assert await sealed_production_db.legacy_snapshot() == before
+    assert await sealed_production_db.no_view_acl_or_completion_partial() is True
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("racer", ["legacy_write", "bound_fact_drift"])
+async def test_0015_lock_race_has_one_serialized_winner(migrator, sealed_production_db, racer):
+    migrated, raced = await migrator.race_upgrade_with(sealed_production_db, racer)
+    assert (migrated, raced) in {(False, True), (True, False)}
+    assert await sealed_production_db.no_lost_write_or_partial_schema() is True
+```
+
+```bash
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/migrations/test_0014_to_0015.py tests/integration/maintenance/test_legacy_cleanup.py tests/integration/ingestion/test_access_roles.py tests/architecture/test_no_legacy_side_effects.py -q
+.venv/bin/python -m pytest tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py -q
+.venv/bin/python -m pytest -q
+git add alembic/versions/20260713_0015_legacy_contract_ddl.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/integration/migrations/test_0014_to_0015.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py
+git commit -m "refactor: contract legacy schema after production proof"
+```
+
+Expected: production final head is exactly `0015`; the old name is read-only, completion evidence matches the sealed authorization, no runtime/maintenance role has DDL, and only after this succeeds may the separate code-removal commit claim legacy contraction complete.
 
 ---
 
-### Task 10: Run the Soak Test and Produce the Final Production Acceptance Report
+### Task 10: Run the Soak Test and Produce Implementation/Production Acceptance Reports
 
 **Files:**
 - Create: `scripts/run_soak.py`
 - Create: `scripts/final_acceptance.py`
 - Create: `tests/acceptance/test_design_acceptance.py`
-- Create: `docs/superpowers/reports/2026-07-10-final-production-acceptance.md`
+- Create: `tests/acceptance/test_activation_successors.py`
+- Create: `docs/superpowers/reports/2026-07-10-implementation-acceptance.md`
+- Create after real activation: `docs/superpowers/reports/2026-07-10-production-activation-acceptance.md`
+- Create after `0015` contraction: `docs/superpowers/reports/2026-07-10-production-contraction-acceptance.md`
 - Create: `docs/superpowers/reports/2026-07-10-exchange-server-follow-up-boundary.md`
+- Modify: `src/ingestion/cutover_barrier.py`
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
 **Interfaces:**
 - Consumes: CI artifacts, migration/backup/cutover evidence, alerts, metrics, coverage and load results
-- Produces: machine-checkable mapping for all 21 design criteria and a decision on whether server-side design may start
+- Produces: machine-checkable mapping for all 21 design criteria; `implementation_complete_external_blocked`, `production_activated`, or final `production_contracted`; and a decision on whether the separate server-side design may start
 
 - [ ] **Step 1: Implement a reproducible 24-hour-equivalent soak**
 
@@ -723,7 +882,7 @@ Require zero lost Inbox/Outbox, zero duplicate business side effect, zero automa
 
 - [ ] **Step 3: Map every design criterion to evidence**
 
-`final_acceptance.py` reads a checked-in manifest with criteria 1-21 and fails when a criterion lacks a passing test ID plus CI artifact or operator evidence hash. The report contains commits, image/SBOM digests, migration heads, backup restore ID, cutover/reconciliation IDs, coverage, security gate, alerts/Runbooks and soak percentiles. It records no body, address, token, card or internal credential.
+`final_acceptance.py` reads a checked-in manifest with criteria 1-21 and fails when an AI-repository implementation criterion lacks a passing test ID plus CI artifact or operator evidence hash. It has four explicit modes. `implementation` requires pre-activation head `0014`, accepts all dormant/fail-closed AI work, records the known incompatibility and appends immutable `phase6_implementation_complete_external_blocked` with null target/live-barrier fields; it does not quiesce or invalidate anything. `production-ready` runs only after the separate extension release, reserved target and ready live cutover barrier, revalidates the full predecessor chain/current `0014` head/four business Outboxes/Graph/security/operations plus all live-cutover evidence and appends a complete non-superseded `production_ready` successor. `activation` runs only after Phase-3 consumes that exact successor and requires controlled FolderScope apply, real cutover/reconciliation IDs and observed active authority; it writes the production-activation report and may mark `production_activated`, but not contraction complete. Final `production` additionally requires the hard seven-day/1,000-event window, sealed authorization, successful `0015` migration/completion evidence, read-only legacy view and code-removal architecture gate; only it writes the contraction report and marks `production_contracted`. Reports contain no body, address, token, card or internal credential. Tests reject base/P4/P5/P6-implementation/current-extension/mock leaves and accept only a real-v2 `production_ready` leaf bound to a ready live barrier.
 
 - [ ] **Step 4: Run the final gate**
 
@@ -735,21 +894,21 @@ TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test uv 
 TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test uv run pytest --cov=src --cov-report=json:artifacts/coverage.json --cov-fail-under=80 -q
 uv run python scripts/check_coverage_ratchet.py artifacts/coverage.json .coverage-baseline.json
 uv run python scripts/run_soak.py --seed 20260710 --virtual-hours 24 --messages 10000 --output artifacts/soak.json
-uv run python scripts/final_acceptance.py --evidence artifacts --output docs/superpowers/reports/2026-07-10-final-production-acceptance.md
+uv run python scripts/final_acceptance.py --mode implementation --evidence artifacts --output docs/superpowers/reports/2026-07-10-implementation-acceptance.md
 docker compose config --quiet
 docker build --target runtime -t ai-exchange:final .
 git diff --check
 ```
 
-Expected: every command exits 0, coverage is at least 80% globally/90% on critical modules, soak thresholds pass, and all 21 criteria have evidence.
+Expected: every AI implementation command exits 0, coverage is at least 80% globally/90% on critical modules, soak thresholds pass, and all 21 implementation criteria have evidence. With the current extension the report exits successfully only in implementation mode, records `implementation_complete_external_blocked`, appends the non-consumable Phase-6 successor and leaves production-ready/activation/production modes fail-closed.
 
 - [ ] **Step 5: Record the service-repository boundary and commit**
 
-The follow-up boundary report repeats only verified server gaps: synchronous reply/forward without idempotency keys or operation query, ordinary send accepted-only semantics, Sync without explicit `has_more`, and Webhook timestamp not signed. It states the server repository remained unmodified and that a separate brainstorming/design cycle is required.
+The follow-up boundary report repeats only verified server gaps: synchronous reply/forward without idempotency keys or operation query, ordinary send accepted-only semantics, Sync generator auto-pagination that defeats the HTTP `limit`, missing continuation/`includes_last` v2 contract, raw `read_flag_change` with `item=None`, and the lack of an authenticated header/nonce freshness contract. It records the exact timestamp distinction: the JSON body timestamp is already inside the HMAC-signed payload and remains trusted source-event data, while `X-Webhook-Timestamp` is separately generated and cannot authorize freshness. A future version may sign an explicit timestamp/body/nonce tuple. The report states the server repository remained unmodified and that a separate brainstorming/design cycle is required. Reaching `implementation_complete_external_blocked` authorizes that later design task. After its release the exact order is: real v2 probe; `production-ready`; Phase-3 switch; controlled per-folder apply/reconciliation; `activation` acceptance at head `0014`; hard stability window and sealed contraction authorization; reviewed `0015` migration/code removal; final `production` acceptance. No pre-switch report may claim `production_activated`, and no head-`0014` report may claim `production_contracted`.
 
 ```bash
-git add scripts/run_soak.py scripts/final_acceptance.py tests/acceptance/test_design_acceptance.py docs/superpowers/reports/2026-07-10-final-production-acceptance.md docs/superpowers/reports/2026-07-10-exchange-server-follow-up-boundary.md README.md CLAUDE.md
-git commit -m "docs: certify AI-Exchange production acceptance"
+git add scripts/run_soak.py scripts/final_acceptance.py src/ingestion/cutover_barrier.py tests/acceptance/test_design_acceptance.py tests/acceptance/test_activation_successors.py docs/superpowers/reports/2026-07-10-implementation-acceptance.md docs/superpowers/reports/2026-07-10-exchange-server-follow-up-boundary.md README.md CLAUDE.md
+git commit -m "docs: certify AI-Exchange implementation acceptance"
 ```
 
-Expected: the final report explicitly says `AI-Exchange accepted` only when all evidence is green; otherwise it records `blocked` and the exact unmet criterion. Only the accepted outcome authorizes a later Exchange server design task.
+Expected: the report says `implementation_complete_external_blocked` only when all AI evidence is green and the external blocker is exact; that outcome authorizes the later Exchange server design task but not production activation. A subsequent real v2 proof plus Phase-3 switch may produce `production_activated` at head `0014`; only the hard stability gate plus successful `0015` contraction may produce `production_contracted`.

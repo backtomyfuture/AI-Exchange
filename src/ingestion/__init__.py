@@ -1,5 +1,10 @@
 """Durable ingestion domain boundary."""
 
+from src.ingestion.normalization import (
+    normalize_sync_change,
+    normalize_webhook_event,
+    validate_sync_change_contract,
+)
 from src.ingestion.models import (
     ChangeKind,
     InboxDisposition,
@@ -34,4 +39,7 @@ __all__ = [
     "SyncBatch",
     "SyncChange",
     "SyncCursorStatus",
+    "normalize_sync_change",
+    "normalize_webhook_event",
+    "validate_sync_change_contract",
 ]

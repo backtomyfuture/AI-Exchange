@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -43,6 +44,11 @@ def _event(**overrides: object) -> NormalizedIngressEvent:
     return NormalizedIngressEvent(**values)  # type: ignore[arg-type]
 
 
+class _InvalidOffsetTimezone(tzinfo):
+    def utcoffset(self, _value: datetime | None) -> timedelta:  # type: ignore[override]
+        return "invalid-offset"  # type: ignore[return-value]
+
+
 def test_ingestion_enums_lock_database_vocabulary() -> None:
     assert {value.value for value in ChangeKind} == {
         "create",
@@ -60,12 +66,18 @@ def test_ingestion_enums_lock_database_vocabulary() -> None:
         "archive",
         "metadata_only",
         "historical_suppressed",
+        "ignored",
     }
     assert {value.value for value in InboxStatus} == {
         "pending",
         "retry_wait",
         "leased",
         "completed",
+        "dead_letter",
+        "manual_review",
+    }
+    assert {value.value for value in InboxDispositionStatus} == {
+        "retry_wait",
         "dead_letter",
         "manual_review",
     }
@@ -120,11 +132,49 @@ def test_normalized_event_normalizes_enums_time_and_deep_freezes_payload() -> No
         event.account_id = 9  # type: ignore[misc]
 
 
+def test_normalized_event_exposes_recursive_plain_payload_for_jsonb_storage() -> None:
+    event = _event(
+        payload={
+            "routing": {"folder_aliases": ["INBOX"]},
+            "nested": [{"unicode": "合成邮件"}],
+        }
+    )
+
+    storage_payload = event.payload_for_storage()
+
+    assert type(storage_payload) is dict
+    assert type(storage_payload["routing"]) is dict
+    assert type(storage_payload["routing"]["folder_aliases"]) is list
+    assert type(storage_payload["nested"]) is list
+    assert type(storage_payload["nested"][0]) is dict
+    assert (
+        json.loads(json.dumps(storage_payload, ensure_ascii=False)) == storage_payload
+    )
+
+
+def test_normalized_event_requires_explicit_processing_policy() -> None:
+    values: dict[str, object] = {
+        "account_id": 8,
+        "source": IngressSource.WEBHOOK,
+        "raw_event_type": "NewMailEvent",
+        "kind": ChangeKind.CREATE,
+        "external_email_id": "exchange-message-1",
+        "folder": "INBOX",
+        "source_version": "version-1",
+        "dedupe_key": "a" * 64,
+        "payload": {},
+    }
+
+    with pytest.raises(TypeError, match="processing_policy"):
+        NormalizedIngressEvent(**values)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("account_id", 0),
         ("account_id", True),
+        ("account_id", 2**63),
         ("source", 1),
         ("source", "mailbox"),
         ("raw_event_type", " "),
@@ -132,6 +182,7 @@ def test_normalized_event_normalizes_enums_time_and_deep_freezes_payload() -> No
         ("raw_event_type", "x" * 129),
         ("kind", "move"),
         ("external_email_id", ""),
+        ("external_email_id", "\ud800"),
         ("external_email_id", "x" * 1025),
         ("folder", "\n"),
         ("folder", "x" * 513),
@@ -140,6 +191,26 @@ def test_normalized_event_normalizes_enums_time_and_deep_freezes_payload() -> No
         ("dedupe_key", "A" * 64),
         ("dedupe_key", "a" * 63),
         ("source_event_at", datetime(2026, 7, 12)),
+        (
+            "source_event_at",
+            datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=14))),
+        ),
+        (
+            "source_event_at",
+            datetime(
+                9999,
+                12,
+                31,
+                23,
+                59,
+                59,
+                tzinfo=timezone(-timedelta(hours=14)),
+            ),
+        ),
+        (
+            "source_event_at",
+            datetime(2026, 7, 12, tzinfo=_InvalidOffsetTimezone()),
+        ),
         ("payload", []),
         ("processing_policy", "execute_everything"),
     ],
@@ -156,6 +227,10 @@ def test_normalized_event_rejects_invalid_inputs(field: str, value: object) -> N
         {"nan": float("nan")},
         {"infinity": float("inf")},
         {"unsupported": object()},
+        {"nul_value": "not-storable\x00in-jsonb"},
+        {"nul_key\x00": "not-storable"},
+        {"surrogate_value": "\ud800"},
+        {"surrogate_key\ud800": "not-storable"},
         {"too_large": "x" * (256 * 1024)},
     ],
 )
@@ -166,12 +241,47 @@ def test_normalized_event_rejects_non_json_or_oversized_payload(
         _event(payload=payload)
 
 
+def test_normalized_event_rejects_payload_that_postgres_jsonb_expands_past_limit() -> (
+    None
+):
+    payload = {"metadata": [1e-300] * 1_000}
+
+    with pytest.raises(ValueError, match="byte limit"):
+        _event(payload=payload)
+
+
+def test_normalized_event_accepts_postgres_jsonb_expanded_numeric_payload_under_limit() -> (
+    None
+):
+    event = _event(payload={"metadata": [1e-300] * 800})
+
+    assert len(event.payload["metadata"]) == 800
+
+
 def test_normalized_event_rejects_cyclic_payload() -> None:
     payload: dict[str, object] = {}
     payload["cycle"] = payload
 
     with pytest.raises(ValueError, match="cycle"):
         _event(payload=payload)
+
+
+@pytest.mark.parametrize("target", ["event", "sync_change"])
+def test_json_models_reject_excessive_nesting_as_validation_error(
+    target: str,
+) -> None:
+    payload: dict[str, object] = {}
+    nested = payload
+    for _ in range(600):
+        child: dict[str, object] = {}
+        nested["child"] = child
+        nested = child
+
+    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+        if target == "event":
+            _event(payload=payload)
+        else:
+            SyncChange(ChangeKind.CREATE, "exchange-message-1", payload)
 
 
 def test_pipeline_generation_is_frozen_and_validated() -> None:
@@ -229,10 +339,16 @@ def test_sync_change_deep_freezes_item_and_normalizes_kind() -> None:
     [
         {"kind": "move"},
         {"external_email_id": ""},
+        {"external_email_id": "\ud800"},
         {"external_email_id": "x" * 1025},
         {"item": []},
         {"item": {"bad": object()}},
+        {"item": {"subject": "not-storable\x00in-jsonb"}},
+        {"item": {"nul_key\x00": "not-storable"}},
+        {"item": {"subject": "\ud800"}},
+        {"item": {"surrogate_key\ud800": "not-storable"}},
         {"source_version": ""},
+        {"source_version": "\ud800"},
     ],
 )
 def test_sync_change_rejects_invalid_inputs(kwargs: dict[str, object]) -> None:
@@ -262,6 +378,7 @@ def test_sync_batch_copies_changes_to_an_immutable_tuple() -> None:
     "kwargs",
     [
         {"cursor": ""},
+        {"cursor": " cursor-1 "},
         {"cursor": "x" * 8193},
         {"changes": "not-a-sequence-of-changes"},
         {"changes": [object()]},
@@ -368,13 +485,16 @@ def test_inbox_stats_validate_nonnegative_finite_counts() -> None:
         retry_wait=2,
         leased=3,
         dead_letter=4,
+        manual_review=5,
         oldest_pending_seconds=5,
     )
+    assert stats.manual_review == 5
     assert stats.oldest_pending_seconds == 5.0
 
     for invalid in (
         {"pending": -1},
         {"retry_wait": True},
+        {"manual_review": -1},
         {"oldest_pending_seconds": -0.1},
         {"oldest_pending_seconds": float("nan")},
         {"oldest_pending_seconds": 10**1000},
@@ -384,6 +504,7 @@ def test_inbox_stats_validate_nonnegative_finite_counts() -> None:
             "retry_wait": 0,
             "leased": 0,
             "dead_letter": 0,
+            "manual_review": 0,
             "oldest_pending_seconds": 0,
         }
         values.update(invalid)
@@ -406,15 +527,23 @@ def test_inbox_disposition_locks_retry_and_dead_letter_state_matrix(
         available_at=None,
         safe_error_code="attempt_budget_exhausted",
     )
+    manual = InboxDisposition(
+        status=InboxDispositionStatus.MANUAL_REVIEW,
+        attempts=2,
+        available_at=None,
+        safe_error_code="external_effect_outcome_unknown",
+    )
 
     assert retry.status is InboxDispositionStatus.RETRY_WAIT
     assert dead.status is InboxDispositionStatus.DEAD_LETTER
+    assert manual.status is InboxDispositionStatus.MANUAL_REVIEW
 
     for invalid in (
         {"status": "completed"},
         {"attempts": -1},
         {"status": "retry_wait", "available_at": None},
         {"status": "dead_letter", "available_at": ingestion_time},
+        {"status": "manual_review", "available_at": ingestion_time},
         {"available_at": datetime(2026, 7, 12)},
         {"safe_error_code": ""},
         {"safe_error_code": "x" * 65},

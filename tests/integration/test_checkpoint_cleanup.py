@@ -284,8 +284,8 @@ async def test_cli_plan_and_execute_use_distinct_roles_and_ed25519_v2(
 
 @pytest.mark.parametrize(
     "revision",
-    ["20260710_0002", "20260710_0003"],
-    ids=["0002-metadata", "0003-metadata"],
+    ["20260710_0002", "20260710_0003", "20260713_0004"],
+    ids=["0002-metadata", "0003-metadata", "0004-metadata"],
 )
 async def test_cleanup_plan_metadata_allowlist_reports_stored_revision_value(
     checkpoint_schema,

@@ -181,6 +181,27 @@ def _upgrade_business_schema(dsn: str) -> None:
     command.upgrade(config, "head")
 
 
+async def _require_empty_event_inbox_for_0004(
+    dsn: str,
+    *,
+    target_schema: str,
+) -> None:
+    """Fail closed before the policy CHECK migration scans a live Inbox."""
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                sql.SQL("SELECT EXISTS (SELECT 1 FROM {}.event_inbox LIMIT 1)").format(
+                    sql.Identifier(target_schema)
+                )
+            )
+            row = await cursor.fetchone()
+    if row is None or not isinstance(row[0], bool):
+        raise RuntimeError("event_inbox_preflight_unavailable_for_0004_migration")
+    if row[0]:
+        raise RuntimeError("event_inbox_not_empty_for_0004_migration")
+
+
 async def _revoke_relation_access(
     conn: psycopg.AsyncConnection,
     *,
@@ -551,21 +572,40 @@ async def bootstrap_database(
     )
     _require_checkpoint_migration_manifest()
     preexisting_revision = await get_current_database_revision(dsn)
+    known_preexisting_revision = preexisting_revision in {
+        "20260710_0002",
+        "20260710_0003",
+        "20260713_0004",
+    }
     await require_database_schema_contract(
         dsn,
         target_schema=target_schema,
         require_complete=False,
+        require_business_complete=known_preexisting_revision,
         expected_revision=(
-            preexisting_revision
-            if preexisting_revision in {"20260710_0002", "20260710_0003"}
-            else None
+            preexisting_revision if known_preexisting_revision else None
         ),
     )
+    checkpoint_count = 0
+    if known_preexisting_revision:
+        checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)
+        await require_database_schema_contract(
+            dsn,
+            target_schema=target_schema,
+            require_complete=True,
+            expected_revision=preexisting_revision,
+        )
+    if preexisting_revision == "20260710_0003":
+        await _require_empty_event_inbox_for_0004(
+            dsn,
+            target_schema=target_schema,
+        )
     await asyncio.to_thread(_upgrade_business_schema, dsn)
     business_revision = await get_current_database_revision(dsn)
     if business_revision is None or "," in business_revision:
         raise RuntimeError("Business schema revision is unavailable after bootstrap")
-    checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)
+    if not known_preexisting_revision:
+        checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)
     await _apply_database_access_contract(
         dsn,
         target_schema=target_schema,

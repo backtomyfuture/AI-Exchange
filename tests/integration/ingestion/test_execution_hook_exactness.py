@@ -298,7 +298,7 @@ async def _accepted_role_gates(schema) -> list[str]:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_fresh_0003_matches_test_owned_trigger_and_fk_manifests(
+async def test_fresh_0004_matches_test_owned_trigger_and_fk_manifests(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()

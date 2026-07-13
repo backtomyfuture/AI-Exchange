@@ -6,7 +6,17 @@ from unittest.mock import patch
 
 import pytest
 
-from src.db import schema_contract
+from src.db import access_contract, schema_contract
+
+
+def test_phase2_manifest_tracks_ignored_policy_revision() -> None:
+    assert access_contract.PHASE2_DATABASE_REVISION == "20260713_0004"
+    assert (
+        access_contract.PHASE2_CHECK_CONSTRAINT_SHA256[
+            ("event_inbox", "ck_event_inbox_processing_policy")
+        ]
+        == "d8fa97e98d89b2275a29c6899ce83136be195423cfdb907070a06074a4d7ab7c"
+    )
 
 
 class _ContractCursor:
@@ -28,14 +38,17 @@ class _ContractCursor:
 
 
 class _ContractConnection:
-    def __init__(self, rows, *, structure_batches=None):
+    def __init__(self, rows, *, structure_batches=None, check_manifest=None):
         phase2_present = any(row[0] in schema_contract.PHASE2_RELATIONS for row in rows)
         if structure_batches is None:
             if phase2_present:
                 checks = [
                     (relation, name, digest, True, False)
                     for (relation, name), digest in (
-                        schema_contract.PHASE2_CHECK_CONSTRAINT_SHA256.items()
+                        (
+                            check_manifest
+                            or schema_contract.PHASE2_CHECK_CONSTRAINT_SHA256
+                        ).items()
                     )
                 ]
                 unique = [
@@ -177,6 +190,110 @@ async def test_schema_contract_accepts_complete_0002_catalog_types():
             target_schema="public",
             require_complete=True,
             expected_revision="20260710_0002",
+        )
+
+
+@pytest.mark.asyncio
+async def test_schema_contract_accepts_complete_0004_catalog_types():
+    check_manifest = dict(schema_contract.PHASE2_CHECK_CONSTRAINT_SHA256)
+    check_manifest[("event_inbox", "ck_event_inbox_processing_policy")] = (
+        "d8fa97e98d89b2275a29c6899ce83136be195423cfdb907070a06074a4d7ab7c"
+    )
+    connection = _ContractConnection(
+        _deployed_rows(),
+        check_manifest=check_manifest,
+    )
+
+    async def connect(*_args, **_kwargs):
+        return connection
+
+    with patch.object(
+        schema_contract.psycopg.AsyncConnection,
+        "connect",
+        side_effect=connect,
+    ):
+        await schema_contract.require_database_schema_contract(
+            "postgresql://runtime/private",
+            target_schema="public",
+            require_complete=True,
+            expected_revision="20260713_0004",
+        )
+
+
+@pytest.mark.asyncio
+async def test_schema_contract_keeps_exact_0003_policy_digest_compatibility():
+    check_manifest = dict(schema_contract.PHASE2_CHECK_CONSTRAINT_SHA256)
+    check_manifest[("event_inbox", "ck_event_inbox_processing_policy")] = (
+        "f2c35a7d5a10689cc78f15a3d83cf656c89dc26578f2390519a7679012f1d9bb"
+    )
+    connection = _ContractConnection(
+        _deployed_rows(),
+        check_manifest=check_manifest,
+    )
+
+    async def connect(*_args, **_kwargs):
+        return connection
+
+    with patch.object(
+        schema_contract.psycopg.AsyncConnection,
+        "connect",
+        side_effect=connect,
+    ):
+        await schema_contract.require_database_schema_contract(
+            "postgresql://runtime/private",
+            target_schema="public",
+            require_complete=True,
+            expected_revision="20260710_0003",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_revision", "deployed_policy_digest"),
+    [
+        (
+            "20260713_0004",
+            "f2c35a7d5a10689cc78f15a3d83cf656c89dc26578f2390519a7679012f1d9bb",
+        ),
+        (
+            "20260710_0003",
+            "d8fa97e98d89b2275a29c6899ce83136be195423cfdb907070a06074a4d7ab7c",
+        ),
+    ],
+    ids=("0003-digest-as-0004", "0004-digest-as-0003"),
+)
+async def test_schema_contract_rejects_cross_revision_policy_digest(
+    expected_revision: str,
+    deployed_policy_digest: str,
+) -> None:
+    check_manifest = dict(schema_contract.PHASE2_CHECK_CONSTRAINT_SHA256)
+    check_manifest[("event_inbox", "ck_event_inbox_processing_policy")] = (
+        deployed_policy_digest
+    )
+    connection = _ContractConnection(
+        _deployed_rows(),
+        check_manifest=check_manifest,
+    )
+
+    async def connect(*_args, **_kwargs):
+        return connection
+
+    with (
+        patch.object(
+            schema_contract.psycopg.AsyncConnection,
+            "connect",
+            side_effect=connect,
+        ),
+        pytest.raises(
+            schema_contract.DatabaseSchemaContractError,
+            match="database_schema_contract_invalid",
+        ),
+    ):
+        await schema_contract.require_database_schema_contract(
+            "postgresql://runtime/private",
+            target_schema="public",
+            require_complete=True,
+            expected_revision=expected_revision,
         )
 
 
@@ -435,7 +552,7 @@ async def test_schema_contract_rejects_relation_metadata_drift(
             "postgresql://migration/private",
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
@@ -467,7 +584,7 @@ async def test_schema_contract_rejects_phase2_constraint_or_index_drift(
             "postgresql://migration/private",
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 
@@ -533,7 +650,7 @@ async def test_schema_contract_rejects_unique_backing_index_metadata_drift(
             "postgresql://migration/private",
             target_schema="public",
             require_complete=True,
-            expected_revision="20260710_0003",
+            expected_revision="20260713_0004",
         )
 
 

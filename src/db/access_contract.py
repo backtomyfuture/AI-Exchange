@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Final
 
 
-PHASE2_DATABASE_REVISION: Final = "20260710_0003"
+PHASE2_DATABASE_REVISION: Final = "20260713_0004"
 PHASE2_RELATIONS: Final = (
     "audit_events",
     "emails",
@@ -130,7 +130,7 @@ PHASE2_CHECK_CONSTRAINT_SHA256: Final[dict[tuple[str, str], str]] = {
         "e5e43f686cf6aca5560d22d5bfa18bd0e5cba8341a5f26e09eff5a37b6bba9c6"
     ),
     ("event_inbox", "ck_event_inbox_processing_policy"): (
-        "f2c35a7d5a10689cc78f15a3d83cf656c89dc26578f2390519a7679012f1d9bb"
+        "d8fa97e98d89b2275a29c6899ce83136be195423cfdb907070a06074a4d7ab7c"
     ),
     ("event_inbox", "ck_event_inbox_raw_event_type"): (
         "d18bc1df47462aa76d502b521bfb7195468040b95103992c63b6470f073a9375"
@@ -210,6 +210,19 @@ PHASE2_CHECK_CONSTRAINT_SHA256: Final[dict[tuple[str, str], str]] = {
     ("sync_cursors", "ck_sync_cursors_version"): (
         "13b6703b3832f8093fcd588c3f98b34dab1891a6f3c8033c72f8f246941a6998"
     ),
+}
+
+# Revision 0004 changes exactly one existing CHECK constraint.  Keep the prior
+# digest explicit so rolling bootstrap/readiness checks can still prove an
+# unmodified 0003 schema before applying the forward-only revision.
+PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION: Final[
+    dict[str, dict[tuple[str, str], str]]
+] = {
+    "20260710_0003": {
+        ("event_inbox", "ck_event_inbox_processing_policy"): (
+            "f2c35a7d5a10689cc78f15a3d83cf656c89dc26578f2390519a7679012f1d9bb"
+        )
+    }
 }
 
 
