@@ -65,6 +65,7 @@ def _lease(*, generation: int, fencing_token: int) -> InboxLease:
     return InboxLease(
         id=str(uuid4()),
         account_id=8,
+        pipeline_name="legacy_compat" if generation == 1 else "durable_v1",
         generation=generation,
         fencing_token=fencing_token,
         lease_owner="worker-1",

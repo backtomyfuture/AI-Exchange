@@ -438,6 +438,7 @@ class SyncBatch:
 class InboxLease:
     id: str
     account_id: int
+    pipeline_name: str
     generation: int
     fencing_token: int
     lease_owner: str
@@ -449,6 +450,15 @@ class InboxLease:
     def __post_init__(self) -> None:
         object.__setattr__(self, "id", _require_uuid("id", self.id))
         _require_int("account_id", self.account_id, minimum=1)
+        pipeline_name = _require_text(
+            "pipeline_name",
+            self.pipeline_name,
+            max_length=64,
+        )
+        if pipeline_name != pipeline_name.strip():
+            raise ValueError(
+                "pipeline_name must not contain leading or trailing whitespace"
+            )
         _require_int("generation", self.generation, minimum=1)
         _require_int("fencing_token", self.fencing_token, minimum=1)
         _require_text("lease_owner", self.lease_owner, max_length=128)

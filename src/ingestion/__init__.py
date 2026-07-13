@@ -11,6 +11,7 @@ from src.ingestion.ownership import (
     RetirementBlockCode,
     RetirementGuard,
 )
+from src.ingestion.repository import InboxRepository
 from src.ingestion.models import (
     ChangeKind,
     InboxDisposition,
@@ -34,6 +35,7 @@ __all__ = [
     "InboxDisposition",
     "InboxDispositionStatus",
     "InboxLease",
+    "InboxRepository",
     "InboxStats",
     "InboxStatus",
     "IngressReceipt",

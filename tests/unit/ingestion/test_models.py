@@ -403,6 +403,7 @@ def test_inbox_lease_includes_received_and_expiry_times(
     lease = InboxLease(
         id="00000000-0000-4000-8000-000000000001",
         account_id=8,
+        pipeline_name="durable_v1",
         generation=3,
         fencing_token=5,
         lease_owner="worker-1",
@@ -414,8 +415,27 @@ def test_inbox_lease_includes_received_and_expiry_times(
 
     assert lease.received_at == ingestion_time
     assert lease.lease_until == ingestion_time + timedelta(seconds=30)
+    assert lease.pipeline_name == "durable_v1"
     with pytest.raises(FrozenInstanceError):
         lease.attempts = 2  # type: ignore[misc]
+
+
+def test_inbox_lease_requires_pipeline_name(
+    normalized_event: NormalizedIngressEvent,
+    ingestion_time: datetime,
+) -> None:
+    with pytest.raises(TypeError, match="pipeline_name"):
+        InboxLease(
+            id="00000000-0000-4000-8000-000000000001",
+            account_id=8,
+            generation=3,
+            fencing_token=5,
+            lease_owner="worker-1",
+            attempts=1,
+            event=normalized_event,
+            received_at=ingestion_time,
+            lease_until=ingestion_time + timedelta(seconds=30),
+        )
 
 
 @pytest.mark.parametrize(
@@ -424,6 +444,11 @@ def test_inbox_lease_includes_received_and_expiry_times(
         {"id": "not-a-uuid"},
         {"id": 1},
         {"account_id": 0},
+        {"pipeline_name": ""},
+        {"pipeline_name": " durable_v1"},
+        {"pipeline_name": "durable_v1 "},
+        {"pipeline_name": "x" * 65},
+        {"pipeline_name": 1},
         {"generation": 0},
         {"fencing_token": True},
         {"lease_owner": ""},
@@ -443,6 +468,7 @@ def test_inbox_lease_rejects_invalid_fields(
     values: dict[str, object] = {
         "id": "00000000-0000-4000-8000-000000000001",
         "account_id": 8,
+        "pipeline_name": "durable_v1",
         "generation": 3,
         "fencing_token": 5,
         "lease_owner": "worker-1",
@@ -462,6 +488,7 @@ def test_inbox_lease_rejects_account_mismatch_and_non_future_expiry(
 ) -> None:
     common: dict[str, object] = {
         "id": "00000000-0000-4000-8000-000000000001",
+        "pipeline_name": "durable_v1",
         "generation": 3,
         "fencing_token": 5,
         "lease_owner": "worker-1",

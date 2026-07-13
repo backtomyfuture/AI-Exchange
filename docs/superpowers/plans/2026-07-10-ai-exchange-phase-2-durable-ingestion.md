@@ -152,11 +152,14 @@ class SyncBatch:
 class InboxLease:
     id: str
     account_id: int
+    pipeline_name: str
     generation: int
     fencing_token: int
     lease_owner: str
     attempts: int
     event: NormalizedIngressEvent
+    received_at: datetime
+    lease_until: datetime
 
 
 @dataclass(frozen=True)
@@ -394,13 +397,23 @@ git commit -m "feat: add pipeline generations and fencing"
 
 **Files:**
 - Create: `src/ingestion/repository.py`
+- Create: `tests/unit/ingestion/test_repository.py`
 - Create: `tests/integration/ingestion/test_inbox_repository.py`
+- Create: `tests/architecture/test_inbox_repository_boundary.py`
+- Modify: `src/ingestion/models.py`
+- Modify: `src/ingestion/ownership.py`
+- Modify: `src/ingestion/__init__.py`
+- Modify: `tests/unit/ingestion/test_models.py`
+- Modify: `tests/unit/ingestion/test_ownership.py`
+- Modify: `tests/integration/ingestion/test_pipeline_fencing.py`
 
 **Interfaces:**
 - Consumes: ownership rows and `NormalizedIngressEvent`
-- Produces: `insert(event, generation, fencing_token) -> IngressReceipt`; `claim_batch(worker_id, pipeline_names, limit, lease_seconds) -> list[InboxLease]`; `renew(lease, lease_seconds) -> InboxLease | None`; repeatable `begin_effect(lease) -> bool`; `recover_expired_leases(limit) -> int`; `complete(lease) -> bool`; `fail(lease, error) -> InboxDisposition`; `stats() -> InboxStats`
+- Produces: `InboxLease` with immutable `pipeline_name`; `insert(event, generation, fencing_token) -> IngressReceipt`; `claim_batch(worker_id, pipeline_names, limit, lease_seconds) -> list[InboxLease]`; rotating-token `renew(lease, lease_seconds) -> InboxLease | None`; repeatable `begin_effect(lease) -> bool`; `recover_expired_leases(limit) -> int`; `complete(lease) -> bool`; `fail(lease, error) -> InboxDisposition`; `stats() -> InboxStats`
 
-- [ ] **Step 1: Write concurrent claim tests**
+- [ ] **Step 1: Write unit, real-PostgreSQL, architecture, and concurrent claim tests**
+
+The test module owns a private `TypedFailure(kind: ErrorKind)` stub plus all inspection/seed helpers such as `get`, `status`, `audit_count`, `seed_lease`, `expire_for_test`, and `seed_pending_policy`; none of those helpers are production repository API. Tests cover the complete attempts boundary `old=0..6`, PostgreSQL BIGINT maximum, every `ErrorKind`, `DatabaseOperationError.retryable`, `ManualReviewRequired`, an unknown exception, and `asyncio.CancelledError` propagation. Production methods are limited to the interface above.
 
 ```python
 @pytest.mark.integration
@@ -414,17 +427,46 @@ async def test_skip_locked_claims_are_disjoint(repo_a, repo_b, seeded_events):
 
 @pytest.mark.integration
 async def test_complete_requires_matching_fence(repo, leased_event):
-    stale = replace(leased_event, fencing_token=leased_event.fencing_token - 1)
+    stale = replace(leased_event, fencing_token=leased_event.fencing_token + 1)
     assert await repo.complete(stale) is False
 
 
 @pytest.mark.integration
+async def test_same_worker_reclaim_cannot_be_completed_by_old_lease(repo, leased_event):
+    old = leased_event
+    await repo.expire_and_reap_for_test(old)
+    replacement = (await repo.claim_batch(
+        worker_id=old.lease_owner,
+        pipeline_names={old.pipeline_name},
+        limit=1,
+        lease_seconds=60,
+    ))[0]
+    assert replacement.attempts != old.attempts
+    assert replacement.lease_until != old.lease_until
+    assert await repo.complete(old) is False
+    assert await repo.complete(replacement) is True
+
+
+@pytest.mark.integration
+async def test_renew_rotates_the_lease_token(repo, leased_event):
+    renewed = await repo.renew(leased_event, lease_seconds=60)
+    assert renewed is not None
+    assert renewed.lease_until > leased_event.lease_until
+    assert await repo.begin_effect(leased_event) is False
+    assert await repo.begin_effect(renewed) is True
+
+
+@pytest.mark.integration
 async def test_retry_and_dead_letter_are_bounded(repo, leased_event):
-    disposition = await repo.fail(leased_event, TransientDependencyError("temporary"))
+    disposition = await repo.fail(
+        leased_event, TypedFailure(ErrorKind.TRANSIENT_DEPENDENCY)
+    )
     assert disposition.status == "retry_wait"
     assert disposition.available_at > leased_event.received_at
     fifth = await repo.seed_lease(attempts=5)
-    disposition = await repo.fail(fifth, TransientDependencyError("still temporary"))
+    disposition = await repo.fail(
+        fifth, TypedFailure(ErrorKind.TRANSIENT_DEPENDENCY)
+    )
     assert disposition.status == "dead_letter"
 
 
@@ -470,7 +512,12 @@ async def test_effect_start_and_expiry_recovery_cannot_both_win(repo, leased_eve
         repo.begin_effect(leased_event),
         repo.recover_expired_leases(limit=10),
     )
-    assert (started, recovered) in {(True, 0), (False, 1)}
+    row = await repo.get(leased_event.id)
+    if started and recovered:
+        assert row.effect_started_at is not None
+        assert row.status == "manual_review"
+    else:
+        assert (started, recovered) in {(True, 0), (False, 1)}
 
 
 @pytest.mark.integration
@@ -487,7 +534,7 @@ async def test_failure_after_effect_marker_is_never_automatically_retried(
 ):
     assert await repo.begin_effect(leased_event) is True
     disposition = await repo.fail(
-        leased_event, SyncTransientError("outcome unknown")
+        leased_event, TypedFailure(ErrorKind.TRANSIENT_DEPENDENCY)
     )
     assert disposition.status == "manual_review"
     assert disposition.available_at is None
@@ -497,16 +544,16 @@ async def test_failure_after_effect_marker_is_never_automatically_retried(
 @pytest.mark.integration
 async def test_definite_failure_before_effect_marker_can_retry(repo, leased_event):
     disposition = await repo.fail(
-        leased_event, SyncTransientError("definitely before effect")
+        leased_event, TypedFailure(ErrorKind.TRANSIENT_DEPENDENCY)
     )
     assert disposition.status == "retry_wait"
 ```
 
 - [ ] **Step 2: Implement claim SQL**
 
-`insert()` recursively materializes the immutable payload only through `event.payload_for_storage()` before wrapping it in psycopg `Jsonb`; a real-PostgreSQL nested mapping/list round-trip test is mandatory. For `IGNORED` and `HISTORICAL_SUPPRESSED`, the first insert writes `status='completed'` plus one append-only `ingress.policy_suppressed` audit row in the same transaction. A duplicate dedupe key returns the existing receipt and never appends another audit row.
+`insert()` recursively materializes the immutable payload only through `event.payload_for_storage()` before wrapping it in psycopg `Jsonb`; a real-PostgreSQL nested mapping/list round-trip test is mandatory. It takes the same per-account ownership advisory lock in shared transaction mode, so Task 3 quiesce/switch takes the exclusive form and is a real intake barrier. A new row requires the exact account/generation/fence in `current_ingress` and derives `pipeline_name` from that locked ownership fact rather than caller text. For `IGNORED` and `HISTORICAL_SUPPRESSED`, the first insert writes `status='completed'` plus one append-only `ingress.policy_suppressed` audit row in the same transaction. A duplicate dedupe key is global first-write-wins and returns the original receipt even after quiesce/switch; it never changes payload/policy/ownership or appends another audit. Payload or policy drift never mutates durable state; if later observed through Task 11 telemetry it may use only a bounded low-cardinality counter. First `FULL` then duplicate `IGNORED` remains executable, and first `IGNORED` then duplicate `FULL` remains suppressed. A same-dedupe collision with a different account or immutable source identity fails closed with a fixed non-retryable invariant instead of disclosing another tenant's receipt.
 
-Use this single-statement claim inside one transaction; pass pipeline names, limit, worker ID and lease seconds as parameters:
+Worker IDs, pipeline-name sets, limits and lease seconds are exact, nonempty and bounded before any pool access (`limit <= 500`, at most 64 pipelines, `lease_seconds <= 3600`). Claim first selects only the accounts represented by the next bounded candidate window, acquires their ownership advisory locks in shared mode and sorted account order, then executes the following single mutation statement restricted to those locked accounts. Thus a quiesce that wins first yields no lease, while a claim that wins first commits before quiesce can return; a statement snapshot can never publish a new lease after the barrier. The mutation still uses `SKIP LOCKED`, so workers holding compatible shared account locks claim disjoint Inbox rows concurrently.
 
 ```sql
 WITH claimable AS (
@@ -517,9 +564,10 @@ WITH claimable AS (
      AND p.generation = e.generation
      AND p.fencing_token = e.fencing_token
     WHERE e.status IN ('pending', 'retry_wait')
-      AND e.available_at <= now()
-      AND e.processing_policy NOT IN ('ignored', 'historical_suppressed')
+      AND e.available_at <= pg_catalog.statement_timestamp()
+      AND e.processing_policy IN ('full', 'archive', 'metadata_only')
       AND e.pipeline_name = ANY(%s)
+      AND e.account_id = ANY(%s)
       AND p.state IN ('current_ingress', 'draining')
     ORDER BY e.received_at, e.id
     FOR UPDATE OF e SKIP LOCKED
@@ -528,26 +576,48 @@ WITH claimable AS (
 UPDATE event_inbox AS e
 SET status = 'leased',
     lease_owner = %s,
-    lease_until = now() + make_interval(secs => %s),
-    updated_at = now()
+    lease_until = pg_catalog.statement_timestamp()
+        + pg_catalog.make_interval(secs => %s),
+    processing_started_at = COALESCE(
+        e.processing_started_at,
+        pg_catalog.statement_timestamp()
+    ),
+    safe_error_code = NULL,
+    safe_error_summary = NULL,
+    updated_at = pg_catalog.statement_timestamp()
 FROM claimable AS c
 WHERE e.id = c.id
-RETURNING e.*
+RETURNING e.id, e.account_id, e.external_email_id, e.folder_key,
+          e.source, e.raw_event_type, e.change_kind, e.dedupe_key,
+          e.source_version, e.source_event_at, e.payload,
+          e.processing_policy, e.pipeline_name, e.generation,
+          e.fencing_token, e.lease_owner, e.lease_until, e.attempts,
+          e.received_at
 ```
 
-`complete` and `fail` update only where ID, `lease_owner`, generation and fencing token match and the ownership row still permits that exact generation. `fail` locks and reads the durable effect marker in the same CAS transaction: only `effect_started_at IS NULL` may enter bounded retry/dead-letter classification. Any failure after the marker defaults to `manual_review`, clears the lease, stores a fixed outcome-unknown code and appends one idempotent safe audit; it is never scheduled automatically. A future adapter may bypass that rule only with a typed, tested proof that the remote operation definitely did not execute or uses an approved stable idempotency key—generic timeout/transport exceptions are never such proof. The explicit policy predicate is a defense in depth: even a malformed legacy `pending` ignored/historical row is never claimable. Shadow comparison rows live outside this claim path; no `event_inbox.execution_mode` column exists.
+Every lease mutation first takes the shared account lock and matches the complete lease token: Inbox ID, account, pipeline, worker, attempts, exact `lease_until`, generation and fence. It also requires `status='leased'`, `lease_until > pg_catalog.clock_timestamp()` and an ownership state in `current_ingress/quiescing/draining`. This prevents same-worker ABA after expiry/reclaim and gives the reaper the complementary `lease_until <= pg_catalog.clock_timestamp()` boundary even after a statement waits on a row lock. `renew()` caps each requested TTL at 3,600 seconds, never shortens the current deadline, strictly advances it by at least one microsecond, and returns a replacement immutable lease; every pre-renew object is stale. `complete()` and `begin_effect()` return false, `renew()` returns `None`, and `fail()` raises fixed `StaleFence` after authority loss. All SQL uses explicit column lists and explicit `RETURNING` lists; `RETURNING *` is forbidden.
 
-Expired leases are durable work, not permanent `leased` rows. A bounded `FOR UPDATE SKIP LOCKED` reaper runs before claim cycles and on startup. If `effect_started_at IS NULL`, it clears owner/deadline, increments attempts once and applies the same capped retry/dead-letter policy as `fail()`. If the effect marker exists, it clears the lease into `manual_review` with a privacy-safe unknown-outcome code and one idempotent audit; it never retries. `renew()` is a capped CAS available for the worker's entire lease lifetime, including after the effect marker. `begin_effect()` is a repeatable, idempotent authority guard: every invocation atomically requires matching ID/owner, unexpired lease, generation/fence and `status='leased'`, records only the first marker with `COALESCE(effect_started_at, now())`, and returns false after reaping or fencing. Completion/failure use the same fence, so an old worker cannot act after a reaper or replacement worker wins.
+`fail` locks and reads the durable effect marker in the same token-bound transaction: only `effect_started_at IS NULL` may enter bounded retry/dead-letter classification. Any failure after the marker defaults to `manual_review`, clears the lease, stores a fixed outcome-unknown code and appends one idempotent safe audit; it is never scheduled automatically. A future adapter may bypass that rule only with a typed, tested proof that the remote operation definitely did not execute or uses an approved stable idempotency key—generic timeout/transport exceptions are never such proof. The explicit policy predicate is a defense in depth: even a malformed legacy `pending` ignored/historical row is never claimable. Shadow comparison rows live outside this claim path; no `event_inbox.execution_mode` column exists.
+
+Expired leases are durable work, not permanent `leased` rows. A bounded `FOR UPDATE SKIP LOCKED` reaper runs before claim cycles and on startup. It intentionally does not acquire the account advisory lock after an Inbox row lock, avoiding inversion with retirement's account-lock-then-Inbox order. It may clean expired rows in `current_ingress/quiescing/draining`; a row attached to `retired` is never re-enqueued and instead fails closed to `manual_review` as a stale-ownership invariant. Retirement already blocks every leased row, so this branch is corruption defense rather than a normal path. If `effect_started_at IS NULL`, the reaper clears owner/deadline, increments attempts once without BIGINT overflow and applies the same capped retry/dead-letter policy as `fail()`. If the effect marker exists, it clears the lease into `manual_review` with a privacy-safe unknown-outcome code and one idempotent audit; it never retries. A begin-effect that linearizes before expiry may therefore be followed by reaping, but that path must preserve the marker and end only in `manual_review`, never `retry_wait`. `renew()` is a capped CAS available for the worker's entire lease lifetime, including after the effect marker. `begin_effect()` is a repeatable, idempotent authority guard: every invocation atomically requires the complete unexpired lease token, records only the first marker with `COALESCE(effect_started_at, pg_catalog.clock_timestamp())`, and returns false after reaping, renewal-token rotation or fencing. Completion/failure use the same token and fence, so an old worker cannot act after a reaper or replacement worker wins.
 
 - [ ] **Step 3: Implement error disposition**
 
-Before the effect marker, retryable errors increment attempts and set `retry_wait` with exponential delay capped at 15 minutes. Authentication and invariant errors dead-letter immediately. Exceeding five attempts sets `dead_letter`, stores only safe code/summary, and appends audit. After the marker, all unproven outcomes instead return `InboxDispositionStatus.MANUAL_REVIEW`; `InboxStats`, repository SQL, `/queue`, metrics and drain/retire reporting expose `manual_review` as a first-class operator backlog.
+Before the effect marker, only `ErrorKind.TRANSIENT_DEPENDENCY` and `RATE_LIMITED`, plus an explicitly retryable `DatabaseOperationError`, may retry. `SEND_UNKNOWN` and the existing `ManualReviewRequired` go directly to `manual_review`; authentication, validation, policy, permanent-dependency, internal-invariant and unknown/untyped exceptions dead-letter. Classification uses this closed type/kind matrix and fixed repository-owned safe codes/summaries; it never persists exception text, URLs, IDs, response bodies or arbitrary `safe_code` attributes. `asyncio.CancelledError` is always re-raised before any disposition write so expiry recovery remains the sole durable recovery path.
+
+`attempts` is exactly the count of already committed failed or expired lease dispositions before the current claim. Insert starts at zero; claim and renew never increment it; every successful `fail()` or expiry-reaper disposition increments it exactly once, including terminal/manual dispositions, while a stale/lost CAS increments nothing. Let `new_attempts = min(old_attempts + 1, POSTGRES_BIGINT_MAX)`. With `MAX_RETRIES=5`, a retryable pre-effect failure enters `retry_wait` only when `new_attempts <= 5`; otherwise it enters `dead_letter`. Thus initial execution plus at most five retries gives six executions. Backoff is based on `new_attempts`, starts at five seconds, doubles, and caps at 900 seconds. An already-maximal counter remains maximal without PostgreSQL overflow. Administrator requeue is a later authenticated operation and must increment the token generation before making work claimable; it may never resurrect an old lease token.
+
+Every terminal state transition and suppression audit is in the same transaction as its Inbox mutation. Audit rows use `email_id=NULL`, `object_type='event_inbox'`, a SHA-256 fingerprint of the Inbox UUID, a fixed actor/result/reason, and bounded safe metadata containing no payload, exception text, URL, external email/folder ID, or lease owner. The deterministic event key includes Inbox UUID, action and resulting attempts. `ON CONFLICT(event_key) DO NOTHING` is followed by a read-and-compare of action, object fingerprint, result, actor, reason and canonical safe metadata; any mismatch raises a fixed invariant and rolls back the Inbox transition. Concurrent/replayed suppression, completion, dead-letter and manual-review tests prove exactly one matching audit, and an injected audit failure proves atomic rollback.
+
+Because schema `0004` keeps `available_at NOT NULL`, terminal rows retain that physically irrelevant timestamp while the typed disposition projects `available_at=None`; only `pending/retry_wait` may use it for scheduling. `InboxStats`, repository SQL, `/queue`, metrics and drain/retire reporting expose `manual_review` as a first-class operator backlog. Real-role integration coverage constructs the pool exactly like production (`autocommit=True`, `row_factory=dict_row`) from `schema.runtime_dsn` and exercises insert, nested JSONB round-trip, duplicate, claim, renew, begin-effect, complete, fail, reaper and stats. Tuple-row unit fakes remain supported, but production code never relies on test-only seed/read helpers.
+
+`tests/architecture/test_inbox_repository_boundary.py` scans `src/` and `scripts/` and forbids direct `event_inbox` INSERT/UPDATE outside this repository; migrations, schema manifests, and the test harness are the only exceptions. This Python boundary is supplemental and Durable intake remains dormant while runtime still has raw table DML. Task 10/`0007` must revoke runtime raw `event_inbox` INSERT/UPDATE and replace every repository mutation with fixed-`search_path`, source-digest-locked, narrowly granted database functions before activation can become reachable.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/integration/ingestion/test_inbox_repository.py -q
-git add src/ingestion/repository.py tests/integration/ingestion/test_inbox_repository.py
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_repository.py tests/integration/ingestion/test_inbox_repository.py tests/architecture/test_inbox_repository_boundary.py tests/unit/ingestion/test_models.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py -q
+git add src/ingestion/repository.py src/ingestion/models.py src/ingestion/ownership.py src/ingestion/__init__.py tests/unit/ingestion/test_repository.py tests/integration/ingestion/test_inbox_repository.py tests/architecture/test_inbox_repository_boundary.py tests/unit/ingestion/test_models.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py
 git commit -m "feat: add leased durable inbox repository"
 ```
 
@@ -1691,6 +1761,7 @@ git commit -m "feat: accept Exchange webhooks into durable inbox"
 - Modify: `src/scheduler/polling.py`
 - Modify: `src/utils/self_healing.py`
 - Modify: `src/domain/email_state.py`
+- Modify: `src/ingestion/repository.py`
 - Modify: `src/ingestion/ownership.py`
 - Modify: `src/db/access_contract.py`
 - Modify: `src/db/bootstrap.py`
@@ -1705,6 +1776,8 @@ git commit -m "feat: accept Exchange webhooks into durable inbox"
 - Modify: `tests/integration/ingestion/test_access_roles.py`
 - Modify: `tests/unit/ingestion/test_ownership.py`
 - Modify: `tests/integration/ingestion/test_pipeline_fencing.py`
+- Modify: `tests/integration/ingestion/test_inbox_repository.py`
+- Modify: `tests/architecture/test_inbox_repository_boundary.py`
 - Modify: `tests/architecture/test_pipeline_ownership_boundary.py`
 - Modify: `tests/integration/test_checkpoint_cleanup.py`
 
@@ -1912,9 +1985,9 @@ Migration `20260713_0007` is linear from `20260713_0006`; Phase 3 therefore star
 - `pipeline_cutover_barriers` and `pipeline_cutover_barrier_members`: immutable predecessor barrier, target mode/config/build/protocol, exact external deployment roster and revision/hash, expected instance count, exact completed backfill-plan and sealed Shadow-evidence FKs plus their source/cutoff/high-water/build/config/count/hash facts, legacy nonterminal/quarantine counts and hash, versioned `exchange_sync_contract_v2` build/profile/page/continuation/read-flag probe hash, the complete configured `FolderScope` manifest plus one exact target-bound active cursor or unexpired approved cold-start boundary per folder and its rolling hash, expiring LB isolation, effect-secret rotation and legacy-DB-connection isolation proof hashes, and nullable Phase-3 approval/outbox/legacy-card/adapter-manifest evidence hashes that are mandatory for a `durable_active` target row. Barrier state is the strict sequence `planned -> fence_verified -> quiesced -> drained -> evidence_frozen -> target_standby -> legacy_isolated -> proof_fresh -> ready -> consumed`, with only pre-ready cancellation allowed.
 - `legacy_backfill_plans`: account, ownership generation/fence, mapping/config versions, source count/high-water/rolling hash, legacy-nonterminal count, exact quarantine count/hash, target count/reconciliation hash, applied cursor/hash/counts, status, actor/reason and timestamps; it stores no email body, draft, response or raw identifier sample. Idempotency lives in the shared append-only command receipts, not a mutable key column on the plan.
 
-All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Before any activation API exists, `0007` revokes runtime's direct `INSERT`/`UPDATE` authority over `pipeline_ownership`. Bootstrap, quiesce, target preparation/promotion/cancellation and evidence-backed retirement then use only source-digest-locked, fixed-`search_path`, narrowly granted database functions. `PipelineOwnershipRepository` is updated in this task to call those governed entry points; its Phase-2 direct DML and transaction-local handoff implementation cannot remain reachable after the revoke. Each function takes the account advisory lock and revalidates the exact caller-visible authority epoch where applicable, barrier, reservation, generation/fence, state and append-only command receipt inside one transaction. General runtime DML, ad-hoc SQL, or a Python-only `ActivationService` cannot create a second current row, promote an unreserved target, rotate a reserved fence, skip an audit/receipt, or retire without evidence. If a separate control credential is introduced instead, it must be explicit in the ACL/bootstrap contract and no broader than those same operations; it cannot inherit migration/maintenance power.
+All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Before any activation API exists, `0007` revokes runtime's direct `INSERT`/`UPDATE` authority over both `pipeline_ownership` and `event_inbox`. Bootstrap, quiesce, target preparation/promotion/cancellation, evidence-backed retirement, Inbox insert/claim/renew/begin/complete/fail/reap, and authenticated administrator recovery then use only source-digest-locked, fixed-`search_path`, narrowly granted database functions. `PipelineOwnershipRepository` and `InboxRepository` are updated in this task to call those governed entry points; their Phase-2 direct DML implementations cannot remain reachable after the revoke. Inbox functions enforce the Task-4 transition matrix, exact lease token, expiry boundary, attempts delta/overflow rule, processing-policy whitelist, ownership state/fence, immutable identity, audit equality and advisory-lock order inside the database. Each ownership/control function takes the account advisory lock and revalidates the exact caller-visible authority epoch where applicable, barrier, reservation, generation/fence, state and append-only command receipt inside one transaction. General runtime DML, ad-hoc SQL, or a Python-only service cannot create a second current row, forge/reopen/steal Inbox work, promote an unreserved target, rotate a reserved fence, skip an audit/receipt, or retire without evidence. If a separate control credential is introduced instead, it must be explicit in the ACL/bootstrap contract and no broader than those same operations; it cannot inherit migration/maintenance power.
 
-Runtime otherwise receives SELECT on authority/barriers, INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations, INSERT on `pipeline_legacy_effects`, and only `state/evidence_hash/completed_at` UPDATE needed to close its own `started -> completed|unknown`; it has no reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance may classify a provably stale/crashed `started -> unknown`, performs `unknown -> reconciled` with actor/reason/evidence, and owns cutover/backfill transitions; it cannot rewrite identity or reopen a terminal row. Auditor has SELECT only; migration owns DDL. Real-role tests prove every allowed and forbidden raw operation plus every allowed and rejected governed function transition, including concurrent promotion, replay, stale reservation/fence, wrong barrier/epoch, and rollback. Architecture scans are supplementary and cannot substitute for database ACL/behavior tests. The same task updates exact schema/function-source digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
+Runtime otherwise receives SELECT on authority/barriers/Inbox, EXECUTE only on the exact Inbox and ownership functions needed by its role, INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations, INSERT on `pipeline_legacy_effects`, and only `state/evidence_hash/completed_at` UPDATE needed to close its own `started -> completed|unknown`; it has no raw Inbox/ownership mutation, reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance receives only separately named recovery/reaper functions plus the control transitions it owns; it cannot use runtime claim/effect functions, rewrite identity or reopen a terminal row without the authenticated recovery contract. Auditor has SELECT only; migration owns DDL. Real-role tests prove raw runtime and maintenance Inbox INSERT/UPDATE are rejected, every allowed and forbidden governed Inbox transition, every allowed and forbidden ownership/control operation, concurrent promotion/replay/reclaim, stale lease/reservation/fence, wrong barrier/epoch, audit mismatch and rollback. Architecture scans are supplementary and cannot substitute for database ACL/behavior tests. The same task updates exact schema/function-source digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
 
 - [ ] **Step 3: Implement the authority state machine and mandatory legacy fence**
 
@@ -1935,8 +2008,8 @@ Every legacy source nonterminal row must either be absent at the frozen source h
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_runtime_authority.py tests/integration/ingestion/test_runtime_activation.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
-git add alembic/versions/20260713_0007_runtime_activation.py src/domain/email_state.py src/ingestion/ownership.py src/ingestion/runtime_authority.py src/ingestion/cutover_barrier.py src/exchange_service.py src/server.py src/scheduler/polling.py src/utils/self_healing.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/ingestion/test_runtime_authority.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_runtime_activation.py tests/integration/ingestion/test_pipeline_fencing.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_runtime_authority.py tests/integration/ingestion/test_runtime_activation.py tests/integration/ingestion/test_inbox_repository.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/architecture/test_inbox_repository_boundary.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
+git add alembic/versions/20260713_0007_runtime_activation.py src/domain/email_state.py src/ingestion/repository.py src/ingestion/ownership.py src/ingestion/runtime_authority.py src/ingestion/cutover_barrier.py src/exchange_service.py src/server.py src/scheduler/polling.py src/utils/self_healing.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/ingestion/test_runtime_authority.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_runtime_activation.py tests/integration/ingestion/test_pipeline_fencing.py tests/integration/ingestion/test_inbox_repository.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/architecture/test_inbox_repository_boundary.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py
 git commit -m "feat: add database-authoritative ingestion readiness"
 ```
 

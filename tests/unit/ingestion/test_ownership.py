@@ -24,6 +24,7 @@ from src.ingestion.ownership import (
     PipelineRetirementBlocked,
     RetirementBlockCode,
     _generation_from_row,
+    ownership_advisory_lock_key,
 )
 
 
@@ -71,6 +72,7 @@ def _lease() -> InboxLease:
     return InboxLease(
         id=str(uuid4()),
         account_id=8,
+        pipeline_name="legacy_compat",
         generation=1,
         fencing_token=1,
         lease_owner="worker-1",
@@ -79,6 +81,26 @@ def _lease() -> InboxLease:
         received_at=now,
         lease_until=now + timedelta(minutes=5),
     )
+
+
+def test_ownership_advisory_lock_key_is_stable() -> None:
+    assert ownership_advisory_lock_key(8) == -2_138_553_817_419_182_844
+    assert ownership_advisory_lock_key(8) == ownership_advisory_lock_key(8)
+
+
+@pytest.mark.parametrize("account_id", [1, 8, 2**63 - 1])
+def test_ownership_advisory_lock_key_fits_postgres_bigint(account_id: int) -> None:
+    lock_key = ownership_advisory_lock_key(account_id)
+
+    assert -(2**63) <= lock_key <= 2**63 - 1
+
+
+@pytest.mark.parametrize("account_id", [0, -1, True, False, 1.0, "8", None, 2**63])
+def test_ownership_advisory_lock_key_rejects_invalid_account_ids(
+    account_id: object,
+) -> None:
+    with pytest.raises(ValueError, match="positive PostgreSQL BIGINT"):
+        ownership_advisory_lock_key(account_id)  # type: ignore[arg-type]
 
 
 def test_stale_fence_is_a_fixed_safe_internal_invariant() -> None:

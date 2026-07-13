@@ -160,7 +160,10 @@ def _hash_parts(*parts: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _advisory_lock_key(account_id: int) -> int:
+def ownership_advisory_lock_key(account_id: int) -> int:
+    """Return the stable shared/exclusive lock key for one account."""
+
+    _require_bigint("account_id", account_id)
     digest = hashlib.sha256(
         b"pipeline-ownership\x00" + str(account_id).encode("ascii")
     ).digest()
@@ -245,7 +248,7 @@ class PipelineOwnershipRepository:
     ) -> None:
         await connection.execute(
             "SELECT pg_catalog.pg_advisory_xact_lock(%s)",
-            (_advisory_lock_key(account_id),),
+            (ownership_advisory_lock_key(account_id),),
         )
 
     async def _configure_transaction(
@@ -1023,4 +1026,5 @@ __all__ = [
     "PipelineRetirementBlocked",
     "RetirementBlockCode",
     "RetirementGuard",
+    "ownership_advisory_lock_key",
 ]
