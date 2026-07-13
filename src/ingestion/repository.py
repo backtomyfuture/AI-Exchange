@@ -8,10 +8,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Final
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg import sql
+from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 from psycopg_pool import PoolTimeout
 
@@ -22,12 +23,22 @@ from src.domain.errors import (
     ManualReviewRequired,
     StaleFence,
 )
+from src.ingestion.email_events import (
+    EmailEventApplication,
+    EmailEventDecision,
+    EmailEventDisposition,
+    EmailEventReason,
+    EmailStatus,
+    decide_email_event,
+)
 from src.ingestion.models import (
+    ChangeKind,
     InboxDisposition,
     InboxDispositionStatus,
     InboxLease,
     InboxStats,
     IngressReceipt,
+    IngressSource,
     NormalizedIngressEvent,
     POSTGRES_BIGINT_MAX,
     ProcessingPolicy,
@@ -45,6 +56,11 @@ _MAX_LEASE_SECONDS: Final = 3600
 _MAX_RETRIES: Final = 5
 _MAX_BACKOFF_SECONDS: Final = 900
 _AUDIT_ACTOR: Final = "inbox_repository"
+_PROCESSING_EXECUTION_EPOCH: Final = 0
+_PROCESSING_ATTEMPT_ACTION: Final = "email.processing_attempt"
+_PROCESSING_ATTEMPT_REASON: Final = "email.processing_attempt_authorized"
+_PROCESSING_ATTEMPT_OBJECT_TYPE: Final = "email_processing_attempt"
+_PROCESSING_ATTEMPT_RESULT: Final = "authorized"
 
 _CLAIMABLE_POLICIES = (
     ProcessingPolicy.FULL.value,
@@ -65,6 +81,20 @@ _LEASE_OWNERSHIP_STATES = (
 _CLAIM_OWNERSHIP_STATES = (
     PipelineGenerationState.CURRENT_INGRESS.value,
     PipelineGenerationState.DRAINING.value,
+)
+_RETIRED_BLOCKING_EMAIL_STATUSES = frozenset(
+    {
+        EmailStatus.INGESTED,
+        EmailStatus.PROCESSING,
+        EmailStatus.RETRY_WAIT,
+        EmailStatus.MANUAL_REVIEW,
+        EmailStatus.WAITING_APPROVAL,
+        EmailStatus.SEND_QUEUED,
+        EmailStatus.SENDING,
+        EmailStatus.ACCEPTED,
+        EmailStatus.SEND_UNKNOWN,
+        EmailStatus.DEAD_LETTER,
+    }
 )
 
 _LEASE_COLUMNS = (
@@ -92,12 +122,58 @@ _LEASE_RETURNING = sql.SQL(", ").join(
     sql.SQL("e.{} ").format(sql.Identifier(column)) for column in _LEASE_COLUMNS
 )
 
+_EMAIL_COLUMNS = (
+    "id",
+    "account_id",
+    "external_email_id",
+    "source_folder_key",
+    "status",
+    "version",
+    "owner_generation",
+    "owner_fencing_token",
+    "processing_inbox_id",
+    "create_seen_at",
+    "processing_started_at",
+    "source_deleted_at",
+    "external_effects_started_at",
+    "safe_error_code",
+    "safe_error_summary",
+    "is_read",
+    "is_read_refresh_required",
+    "updated_at",
+)
+_EMAIL_RETURNING = sql.SQL(", ").join(
+    sql.SQL("e.{}").format(sql.Identifier(column)) for column in _EMAIL_COLUMNS
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _FailureDecision:
     status: InboxDispositionStatus
     safe_code: str
     safe_summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EmailRow:
+    id: str
+    account_id: int
+    external_email_id: str
+    source_folder_key: str
+    status: EmailStatus
+    version: int
+    owner_generation: int
+    owner_fencing_token: int
+    processing_inbox_id: str | None
+    create_seen_at: object | None
+    processing_started_at: object | None
+    source_deleted_at: object | None
+    external_effects_started_at: object | None
+    safe_error_code: str | None
+    safe_error_summary: str | None
+    is_read: bool | None
+    is_read_refresh_required: bool
+    updated_at: object
 
 
 class _AuditInvariantError(DatabaseOperationError):
@@ -308,6 +384,196 @@ def _lease_from_row(row: object) -> InboxLease:
         raise _invariant_error("event inbox database row is invalid") from None
 
 
+def _email_from_row(row: object) -> _EmailRow:
+    try:
+        values = dict(
+            zip(_EMAIL_COLUMNS, _row_values(row, _EMAIL_COLUMNS), strict=True)
+        )
+        status = EmailStatus(values["status"])
+        version = values["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 0
+            or version > POSTGRES_BIGINT_MAX
+        ):
+            raise ValueError
+        account_id = _require_bigint("account_id", values["account_id"])
+        owner_generation = _require_bigint(
+            "owner_generation",
+            values["owner_generation"],
+        )
+        owner_fencing_token = _require_bigint(
+            "owner_fencing_token",
+            values["owner_fencing_token"],
+        )
+        is_read = values["is_read"]
+        if is_read is not None and not isinstance(is_read, bool):
+            raise ValueError
+        refresh_required = values["is_read_refresh_required"]
+        if not isinstance(refresh_required, bool):
+            raise ValueError
+        processing_inbox_id = values["processing_inbox_id"]
+        return _EmailRow(
+            id=str(values["id"]),
+            account_id=account_id,
+            external_email_id=str(values["external_email_id"]),
+            source_folder_key=str(values["source_folder_key"]),
+            status=status,
+            version=version,
+            owner_generation=owner_generation,
+            owner_fencing_token=owner_fencing_token,
+            processing_inbox_id=(
+                str(processing_inbox_id) if processing_inbox_id is not None else None
+            ),
+            create_seen_at=values["create_seen_at"],
+            processing_started_at=values["processing_started_at"],
+            source_deleted_at=values["source_deleted_at"],
+            external_effects_started_at=values["external_effects_started_at"],
+            safe_error_code=(
+                str(values["safe_error_code"])
+                if values["safe_error_code"] is not None
+                else None
+            ),
+            safe_error_summary=(
+                str(values["safe_error_summary"])
+                if values["safe_error_summary"] is not None
+                else None
+            ),
+            is_read=is_read,
+            is_read_refresh_required=refresh_required,
+            updated_at=values["updated_at"],
+        )
+    except DatabaseOperationError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        raise _invariant_error("email aggregate database row is invalid") from None
+
+
+def _source_is_read(event: NormalizedIngressEvent) -> bool | None:
+    if event.kind is ChangeKind.READ:
+        return True
+    if event.source is IngressSource.SYNC:
+        item = event.payload.get("item")
+        if isinstance(item, Mapping):
+            value = item.get("is_read")
+            return value if isinstance(value, bool) else None
+        return None
+    if event.source is IngressSource.WEBHOOK:
+        value = event.payload.get("is_read")
+        return value if isinstance(value, bool) else None
+    return None
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    """Compare values by JSON type, keeping booleans distinct from numbers."""
+
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        return (
+            isinstance(left, (int, float))
+            and not isinstance(left, bool)
+            and isinstance(right, (int, float))
+            and not isinstance(right, bool)
+            and left == right
+        )
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if left.keys() != right.keys():
+            return False
+        return all(_json_values_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
+            return False
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return False
+
+
+def _leases_equal(persisted: InboxLease, supplied: InboxLease) -> bool:
+    persisted_event = persisted.event
+    supplied_event = supplied.event
+    return (
+        (
+            persisted.id,
+            persisted.account_id,
+            persisted.pipeline_name,
+            persisted.generation,
+            persisted.fencing_token,
+            persisted.lease_owner,
+            persisted.attempts,
+            persisted.received_at,
+            persisted.lease_until,
+        )
+        == (
+            supplied.id,
+            supplied.account_id,
+            supplied.pipeline_name,
+            supplied.generation,
+            supplied.fencing_token,
+            supplied.lease_owner,
+            supplied.attempts,
+            supplied.received_at,
+            supplied.lease_until,
+        )
+        and (
+            persisted_event.account_id,
+            persisted_event.source,
+            persisted_event.raw_event_type,
+            persisted_event.kind,
+            persisted_event.external_email_id,
+            persisted_event.folder,
+            persisted_event.source_version,
+            persisted_event.dedupe_key,
+            persisted_event.processing_policy,
+            persisted_event.source_event_at,
+        )
+        == (
+            supplied_event.account_id,
+            supplied_event.source,
+            supplied_event.raw_event_type,
+            supplied_event.kind,
+            supplied_event.external_email_id,
+            supplied_event.folder,
+            supplied_event.source_version,
+            supplied_event.dedupe_key,
+            supplied_event.processing_policy,
+            supplied_event.source_event_at,
+        )
+        and _json_values_equal(persisted_event.payload, supplied_event.payload)
+    )
+
+
+def _processing_attempt_event_key(inbox_id: str, attempts: int) -> str:
+    payload = (
+        b"email-processing-attempt-v1\x00"
+        + inbox_id.encode("ascii")
+        + b"\x00"
+        + str(_PROCESSING_EXECUTION_EPOCH).encode("ascii")
+        + b"\x00"
+        + str(attempts).encode("ascii")
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _processing_attempt_fingerprint(email_id: str, inbox_id: str) -> str:
+    payload = (
+        b"email-processing-attempt-object-v1\x00"
+        + email_id.encode("ascii")
+        + b"\x00"
+        + inbox_id.encode("ascii")
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _audit_event_key(inbox_id: str, action: str, attempts: int) -> str:
     payload = f"event_inbox\x00{inbox_id}\x00{action}\x00{attempts}".encode()
     return hashlib.sha256(payload).hexdigest()
@@ -380,6 +646,33 @@ class InboxRepository:
             "SELECT pg_catalog.pg_advisory_xact_lock_shared(%s)",
             (ownership_advisory_lock_key(account_id),),
         )
+
+    def transaction(
+        self,
+        connection: psycopg.AsyncConnection[Any],
+    ) -> EmailEventTransaction:
+        return EmailEventTransaction(self, connection)
+
+    async def apply_email_event(
+        self,
+        lease: InboxLease,
+    ) -> EmailEventApplication:
+        lease = self._require_lease(lease)
+        try:
+            async with self._pool.connection() as connection:
+                async with connection.transaction():
+                    await self._configure_transaction(connection)
+                    return await self.transaction(connection).apply_email_event(lease)
+        except (
+            StaleFence,
+            ManualReviewRequired,
+            DatabaseOperationError,
+            ValueError,
+            RuntimeError,
+        ):
+            raise
+        except _DATABASE_EXCEPTIONS as error:
+            raise _database_error("apply_email_event", error) from None
 
     async def _append_audit(
         self,
@@ -1263,4 +1556,628 @@ class InboxRepository:
         )
 
 
-__all__ = ["InboxRepository"]
+class EmailEventTransaction:
+    """Email aggregate primitive bound to one caller-owned transaction."""
+
+    def __init__(
+        self,
+        repository: InboxRepository,
+        connection: psycopg.AsyncConnection[Any],
+    ) -> None:
+        self._repository = repository
+        self._connection = connection
+        self._transaction_id: str | None = None
+
+    def _require_transaction(self) -> None:
+        if self._connection.info.transaction_status is not TransactionStatus.INTRANS:
+            raise RuntimeError("email event transaction is required")
+
+    async def _assert_transaction_identity(self) -> None:
+        self._require_transaction()
+        cursor = await self._connection.execute(
+            "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text "
+            "AS transaction_id, "
+            "pg_catalog.current_setting('transaction_isolation') "
+            "AS transaction_isolation"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise _invariant_error("email event transaction identity is invalid")
+        transaction_id, transaction_isolation = _row_values(
+            row,
+            ("transaction_id", "transaction_isolation"),
+        )
+        if (
+            not isinstance(transaction_id, str)
+            or not transaction_id.isascii()
+            or not transaction_id.isdigit()
+            or len(transaction_id) > 32
+        ):
+            raise _invariant_error("email event transaction identity is invalid")
+        if transaction_isolation != "read committed":
+            raise RuntimeError("email event transaction requires READ COMMITTED")
+        if self._transaction_id is None:
+            self._transaction_id = transaction_id
+        elif self._transaction_id != transaction_id:
+            raise StaleFence()
+
+    async def _insert_neutral_shell(
+        self,
+        lease: InboxLease,
+    ) -> tuple[bool, str]:
+        email_id = str(uuid4())
+        source_is_read = _source_is_read(lease.event)
+        insert = sql.SQL(
+            "INSERT INTO {} ("
+            "id, account_id, external_email_id, source_folder_key, status, "
+            "owner_generation, owner_fencing_token, processing_inbox_id, "
+            "create_seen_at, processing_started_at, source_deleted_at, "
+            "external_effects_started_at, safe_error_code, safe_error_summary, "
+            "content_ref, is_read, is_read_refresh_required"
+            ") VALUES ("
+            "%s, %s, %s, %s, 'ingested', %s, %s, NULL, NULL, NULL, NULL, "
+            "NULL, NULL, NULL, NULL, %s, %s"
+            ") ON CONFLICT (account_id, external_email_id) DO NOTHING RETURNING id"
+        ).format(self._repository._table("emails"))
+        try:
+            cursor = await self._connection.execute(
+                insert,
+                (
+                    email_id,
+                    lease.account_id,
+                    lease.event.external_email_id,
+                    lease.event.folder,
+                    lease.generation,
+                    lease.fencing_token,
+                    source_is_read,
+                    source_is_read is None,
+                ),
+            )
+        except psycopg.errors.ForeignKeyViolation as error:
+            if error.diag.constraint_name == "fk_emails_pipeline_ownership":
+                raise StaleFence() from None
+            raise
+        row = await cursor.fetchone()
+        if row is None:
+            return False, email_id
+        inserted_id = str(_row_values(row, ("id",))[0])
+        if inserted_id != email_id:
+            raise _invariant_error("email aggregate insert row is invalid")
+        return True, email_id
+
+    async def _lock_email(self, lease: InboxLease) -> _EmailRow:
+        query = sql.SQL(
+            "SELECT {} FROM {} AS e WHERE e.account_id = %s "
+            "AND e.external_email_id = %s FOR UPDATE"
+        ).format(
+            _EMAIL_RETURNING,
+            self._repository._table("emails"),
+        )
+        cursor = await self._connection.execute(
+            query,
+            (lease.account_id, lease.event.external_email_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise _invariant_error("email aggregate lock row is unavailable")
+        return _email_from_row(row)
+
+    async def _lock_ownership(
+        self,
+        email: _EmailRow,
+        lease: InboxLease,
+    ) -> PipelineGenerationState:
+        generations = sorted({email.owner_generation, lease.generation})
+        query = sql.SQL(
+            "SELECT account_id, generation, pipeline_name, state, fencing_token "
+            "FROM {} WHERE account_id = %s "
+            "AND generation = ANY(%s::pg_catalog.int8[]) "
+            "ORDER BY generation FOR SHARE"
+        ).format(self._repository._table("pipeline_ownership"))
+        cursor = await self._connection.execute(query, (lease.account_id, generations))
+        rows = await cursor.fetchall()
+        locked: dict[int, tuple[object, ...]] = {}
+        for row in rows:
+            values = _row_values(
+                row,
+                (
+                    "account_id",
+                    "generation",
+                    "pipeline_name",
+                    "state",
+                    "fencing_token",
+                ),
+            )
+            generation = values[1]
+            if isinstance(generation, bool) or not isinstance(generation, int):
+                raise _invariant_error("email ownership row is invalid")
+            locked[generation] = values
+        if set(locked) != set(generations):
+            raise StaleFence()
+
+        incoming = locked[lease.generation]
+        if (
+            incoming[0] != lease.account_id
+            or incoming[2] != lease.pipeline_name
+            or incoming[3] not in _LEASE_OWNERSHIP_STATES
+            or incoming[4] != lease.fencing_token
+        ):
+            raise StaleFence()
+        sticky = locked[email.owner_generation]
+        if (
+            sticky[0] != email.account_id
+            or sticky[4] != email.owner_fencing_token
+            or not isinstance(sticky[2], str)
+        ):
+            raise StaleFence()
+        try:
+            return PipelineGenerationState(sticky[3])
+        except (TypeError, ValueError):
+            raise _invariant_error("email ownership state is invalid") from None
+
+    async def _lock_exact_lease(self, lease: InboxLease) -> None:
+        query = sql.SQL(
+            "SELECT {}, e.status AS inbox_status, "
+            "e.lease_until > pg_catalog.clock_timestamp() AS lease_active "
+            "FROM {} AS e WHERE e.id = %s FOR UPDATE"
+        ).format(
+            _LEASE_RETURNING,
+            self._repository._table("event_inbox"),
+        )
+        cursor = await self._connection.execute(query, (lease.id,))
+        row = await cursor.fetchone()
+        if row is None:
+            raise StaleFence()
+        lock_columns = _LEASE_COLUMNS + ("inbox_status", "lease_active")
+        locked_values = _row_values(row, lock_columns)
+        inbox_status, lease_active = locked_values[-2:]
+        if inbox_status != "leased" or lease_active is not True:
+            raise StaleFence()
+        persisted = _lease_from_row(locked_values[: len(_LEASE_COLUMNS)])
+        if not _leases_equal(persisted, lease):
+            raise StaleFence()
+
+    async def _load_processing_attempt(
+        self,
+        email: _EmailRow,
+        lease: InboxLease,
+    ) -> bool:
+        event_key = _processing_attempt_event_key(lease.id, lease.attempts)
+        fingerprint = _processing_attempt_fingerprint(email.id, lease.id)
+        metadata = {
+            "execution_epoch": _PROCESSING_EXECUTION_EPOCH,
+            "attempts": lease.attempts,
+            "generation": lease.generation,
+            "fencing_token": lease.fencing_token,
+        }
+        select = sql.SQL(
+            "SELECT event_key, account_id, email_id, object_type, "
+            "object_fingerprint, action, result, actor, reason, safe_metadata "
+            "FROM {} WHERE event_key = %s"
+        ).format(self._repository._table("audit_events"))
+        selected_cursor = await self._connection.execute(select, (event_key,))
+        row = await selected_cursor.fetchone()
+        if row is None:
+            return False
+        actual = _row_values(
+            row,
+            (
+                "event_key",
+                "account_id",
+                "email_id",
+                "object_type",
+                "object_fingerprint",
+                "action",
+                "result",
+                "actor",
+                "reason",
+                "safe_metadata",
+            ),
+        )
+        expected = (
+            event_key,
+            email.account_id,
+            UUID(email.id),
+            _PROCESSING_ATTEMPT_OBJECT_TYPE,
+            fingerprint,
+            _PROCESSING_ATTEMPT_ACTION,
+            _PROCESSING_ATTEMPT_RESULT,
+            _AUDIT_ACTOR,
+            _PROCESSING_ATTEMPT_REASON,
+        )
+        if actual[:-1] != expected or not _json_values_equal(actual[-1], metadata):
+            raise _invariant_error("email processing receipt invariant failed")
+        return True
+
+    async def _elect_processing_attempt(
+        self,
+        email: _EmailRow,
+        lease: InboxLease,
+    ) -> bool:
+        event_key = _processing_attempt_event_key(lease.id, lease.attempts)
+        fingerprint = _processing_attempt_fingerprint(email.id, lease.id)
+        metadata = {
+            "execution_epoch": _PROCESSING_EXECUTION_EPOCH,
+            "attempts": lease.attempts,
+            "generation": lease.generation,
+            "fencing_token": lease.fencing_token,
+        }
+        insert = sql.SQL(
+            "INSERT INTO {} ("
+            "id, event_key, account_id, email_id, object_type, "
+            "object_fingerprint, action, result, actor, reason, safe_metadata"
+            ") VALUES ("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s"
+            ") ON CONFLICT (event_key) DO NOTHING RETURNING id"
+        ).format(self._repository._table("audit_events"))
+        cursor = await self._connection.execute(
+            insert,
+            (
+                str(uuid4()),
+                event_key,
+                email.account_id,
+                email.id,
+                _PROCESSING_ATTEMPT_OBJECT_TYPE,
+                fingerprint,
+                _PROCESSING_ATTEMPT_ACTION,
+                _PROCESSING_ATTEMPT_RESULT,
+                _AUDIT_ACTOR,
+                _PROCESSING_ATTEMPT_REASON,
+                Jsonb(metadata),
+            ),
+        )
+        fresh = await cursor.fetchone() is not None
+        if not await self._load_processing_attempt(email, lease):
+            raise _invariant_error("email processing receipt invariant failed")
+        return fresh
+
+    async def _enter_processing(
+        self,
+        email: _EmailRow,
+        lease: InboxLease,
+        *,
+        inserted: bool,
+    ) -> _EmailRow:
+        source_folder_key = email.source_folder_key
+        is_read = email.is_read
+        refresh_required = email.is_read_refresh_required
+        if not inserted:
+            incoming_read = _source_is_read(lease.event)
+            if lease.event.folder != email.source_folder_key:
+                refresh_required = True
+            if incoming_read is None:
+                refresh_required = True
+            elif email.is_read is None:
+                is_read = incoming_read
+            elif incoming_read != email.is_read:
+                refresh_required = True
+        update = sql.SQL(
+            "UPDATE {} AS e SET status = 'processing', version = e.version + 1, "
+            "processing_inbox_id = COALESCE(e.processing_inbox_id, %s), "
+            "create_seen_at = COALESCE(e.create_seen_at, "
+            "pg_catalog.clock_timestamp()), "
+            "processing_started_at = COALESCE(e.processing_started_at, "
+            "pg_catalog.clock_timestamp()), safe_error_code = NULL, "
+            "safe_error_summary = NULL, source_folder_key = %s, is_read = %s, "
+            "is_read_refresh_required = %s, "
+            "updated_at = pg_catalog.clock_timestamp() "
+            "WHERE e.id = %s AND e.version = %s "
+            "AND e.version < %s RETURNING {}"
+        ).format(
+            self._repository._table("emails"),
+            _EMAIL_RETURNING,
+        )
+        cursor = await self._connection.execute(
+            update,
+            (
+                lease.id,
+                source_folder_key,
+                is_read,
+                refresh_required,
+                email.id,
+                email.version,
+                POSTGRES_BIGINT_MAX,
+            ),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise _invariant_error("email processing version CAS failed")
+        return _email_from_row(row)
+
+    async def _record_source_delete(
+        self,
+        email: _EmailRow,
+        decision: EmailEventDecision,
+    ) -> _EmailRow:
+        if email.version >= POSTGRES_BIGINT_MAX:
+            raise DatabaseOperationError(
+                operation="email.version_exhausted",
+                retryable=False,
+                message="Email aggregate version is exhausted",
+            )
+        clears_processing = decision.new_status is EmailStatus.CANCELLED
+        update = sql.SQL(
+            "UPDATE {} AS e SET status = %s, version = e.version + 1, "
+            "source_deleted_at = COALESCE(e.source_deleted_at, "
+            "pg_catalog.clock_timestamp()), processing_inbox_id = CASE "
+            "WHEN %s THEN NULL ELSE e.processing_inbox_id END, "
+            "safe_error_code = CASE WHEN %s THEN NULL ELSE e.safe_error_code END, "
+            "safe_error_summary = CASE WHEN %s THEN NULL "
+            "ELSE e.safe_error_summary END, updated_at = pg_catalog.clock_timestamp() "
+            "WHERE e.id = %s AND e.version = %s AND e.version < %s RETURNING {}"
+        ).format(
+            self._repository._table("emails"),
+            _EMAIL_RETURNING,
+        )
+        cursor = await self._connection.execute(
+            update,
+            (
+                decision.new_status.value,
+                clears_processing,
+                clears_processing,
+                clears_processing,
+                email.id,
+                email.version,
+                POSTGRES_BIGINT_MAX,
+            ),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise _invariant_error("email deletion version CAS failed")
+        return _email_from_row(row)
+
+    async def _apply_metadata_projection(
+        self,
+        email: _EmailRow,
+        event: NormalizedIngressEvent,
+    ) -> tuple[_EmailRow, bool]:
+        incoming_read = _source_is_read(event)
+        projected_read = email.is_read
+        refresh_required = email.is_read_refresh_required
+        if incoming_read is None:
+            refresh_required = True
+        elif incoming_read:
+            projected_read = True
+        elif email.is_read is True:
+            projected_read = True
+            refresh_required = True
+        else:
+            projected_read = False
+
+        changed = (
+            event.folder != email.source_folder_key
+            or projected_read is not email.is_read
+            or refresh_required is not email.is_read_refresh_required
+        )
+        if not changed:
+            return email, False
+        update = sql.SQL(
+            "UPDATE {} AS e SET source_folder_key = %s, is_read = %s, "
+            "is_read_refresh_required = %s, "
+            "updated_at = pg_catalog.clock_timestamp() "
+            "WHERE e.id = %s AND e.version = %s RETURNING {}"
+        ).format(
+            self._repository._table("emails"),
+            _EMAIL_RETURNING,
+        )
+        cursor = await self._connection.execute(
+            update,
+            (
+                event.folder,
+                projected_read,
+                refresh_required,
+                email.id,
+                email.version,
+            ),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise _invariant_error("email metadata projection CAS failed")
+        return _email_from_row(row), True
+
+    @staticmethod
+    def _application(
+        *,
+        decision: EmailEventDecision,
+        email: _EmailRow,
+        disposition: EmailEventDisposition,
+        may_complete_without_processing: bool,
+    ) -> EmailEventApplication:
+        return EmailEventApplication(
+            decision=decision,
+            email_id=email.id,
+            persisted_status=email.status,
+            version=email.version,
+            disposition=disposition,
+            may_complete_without_processing=may_complete_without_processing,
+        )
+
+    async def apply_email_event(
+        self,
+        lease: InboxLease,
+    ) -> EmailEventApplication:
+        lease = self._repository._require_lease(lease)
+        try:
+            await self._assert_transaction_identity()
+            await self._repository._acquire_account_lock(
+                self._connection,
+                lease.account_id,
+            )
+            inserted, _candidate_id = await self._insert_neutral_shell(lease)
+            email = await self._lock_email(lease)
+            sticky_state = await self._lock_ownership(email, lease)
+            await self._lock_exact_lease(lease)
+
+            cross_generation = (
+                email.owner_generation != lease.generation
+                or email.owner_fencing_token != lease.fencing_token
+            )
+            if (
+                cross_generation
+                and lease.event.kind is ChangeKind.CREATE
+                and email.create_seen_at is None
+                and email.source_deleted_at is None
+                and email.status in _RETIRED_BLOCKING_EMAIL_STATUSES
+            ):
+                raise ManualReviewRequired(
+                    reason="email.sticky_owner_mismatch",
+                    safe_summary="Email ownership requires review",
+                )
+            if (
+                cross_generation
+                and lease.event.kind is ChangeKind.DELETE
+                and sticky_state is PipelineGenerationState.RETIRED
+                and email.status in _RETIRED_BLOCKING_EMAIL_STATUSES
+            ):
+                raise ManualReviewRequired(
+                    reason="email.retired_owner_unresolved",
+                    safe_summary="Email ownership requires review",
+                )
+
+            if not inserted and lease.event.kind is ChangeKind.CREATE:
+                receipt_exists = await self._load_processing_attempt(email, lease)
+                if receipt_exists:
+                    if (
+                        email.status is not EmailStatus.PROCESSING
+                        or email.processing_inbox_id != lease.id
+                    ):
+                        raise _invariant_error(
+                            "email processing receipt conflicts with aggregate state"
+                        )
+                    duplicate_decision = EmailEventDecision(
+                        should_process=False,
+                        should_cancel=False,
+                        new_status=EmailStatus.PROCESSING,
+                        cancel_pending_side_effects=False,
+                        create_seen=True,
+                        reason=EmailEventReason.PROCESSING_ATTEMPT_ALREADY_ELECTED,
+                    )
+                    return self._application(
+                        decision=duplicate_decision,
+                        email=email,
+                        disposition=(EmailEventDisposition.PROCESSING_ALREADY_ELECTED),
+                        may_complete_without_processing=False,
+                    )
+
+            decision = decide_email_event(
+                current_status=None if inserted else email.status,
+                create_seen=False if inserted else email.create_seen_at is not None,
+                kind=lease.event.kind,
+                source_is_read=_source_is_read(lease.event),
+                processing_owner_matches=(
+                    not inserted and email.processing_inbox_id == lease.id
+                ),
+                external_effects_started=(
+                    not inserted and email.external_effects_started_at is not None
+                ),
+                source_deleted=(not inserted and email.source_deleted_at is not None),
+            )
+
+            if decision.should_process:
+                if email.version > POSTGRES_BIGINT_MAX - 2:
+                    raise DatabaseOperationError(
+                        operation="email.processing_version_exhausted",
+                        retryable=False,
+                        message="Email processing version is exhausted",
+                    )
+                fresh = await self._elect_processing_attempt(email, lease)
+                if not fresh:
+                    if email.status is not EmailStatus.PROCESSING:
+                        raise _invariant_error(
+                            "email processing receipt conflicts with aggregate state"
+                        )
+                    duplicate_decision = EmailEventDecision(
+                        should_process=False,
+                        should_cancel=False,
+                        new_status=EmailStatus.PROCESSING,
+                        cancel_pending_side_effects=False,
+                        create_seen=True,
+                        reason=(EmailEventReason.PROCESSING_ATTEMPT_ALREADY_ELECTED),
+                    )
+                    return self._application(
+                        decision=duplicate_decision,
+                        email=email,
+                        disposition=(EmailEventDisposition.PROCESSING_ALREADY_ELECTED),
+                        may_complete_without_processing=False,
+                    )
+                email = await self._enter_processing(
+                    email,
+                    lease,
+                    inserted=inserted,
+                )
+                disposition = (
+                    EmailEventDisposition.CREATOR_ELECTED
+                    if decision.reason is EmailEventReason.FIRST_CREATE
+                    else EmailEventDisposition.PROCESSING_RESUMED
+                )
+                return self._application(
+                    decision=decision,
+                    email=email,
+                    disposition=disposition,
+                    may_complete_without_processing=False,
+                )
+
+            if lease.event.kind is ChangeKind.DELETE:
+                if email.source_deleted_at is None:
+                    email = await self._record_source_delete(email, decision)
+                    disposition = (
+                        EmailEventDisposition.TOMBSTONE_CREATED
+                        if inserted
+                        else EmailEventDisposition.AGGREGATE_UPDATED
+                    )
+                else:
+                    disposition = EmailEventDisposition.AGGREGATE_NOOP
+                return self._application(
+                    decision=decision,
+                    email=email,
+                    disposition=disposition,
+                    may_complete_without_processing=True,
+                )
+
+            if (
+                not inserted
+                and lease.event.kind in {ChangeKind.UPDATE, ChangeKind.READ}
+                and email.source_deleted_at is None
+            ):
+                email, changed = await self._apply_metadata_projection(
+                    email,
+                    lease.event,
+                )
+                return self._application(
+                    decision=decision,
+                    email=email,
+                    disposition=(
+                        EmailEventDisposition.AGGREGATE_UPDATED
+                        if changed
+                        else EmailEventDisposition.AGGREGATE_NOOP
+                    ),
+                    may_complete_without_processing=True,
+                )
+
+            if inserted:
+                disposition = (
+                    EmailEventDisposition.METADATA_SHELL_CREATED
+                    if lease.event.kind in {ChangeKind.UPDATE, ChangeKind.READ}
+                    else EmailEventDisposition.TOMBSTONE_CREATED
+                )
+            else:
+                disposition = EmailEventDisposition.AGGREGATE_NOOP
+            return self._application(
+                decision=decision,
+                email=email,
+                disposition=disposition,
+                may_complete_without_processing=True,
+            )
+        except (
+            StaleFence,
+            ManualReviewRequired,
+            DatabaseOperationError,
+            ValueError,
+            RuntimeError,
+        ):
+            raise
+        except _DATABASE_EXCEPTIONS as error:
+            raise _database_error("apply_email_event", error) from None
+
+
+__all__ = ["EmailEventTransaction", "InboxRepository"]

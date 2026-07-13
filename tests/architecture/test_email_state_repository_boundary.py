@@ -1,0 +1,1836 @@
+from __future__ import annotations
+
+import ast
+import hashlib
+import re
+from pathlib import Path
+
+import src.ingestion as ingestion
+from src.ingestion.email_events import (
+    EMAIL_STATUS_TRANSITIONS,
+    EmailEventApplication,
+    EmailEventDecision,
+    EmailEventDisposition,
+    EmailEventReason,
+    EmailStatus,
+    decide_email_event,
+)
+from src.ingestion.repository import EmailEventTransaction, InboxRepository
+
+
+_SQL_EXECUTION_METHODS = frozenset(
+    {"copy", "copy_expert", "execute", "executemany", "exec_driver_sql"}
+)
+_DYNAMIC_CODE_NAME_CALLS = frozenset({"compile", "eval", "exec"})
+_REFLECTION_NAME_PRIMITIVES = frozenset(
+    {"compile", "eval", "exec", "getattr", "globals", "locals", "vars"}
+)
+_REFLECTION_ATTRIBUTE_PRIMITIVE_PATHS = frozenset(
+    {
+        "dict.__getitem__",
+        "object.__getattribute__",
+        "operator.attrgetter",
+        "operator.methodcaller",
+    }
+)
+_SQL_TEXT_CONSTRUCTORS = frozenset({"SQL", "text"})
+_SQL_IDENTIFIER_CONSTRUCTORS = frozenset({"Identifier"})
+_TRUSTED_TABLE_CONSTRUCTORS = frozenset({"_table"})
+_DYNAMIC_IDENTIFIER = "dynamic_identifier"
+_TRUSTED_TABLE_PREFIX = "__task5_trusted_schema__"
+_TRUSTED_TABLE_MARKER_ATTRIBUTE = "_task5_trusted_table_marker"
+_NON_SQL_EXECUTION_CALLS = frozenset(
+    {
+        (
+            "scripts/manual_exchange_test.py",
+            "test_search",
+            "headers.copy",
+        ),
+        (
+            "src/router/engine.py",
+            "RoutingEngine._apply_skills",
+            "skill.execute",
+        ),
+        (
+            "src/utils/email_processor.py",
+            "EmailProcessor.process_batch",
+            "email.copy",
+        ),
+    }
+)
+_TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES = {
+    (
+        "scripts/reprocess_email.py",
+        "list_stuck_emails",
+        "cur.execute",
+    ): {
+        # Status placeholders are generated separately from a fixed SELECT.
+        "a3f6bd7bf63fced2fa8eee95a16b6a0ab645871580da8064c1689031d88cccaa": 1,
+    },
+    (
+        "src/db/auditor.py",
+        "require_checkpoint_auditor_database_role",
+        "conn.execute",
+    ): {
+        # Fixed catalog query with three separately tested SQL fragments.
+        "62931e64d649ee962ce4ff4508f44d80481eaa183ab0d1fd3770695481ac6eb9": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_apply_database_access_contract",
+        "cursor.execute",
+    ): {
+        # GRANT USAGE ON SCHEMA.
+        "09154950a018e8194476538bcf73fe2d3fdd55a8f450fcd719e0b296ef59179a": 1,
+        # REVOKE ALL PRIVILEGES ON DATABASE.
+        "499bce4168e130b8108f3f97bea7d608983c7865906ab3746557b8334586a48d": 1,
+        # REVOKE ALL PRIVILEGES ON SCHEMA.
+        "6eb7cf6d70cf42bf8a4f2974661da228538775770e8f44d3a91345db9365c11a": 1,
+        # GRANT CONNECT ON DATABASE.
+        "b7121817f7e4b54394a61e7121bf9420f186c60c160a35df1a6b1f6fd7c751d5": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_apply_checkpoint_migrations",
+        "cur.execute",
+    ): {
+        # migration and migrations[0] are the two approved fully dynamic nodes.
+        "2d89eba3bea05c135c362fa01ea80279726b42d2fcc8b0dc8396d15e320984b0": 1,
+        "504f5cab3f094a3bf34e3e23823532676b73bfefc75b139fbcd8b3c15af43365": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_ensure_checkpoint_index",
+        "cur.execute",
+    ): {
+        # migration and spec.drop_sql are the two approved fully dynamic nodes.
+        "2d89eba3bea05c135c362fa01ea80279726b42d2fcc8b0dc8396d15e320984b0": 1,
+        "539735bf4fe5567cbb3f857eed8253b6db5a0395453d6a234bd26ae413d96d4d": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_grant_relation_access",
+        "cursor.execute",
+    ): {
+        # DELETE, relation-level, and column-level GRANT shapes.
+        "00f483e2606f67aab5e72c52d2999f76b6b754470180cd5a6fd6ee57e5bb6afa": 1,
+        "40280c13a21b9df60f1e10bed351663e16388c2515bfe050c887368b5b9313aa": 1,
+        "f4802b22fb4b3d028a2f0e014f3279950f45da1dbebcb0628bd62ae50e0a6fa3": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_require_empty_event_inbox_for_0004",
+        "cursor.execute",
+    ): {
+        "8cbc57e67cb1b2c3a36c8dd8b235d22403a5dfd243f227d363f431b27f68b943": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_revoke_relation_access",
+        "cursor.execute",
+    ): {
+        # Column-level and relation-level REVOKE shapes.
+        "41552e769455347793db4a5394928a7abe40942dbb33215c24517460489e320d": 1,
+        "56c99b6192c33c5d72d39bfe60fd0f59c8572498518e53e7d994a1d7a1982086": 1,
+    },
+    (
+        "src/db/roles.py",
+        "_fetch_snapshot",
+        "cursor.execute",
+    ): {
+        # The single approved caller-supplied role snapshot query.
+        "bcc1067e5aa1d30a2c57375165ce14348c9aeeacf6120797c200adb19c2a3fd8": 1,
+    },
+}
+_TRUSTED_DYNAMIC_NON_SQL_CALL_SHAPES = {
+    ("src/server.py", "inject_test_email"): {
+        "0e0dbb6d9029a6d2ce5b6f1d191c2b3825cd9061ca292b23b7a2c62d5f51b450": 1,
+    },
+}
+_TASK5_REPOSITORY_STRUCTURAL_AST_SHA256 = {
+    "src/domain/email_state.py": (
+        "f6171bcd68eab46b13ce3590ada575780f93389bb0790092d669d8adca38e6a5"
+    ),
+    "src/domain/errors.py": (
+        "4397b6f94d28bcc29d298b6282d37eed0aa31931d543438b3d49bbe881f94c0c"
+    ),
+    "src/ingestion/repository.py": (
+        "a5b01672ba755da251a6fa6b54f7611e3e89555712ecba318e3f6dfc067fa969"
+    ),
+    "src/ingestion/email_events.py": (
+        "a036b9cfbc9da22602155724bda167e5dd09313369d8f1998c76cd872e2d47f5"
+    ),
+    "src/ingestion/ownership.py": (
+        "15ef5d20aba66b3f773d7a6988c4648fde06a3d031b56388ae7ea03603da58d1"
+    ),
+    "src/ingestion/models.py": (
+        "b5328a09b0ad63fd7cf283d74a8e938e19e02ea3551c48fce160db3b27128c2f"
+    ),
+}
+_TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
+    "scripts/reprocess_email.py": (
+        "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
+    ),
+    "src/db/auditor.py": (
+        "3db5f148a405402f21ca61fa3e465f7453cda8f99b7ed36986d2e2fb8903fde9"
+    ),
+    "src/db/bootstrap.py": (
+        "b9cf227f8e83b1f399c2bd778fe2a23fd324a36b76a8d78a994dfd0c9852a139"
+    ),
+    "src/db/roles.py": (
+        "7267adc2b261905ee3fbd92ed377a546ccaec9a088f14af8b473e9411b686521"
+    ),
+}
+_NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
+    "scripts/manual_exchange_test.py": (
+        "df77d3f8aca82be9cb4ec9af74ed87682c9dfa4e555c8e55157a09dd66ab7b86"
+    ),
+    "src/router/engine.py": (
+        "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
+    ),
+    "src/server.py": (
+        "e6c13889b3dedfb0f88f49d3434c800fc15ee2f3dcad70e577129459193c9786"
+    ),
+    "src/utils/email_processor.py": (
+        "ba933f7ec3b7c6be28039bcf050b580c45e6fdf0d4e555916525a7d96e3c2332"
+    ),
+}
+_EMAIL_MUTATION = re.compile(
+    r"""
+    (?:
+        \b(?:
+            insert\s+into
+            |
+            update\s+(?:only\s+)?
+            |
+            delete\s+from\s+(?:only\s+)?
+            |
+            merge\s+into\s+(?:only\s+)?
+            |
+            truncate\s+(?:table\s+)?(?:only\s+)?
+        )
+        \s*
+        (?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?
+        (?:"emails"|emails\b)
+        |
+        \bcopy\s+
+        (?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?
+        (?:"emails"|emails\b)
+        (?:\s*\([^)]*\))?\s+from\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _call_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _expression_path(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        value = _expression_path(node.value)
+        return f"{value}.{node.attr}" if value else None
+    return None
+
+
+def _execution_policy_matches(
+    filename: str,
+    owner: str,
+    call_path: str | None,
+    policies: frozenset[tuple[str, str, str]],
+) -> bool:
+    normalized = _project_relative_path(filename)
+    return call_path is not None and any(
+        normalized == path and owner == allowed_owner and call_path == allowed_call
+        for path, allowed_owner, allowed_call in policies
+    )
+
+
+def _project_relative_path(filename: str) -> str | None:
+    candidate = Path(filename)
+    if not candidate.is_absolute():
+        return None
+    project_root = Path(__file__).resolve().parents[2]
+    try:
+        return candidate.resolve().relative_to(project_root).as_posix()
+    except ValueError:
+        return None
+
+
+def _normalized_file_ast_sha256(path: Path) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    normalized = ast.dump(tree, include_attributes=False)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _trusted_dynamic_execution_matches(
+    filename: str,
+    owner: str,
+    call_path: str | None,
+    query: ast.expr | None,
+    bindings: dict[str, list[ast.expr]],
+    occurrences: dict[tuple[str, str, str, str], int],
+) -> bool:
+    normalized = _project_relative_path(filename)
+    if normalized is None or call_path is None or query is None:
+        return False
+    policy_key = (normalized, owner, call_path)
+    shape = hashlib.sha256(
+        ast.dump(query, include_attributes=False).encode("utf-8")
+    ).hexdigest()
+    maximum = _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES.get(policy_key, {}).get(shape)
+    if maximum is None:
+        return False
+    if isinstance(query, ast.Name):
+        query_bindings = bindings.get(query.id, [])
+        if not query_bindings or any(
+            not isinstance(value, ast.Name) or value.id != _DYNAMIC_IDENTIFIER
+            for value in query_bindings
+        ):
+            return False
+    occurrence_key = (*policy_key, shape)
+    used = occurrences.get(occurrence_key, 0)
+    if used >= maximum:
+        return False
+    occurrences[occurrence_key] = used + 1
+    return True
+
+
+def _trusted_dynamic_non_sql_call_matches(
+    filename: str,
+    owner: str,
+    call: ast.Call,
+    occurrences: dict[tuple[str, str, str], int],
+) -> bool:
+    normalized = _project_relative_path(filename)
+    if normalized is None:
+        return False
+    policy_key = (normalized, owner)
+    shape = hashlib.sha256(
+        ast.dump(call, include_attributes=False).encode("utf-8")
+    ).hexdigest()
+    maximum = _TRUSTED_DYNAMIC_NON_SQL_CALL_SHAPES.get(policy_key, {}).get(shape)
+    if maximum is None:
+        return False
+    occurrence_key = (*policy_key, shape)
+    used = occurrences.get(occurrence_key, 0)
+    if used >= maximum:
+        return False
+    occurrences[occurrence_key] = used + 1
+    return True
+
+
+def _scope_nodes(root: ast.AST):
+    pending = list(ast.iter_child_nodes(root))
+    while pending:
+        node = pending.pop()
+        if isinstance(
+            node,
+            (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        yield node
+        pending.extend(ast.iter_child_nodes(node))
+
+
+def _scope_bindings(root: ast.AST) -> dict[str, list[ast.expr]]:
+    bindings: dict[str, list[ast.expr]] = {}
+
+    def mark_dynamic(target: ast.expr) -> None:
+        if isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                mark_dynamic(element)
+            return
+        current = target
+        while isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+        if isinstance(current, ast.Name):
+            bindings.setdefault(current.id, []).append(
+                ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())
+            )
+
+    def bind_assignment(target: ast.expr, value: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            bindings.setdefault(target.id, []).append(value)
+            return
+        if isinstance(target, (ast.List, ast.Tuple)):
+            for index, element in enumerate(target.elts):
+                extracted = ast.Subscript(
+                    value=value,
+                    slice=ast.Constant(value=index),
+                    ctx=ast.Load(),
+                )
+                bind_assignment(element, extracted)
+            return
+        if isinstance(target, (ast.Starred, ast.Subscript)):
+            mark_dynamic(target.value if isinstance(target, ast.Starred) else target)
+
+    for node in _scope_nodes(root):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind_assignment(target, node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                bindings.setdefault(node.target.id, []).append(node.value)
+            elif not isinstance(node.target, ast.Name):
+                mark_dynamic(node.target)
+        elif isinstance(node, ast.AugAssign):
+            mark_dynamic(node.target)
+        elif isinstance(node, (ast.AsyncFor, ast.For)):
+            mark_dynamic(node.target)
+        elif isinstance(node, (ast.AsyncWith, ast.With)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    mark_dynamic(item.optional_vars)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                mark_dynamic(target)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bindings.setdefault(node.name, []).append(
+                ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())
+            )
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            bindings.setdefault(node.name, []).append(
+                ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())
+            )
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            bindings.setdefault(node.rest, []).append(
+                ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())
+            )
+        elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+            bindings.setdefault(node.target.id, []).append(node.value)
+    return bindings
+
+
+def _scope_import_binding_names(root: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in _scope_nodes(root):
+        if isinstance(node, ast.Import):
+            names.update(
+                alias.asname or alias.name.partition(".")[0] for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            names.update(
+                alias.asname or alias.name for alias in node.names if alias.name != "*"
+            )
+    return names
+
+
+def _comprehension_bound_names(root: ast.AST, call: ast.Call) -> frozenset[str]:
+    names: set[str] = set()
+    for expression in _scope_nodes(root):
+        if not isinstance(
+            expression,
+            (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
+        ) or not any(node is call for node in ast.walk(expression)):
+            continue
+        for generator in expression.generators:
+            names.update(
+                node.id
+                for node in ast.walk(generator.target)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+            )
+    return frozenset(names)
+
+
+def _nested_lambdas(root: ast.AST):
+    pending = list(ast.iter_child_nodes(root))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Lambda):
+            yield node
+            continue
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+
+
+def _sequence_expressions(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> list[list[ast.expr]]:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [list(node.elts)]
+    if not isinstance(node, ast.Name) or node.id in resolving:
+        return []
+    return [
+        sequence
+        for value in bindings.get(node.id, [])
+        for sequence in _sequence_expressions(
+            value,
+            bindings,
+            resolving=resolving | {node.id},
+        )
+    ]
+
+
+def _mapping_expressions(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> list[dict[str, ast.expr]]:
+    if isinstance(node, ast.Dict):
+        mapping: dict[str, ast.expr] = {}
+        for key, value in zip(node.keys, node.values, strict=True):
+            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                return []
+            mapping[key.value] = value
+        return [mapping]
+    if not isinstance(node, ast.Name) or node.id in resolving:
+        return []
+    values = bindings.get(node.id, [])
+    if any(
+        isinstance(value, ast.Name) and value.id == _DYNAMIC_IDENTIFIER
+        for value in values
+    ):
+        return []
+    return [
+        mapping
+        for value in values
+        for mapping in _mapping_expressions(
+            value,
+            bindings,
+            resolving=resolving | {node.id},
+        )
+    ]
+
+
+def _cartesian_identifier(
+    arguments: list[ast.expr],
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> list[str]:
+    rendered = [""]
+    for argument in arguments:
+        values = _render_sql(
+            argument,
+            bindings,
+            resolving=resolving,
+        ) or [_DYNAMIC_IDENTIFIER]
+        rendered = [
+            value if not prefix else f"{prefix}.{value}"
+            for prefix in rendered
+            for value in values
+        ]
+    return rendered or [_DYNAMIC_IDENTIFIER]
+
+
+def _render_sql(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str] = frozenset(),
+) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        rendered = [""]
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                values = [part.value]
+            elif isinstance(part, ast.FormattedValue):
+                values = _render_sql(
+                    part.value,
+                    bindings,
+                    resolving=resolving,
+                ) or [_DYNAMIC_IDENTIFIER]
+            else:
+                values = [_DYNAMIC_IDENTIFIER]
+            rendered = [prefix + value for prefix in rendered for value in values]
+        return rendered
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _render_sql(node.left, bindings, resolving=resolving)
+        right = _render_sql(node.right, bindings, resolving=resolving)
+        return [left_part + right_part for left_part in left for right_part in right]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        rendered = [""]
+        for element in node.elts:
+            values = _render_sql(
+                element,
+                bindings,
+                resolving=resolving,
+            ) or [_DYNAMIC_IDENTIFIER]
+            rendered = [prefix + value for prefix in rendered for value in values]
+        return rendered
+    if isinstance(node, ast.Name):
+        if node.id in resolving:
+            return [_DYNAMIC_IDENTIFIER]
+        values = bindings.get(node.id, [])
+        if not values:
+            return [_DYNAMIC_IDENTIFIER]
+        return [
+            rendered
+            for value in values
+            for rendered in (
+                _render_sql(
+                    value,
+                    bindings,
+                    resolving=resolving | {node.id},
+                )
+                or [_DYNAMIC_IDENTIFIER]
+            )
+        ]
+    if isinstance(node, ast.IfExp):
+        return [
+            rendered
+            for branch in (node.body, node.orelse)
+            for rendered in _render_sql(
+                branch,
+                bindings,
+                resolving=resolving,
+            )
+        ]
+    if not isinstance(node, ast.Call):
+        return []
+    call_name = _call_name(node.func)
+    if call_name in _SQL_TEXT_CONSTRUCTORS and node.args:
+        return _render_sql(node.args[0], bindings, resolving=resolving)
+    if call_name in _SQL_IDENTIFIER_CONSTRUCTORS:
+        return _cartesian_identifier(
+            list(node.args),
+            bindings,
+            resolving=resolving,
+        )
+    if call_name in _TRUSTED_TABLE_CONSTRUCTORS:
+        trusted_prefix = getattr(
+            node,
+            _TRUSTED_TABLE_MARKER_ATTRIBUTE,
+            _TRUSTED_TABLE_PREFIX,
+        )
+        values = (
+            _render_sql(node.args[0], bindings, resolving=resolving)
+            if len(node.args) == 1
+            else [_DYNAMIC_IDENTIFIER]
+        )
+        return [
+            (
+                f"{trusted_prefix}.{value}"
+                if value != _DYNAMIC_IDENTIFIER
+                and "." not in value
+                and value.replace("$", "_").isidentifier()
+                else _DYNAMIC_IDENTIFIER
+            )
+            for value in values
+        ]
+    if call_name == "Composed" and node.args:
+        return _render_sql(node.args[0], bindings, resolving=resolving)
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "join" and node.args:
+        separators = _render_sql(node.func.value, bindings, resolving=resolving)
+        value_groups: list[list[list[str]]] = []
+        sequence = node.args[0]
+        if isinstance(sequence, ast.GeneratorExp):
+            if (
+                len(sequence.generators) == 1
+                and isinstance(sequence.generators[0].target, ast.Name)
+                and not sequence.generators[0].ifs
+                and not sequence.generators[0].is_async
+            ):
+                generator = sequence.generators[0]
+                for elements in _sequence_expressions(
+                    generator.iter,
+                    bindings,
+                    resolving=resolving,
+                ):
+                    rendered_elements: list[list[str]] = []
+                    for element in elements:
+                        generator_bindings = {
+                            name: list(values) for name, values in bindings.items()
+                        }
+                        generator_bindings[generator.target.id] = [element]
+                        rendered_elements.append(
+                            _render_sql(
+                                sequence.elt,
+                                generator_bindings,
+                                resolving=resolving,
+                            )
+                            or [_DYNAMIC_IDENTIFIER]
+                        )
+                    value_groups.append(rendered_elements)
+        else:
+            for elements in _sequence_expressions(
+                sequence,
+                bindings,
+                resolving=resolving,
+            ):
+                value_groups.append(
+                    [
+                        _render_sql(element, bindings, resolving=resolving)
+                        or [_DYNAMIC_IDENTIFIER]
+                        for element in elements
+                    ]
+                )
+        rendered: list[str] = []
+        for element_values in value_groups:
+            for separator in separators:
+                statements = [""]
+                for index, values in enumerate(element_values):
+                    prefix = "" if index == 0 else separator
+                    statements = [
+                        statement + prefix + value
+                        for statement in statements
+                        for value in values
+                    ]
+                rendered.extend(statements)
+        return rendered
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        templates = _render_sql(node.func.value, bindings, resolving=resolving)
+        positional = list(templates)
+        for index, argument in enumerate(node.args):
+            values = _render_sql(
+                argument,
+                bindings,
+                resolving=resolving,
+            ) or [_DYNAMIC_IDENTIFIER]
+            expanded: list[str] = []
+            for statement in positional:
+                marker = "{}" if "{}" in statement else "{" + str(index) + "}"
+                expanded.extend(statement.replace(marker, value, 1) for value in values)
+            positional = expanded
+
+        environments: list[dict[str, str]] = [{}]
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                mappings = [{keyword.arg: keyword.value}]
+            else:
+                mappings = _mapping_expressions(
+                    keyword.value,
+                    bindings,
+                    resolving=resolving,
+                )
+            if not mappings:
+                environments = [
+                    {**environment, "__unresolved__": _DYNAMIC_IDENTIFIER}
+                    for environment in environments
+                ]
+                continue
+            expanded_environments: list[dict[str, str]] = []
+            for environment in environments:
+                for mapping in mappings:
+                    candidates = [dict(environment)]
+                    for key, value_node in mapping.items():
+                        values = _render_sql(
+                            value_node,
+                            bindings,
+                            resolving=resolving,
+                        ) or [_DYNAMIC_IDENTIFIER]
+                        candidates = [
+                            {**candidate, key: value}
+                            for candidate in candidates
+                            for value in values
+                        ]
+                    expanded_environments.extend(candidates)
+            environments = expanded_environments
+
+        rendered: list[str] = []
+        for statement in positional:
+            for environment in environments:
+                formatted = statement
+                for key, value in environment.items():
+                    if key != "__unresolved__":
+                        formatted = formatted.replace("{" + key + "}", value)
+                if "__unresolved__" in environment:
+                    formatted = re.sub(r"\{[^{}]+\}", _DYNAMIC_IDENTIFIER, formatted)
+                rendered.append(formatted)
+        return rendered
+    return []
+
+
+def _is_sql_execution(
+    call: ast.Call,
+    bindings: dict[str, list[ast.expr]] | None = None,
+) -> bool:
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr in _SQL_EXECUTION_METHODS
+    )
+
+
+def _container_expressions(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> list[ast.expr]:
+    if isinstance(node, ast.Name):
+        if node.id in resolving:
+            return []
+        return [
+            candidate
+            for value in bindings.get(node.id, [])
+            for candidate in _container_expressions(
+                value,
+                bindings,
+                resolving=resolving | {node.id},
+            )
+        ]
+    if isinstance(node, ast.Subscript):
+        return _subscript_expressions(
+            node,
+            bindings,
+            resolving=resolving,
+        )
+    return [node]
+
+
+def _subscript_keys(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> set[str | int] | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, int)):
+        return {node.value}
+    candidates = _string_candidates(node, bindings, resolving=resolving)
+    if _DYNAMIC_IDENTIFIER in candidates:
+        return None
+    return set(candidates)
+
+
+def _subscript_expressions(
+    node: ast.Subscript,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str],
+) -> list[ast.expr]:
+    keys = _subscript_keys(node.slice, bindings, resolving=resolving)
+    values: list[ast.expr] = []
+    for container in _container_expressions(
+        node.value,
+        bindings,
+        resolving=resolving,
+    ):
+        if isinstance(container, ast.Dict):
+            for key, value in zip(container.keys, container.values, strict=True):
+                if key is None:
+                    continue
+                if keys is None or (
+                    isinstance(key, ast.Constant) and key.value in keys
+                ):
+                    values.append(value)
+        elif isinstance(container, (ast.List, ast.Tuple)):
+            if keys is None:
+                values.extend(container.elts)
+                continue
+            for key in keys:
+                if isinstance(key, int) and -len(container.elts) <= key < len(
+                    container.elts
+                ):
+                    values.append(container.elts[key])
+    return values
+
+
+def _string_candidates(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str] = frozenset(),
+) -> set[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.Name):
+        if node.id in resolving:
+            return {_DYNAMIC_IDENTIFIER}
+        values = bindings.get(node.id, [])
+        if not values:
+            return {_DYNAMIC_IDENTIFIER}
+        return {
+            candidate
+            for value in values
+            for candidate in _string_candidates(
+                value,
+                bindings,
+                resolving=resolving | {node.id},
+            )
+        }
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _string_candidates(node.left, bindings, resolving=resolving)
+        right = _string_candidates(node.right, bindings, resolving=resolving)
+        if _DYNAMIC_IDENTIFIER in left | right:
+            return {_DYNAMIC_IDENTIFIER}
+        return {left_part + right_part for left_part in left for right_part in right}
+    if isinstance(node, ast.IfExp):
+        return _string_candidates(
+            node.body, bindings, resolving=resolving
+        ) | _string_candidates(node.orelse, bindings, resolving=resolving)
+    if isinstance(node, ast.BoolOp):
+        return {
+            candidate
+            for value in node.values
+            for candidate in _string_candidates(value, bindings, resolving=resolving)
+        }
+    if isinstance(node, ast.NamedExpr):
+        return _string_candidates(node.value, bindings, resolving=resolving)
+    if isinstance(node, ast.Subscript):
+        values = _subscript_expressions(
+            node,
+            bindings,
+            resolving=resolving,
+        )
+        if not values:
+            return {_DYNAMIC_IDENTIFIER}
+        return {
+            candidate
+            for value in values
+            for candidate in _string_candidates(
+                value,
+                bindings,
+                resolving=resolving,
+            )
+        }
+    return {_DYNAMIC_IDENTIFIER}
+
+
+def _has_dangerous_reflective_name(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    reject_dynamic: bool,
+) -> bool:
+    candidates = {candidate.lower() for candidate in _string_candidates(node, bindings)}
+    static_candidates = candidates - {_DYNAMIC_IDENTIFIER}
+    return (
+        (reject_dynamic and _DYNAMIC_IDENTIFIER in candidates)
+        or not all(candidate.isidentifier() for candidate in static_candidates)
+        or bool(static_candidates & (_SQL_EXECUTION_METHODS | _DYNAMIC_CODE_NAME_CALLS))
+    )
+
+
+def _is_reflection_primitive(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in _REFLECTION_NAME_PRIMITIVES
+    if not isinstance(node, ast.Attribute):
+        return False
+    path = _expression_path(node)
+    return path in _REFLECTION_ATTRIBUTE_PRIMITIVE_PATHS or node.attr in {
+        "__getattr__",
+        "__getattribute__",
+    }
+
+
+def _is_dangerous_reflective_lookup(
+    node: ast.AST,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    reject_dynamic: bool,
+) -> bool:
+    if isinstance(node, ast.Call):
+        call_name = _call_name(node.func)
+        call_path = _expression_path(node.func)
+        if call_name == "getattr":
+            return len(node.args) < 2 or _has_dangerous_reflective_name(
+                node.args[1], bindings, reject_dynamic=reject_dynamic
+            )
+        if call_name in {"attrgetter", "methodcaller"}:
+            return not node.args or _has_dangerous_reflective_name(
+                node.args[0], bindings, reject_dynamic=reject_dynamic
+            )
+        if call_name in {"__getattr__", "__getattribute__"}:
+            method_index = 1 if call_path == "object.__getattribute__" else 0
+            return len(node.args) <= method_index or _has_dangerous_reflective_name(
+                node.args[method_index],
+                bindings,
+                reject_dynamic=reject_dynamic,
+            )
+        if call_path == "dict.__getitem__":
+            return len(node.args) < 2 or _has_dangerous_reflective_name(
+                node.args[1], bindings, reject_dynamic=reject_dynamic
+            )
+    return (
+        isinstance(node, ast.Subscript)
+        and (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "__builtins__"
+            or isinstance(node.value, ast.Call)
+            and _call_name(node.value.func) in {"globals", "locals", "vars"}
+        )
+        and _has_dangerous_reflective_name(
+            node.slice,
+            bindings,
+            reject_dynamic=reject_dynamic,
+        )
+    )
+
+
+def _resolves_to_reflective_callable(
+    node: ast.expr,
+    bindings: dict[str, list[ast.expr]],
+    *,
+    resolving: frozenset[str] = frozenset(),
+) -> bool:
+    if isinstance(node, (ast.Call, ast.Subscript)):
+        return _is_dangerous_reflective_lookup(
+            node,
+            bindings,
+            reject_dynamic=True,
+        )
+    if isinstance(node, ast.Name):
+        if node.id in resolving:
+            return True
+        return any(
+            _resolves_to_reflective_callable(
+                value,
+                bindings,
+                resolving=resolving | {node.id},
+            )
+            for value in bindings.get(node.id, [])
+        )
+    if isinstance(node, ast.NamedExpr):
+        return _resolves_to_reflective_callable(
+            node.value,
+            bindings,
+            resolving=resolving,
+        )
+    if isinstance(node, ast.IfExp):
+        return _resolves_to_reflective_callable(
+            node.body,
+            bindings,
+            resolving=resolving,
+        ) or _resolves_to_reflective_callable(
+            node.orelse,
+            bindings,
+            resolving=resolving,
+        )
+    return False
+
+
+def _reflective_executor_argument(call: ast.Call) -> ast.expr | None:
+    call_name = _call_name(call.func)
+    argument_index = 1 if call_name == "run_in_executor" else 0
+    if call_name not in {"partial", "run_in_executor", "submit", "to_thread"}:
+        return None
+    return call.args[argument_index] if len(call.args) > argument_index else None
+
+
+def _execution_query(
+    call: ast.Call,
+    bindings: dict[str, list[ast.expr]] | None = None,
+) -> ast.expr | None:
+    if not _is_sql_execution(call, bindings):
+        return None
+    if call.args:
+        return call.args[0]
+    for keyword in call.keywords:
+        if keyword.arg in {"operation", "query", "sql", "statement"}:
+            return keyword.value
+    query_expressions: list[ast.expr] = []
+    unresolved_mapping = False
+    for keyword in call.keywords:
+        if keyword.arg is not None:
+            continue
+        mappings = _mapping_expressions(
+            keyword.value,
+            bindings or {},
+            resolving=frozenset(),
+        )
+        if not mappings:
+            unresolved_mapping = True
+            continue
+        for mapping in mappings:
+            query_expressions.extend(
+                value
+                for name, value in mapping.items()
+                if name in {"operation", "query", "sql", "statement"}
+            )
+    if not unresolved_mapping and len(query_expressions) == 1:
+        return query_expressions[0]
+    return None
+
+
+def _find_email_mutations(source: str, *, filename: str) -> list[int]:
+    tree = ast.parse(source, filename=filename)
+    violations: list[int] = []
+    trusted_dynamic_occurrences: dict[tuple[str, str, str, str], int] = {}
+    trusted_dynamic_non_sql_occurrences: dict[tuple[str, str, str], int] = {}
+
+    def inspect_scope(
+        root: ast.AST,
+        inherited_bindings: dict[str, list[ast.expr]],
+        owner: str,
+    ) -> None:
+        bindings = {name: list(values) for name, values in inherited_bindings.items()}
+        parameter_names: set[str] = set()
+        if isinstance(root, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+            arguments = root.args
+            parameter_names.update(
+                argument.arg
+                for argument in (
+                    *arguments.posonlyargs,
+                    *arguments.args,
+                    *arguments.kwonlyargs,
+                )
+            )
+            if arguments.vararg is not None:
+                parameter_names.add(arguments.vararg.arg)
+            if arguments.kwarg is not None:
+                parameter_names.add(arguments.kwarg.arg)
+            for name in parameter_names:
+                bindings[name] = [ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())]
+        for name, values in _scope_bindings(root).items():
+            if name in parameter_names:
+                bindings[name].extend(values)
+            else:
+                bindings[name] = values
+        for name in _scope_import_binding_names(root):
+            bindings.setdefault(name, []).append(
+                ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())
+            )
+        scope_nodes = list(_scope_nodes(root))
+        calls = sorted(
+            (node for node in scope_nodes if isinstance(node, ast.Call)),
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        direct_call_functions = {id(node.func) for node in calls}
+        for candidate in scope_nodes:
+            if (
+                isinstance(candidate, ast.Attribute)
+                and candidate.attr in _SQL_EXECUTION_METHODS
+                and id(candidate) not in direct_call_functions
+            ) or (
+                _is_reflection_primitive(candidate)
+                and id(candidate) not in direct_call_functions
+            ):
+                violations.append(candidate.lineno)
+                continue
+            if not isinstance(candidate, ast.Call) and _is_dangerous_reflective_lookup(
+                candidate,
+                bindings,
+                reject_dynamic=False,
+            ):
+                violations.append(candidate.lineno)
+        for node in calls:
+            call_bindings = {name: list(values) for name, values in bindings.items()}
+            for name in _comprehension_bound_names(root, node):
+                call_bindings[name] = [ast.Name(id=_DYNAMIC_IDENTIFIER, ctx=ast.Load())]
+            call_path = _expression_path(node.func)
+            if _is_dangerous_reflective_lookup(
+                node,
+                call_bindings,
+                reject_dynamic=False,
+            ):
+                violations.append(node.lineno)
+            executor_argument = _reflective_executor_argument(node)
+            if _resolves_to_reflective_callable(
+                node.func,
+                call_bindings,
+            ) or (
+                executor_argument is not None
+                and _resolves_to_reflective_callable(
+                    executor_argument,
+                    call_bindings,
+                )
+            ):
+                violations.append(node.lineno)
+            if _execution_policy_matches(
+                filename,
+                owner,
+                call_path,
+                _NON_SQL_EXECUTION_CALLS,
+            ):
+                continue
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in _DYNAMIC_CODE_NAME_CALLS
+            ):
+                violations.append(node.lineno)
+                continue
+            if not isinstance(node.func, (ast.Attribute, ast.Name)):
+                if not _trusted_dynamic_non_sql_call_matches(
+                    filename,
+                    owner,
+                    node,
+                    trusted_dynamic_non_sql_occurrences,
+                ):
+                    violations.append(node.lineno)
+                continue
+            query = _execution_query(node, call_bindings)
+            if query is None:
+                if _is_sql_execution(
+                    node, call_bindings
+                ) and not _trusted_dynamic_execution_matches(
+                    filename,
+                    owner,
+                    call_path,
+                    query,
+                    call_bindings,
+                    trusted_dynamic_occurrences,
+                ):
+                    violations.append(node.lineno)
+                continue
+            statements = _render_sql(query, call_bindings)
+            if any(_EMAIL_MUTATION.search(statement) for statement in statements):
+                violations.append(node.lineno)
+                continue
+            unresolved = not statements or any(
+                _DYNAMIC_IDENTIFIER in statement for statement in statements
+            )
+            if unresolved and not _trusted_dynamic_execution_matches(
+                filename,
+                owner,
+                call_path,
+                query,
+                call_bindings,
+                trusted_dynamic_occurrences,
+            ):
+                violations.append(node.lineno)
+        for child in ast.iter_child_nodes(root):
+            if isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)):
+                child_owner = f"{owner}.{child.name}" if owner else child.name
+                inspect_scope(child, bindings, child_owner)
+        for child in _nested_lambdas(root):
+            child_owner = f"{owner}.<lambda>" if owner else "<lambda>"
+            inspect_scope(child, bindings, child_owner)
+
+    inspect_scope(tree, {}, "")
+    return sorted(set(violations))
+
+
+def _render_bound_expression(source: str, name: str) -> list[str]:
+    tree = ast.parse(source, filename="<renderer-contract>")
+    bindings = _scope_bindings(tree)
+    return _render_sql(bindings[name][-1], bindings)
+
+
+def test_renderer_preserves_identifier_candidates_and_unresolved_parts() -> None:
+    source = """
+schema = "tenant_a"
+schema = "tenant_b"
+table = "emails"
+table = unresolved_table
+identifier = sql.Identifier(schema, table)
+"""
+
+    assert set(_render_bound_expression(source, "identifier")) == {
+        "tenant_a.dynamic_identifier",
+        "tenant_a.emails",
+        "tenant_b.dynamic_identifier",
+        "tenant_b.emails",
+    }
+
+
+def test_renderer_expands_format_cartesian_and_static_kwargs() -> None:
+    source = """
+verb = "UPDATE"
+verb = "INSERT INTO"
+target = sql.Identifier("emails")
+target = sql.Identifier("audit_events")
+parts = {"verb": verb, "target": target}
+positional = sql.SQL("{} {}").format(verb, target)
+keyword = sql.SQL("{verb} {target}").format(**parts)
+"""
+    expected = {
+        "INSERT INTO audit_events",
+        "INSERT INTO emails",
+        "UPDATE audit_events",
+        "UPDATE emails",
+    }
+
+    assert set(_render_bound_expression(source, "positional")) == expected
+    assert set(_render_bound_expression(source, "keyword")) == expected
+
+
+def test_renderer_marks_only_table_helper_as_trusted_in_compositions() -> None:
+    source = """
+trusted = _table("emails")
+plain = sql.Identifier("emails")
+composed = sql.Composed([sql.SQL("UPDATE "), trusted, sql.SQL(" SET status = %s")])
+joined = sql.SQL(" ").join([sql.SQL("UPDATE"), trusted, sql.SQL("SET status = %s")])
+"""
+
+    assert _render_bound_expression(source, "trusted") == [
+        "__task5_trusted_schema__.emails"
+    ]
+    assert _render_bound_expression(source, "plain") == ["emails"]
+    assert _render_bound_expression(source, "composed") == [
+        "UPDATE __task5_trusted_schema__.emails SET status = %s"
+    ]
+    assert _render_bound_expression(source, "joined") == [
+        "UPDATE __task5_trusted_schema__.emails SET status = %s"
+    ]
+
+
+def test_renderer_expands_generator_join_over_static_tuple() -> None:
+    source = """
+columns = ("id", "status")
+returning = sql.SQL(", ").join(
+    sql.SQL("e.{}").format(sql.Identifier(column)) for column in columns
+)
+"""
+
+    assert _render_bound_expression(source, "returning") == ["e.id, e.status"]
+
+
+def test_renderer_expands_static_conditional_composition_branches() -> None:
+    source = """
+predicate = sql.SQL(" AND state = %s") if enabled else sql.SQL("")
+query = sql.SQL("SELECT id FROM {} WHERE account_id = %s{}").format(
+    _table("pipeline_ownership"),
+    predicate,
+)
+"""
+
+    assert set(_render_bound_expression(source, "query")) == {
+        "SELECT id FROM __task5_trusted_schema__.pipeline_ownership "
+        "WHERE account_id = %s",
+        "SELECT id FROM __task5_trusted_schema__.pipeline_ownership "
+        "WHERE account_id = %s AND state = %s",
+    }
+
+
+def test_detector_handles_composed_fstring_and_keyword_sql_only_at_execution() -> None:
+    source = """
+async def mutate(cursor, sql, _table, schema):
+    composed = sql.SQL("InSeRt Into {} (id) VALUES (%s)").format(_table("emails"))
+    await cursor.execute(composed)
+    await cursor.execute(statement=f"UPDATE {schema}.emails SET status = 'sent'")
+    await cursor.execute(query='DELETE FROM ONLY "runtime"."emails" WHERE id = %s')
+    logger.info("TRUNCATE emails is forbidden explanatory text")
+"""
+
+    assert _find_email_mutations(source, filename="<composition-contract>") == [
+        4,
+        5,
+        6,
+    ]
+
+
+def test_detector_resolves_bound_identifier_inside_fstring() -> None:
+    source = """
+async def mutate(cursor):
+    table = "emails"
+    await cursor.execute(f"UPDATE {table} SET status = 'processing'")
+"""
+
+    assert _find_email_mutations(source, filename="<bound-fstring-contract>") == [4]
+
+
+def test_detector_handles_psycopg_composed_and_joined_sql() -> None:
+    source = """
+async def mutate(cursor, sql):
+    composed = sql.Composed([
+        sql.SQL("UPDATE "),
+        sql.Identifier("emails"),
+        sql.SQL(" SET status = %s"),
+    ])
+    await cursor.execute(composed)
+    joined = sql.SQL(" ").join((
+        sql.SQL("UPDATE"),
+        sql.Identifier("emails"),
+        sql.SQL("SET status = %s"),
+    ))
+    await cursor.execute(joined)
+"""
+
+    assert _find_email_mutations(source, filename="<psycopg-composed-contract>") == [
+        8,
+        14,
+    ]
+
+
+def test_detector_covers_every_mutation_form_and_ignores_select_and_copy_to() -> None:
+    source = """
+async def mutate(cursor, sql, _table):
+    await cursor.execute('INSERT INTO emails (id) VALUES (%s)')
+    await cursor.executemany('UPDATE ONLY "emails" SET status = %s', rows)
+    await cursor.exec_driver_sql('DELETE FROM runtime.emails')
+    await cursor.execute(sql.SQL('MERGE INTO {} USING source ON false').format(sql.Identifier('runtime', 'emails')))
+    await cursor.execute(sql.SQL('TRUNCATE TABLE {}').format(_table('emails')))
+    async with cursor.copy('COPY "runtime"."emails" (id) FROM STDIN') as writer:
+        await writer.write_row((1,))
+    await cursor.copy_expert(sql='COPY emails FROM STDIN', file=stream)
+    await cursor.execute('SELECT * FROM emails')
+    await cursor.execute('COPY emails TO STDOUT')
+    await cursor.copy_expert('COPY emails TO STDOUT', stream)
+"""
+
+    assert _find_email_mutations(source, filename="<mutation-contract>") == [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        10,
+    ]
+
+
+def test_detector_fail_closes_shadowed_and_unrenderable_execution_queries() -> None:
+    source = """
+QUERY = "SELECT 1"
+
+async def shadowed(cursor, QUERY):
+    await cursor.execute(QUERY)
+
+def query():
+    return "UPDATE emails SET status = 'sent'"
+
+async def returned(cursor):
+    await cursor.execute(query())
+
+async def partial(cursor, table):
+    await cursor.execute(f"UPDATE {table} SET status = 1")
+"""
+    execution_lines = sorted(
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "execute"
+    )
+
+    assert _find_email_mutations(source, filename="<dynamic-query-contract>") == (
+        execution_lines
+    )
+
+
+def test_detector_rejects_module_query_import_rebinding() -> None:
+    source = """
+QUERY = "SELECT 1"
+from evil import QUERY
+
+async def mutate(cursor):
+    await cursor.execute(QUERY)
+"""
+
+    assert _find_email_mutations(source, filename="<module-query-rebinding>") == [6]
+
+
+def test_detector_follows_indirect_sql_execution_callables() -> None:
+    cases = {
+        "name-alias": """
+async def mutate(cursor):
+    run = cursor.execute
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "alias-chain": """
+async def mutate(cursor):
+    first = cursor.execute
+    second = first
+    await second("UPDATE emails SET status = 'sent'")
+""",
+        "mapping-subscript": """
+async def mutate(cursor):
+    calls = {"run": cursor.execute}
+    await calls["run"]("UPDATE emails SET status = 'sent'")
+""",
+        "tuple-unpack": """
+async def mutate(cursor):
+    run, harmless = (cursor.execute, logger.info)
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "attribute-alias": """
+async def mutate(cursor, holder):
+    holder.run = cursor.execute
+    await holder.run("UPDATE emails SET status = 'sent'")
+""",
+        "conditional": """
+async def mutate(cursor, use_many):
+    await (cursor.execute if use_many else cursor.executemany)(
+        "UPDATE emails SET status = 'sent'",
+        rows,
+    )
+""",
+        "getattr": """
+async def mutate(cursor):
+    run = getattr(cursor, "execute")
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "named-expression": """
+async def mutate(cursor):
+    await (run := cursor.execute)("UPDATE emails SET status = 'sent'")
+""",
+        "dunder-getattribute": """
+async def mutate(cursor):
+    run = cursor.__getattribute__("execute")
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "attrgetter": """
+import operator
+
+async def mutate(cursor):
+    run = operator.attrgetter("execute")(cursor)
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "methodcaller": """
+import operator
+
+async def mutate(cursor):
+    run = operator.methodcaller("execute", "UPDATE emails SET status = 'sent'")
+    await run(cursor)
+""",
+        "vars-subscript": """
+async def mutate(cursor):
+    run = vars(cursor)["execute"]
+    await run("UPDATE emails SET status = 'sent'")
+""",
+        "partial": """
+import functools
+
+async def mutate(cursor):
+    await functools.partial(cursor.execute)(
+        "UPDATE emails SET status = 'sent'"
+    )
+""",
+        "to-thread": """
+import asyncio
+
+async def mutate(cursor):
+    await asyncio.to_thread(
+        cursor.execute,
+        "UPDATE emails SET status = 'sent'",
+    )
+""",
+    }
+    missed: list[str] = []
+    for label, source in cases.items():
+        actual = _find_email_mutations(
+            source,
+            filename=f"<indirect-sql-callable-{label}>",
+        )
+        if not actual:
+            missed.append(label)
+
+    assert missed == []
+
+
+def test_detector_fail_closes_dynamic_code_name_calls() -> None:
+    source = """
+def mutate():
+    exec(payload)
+    eval(payload)
+    compile(payload, "<dynamic>", "exec")
+"""
+
+    assert _find_email_mutations(source, filename="<dynamic-code-calls>") == [3, 4, 5]
+
+
+def test_detector_rejects_aliased_reflection_primitives() -> None:
+    cases = {
+        "getattr-alias": """
+def mutate(cursor):
+    lookup = getattr
+    run = lookup(cursor, "execute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "method-variable": """
+def mutate(cursor):
+    method = "execute"
+    run = getattr(cursor, method)
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "dynamic-method": """
+def mutate(cursor, method):
+    run = getattr(cursor, method)
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "dunder-alias": """
+def mutate(cursor):
+    lookup = cursor.__getattribute__
+    run = lookup("execute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "dunder-getattr": """
+def mutate(cursor):
+    run = cursor.__getattr__("execute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "attrgetter-alias": """
+import operator
+
+def mutate(cursor):
+    lookup = operator.attrgetter
+    factory = lookup("execute")
+    run = factory(cursor)
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "methodcaller-alias": """
+import operator
+
+def mutate(cursor):
+    lookup = operator.methodcaller
+    run = lookup("execute", "UPDATE emails SET status = 'sent'")
+    run(cursor)
+""",
+        "dict-getitem": """
+def mutate(cursor):
+    run = dict.__getitem__(vars(cursor), "execute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "object-getattribute": """
+def mutate(cursor):
+    run = object.__getattribute__(cursor, "execute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "constant-folded-method": """
+def mutate(cursor):
+    run = getattr(cursor, "exe" + "cute")
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "dynamic-partial": """
+import functools
+
+def mutate(cursor, method):
+    run = functools.partial(getattr(cursor, method))
+    run("UPDATE emails SET status = 'sent'")
+""",
+        "dynamic-to-thread": """
+import asyncio
+
+async def mutate(cursor, method):
+    await asyncio.to_thread(
+        getattr(cursor, method),
+        "UPDATE emails SET status = 'sent'",
+    )
+""",
+    }
+    missed = [
+        label
+        for label, source in cases.items()
+        if not _find_email_mutations(
+            source,
+            filename=f"<aliased-reflection-{label}>",
+        )
+    ]
+
+    assert missed == []
+
+
+def test_detector_allows_dynamic_reflection_that_stays_data_only() -> None:
+    source = """
+def inspect(settings, snapshot, field, name, default, logger, level):
+    value = getattr(settings, name, None)
+    enabled = getattr(snapshot, field.name) is True
+    fallback = getattr(settings, name, default)
+    logger.setLevel(getattr(logger, level.upper(), 20))
+    return value, enabled, fallback
+"""
+
+    assert _find_email_mutations(source, filename="<dynamic-data-reflection>") == []
+
+
+def test_detector_resolves_reflection_names_from_static_tuple_registries() -> None:
+    safe_source = """
+REGISTRY = {
+    "codex": ("providers.codex", "CodexChatModel"),
+    "gemini": ("providers.gemini", "GeminiChatModel"),
+}
+
+def build(module, provider):
+    module_path, class_name = REGISTRY[provider]
+    cls = getattr(module, class_name)
+    return cls()
+"""
+    dangerous_source = safe_source.replace("GeminiChatModel", "execute")
+
+    assert _find_email_mutations(safe_source, filename="<static-registry-safe>") == []
+    assert _find_email_mutations(
+        dangerous_source,
+        filename="<static-registry-dangerous>",
+    )
+
+
+def test_detector_rejects_escaped_dynamic_code_primitives() -> None:
+    cases = {
+        "exec-alias": "runner = exec",
+        "eval-alias": "runner = eval",
+        "compile-alias": "runner = compile",
+        "globals": 'runner = globals()["exec"]',
+        "locals": 'runner = locals()["eval"]',
+        "builtins-subscript": 'runner = __builtins__["compile"]',
+        "builtins-getattr": 'runner = getattr(__builtins__, "exec")',
+    }
+    missed: list[str] = []
+    for label, binding in cases.items():
+        source = f"""
+def mutate(payload):
+    {binding}
+    runner(payload)
+"""
+        if not _find_email_mutations(
+            source,
+            filename=f"<escaped-dynamic-code-{label}>",
+        ):
+            missed.append(label)
+
+    assert missed == []
+
+
+def test_dynamic_execution_allowlist_requires_exact_project_relative_path() -> None:
+    source = """
+async def _apply_checkpoint_migrations(cur, migration):
+    await cur.execute(migration)
+"""
+
+    assert _find_email_mutations(
+        source,
+        filename="/tmp/rogue/src/db/bootstrap.py",
+    ) == [3]
+
+
+def test_dynamic_execution_allowlist_freezes_query_shapes_and_counts() -> None:
+    source = """
+async def _ensure_checkpoint_index(cur, spec, migration, evil):
+    await cur.execute(spec.drop_sql)
+    await cur.execute(migration)
+    await cur.execute(migration)
+    await cur.execute(evil)
+"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert _find_email_mutations(
+        source,
+        filename=str(project_root / "src" / "db" / "bootstrap.py"),
+    ) == [5, 6]
+
+
+def test_dynamic_execution_allowlist_rejects_rebound_query_bindings() -> None:
+    source = """
+async def _ensure_checkpoint_index(cur, migration, evil):
+    migration = evil
+    await cur.execute(migration)
+"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert _find_email_mutations(
+        source,
+        filename=str(project_root / "src" / "db" / "bootstrap.py"),
+    ) == [4]
+
+
+def test_dynamic_non_sql_allowlist_freezes_server_constructor_shape_and_count() -> None:
+    source = """
+async def inject_test_email():
+    type("MockState", (), {})()
+    type("MockState", (), {})()
+    factory()()
+"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert _find_email_mutations(
+        source,
+        filename=str(project_root / "src" / "server.py"),
+    ) == [4, 5]
+
+
+def test_detector_applies_comprehension_bindings_only_inside_the_expression() -> None:
+    source = """
+QUERY = "SELECT 1"
+
+async def mutate(cursor, queries):
+    return [await cursor.execute(QUERY) for QUERY in queries]
+"""
+
+    assert _find_email_mutations(source, filename="<comprehension-query>") == [5]
+
+
+def test_detector_inspects_sql_executions_inside_lambda_bodies() -> None:
+    source = """
+def mutate(cursor):
+    runner = lambda: cursor.execute("UPDATE emails SET status = 'sent'")
+    runner()
+"""
+
+    assert _find_email_mutations(source, filename="<lambda-query>") == [3]
+
+
+def test_email_mutations_are_owned_only_by_the_ingestion_repository() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    allowed = project_root / "src" / "ingestion" / "repository.py"
+    candidates = list((project_root / "src").rglob("*.py"))
+    scripts = project_root / "scripts"
+    if scripts.is_dir():
+        candidates.extend(scripts.rglob("*.py"))
+
+    violations: list[str] = []
+    for path in sorted(candidates):
+        if path == allowed:
+            continue
+        source = path.read_text(encoding="utf-8")
+        violations.extend(
+            f"{path.relative_to(project_root)}:{line}"
+            for line in _find_email_mutations(source, filename=str(path))
+        )
+
+    assert violations == [], (
+        f"emails mutations are reserved for src/ingestion/repository.py: {violations}"
+    )
+
+
+def test_task5_repository_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256, (
+        "Task-5 repository structural review required before updating the approved "
+        f"normalized AST SHA-256: expected "
+        f"{_TASK5_REPOSITORY_STRUCTURAL_AST_SHA256}, got {actual}"
+    )
+
+
+def test_trusted_dynamic_sql_files_require_explicit_structural_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256, (
+        "Trusted dynamic SQL structural review required before updating the "
+        f"approved normalized AST SHA-256: expected "
+        f"{_TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256}, got {actual}"
+    )
+
+
+def test_policy_exception_paths_equal_structural_ratchet_paths() -> None:
+    dynamic_policy_paths = {
+        path for path, _, _ in _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES
+    }
+    assert dynamic_policy_paths == set(_TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256)
+
+    non_sql_policy_paths = {path for path, _, _ in _NON_SQL_EXECUTION_CALLS} | {
+        path for path, _ in _TRUSTED_DYNAMIC_NON_SQL_CALL_SHAPES
+    }
+    assert non_sql_policy_paths == set(_NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256)
+
+
+def test_non_sql_exception_files_require_explicit_structural_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256, (
+        "Non-SQL exception structural review required before updating the "
+        f"approved normalized AST SHA-256: expected "
+        f"{_NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256}, got {actual}"
+    )
+
+
+def test_public_ingestion_boundary_exports_email_event_contract() -> None:
+    expected = {
+        "EMAIL_STATUS_TRANSITIONS": EMAIL_STATUS_TRANSITIONS,
+        "EmailEventApplication": EmailEventApplication,
+        "EmailEventDecision": EmailEventDecision,
+        "EmailEventDisposition": EmailEventDisposition,
+        "EmailEventReason": EmailEventReason,
+        "EmailEventTransaction": EmailEventTransaction,
+        "EmailStatus": EmailStatus,
+        "InboxRepository": InboxRepository,
+        "decide_email_event": decide_email_event,
+    }
+
+    assert {name: getattr(ingestion, name, None) for name in expected} == expected

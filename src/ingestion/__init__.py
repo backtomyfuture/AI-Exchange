@@ -1,5 +1,14 @@
 """Durable ingestion domain boundary."""
 
+from src.ingestion.email_events import (
+    EMAIL_STATUS_TRANSITIONS,
+    EmailEventApplication,
+    EmailEventDecision,
+    EmailEventDisposition,
+    EmailEventReason,
+    EmailStatus,
+    decide_email_event,
+)
 from src.ingestion.normalization import (
     normalize_sync_change,
     normalize_webhook_event,
@@ -11,7 +20,6 @@ from src.ingestion.ownership import (
     RetirementBlockCode,
     RetirementGuard,
 )
-from src.ingestion.repository import InboxRepository
 from src.ingestion.models import (
     ChangeKind,
     InboxDisposition,
@@ -29,9 +37,17 @@ from src.ingestion.models import (
     SyncChange,
     SyncCursorStatus,
 )
+from src.ingestion.repository import EmailEventTransaction, InboxRepository
 
 __all__ = [
     "ChangeKind",
+    "EMAIL_STATUS_TRANSITIONS",
+    "EmailEventApplication",
+    "EmailEventDecision",
+    "EmailEventDisposition",
+    "EmailEventReason",
+    "EmailEventTransaction",
+    "EmailStatus",
     "InboxDisposition",
     "InboxDispositionStatus",
     "InboxLease",
@@ -51,6 +67,7 @@ __all__ = [
     "SyncBatch",
     "SyncChange",
     "SyncCursorStatus",
+    "decide_email_event",
     "normalize_sync_change",
     "normalize_webhook_event",
     "validate_sync_change_contract",
