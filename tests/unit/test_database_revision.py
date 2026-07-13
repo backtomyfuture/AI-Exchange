@@ -26,6 +26,8 @@ _ROLE_BOUNDARY = {
     "role_separation_required": True,
     "expected_runtime_role": "runtime_user",
     "expected_migration_role": "migration_owner",
+    "expected_maintenance_role": "maintenance_user",
+    "expected_auditor_role": "checkpoint_auditor",
     "target_schema": "public",
 }
 
@@ -145,7 +147,6 @@ async def test_runtime_gate_accepts_code_first_and_migration_first_when_flags_di
     [
         "durable_inbox_enabled",
         "ingestion_shadow_enabled",
-        "sync_reconciliation_enabled",
     ],
 )
 async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_enabled(
@@ -179,6 +180,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
+        expected_revision="20260710_0003",
     )
 
     with (
@@ -199,6 +201,88 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
             **flags,
             **_ROLE_BOUNDARY,
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_gate_rejects_sync_before_capability_verifier_without_db_access():
+    flags = {**_PHASE_2_FLAGS_DISABLED, "sync_reconciliation_enabled": True}
+    role_gate = AsyncMock()
+    revision_gate = AsyncMock(return_value="20260710_0003")
+    schema_contract = AsyncMock()
+
+    with (
+        patch.object(
+            database_schema,
+            "require_runtime_database_role",
+            new=role_gate,
+        ),
+        patch.object(
+            database_schema,
+            "get_current_database_revision",
+            new=revision_gate,
+        ),
+        patch.object(
+            database_schema,
+            "require_database_schema_contract",
+            new=schema_contract,
+        ),
+        pytest.raises(
+            DatabaseRevisionError,
+            match="sync_reconciliation_capability_unavailable",
+        ),
+    ):
+        await database_schema.require_runtime_database(
+            "postgresql://private:secret@database/email_agent",
+            **flags,
+            **_ROLE_BOUNDARY,
+        )
+
+    role_gate.assert_not_awaited()
+    revision_gate.assert_not_awaited()
+    schema_contract.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_and_readiness_boundaries_fail_closed_for_unverified_sync():
+    from src import main as main_module
+    from src import server as server_module
+
+    settings = SimpleNamespace(
+        database_url="postgresql://private:secret@database/email_agent",
+        DURABLE_INBOX_ENABLED=False,
+        INGESTION_SHADOW_ENABLED=False,
+        SYNC_RECONCILIATION_ENABLED=True,
+        DATABASE_ROLE_SEPARATION_REQUIRED=True,
+        POSTGRES_USER="runtime_user",
+        POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
+        POSTGRES_SCHEMA="public",
+    )
+    connect = AsyncMock(
+        side_effect=AssertionError("unverified_sync_must_not_connect_to_database")
+    )
+    server_module._READINESS_STATES.clear()
+    try:
+        with patch.object(
+            database_schema.psycopg.AsyncConnection,
+            "connect",
+            new=connect,
+        ):
+            with pytest.raises(
+                DatabaseRevisionError,
+                match="sync_reconciliation_capability_unavailable",
+            ):
+                await main_module._require_runtime_database_boundary(settings)
+            with pytest.raises(
+                DatabaseRevisionError,
+                match="sync_reconciliation_capability_unavailable",
+            ):
+                await server_module._require_cached_runtime_database(settings)
+    finally:
+        server_module._READINESS_STATES.clear()
+
+    connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -257,6 +341,8 @@ async def test_runtime_gate_checks_role_invariants_before_revision():
         "postgresql://runtime/private",
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
     revision_reader.assert_awaited_once_with("postgresql://runtime/private")
@@ -264,6 +350,7 @@ async def test_runtime_gate_checks_role_invariants_before_revision():
         "postgresql://runtime/private",
         target_schema="public",
         require_complete=True,
+        expected_revision=EXPECTED_DATABASE_REVISION,
     )
 
 
@@ -303,7 +390,6 @@ async def test_runtime_role_failure_prevents_revision_read():
     [
         "durable_inbox_enabled",
         "ingestion_shadow_enabled",
-        "sync_reconciliation_enabled",
     ],
 )
 async def test_phase_2_activation_requires_role_separation_even_on_expand_head(
@@ -325,6 +411,7 @@ async def test_phase_2_activation_requires_role_separation_even_on_expand_head(
             role_separation_required=False,
             expected_runtime_role="runtime_user",
             expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
             target_schema="public",
         )
 
@@ -350,6 +437,8 @@ async def test_lifespan_checks_revision_before_context_setup():
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
         POSTGRES_SCHEMA="public",
     )
     context = MagicMock()
@@ -388,6 +477,8 @@ async def test_lifespan_checks_revision_before_context_setup():
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
     legacy_revision_check.assert_not_awaited()

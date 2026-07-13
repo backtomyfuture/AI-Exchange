@@ -364,7 +364,13 @@ async def main() -> None:
         return
 
     eml_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "nas.eml")
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "tests",
+            "fixtures",
+            "synthetic_notification.eml",
+        )
     )
     if not os.path.exists(eml_path):
         logger.error("EML fixture was not found")

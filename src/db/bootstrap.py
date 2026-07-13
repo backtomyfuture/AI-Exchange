@@ -13,7 +13,14 @@ import psycopg
 from alembic import command
 from alembic.config import Config
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import sql
 
+from src.db.access_contract import (
+    AUDITOR_RELATION_ACCESS,
+    MAINTENANCE_RELATION_ACCESS,
+    RUNTIME_RELATION_ACCESS,
+    RelationAccess,
+)
 from src.db.migration_settings import load_migration_settings
 from src.db.roles import require_migration_database_role
 from src.db.schema import get_current_database_revision
@@ -172,6 +179,169 @@ def _upgrade_business_schema(dsn: str) -> None:
     config = Config(str(ALEMBIC_CONFIG_PATH))
     config.set_main_option("sqlalchemy.url", dsn.replace("%", "%%"))
     command.upgrade(config, "head")
+
+
+async def _revoke_relation_access(
+    conn: psycopg.AsyncConnection,
+    *,
+    target_schema: str,
+    role: str,
+) -> None:
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT relation.relname::pg_catalog.text, "
+            "ARRAY("
+            "SELECT attribute.attname::pg_catalog.text "
+            "FROM pg_catalog.pg_attribute AS attribute "
+            "WHERE attribute.attrelid = relation.oid "
+            "AND attribute.attnum > 0 AND NOT attribute.attisdropped "
+            "ORDER BY attribute.attnum) "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS relation_schema "
+            "ON relation_schema.oid = relation.relnamespace "
+            "WHERE relation_schema.nspname = %s "
+            "AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')",
+            (target_schema,),
+        )
+        relations = await cursor.fetchall()
+        for relation_name, columns in relations:
+            relation = sql.Identifier(target_schema, relation_name)
+            grantee = sql.Identifier(role)
+            await cursor.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(
+                    relation,
+                    grantee,
+                )
+            )
+            if not columns:
+                continue
+            column_list = sql.SQL(", ").join(map(sql.Identifier, columns))
+            for privilege in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
+                await cursor.execute(
+                    sql.SQL("REVOKE {} ({}) ON TABLE {} FROM {}").format(
+                        sql.SQL(privilege),
+                        column_list,
+                        relation,
+                        grantee,
+                    )
+                )
+
+
+async def _grant_relation_access(
+    conn: psycopg.AsyncConnection,
+    *,
+    target_schema: str,
+    role: str,
+    manifest: dict[str, RelationAccess],
+) -> None:
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT relation.relname::pg_catalog.text "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS relation_schema "
+            "ON relation_schema.oid = relation.relnamespace "
+            "WHERE relation_schema.nspname = %s "
+            "AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')",
+            (target_schema,),
+        )
+        existing_relations = {row[0] for row in await cursor.fetchall()}
+        for relation_name, access in manifest.items():
+            if relation_name not in existing_relations:
+                continue
+            relation = sql.Identifier(target_schema, relation_name)
+            grantee = sql.Identifier(role)
+            if access.table_privileges:
+                privileges = sql.SQL(", ").join(map(sql.SQL, access.table_privileges))
+                await cursor.execute(
+                    sql.SQL("GRANT {} ON TABLE {} TO {}").format(
+                        privileges,
+                        relation,
+                        grantee,
+                    )
+                )
+            for privilege, columns in (
+                ("SELECT", access.select_columns),
+                ("INSERT", access.insert_columns),
+                ("UPDATE", access.update_columns),
+            ):
+                if not columns:
+                    continue
+                column_list = sql.SQL(", ").join(map(sql.Identifier, columns))
+                await cursor.execute(
+                    sql.SQL("GRANT {} ({}) ON TABLE {} TO {}").format(
+                        sql.SQL(privilege),
+                        column_list,
+                        relation,
+                        grantee,
+                    )
+                )
+            if access.delete:
+                await cursor.execute(
+                    sql.SQL("GRANT DELETE ON TABLE {} TO {}").format(
+                        relation,
+                        grantee,
+                    )
+                )
+
+
+async def _apply_database_access_contract(
+    dsn: str,
+    *,
+    target_schema: str,
+    runtime_role: str,
+    maintenance_role: str,
+    auditor_role: str,
+) -> None:
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        for role, manifest in (
+            (runtime_role, RUNTIME_RELATION_ACCESS),
+            (maintenance_role, MAINTENANCE_RELATION_ACCESS),
+            (auditor_role, AUDITOR_RELATION_ACCESS),
+        ):
+            await _revoke_relation_access(
+                conn,
+                target_schema=target_schema,
+                role=role,
+            )
+            await _grant_relation_access(
+                conn,
+                target_schema=target_schema,
+                role=role,
+                manifest=manifest,
+            )
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT pg_catalog.current_database()")
+            row = await cursor.fetchone()
+            if row is None or not isinstance(row[0], str):
+                raise RuntimeError("Database access contract target is unavailable")
+            database = sql.Identifier(row[0])
+            auditor = sql.Identifier(auditor_role)
+            schema = sql.Identifier(target_schema)
+            await cursor.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(
+                    database,
+                    auditor,
+                )
+            )
+            await cursor.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    database,
+                    auditor,
+                )
+            )
+            await cursor.execute(
+                sql.SQL("REVOKE ALL PRIVILEGES ON SCHEMA {} FROM {}").format(
+                    schema,
+                    auditor,
+                )
+            )
+            await cursor.execute(
+                sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                    schema,
+                    auditor,
+                )
+            )
+        await conn.commit()
 
 
 async def _read_checkpoint_index(
@@ -345,39 +515,76 @@ async def bootstrap_database(
     *,
     expected_migration_role: str,
     expected_runtime_role: str,
+    expected_maintenance_role: str,
+    expected_auditor_role: str,
     target_schema: str,
 ) -> dict[str, str | int]:
     """Upgrade both schemas; this is the only supported schema-writing entrypoint."""
-    if not expected_migration_role or not expected_runtime_role or not target_schema:
+    if (
+        not expected_migration_role
+        or not expected_runtime_role
+        or not expected_maintenance_role
+        or not expected_auditor_role
+        or not target_schema
+    ):
         raise RuntimeError("Database bootstrap identity contract is incomplete")
-    if expected_migration_role == expected_runtime_role:
+    if (
+        len(
+            {
+                expected_migration_role,
+                expected_runtime_role,
+                expected_maintenance_role,
+                expected_auditor_role,
+            }
+        )
+        != 4
+    ):
         raise RuntimeError("Database bootstrap identity contract is invalid")
     await require_migration_database_role(
         dsn,
         expected_migration_role=expected_migration_role,
         expected_runtime_role=expected_runtime_role,
+        expected_maintenance_role=expected_maintenance_role,
+        expected_auditor_role=expected_auditor_role,
         target_schema=target_schema,
+        allow_acl_reconciliation=True,
     )
+    _require_checkpoint_migration_manifest()
+    preexisting_revision = await get_current_database_revision(dsn)
     await require_database_schema_contract(
         dsn,
         target_schema=target_schema,
         require_complete=False,
+        expected_revision=(
+            preexisting_revision
+            if preexisting_revision in {"20260710_0002", "20260710_0003"}
+            else None
+        ),
     )
-    _require_checkpoint_migration_manifest()
     await asyncio.to_thread(_upgrade_business_schema, dsn)
     business_revision = await get_current_database_revision(dsn)
     if business_revision is None or "," in business_revision:
         raise RuntimeError("Business schema revision is unavailable after bootstrap")
     checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)
+    await _apply_database_access_contract(
+        dsn,
+        target_schema=target_schema,
+        runtime_role=expected_runtime_role,
+        maintenance_role=expected_maintenance_role,
+        auditor_role=expected_auditor_role,
+    )
     await require_database_schema_contract(
         dsn,
         target_schema=target_schema,
         require_complete=True,
+        expected_revision=business_revision,
     )
     await require_migration_database_role(
         dsn,
         expected_migration_role=expected_migration_role,
         expected_runtime_role=expected_runtime_role,
+        expected_maintenance_role=expected_maintenance_role,
+        expected_auditor_role=expected_auditor_role,
         target_schema=target_schema,
     )
     summary: dict[str, str | int] = {
@@ -396,6 +603,8 @@ def main() -> None:
                 settings.database_url.get_secret_value(),
                 expected_migration_role=settings.expected_migration_role,
                 expected_runtime_role=settings.expected_runtime_role,
+                expected_maintenance_role=settings.expected_maintenance_role,
+                expected_auditor_role=settings.expected_auditor_role,
                 target_schema=settings.target_schema,
             )
         )

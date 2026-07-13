@@ -5,8 +5,10 @@ import re
 import html
 import hashlib
 import hmac
+import threading
 from concurrent.futures import (
     CancelledError as FutureCancelledError,
+    Future as ConcurrentFuture,
     TimeoutError as FutureTimeoutError,
 )
 from copy import deepcopy
@@ -104,6 +106,7 @@ ALLOWED_CARD_ACTIONS = frozenset(
 
 # Global instances
 lark_ws_client: Optional[WsClient] = None
+_lark_ws_thread: threading.Thread | None = None
 lark_api_client: Optional[lark_oapi.Client] = None
 card_builder: Optional[LarkCardBuilder] = None
 db_manager = None
@@ -113,6 +116,23 @@ exchange_client = None
 worker_loop = None
 _mock_store = {} # Store for test card states
 _command_router: Optional[CommandRouter] = None
+_lark_intake_enabled = True
+_lark_intake_lock = threading.Lock()
+_lark_background_futures: set[Any] = set()
+_lark_background_completions: dict[Any, ConcurrentFuture] = {}
+_LARK_CANCEL_FINALIZE_SECONDS = 1.0
+
+
+def enable_lark_intake() -> None:
+    global _lark_intake_enabled
+    with _lark_intake_lock:
+        _lark_intake_enabled = True
+
+
+def disable_lark_intake() -> None:
+    global _lark_intake_enabled
+    with _lark_intake_lock:
+        _lark_intake_enabled = False
 
 
 def _register_builtin_commands():
@@ -223,6 +243,7 @@ def init_lark_app(
     Initialize global dependencies
     """
     global db_manager, graph, graph_dependencies, exchange_client, lark_api_client, card_builder, worker_loop
+    disable_lark_intake()
     db_manager = db_mgr
     graph = graph_instance
     graph_dependencies = dependencies
@@ -252,6 +273,7 @@ def init_lark_app(
 
     init_commands(db_mgr)
     _register_builtin_commands()
+    enable_lark_intake()
 
 
 def _require_graph_dependencies() -> GraphDependencies:
@@ -1545,6 +1567,11 @@ def build_final_response(text):
 
 def _observe_background_future(future):
     def completed(done) -> None:
+        with _lark_intake_lock:
+            completion = _lark_background_completions.get(done)
+            if completion is None or completion.done():
+                _lark_background_futures.discard(done)
+                _lark_background_completions.pop(done, None)
         try:
             done.result()
         except (asyncio.CancelledError, FutureCancelledError):
@@ -1559,20 +1586,159 @@ def _observe_background_future(future):
     return future
 
 
+async def _run_lark_background_operation(coro, completion: ConcurrentFuture):
+    try:
+        return await coro
+    finally:
+        if not completion.done():
+            completion.set_result(None)
+
+
+def _track_foreign_background_completion(future, completion: ConcurrentFuture) -> None:
+    def finalized(_done) -> None:
+        with _lark_intake_lock:
+            _lark_background_futures.discard(future)
+            _lark_background_completions.pop(future, None)
+
+    completion.add_done_callback(finalized)
+
+
+def _run_no_loop_fallback(coro, future, completion: ConcurrentFuture):
+    """Run an admitted fallback without holding the intake admission lock."""
+    try:
+        return asyncio.run(coro)
+    finally:
+        if not future.done():
+            future.set_result(None)
+        if not completion.done():
+            completion.set_result(None)
+
+
+async def _await_foreign_background_future(future: asyncio.Future) -> Any:
+    return await future
+
+
+def _background_waiter(future):
+    if not isinstance(future, asyncio.Future):
+        return asyncio.wrap_future(future)
+
+    current_loop = asyncio.get_running_loop()
+    owner_loop = future.get_loop()
+    if owner_loop is current_loop:
+        return future
+    if owner_loop.is_running():
+        bridge = asyncio.run_coroutine_threadsafe(
+            _await_foreign_background_future(future),
+            owner_loop,
+        )
+        return asyncio.wrap_future(bridge)
+
+    if not future.done():
+        future.cancel()
+
+    async def collect_stopped_loop_future() -> Any:
+        return future.result()
+
+    return current_loop.create_task(collect_stopped_loop_future())
+
+
+async def drain_lark_background_tasks(
+    *,
+    timeout_seconds: float = ACTION_WAIT_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for accepted Lark actions, then cancel and collect on timeout."""
+    with _lark_intake_lock:
+        pending_futures = tuple(_lark_background_futures)
+        completion_by_future = {
+            future: _lark_background_completions.get(future)
+            for future in pending_futures
+        }
+    if not pending_futures:
+        return
+
+    waiter_to_future = {}
+    for future in pending_futures:
+        completion = completion_by_future[future]
+        waiter = (
+            asyncio.wrap_future(completion)
+            if completion is not None
+            else _background_waiter(future)
+        )
+        waiter_to_future[waiter] = future
+
+    done_waiters, pending_waiters = await asyncio.wait(
+        waiter_to_future,
+        timeout=max(0.0, timeout_seconds),
+    )
+    for waiter in pending_waiters:
+        waiter_to_future[waiter].cancel()
+
+    if pending_waiters:
+        finalized, still_pending = await asyncio.wait(
+            pending_waiters,
+            timeout=_LARK_CANCEL_FINALIZE_SECONDS,
+        )
+        done_waiters.update(finalized)
+        if still_pending:
+            raise RuntimeError("lark_background_shutdown_timeout")
+
+    await asyncio.gather(*done_waiters, return_exceptions=True)
+    with _lark_intake_lock:
+        for future in pending_futures:
+            if future.done():
+                _lark_background_futures.discard(future)
+
+
+async def stop_lark_intake(
+    *,
+    timeout_seconds: float = ACTION_WAIT_TIMEOUT_SECONDS,
+) -> None:
+    """Close the Lark intake gate and collect every accepted background action."""
+    disable_lark_intake()
+    await drain_lark_background_tasks(timeout_seconds=timeout_seconds)
+
+
 def safe_async_run(coro):
     """
     Safely run a coroutine in the background (non-blocking for the caller).
     This is thread-safe and MUST be used when calling async code from the WebSocket thread.
     """
     global worker_loop
-    if worker_loop and worker_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro, worker_loop)
-        return _observe_background_future(future)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    return _observe_background_future(loop.create_task(coro))
+    completion = None
+    no_loop_fallback = False
+    with _lark_intake_lock:
+        if not _lark_intake_enabled:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError("lark_intake_disabled")
+        if worker_loop and worker_loop.is_running():
+            completion = ConcurrentFuture()
+            future = asyncio.run_coroutine_threadsafe(
+                _run_lark_background_operation(coro, completion),
+                worker_loop,
+            )
+            _lark_background_futures.add(future)
+            _lark_background_completions[future] = completion
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:
+                future = ConcurrentFuture()
+                completion = ConcurrentFuture()
+                _lark_background_futures.add(future)
+                _lark_background_completions[future] = completion
+                no_loop_fallback = True
+            else:
+                future = loop.create_task(coro)
+                _lark_background_futures.add(future)
+    if completion is not None:
+        _track_foreign_background_completion(future, completion)
+    if no_loop_fallback:
+        return _run_no_loop_fallback(coro, future, completion)
+    return _observe_background_future(future)
 
 def safe_async_wait(coro):
     """
@@ -1580,30 +1746,56 @@ def safe_async_wait(coro):
     This is thread-safe and MUST be used when calling async code from the WebSocket thread.
     """
     global worker_loop
-    if worker_loop and worker_loop.is_running():
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-        if current_loop is worker_loop:
+    completion = None
+    no_loop_fallback = False
+    with _lark_intake_lock:
+        if not _lark_intake_enabled:
             close = getattr(coro, "close", None)
             if callable(close):
                 close()
-            raise RuntimeError("safe_async_wait_same_loop")
-        future = asyncio.run_coroutine_threadsafe(coro, worker_loop)
-        try:
-            return future.result(timeout=ACTION_WAIT_TIMEOUT_SECONDS)
-        except FutureTimeoutError:
-            future.cancel()
-            raise RuntimeError("safe_async_wait_timeout") from None
+            raise RuntimeError("lark_intake_disabled")
+        if worker_loop and worker_loop.is_running():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is worker_loop:
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError("safe_async_wait_same_loop")
+            completion = ConcurrentFuture()
+            future = asyncio.run_coroutine_threadsafe(
+                _run_lark_background_operation(coro, completion),
+                worker_loop,
+            )
+            _lark_background_futures.add(future)
+            _lark_background_completions[future] = completion
+        else:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                future = ConcurrentFuture()
+                completion = ConcurrentFuture()
+                _lark_background_futures.add(future)
+                _lark_background_completions[future] = completion
+                no_loop_fallback = True
+            else:
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError("safe_async_wait_running_loop")
+
+    if completion is not None:
+        _track_foreign_background_completion(future, completion)
+    if no_loop_fallback:
+        return _run_no_loop_fallback(coro, future, completion)
+
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    close = getattr(coro, "close", None)
-    if callable(close):
-        close()
-    raise RuntimeError("safe_async_wait_running_loop")
+        return future.result(timeout=ACTION_WAIT_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        future.cancel()
+        raise RuntimeError("safe_async_wait_timeout") from None
 
 async def _move_claimed_action_to_manual(
     email_id: str,
@@ -2236,7 +2428,11 @@ def start_lark_ws():
         logger.warning("Lark App ID/Secret missing. WS Client not started.")
         return
 
-    global lark_ws_client
+    global lark_ws_client, _lark_ws_thread
+
+    if _lark_ws_thread is not None and _lark_ws_thread.is_alive():
+        logger.warning("Lark WebSocket Client is already running.")
+        return
 
     builder = lark_oapi.EventDispatcherHandler.builder("", "") \
         .register_p2_card_action_trigger(handle_card_action)
@@ -2253,7 +2449,47 @@ def start_lark_ws():
         log_level=lark_oapi.LogLevel.CRITICAL
     )
 
-    import threading
-    ws_thread = threading.Thread(target=lark_ws_client.start, daemon=True)
-    ws_thread.start()
+    _lark_ws_thread = threading.Thread(target=lark_ws_client.start, daemon=True)
+    _lark_ws_thread.start()
     logger.info("Lark WebSocket Client started in background thread.")
+
+
+def stop_lark_ws(*, timeout_seconds: float = 5.0) -> None:
+    """Disconnect the SDK client and join its daemon thread with a hard bound."""
+
+    global lark_ws_client, _lark_ws_thread
+    disable_lark_intake()
+    client = lark_ws_client
+    thread = _lark_ws_thread
+    if client is None or thread is None:
+        lark_ws_client = None
+        _lark_ws_thread = None
+        return
+
+    disconnect_error = False
+    try:
+        setattr(client, "_auto_reconnect", False)
+        public_stop = getattr(client, "stop", None)
+        if callable(public_stop):
+            public_stop()
+        else:
+            from lark_oapi.ws import client as ws_client_module
+
+            sdk_loop = ws_client_module.loop
+            disconnect = getattr(client, "_disconnect", None)
+            if callable(disconnect) and sdk_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(disconnect(), sdk_loop)
+                try:
+                    future.result(timeout=max(0.0, timeout_seconds))
+                except BaseException:
+                    disconnect_error = True
+            if sdk_loop.is_running():
+                sdk_loop.call_soon_threadsafe(sdk_loop.stop)
+    except BaseException:
+        disconnect_error = True
+
+    thread.join(timeout=max(0.0, timeout_seconds))
+    if thread.is_alive() or disconnect_error:
+        raise RuntimeError("lark_ws_shutdown_failed")
+    lark_ws_client = None
+    _lark_ws_thread = None

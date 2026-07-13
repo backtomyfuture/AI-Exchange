@@ -8,6 +8,7 @@ the plan, backup receipt and service-quiescence gates have succeeded.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -20,6 +21,10 @@ import ormsgpack
 import psycopg
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from src.db.maintenance_fence import (
+    CHECKPOINT_MAINTENANCE_LOCK_KEY,
+    DEFAULT_MAINTENANCE_EXCLUSIVE_SETTLE_SECONDS,
+)
 from src.maintenance.cleanup_models import (
     EXCLUSION_REASONS,
     MINIMUM_CLEANUP_AGE,
@@ -41,11 +46,6 @@ DEFAULT_LOCK_TIMEOUT_MS: Final = 2_000
 DEFAULT_STATEMENT_TIMEOUT_MS: Final = 15_000
 DEFAULT_IDLE_TRANSACTION_TIMEOUT_MS: Final = 15_000
 
-_ADVISORY_LOCK_KEY = int.from_bytes(
-    hashlib.sha256(b"ai-exchange/checkpoint-cleanup/v1").digest()[:8],
-    byteorder="big",
-    signed=True,
-)
 _TERMINAL_STATUS_SQL = "('sent', 'rejected', 'draft_saved')"
 _SAFE_ERROR_CODES = frozenset(
     {
@@ -102,9 +102,7 @@ class CheckpointScanSnapshot:
 
     @property
     def estimated_logical_bytes(self) -> int:
-        return sum(
-            candidate.estimated_logical_bytes for candidate in self.candidates
-        )
+        return sum(candidate.estimated_logical_bytes for candidate in self.candidates)
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,9 +431,7 @@ def _validate_scan_inputs(
         raise CheckpointRepositoryError("cleanup_invalid_row_budget")
     if (
         type(max_estimated_logical_bytes) is not int
-        or not 1
-        <= max_estimated_logical_bytes
-        <= MAX_ESTIMATED_LOGICAL_BYTES
+        or not 1 <= max_estimated_logical_bytes <= MAX_ESTIMATED_LOGICAL_BYTES
     ):
         raise CheckpointRepositoryError("cleanup_invalid_byte_budget")
     return normalized_cutoff
@@ -487,7 +483,9 @@ async def _read_database_metadata(
 
     try:
         revision_rows = await (
-            await conn.execute("SELECT version_num FROM alembic_version ORDER BY version_num")
+            await conn.execute(
+                "SELECT version_num FROM alembic_version ORDER BY version_num"
+            )
         ).fetchall()
         migration_rows = await (
             await conn.execute("SELECT v FROM checkpoint_migrations ORDER BY v")
@@ -499,8 +497,7 @@ async def _read_database_metadata(
     if (
         row is None
         or len(actual_revisions) != 1
-        or actual_revisions[0]
-        not in CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS
+        or actual_revisions[0] not in CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS
     ):
         raise CheckpointRepositoryError("cleanup_schema_revision_mismatch")
     actual_revision = actual_revisions[0]
@@ -752,9 +749,7 @@ async def _shape_and_handles(
     )
     if attachment_inline_present is not False or attachment_descriptor is None:
         return False, False
-    attachments_ok, attachment_tokens = _decode_bounded_value(
-        attachment_descriptor
-    )
+    attachments_ok, attachment_tokens = _decode_bounded_value(attachment_descriptor)
 
     pdf_descriptor = await _read_blob_metadata(
         conn,
@@ -789,9 +784,18 @@ async def _inventory_digest(
             SELECT
                 checkpoint_ns,
                 checkpoint_id,
-                coalesce(parent_checkpoint_id, ''),
-                coalesce(type, ''),
-                xmin::text,
+                CASE
+                    WHEN parent_checkpoint_id IS NULL THEN
+                        ARRAY['null']::pg_catalog.text[]
+                    ELSE
+                        ARRAY['text', parent_checkpoint_id]::pg_catalog.text[]
+                END,
+                CASE
+                    WHEN type IS NULL THEN
+                        ARRAY['null']::pg_catalog.text[]
+                    ELSE
+                        ARRAY['text', type]::pg_catalog.text[]
+                END,
                 octet_length(thread_id)
                     + octet_length(checkpoint_ns)
                     + octet_length(checkpoint_id)
@@ -799,7 +803,23 @@ async def _inventory_digest(
                     + coalesce(octet_length(type), 0)
                     + octet_length(checkpoint::text)
                     + octet_length(metadata::text),
-                checkpoint -> 'channel_versions'
+                checkpoint -> 'channel_versions',
+                pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to('checkpoint:v1', 'UTF8')
+                        || pg_catalog.decode('00', 'hex')
+                        || pg_catalog.convert_to(checkpoint::text, 'UTF8')
+                    ),
+                    'hex'
+                ),
+                pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to('metadata:v1', 'UTF8')
+                        || pg_catalog.decode('00', 'hex')
+                        || pg_catalog.convert_to(metadata::text, 'UTF8')
+                    ),
+                    'hex'
+                )
             FROM checkpoints AS checkpoint_row
             WHERE thread_id = %s
             ORDER BY checkpoint_ns, checkpoint_id
@@ -815,13 +835,27 @@ async def _inventory_digest(
                 channel,
                 version,
                 type,
-                xmin::text,
                 octet_length(thread_id)
                     + octet_length(checkpoint_ns)
                     + octet_length(channel)
                     + octet_length(version)
                     + octet_length(type)
-                    + coalesce(octet_length(blob), 0)
+                    + coalesce(octet_length(blob), 0),
+                pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to('checkpoint_blob:v1', 'UTF8')
+                        || pg_catalog.decode('00', 'hex')
+                        || CASE
+                            WHEN blob IS NULL THEN
+                                pg_catalog.convert_to('null', 'UTF8')
+                            ELSE
+                                pg_catalog.convert_to('bytes', 'UTF8')
+                                || pg_catalog.decode('00', 'hex')
+                                || blob
+                        END
+                    ),
+                    'hex'
+                )
             FROM checkpoint_blobs AS blob_row
             WHERE thread_id = %s
             ORDER BY checkpoint_ns, channel, version
@@ -838,9 +872,13 @@ async def _inventory_digest(
                 task_id,
                 idx,
                 channel,
-                coalesce(type, ''),
+                CASE
+                    WHEN type IS NULL THEN
+                        ARRAY['null']::pg_catalog.text[]
+                    ELSE
+                        ARRAY['text', type]::pg_catalog.text[]
+                END,
                 task_path,
-                xmin::text,
                 octet_length(thread_id)
                     + octet_length(checkpoint_ns)
                     + octet_length(checkpoint_id)
@@ -849,7 +887,22 @@ async def _inventory_digest(
                     + octet_length(channel)
                     + coalesce(octet_length(type), 0)
                     + octet_length(blob)
-                    + octet_length(task_path)
+                    + octet_length(task_path),
+                pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to('checkpoint_write_blob:v1', 'UTF8')
+                        || pg_catalog.decode('00', 'hex')
+                        || CASE
+                            WHEN blob IS NULL THEN
+                                pg_catalog.convert_to('null', 'UTF8')
+                            ELSE
+                                pg_catalog.convert_to('bytes', 'UTF8')
+                                || pg_catalog.decode('00', 'hex')
+                                || blob
+                        END
+                    ),
+                    'hex'
+                )
             FROM checkpoint_writes AS write_row
             WHERE thread_id = %s
             ORDER BY checkpoint_ns, checkpoint_id, task_id, idx
@@ -865,12 +918,10 @@ async def _inventory_digest(
     ):
         return None
 
-    checkpoint_ids = {
-        (str(row[0]), str(row[1])) for row in checkpoint_rows
-    }
+    checkpoint_ids = {(str(row[0]), str(row[1])) for row in checkpoint_rows}
     referenced_blobs: set[tuple[str, str, str]] = set()
     for row in checkpoint_rows:
-        versions = row[6]
+        versions = row[5]
         if not isinstance(versions, Mapping):
             return None
         for channel, version in versions.items():
@@ -882,15 +933,20 @@ async def _inventory_digest(
         for row in blob_rows
     ):
         return None
-    if any(
-        (str(row[0]), str(row[1])) not in checkpoint_ids for row in write_rows
-    ):
+    if any((str(row[0]), str(row[1])) not in checkpoint_ids for row in write_rows):
         return None
 
     inventory = {
         "status": stats.status,
         "updated_at": stats.updated_at.isoformat(),
-        "checkpoints": [list(row[:6]) for row in checkpoint_rows],
+        "checkpoints": [
+            [
+                *row[:5],
+                str(row[6]),
+                str(row[7]),
+            ]
+            for row in checkpoint_rows
+        ],
         "checkpoint_blobs": [list(row) for row in blob_rows],
         "checkpoint_writes": [list(row) for row in write_rows],
     }
@@ -928,7 +984,9 @@ async def _inspect_thread(
     try:
         candidate = CleanupCandidate(
             thread_id=stats.thread_id,
-            thread_fingerprint=hashlib.sha256(stats.thread_id.encode("utf-8")).hexdigest(),
+            thread_fingerprint=hashlib.sha256(
+                stats.thread_id.encode("utf-8")
+            ).hexdigest(),
             status=stats.status,
             updated_at=stats.updated_at,
             checkpoint_rows=stats.checkpoint_rows,
@@ -1049,7 +1107,9 @@ class PostgresCheckpointRepository:
                             max_estimated_logical_bytes=max_estimated_logical_bytes,
                         )
                         if inspection.candidate is None:
-                            reason = inspection.exclusion_reason or "inventory_unavailable"
+                            reason = (
+                                inspection.exclusion_reason or "inventory_unavailable"
+                            )
                             counts[reason] += 1
                             continue
                         candidate = inspection.candidate
@@ -1169,12 +1229,22 @@ class PostgresCheckpointRepository:
             lock_row = await (
                 await conn.execute(
                     "SELECT pg_try_advisory_lock(%s)",
-                    (_ADVISORY_LOCK_KEY,),
+                    (CHECKPOINT_MAINTENANCE_LOCK_KEY,),
                 )
             ).fetchone()
             lock_acquired = bool(lock_row and lock_row[0])
             if not lock_acquired:
                 raise CheckpointRepositoryError("cleanup_lock_unavailable")
+
+            # PostgreSQL releases the runtime's shared advisory lock as soon as
+            # its fence backend dies.  The runtime process itself may still be
+            # alive until its next bounded monitor probe hard-stops it, so hold
+            # the exclusive lock through that complete detection window before
+            # exposing a deletion-capable session.
+            await asyncio.sleep(DEFAULT_MAINTENANCE_EXCLUSIVE_SETTLE_SECONDS)
+            metadata = await _read_database_metadata(conn)
+            _assert_plan_metadata(plan, metadata)
+            await _assert_plan_unexpired(conn, plan)
             yield CheckpointExecutionSession(
                 repository=self,
                 conn=conn,
@@ -1190,7 +1260,7 @@ class PostgresCheckpointRepository:
                     try:
                         await conn.execute(
                             "SELECT pg_advisory_unlock(%s)",
-                            (_ADVISORY_LOCK_KEY,),
+                            (CHECKPOINT_MAINTENANCE_LOCK_KEY,),
                         )
                     except psycopg.Error:
                         pass
@@ -1232,13 +1302,19 @@ class CheckpointExecutionSession:
                 metadata = await _read_database_metadata(self._conn)
                 _assert_plan_metadata(self._plan, metadata)
                 await _assert_plan_unexpired(self._conn, self._plan)
-                locked_email = await (
+                # PostgreSQL 15 requires a write-capable privilege for row
+                # locks and non-ACCESS-SHARE table locks.  The maintenance
+                # role intentionally has SELECT only on emails_log, so the
+                # The explicit operator quiescence attestation is a manual
+                # precondition; the runtime/maintenance advisory fence is the
+                # technical write-isolation boundary for this plain read.
+                current_email = await (
                     await self._conn.execute(
-                        "SELECT id FROM emails_log WHERE id = %s FOR UPDATE",
+                        "SELECT id FROM emails_log WHERE id = %s",
                         (candidate.thread_id,),
                     )
                 ).fetchone()
-                if locked_email is None:
+                if current_email is None:
                     return CandidateDeleteResult("stale", 0, 0, 0, 0)
                 await self._conn.execute(
                     "LOCK TABLE checkpoints, checkpoint_blobs, checkpoint_writes "

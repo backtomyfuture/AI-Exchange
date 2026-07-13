@@ -1,7 +1,12 @@
 import logging
 from psycopg_pool import AsyncConnectionPool
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from src.db.checkpoint_saver import (
+    CheckpointWriteFenceConfigurationError,
+    CheckpointWriteGuard,
+    FencedAsyncPostgresSaver,
+    configure_checkpoint_pool_connection,
+)
 from src.graph.builder import build_graph
 from src.graph.dependencies import GraphDependencies
 from src.utils.exchange_api import ExchangeClient
@@ -12,6 +17,7 @@ from src.storage import EncryptedFileContentStore
 
 logger = logging.getLogger(__name__)
 
+
 class AppContext:
     def __init__(self):
         self.exchange_client = None
@@ -21,6 +27,25 @@ class AppContext:
         self.pool = None
         self.content_store = None
         self.graph_dependencies = None
+        self._checkpoint_write_guard: CheckpointWriteGuard | None = None
+        self._checkpoint_setup_started = False
+
+    def bind_checkpoint_write_guard(self, guard: CheckpointWriteGuard) -> None:
+        """Bind the dedicated-session proof exactly once before graph setup."""
+
+        if (
+            self.graph is not None
+            or self._checkpoint_setup_started
+            or self._checkpoint_write_guard is not None
+        ):
+            raise CheckpointWriteFenceConfigurationError(
+                "checkpoint_write_fence_binding_closed"
+            )
+        if not callable(guard):
+            raise CheckpointWriteFenceConfigurationError(
+                "checkpoint_write_fence_not_bound"
+            )
+        self._checkpoint_write_guard = guard
 
     def initialize(self):
         """
@@ -48,15 +73,21 @@ class AppContext:
             content_store=self.content_store,
             drafts=self.db_manager,
         )
-        
+
         # 2. Postgres Connection Pool for LangGraph Checkpointer
         dsn = settings.database_url
-        
+
         # 3. Setup Checkpointer and Graph
         # We skip sync setup logic here assuming DB is initialized or will be by AsyncDatabaseManager
-        
+
         connection_kwargs = {"autocommit": True, "prepare_threshold": 0}
-        self.pool = AsyncConnectionPool(conninfo=dsn, max_size=20, kwargs=connection_kwargs, open=False)
+        self.pool = AsyncConnectionPool(
+            conninfo=dsn,
+            max_size=20,
+            kwargs=connection_kwargs,
+            configure=configure_checkpoint_pool_connection,
+            open=False,
+        )
         # checkpointer and graph will be initialized in setup_async() to ensure loop exists.
         logger.info("Application Context Initialized (Pool created, Graph deferred).")
 
@@ -65,6 +96,12 @@ class AppContext:
         Explicitly open the async connection pool and setup graph.
         Must be called from within a running asyncio loop.
         """
+        if self._checkpoint_write_guard is None:
+            raise CheckpointWriteFenceConfigurationError(
+                "checkpoint_write_fence_not_bound"
+            )
+        self._checkpoint_setup_started = True
+
         if self.db_manager:
             await self.db_manager.open()
 
@@ -93,14 +130,17 @@ class AppContext:
                 "Failed to initialize folder cache; using safe defaults: error_type=%s",
                 type(exc).__name__,
             )
-        
+
         if self.graph is None:
-            checkpointer = AsyncPostgresSaver(self.pool)
+            checkpointer = FencedAsyncPostgresSaver(
+                self.pool,
+                write_guard=self._checkpoint_write_guard,
+            )
             self.graph = build_graph(
                 checkpointer=checkpointer,
                 dependencies=self.graph_dependencies,
             )
-            logger.info("Graph initialized with AsyncPostgresSaver.")
+            logger.info("Graph initialized with FencedAsyncPostgresSaver.")
 
     async def close(self):
         if self.exchange_client:
@@ -110,8 +150,10 @@ class AppContext:
         if self.pool:
             await self.pool.close()
 
+
 # Singleton instance
 app_context = AppContext()
+
 
 def get_app_context():
     if app_context.exchange_client is None:

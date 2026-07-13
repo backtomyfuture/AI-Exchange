@@ -1,6 +1,17 @@
 .venv/
 __pycache__/
 *.pyc
+.coverage*
+.pytest_cache/
+htmlcov/
+.ruff_cache/
+tests/
+docs/
+.agent/
+.superpowers/
+artifacts/
+*.eml
+*.pdf
 .git/
 .env*
 secrets/

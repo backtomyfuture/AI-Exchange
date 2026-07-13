@@ -28,8 +28,15 @@ async def test_categorize_email_success(mock_env, graph_node_harness):
 
         return _decorator
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm", return_value=MagicMock()), patch(
-        "src.nodes.categorizer.with_llm_retry", side_effect=fake_retry_decorator
+    routing_engine = MagicMock()
+    routing_engine.execute_router = AsyncMock(side_effect=lambda routed: routed)
+    with (
+        patch("src.nodes.categorizer.get_routing_engine", return_value=routing_engine),
+        patch("src.providers.factory.get_llm_for_role", return_value=MagicMock()),
+        patch(
+            "src.nodes.categorizer.with_llm_retry",
+            side_effect=fake_retry_decorator,
+        ),
     ):
         result = await categorizer.categorize_email(
             state,
@@ -77,8 +84,11 @@ async def test_generate_draft_no_feedback(mock_env, graph_node_harness):
         context=[{"subject": "Hist", "body": "Old"}],
     )
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create, patch(
-        "src.nodes.drafter.with_llm_retry", side_effect=lambda **_: (lambda fn: fn)
+    with (
+        patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create,
+        patch(
+            "src.nodes.drafter.with_llm_retry", side_effect=lambda **_: lambda fn: fn
+        ),
     ):
         mock_create.return_value = MagicMock()
         mock_response = MagicMock(content="Generated Draft Content")
@@ -86,7 +96,10 @@ async def test_generate_draft_no_feedback(mock_env, graph_node_harness):
         mock_chain.ainvoke = AsyncMock(return_value=mock_response)
         mock_prompt = MagicMock()
         mock_prompt.__or__.return_value = mock_chain
-        with patch("src.nodes.drafter.ChatPromptTemplate.from_messages", return_value=mock_prompt):
+        with patch(
+            "src.nodes.drafter.ChatPromptTemplate.from_messages",
+            return_value=mock_prompt,
+        ):
             result = await drafter.generate_draft(
                 state,
                 graph_node_harness.dependencies,

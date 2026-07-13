@@ -1,0 +1,43 @@
+From: Synthetic Sender <sender@example.test>
+To: Synthetic Recipient <recipient@example.test>
+Cc: Synthetic Reviewer <reviewer@example.test>
+Date: Tue, 01 Jul 2025 09:30:00 +0000
+Message-ID: <synthetic-notification-001@example.test>
+Subject: [SYNTHETIC] Rendering fixture
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="synthetic-related-boundary"
+
+--synthetic-related-boundary
+Content-Type: multipart/alternative; boundary="synthetic-alternative-boundary"
+
+--synthetic-alternative-boundary
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Synthetic rendering fixture. This message contains no production data.
+
+--synthetic-alternative-boundary
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+<!doctype html>
+<html lang="en">
+  <body>
+    <h1>Synthetic rendering fixture</h1>
+    <p>This message contains no production data.</p>
+    <img src="cid:synthetic-pixel@example.test" alt="Synthetic pixel">
+  </body>
+</html>
+
+--synthetic-alternative-boundary--
+
+--synthetic-related-boundary
+Content-Type: image/png; name="synthetic-pixel.png"
+Content-Transfer-Encoding: base64
+Content-Disposition: inline; filename="synthetic-pixel.png"
+Content-ID: <synthetic-pixel@example.test>
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A
+AQUBAScY42YAAAAASUVORK5CYII=
+
+--synthetic-related-boundary--

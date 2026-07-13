@@ -31,6 +31,8 @@ def _environment(secret_path: Path) -> dict[str, str]:
         "MIGRATION_DATABASE_URL_FILE": str(secret_path),
         "POSTGRES_MIGRATION_OWNER_ROLE": "migration_owner",
         "POSTGRES_RUNTIME_ROLE": "runtime_user",
+        "POSTGRES_MAINTENANCE_ROLE": "maintenance_user",
+        "POSTGRES_CHECKPOINT_AUDITOR_ROLE": "checkpoint_auditor",
         "POSTGRES_SCHEMA": "public",
     }
 
@@ -45,6 +47,8 @@ def test_migration_settings_loads_only_a_private_secret_file(tmp_path: Path):
     assert settings.database_url.get_secret_value() == MIGRATION_DSN
     assert settings.expected_migration_role == "migration_owner"
     assert settings.expected_runtime_role == "runtime_user"
+    assert settings.expected_maintenance_role == "maintenance_user"
+    assert settings.expected_auditor_role == "checkpoint_auditor"
     assert settings.target_schema == "public"
     rendered = repr(settings)
     assert MIGRATION_DSN not in rendered
@@ -191,8 +195,17 @@ def test_migration_settings_rejects_fifo_without_blocking(tmp_path: Path):
     ("field_name", "value"),
     [
         ("POSTGRES_MIGRATION_OWNER_ROLE", "runtime_user"),
+        ("POSTGRES_MIGRATION_OWNER_ROLE", "maintenance_user"),
         ("POSTGRES_MIGRATION_OWNER_ROLE", "not-valid-role!"),
+        ("POSTGRES_RUNTIME_ROLE", "maintenance_user"),
         ("POSTGRES_RUNTIME_ROLE", "not-valid-role!"),
+        ("POSTGRES_MAINTENANCE_ROLE", "migration_owner"),
+        ("POSTGRES_MAINTENANCE_ROLE", "runtime_user"),
+        ("POSTGRES_MAINTENANCE_ROLE", "not-valid-role!"),
+        ("POSTGRES_CHECKPOINT_AUDITOR_ROLE", "migration_owner"),
+        ("POSTGRES_CHECKPOINT_AUDITOR_ROLE", "runtime_user"),
+        ("POSTGRES_CHECKPOINT_AUDITOR_ROLE", "maintenance_user"),
+        ("POSTGRES_CHECKPOINT_AUDITOR_ROLE", "not-valid-role!"),
         ("POSTGRES_SCHEMA", "not-valid-schema!"),
     ],
 )
@@ -235,6 +248,8 @@ def test_bootstrap_cli_uses_only_the_dedicated_migration_settings(tmp_path: Path
         database_url=SecretStr(MIGRATION_DSN),
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
     bootstrap = AsyncMock(return_value={"alembic": "20260710_0002", "checkpoint": 9})
@@ -261,6 +276,8 @@ def test_bootstrap_cli_uses_only_the_dedicated_migration_settings(tmp_path: Path
         MIGRATION_DSN,
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
 
@@ -275,6 +292,8 @@ def test_bootstrap_cli_cuts_off_downstream_secret_bearing_exception(
         database_url=SecretStr(MIGRATION_DSN),
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
     downstream = RuntimeError(f"connection failed: {MIGRATION_DSN}")
@@ -320,6 +339,8 @@ def test_migration_settings_does_not_fall_back_to_runtime_environment(
         "POSTGRES_DB": "runtime-db-name",
         "POSTGRES_MIGRATION_OWNER_ROLE": "migration_owner",
         "POSTGRES_RUNTIME_ROLE": "runtime_user",
+        "POSTGRES_MAINTENANCE_ROLE": "maintenance_user",
+        "POSTGRES_CHECKPOINT_AUDITOR_ROLE": "checkpoint_auditor",
         "POSTGRES_SCHEMA": "public",
     }
 

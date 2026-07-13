@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -57,20 +58,79 @@ def test_task7_smoke_scripts_can_be_imported_outside_repository(
 
 @pytest.mark.asyncio
 async def test_reprocess_script_passes_shared_graph_dependencies(monkeypatch):
+    events: list[str] = []
     dependencies = MagicMock(name="graph_dependencies")
+
+    async def setup_async() -> None:
+        events.append("context_setup")
+
+    async def close_context() -> None:
+        events.append("context_close")
+
+    def bind_write_guard(guard) -> None:
+        assert callable(guard)
+        events.append("write_guard_bound")
+
     ctx = SimpleNamespace(
         db_manager=MagicMock(name="db_manager"),
         graph=MagicMock(name="graph"),
         exchange_client=MagicMock(name="exchange_client"),
         graph_dependencies=dependencies,
-        setup_async=AsyncMock(),
-        close=AsyncMock(),
+        bind_checkpoint_write_guard=MagicMock(side_effect=bind_write_guard),
+        setup_async=AsyncMock(side_effect=setup_async),
+        close=AsyncMock(side_effect=close_context),
     )
     init_lark = MagicMock()
 
+    class RuntimeFence:
+        def __init__(self, dsn: str, *, fail_stop) -> None:
+            assert dsn == "postgresql://runtime/test"
+            assert callable(fail_stop)
+
+        async def start(self) -> None:
+            events.append("fence_start")
+
+        async def assert_held(self) -> None:
+            raise AssertionError("startup binds the guard without invoking it")
+
+        async def close(self) -> None:
+            events.append("fence_close")
+
+    def validate_runtime_security(_settings) -> None:
+        events.append("runtime_security_validated")
+
+    async def require_runtime_database_boundary(_settings) -> None:
+        events.append("runtime_database_preflight")
+
     monkeypatch.setattr("src.init_app.get_app_context", lambda: ctx)
+    monkeypatch.setattr(
+        reprocess_email,
+        "get_settings",
+        lambda: SimpleNamespace(database_url="postgresql://runtime/test"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "RuntimeCheckpointMaintenanceFence",
+        RuntimeFence,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "validate_runtime_security",
+        validate_runtime_security,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "require_runtime_database_boundary",
+        require_runtime_database_boundary,
+        raising=False,
+    )
     monkeypatch.setattr(lark_app, "init_lark_app", init_lark)
-    monkeypatch.setattr(reprocess_email, "list_stuck_emails", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        reprocess_email, "list_stuck_emails", AsyncMock(return_value=[])
+    )
     monkeypatch.setattr(sys, "argv", ["reprocess_email.py", "--list-stuck"])
 
     await reprocess_email.main()
@@ -79,6 +139,120 @@ async def test_reprocess_script_passes_shared_graph_dependencies(monkeypatch):
     init_lark.assert_called_once()
     assert init_lark.call_args.kwargs["dependencies"] is dependencies
     ctx.close.assert_awaited_once_with()
+    assert events == [
+        "runtime_security_validated",
+        "runtime_database_preflight",
+        "fence_start",
+        "write_guard_bound",
+        "context_setup",
+        "context_close",
+        "fence_close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reprocess_preflight_failure_starts_no_fence_or_context(monkeypatch):
+    events: list[str] = []
+    settings = SimpleNamespace(database_url="postgresql://runtime/test")
+    get_context = MagicMock()
+
+    def validate_runtime_security(_settings) -> None:
+        events.append("runtime_security_validated")
+
+    async def reject_database(_settings) -> None:
+        events.append("runtime_database_preflight")
+        raise RuntimeError("database_role_preflight_failed")
+
+    class RuntimeFence:
+        def __init__(self, *_args, **_kwargs) -> None:
+            events.append("fence_created")
+
+    monkeypatch.setattr(
+        reprocess_email, "get_settings", lambda: settings, raising=False
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "validate_runtime_security",
+        validate_runtime_security,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "require_runtime_database_boundary",
+        reject_database,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reprocess_email,
+        "RuntimeCheckpointMaintenanceFence",
+        RuntimeFence,
+        raising=False,
+    )
+    monkeypatch.setattr("src.init_app.get_app_context", get_context)
+    monkeypatch.setattr(sys, "argv", ["reprocess_email.py", "--list-stuck"])
+
+    with pytest.raises(RuntimeError, match="database_role_preflight_failed"):
+        await reprocess_email.main()
+
+    assert events == ["runtime_security_validated", "runtime_database_preflight"]
+    get_context.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reprocess_shutdown_failure_hard_exits_without_releasing_fence(
+    monkeypatch,
+):
+    ctx = SimpleNamespace(
+        close=AsyncMock(side_effect=RuntimeError("PRIVATE-CLOSE-DETAIL"))
+    )
+    fence = SimpleNamespace(close=AsyncMock())
+    hard_exit = MagicMock()
+    monkeypatch.setattr(reprocess_email.os, "_exit", hard_exit)
+
+    with pytest.raises(RuntimeError, match="^reprocess_shutdown_incomplete$") as caught:
+        await reprocess_email._close_fenced_context(ctx, fence)
+
+    assert caught.value.__cause__ is None
+    assert "PRIVATE" not in str(caught.value)
+    hard_exit.assert_called_once_with(70)
+    fence.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprocess_shutdown_hang_is_wall_clock_bounded_and_keeps_fence(
+    monkeypatch,
+):
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_tasks: list[asyncio.Task] = []
+
+    async def cancellation_resistant_close() -> None:
+        close_tasks.append(asyncio.current_task())
+        close_started.set()
+        try:
+            await release_close.wait()
+        except asyncio.CancelledError:
+            await release_close.wait()
+
+    ctx = SimpleNamespace(close=cancellation_resistant_close)
+    fence = SimpleNamespace(close=AsyncMock())
+    hard_exit = MagicMock()
+    monkeypatch.setattr(reprocess_email, "_CONTEXT_SHUTDOWN_SECONDS", 0.01)
+    monkeypatch.setattr(reprocess_email.os, "_exit", hard_exit)
+    shutdown = asyncio.create_task(reprocess_email._close_fenced_context(ctx, fence))
+
+    try:
+        await asyncio.wait_for(close_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.05)
+        hard_exit.assert_called_once_with(70)
+        with pytest.raises(RuntimeError, match="^reprocess_shutdown_incomplete$"):
+            await shutdown
+        fence.close.assert_not_awaited()
+    finally:
+        release_close.set()
+        if not shutdown.done():
+            shutdown.cancel()
+        await asyncio.gather(shutdown, *close_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -194,7 +368,9 @@ async def test_manual_node_script_uses_dependencies_and_slim_state(mock_env):
 
 
 @pytest.mark.asyncio
-async def test_push_test_pdf_uses_explicit_test_boundary_not_graph(mock_env, monkeypatch):
+async def test_push_test_pdf_uses_explicit_test_boundary_not_graph(
+    mock_env, monkeypatch
+):
     email = {
         "id": "test_push_script_smoke",
         "subject": "Test PDF",
@@ -319,7 +495,9 @@ async def test_push_test_main_sends_pdf_url_string(mock_env, monkeypatch):
     monkeypatch.setenv("LARK_APP_ID", "app-id")
     monkeypatch.setenv("LARK_CHAT_ID", "chat-id")
     monkeypatch.setattr(push_test_card.os.path, "exists", lambda _path: True)
-    monkeypatch.setattr("email.message_from_binary_file", lambda *_args, **_kwargs: message)
+    monkeypatch.setattr(
+        "email.message_from_binary_file", lambda *_args, **_kwargs: message
+    )
     monkeypatch.setattr("builtins.open", MagicMock())
     monkeypatch.setattr(push_test_card, "_extract_body", lambda _message: "body")
     inject_debug = AsyncMock(return_value=True)
@@ -371,7 +549,9 @@ def _configure_push_test_main_pdf_outcome(monkeypatch, outcome):
     monkeypatch.setenv("LARK_APP_ID", "app-id")
     monkeypatch.setenv("LARK_CHAT_ID", "chat-id")
     monkeypatch.setattr(push_test_card.os.path, "exists", lambda _path: True)
-    monkeypatch.setattr("email.message_from_binary_file", lambda *_args, **_kwargs: message)
+    monkeypatch.setattr(
+        "email.message_from_binary_file", lambda *_args, **_kwargs: message
+    )
     monkeypatch.setattr("builtins.open", MagicMock())
     monkeypatch.setattr(push_test_card, "_extract_body", lambda _message: "body")
     monkeypatch.setattr(push_test_card, "_inject_debug_original", inject_debug)

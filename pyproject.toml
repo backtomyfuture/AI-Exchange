@@ -1,6 +1,9 @@
 [project.optional-dependencies]
 codex = ["oauth-cli-kit>=0.1.3"]
 
+[dependency-groups]
+dev = ["ruff==0.15.13"]
+
 [project]
 name = "ai-exchange"
 version = "0.1.0"

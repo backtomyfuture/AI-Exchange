@@ -80,6 +80,8 @@ async def test_bootstrap_checks_checkpoint_manifest_before_first_schema_write():
             "postgresql://migration/private",
             expected_migration_role="migration_owner",
             expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role="checkpoint_auditor",
             target_schema="public",
         )
 

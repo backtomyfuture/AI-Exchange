@@ -28,6 +28,8 @@ async def run_migrations(
             settings.database_url.get_secret_value(),
             expected_migration_role=settings.expected_migration_role,
             expected_runtime_role=settings.expected_runtime_role,
+            expected_maintenance_role=settings.expected_maintenance_role,
+            expected_auditor_role=settings.expected_auditor_role,
             target_schema=settings.target_schema,
         )
     except Exception:

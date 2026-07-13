@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -11,6 +12,11 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.db.bootstrap import bootstrap_database
+from src.db.maintenance_fence import (
+    CHECKPOINT_MAINTENANCE_LOCK_KEY,
+    RuntimeCheckpointMaintenanceFence,
+)
+from src.maintenance import checkpoint_repository as checkpoint_repository_module
 from src.maintenance.checkpoint_repository import (
     CheckpointRepositoryError,
     PostgresCheckpointRepository,
@@ -19,6 +25,17 @@ from src.maintenance.checkpoint_repository import (
 
 pytestmark = pytest.mark.asyncio
 _DEFAULT_UPDATED_AT = object()
+
+
+@pytest.fixture(autouse=True)
+def _short_exclusive_fence_settle(monkeypatch):
+    """Keep repository tests fast without weakening the production default."""
+
+    monkeypatch.setattr(
+        checkpoint_repository_module,
+        "DEFAULT_MAINTENANCE_EXCLUSIVE_SETTLE_SECONDS",
+        0.001,
+    )
 
 
 @pytest.fixture
@@ -89,8 +106,7 @@ async def _put_checkpoint(
     checkpoint = empty_checkpoint()
     values = state if state is not None else _slim_state(thread_id)
     versions = {
-        channel: f"{checkpoint['id']}:{index}"
-        for index, channel in enumerate(values)
+        channel: f"{checkpoint['id']}:{index}" for index, channel in enumerate(values)
     }
     checkpoint["channel_values"] = values
     checkpoint["channel_versions"] = versions
@@ -216,7 +232,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
     assert [candidate.thread_id for candidate in snapshot.candidates] == ["old-sent"]
     assert snapshot.candidates[0].updated_at.tzinfo is not None
-    assert snapshot.alembic_revision == "20260710_0002"
+    assert snapshot.alembic_revision == "20260710_0003"
     assert snapshot.checkpoint_revision == len(AsyncPostgresSaver.MIGRATIONS) - 1
     assert len(snapshot.database_fingerprint) == 64
     assert snapshot.database_timezone
@@ -228,9 +244,9 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 @pytest.mark.parametrize(
     "revision",
     ["20260710_0002", "20260710_0003"],
-    ids=["code-first", "migration-first"],
+    ids=["0002-metadata", "0003-metadata"],
 )
-async def test_scan_accepts_compatible_business_revision_and_reports_actual_value(
+async def test_scan_metadata_allowlist_reports_stored_revision_value(
     checkpoint_schema,
     revision,
 ):
@@ -276,9 +292,7 @@ async def test_scan_rejects_incompatible_unknown_and_multiple_business_revisions
 async def test_scan_accepts_langgraph_standard_zero_migration_marker(
     checkpoint_schema,
 ):
-    checkpoint_schema.execute(
-        "INSERT INTO checkpoint_migrations (v) VALUES (0)"
-    )
+    checkpoint_schema.execute("INSERT INTO checkpoint_migrations (v) VALUES (0)")
     await _valid_thread(checkpoint_schema.dsn, "standard-setup-marker")
 
     snapshot = await _scan(checkpoint_schema.dsn)
@@ -545,6 +559,54 @@ async def test_revalidate_returns_false_after_inventory_drift(checkpoint_schema)
     assert await repository.revalidate_candidate(candidate, plan=snapshot) is False
 
 
+@pytest.mark.parametrize(
+    ("prepare_null", "mutate_to_empty", "writes_per_checkpoint"),
+    [
+        (
+            "UPDATE checkpoints SET parent_checkpoint_id = NULL WHERE thread_id = %s",
+            "UPDATE checkpoints SET parent_checkpoint_id = '' WHERE thread_id = %s",
+            0,
+        ),
+        (
+            "UPDATE checkpoints SET type = NULL WHERE thread_id = %s",
+            "UPDATE checkpoints SET type = '' WHERE thread_id = %s",
+            0,
+        ),
+        (
+            "UPDATE checkpoint_writes SET type = NULL WHERE thread_id = %s",
+            "UPDATE checkpoint_writes SET type = '' WHERE thread_id = %s",
+            1,
+        ),
+    ],
+    ids=("parent-checkpoint-id", "checkpoint-type", "checkpoint-write-type"),
+)
+async def test_revalidate_rejects_null_to_empty_inventory_drift(
+    checkpoint_schema,
+    prepare_null,
+    mutate_to_empty,
+    writes_per_checkpoint,
+):
+    thread_id = "null-empty-inventory"
+    await _valid_thread(
+        checkpoint_schema.dsn,
+        thread_id,
+        writes_per_checkpoint=writes_per_checkpoint,
+    )
+    checkpoint_schema.execute(prepare_null, (thread_id,))
+    repository = PostgresCheckpointRepository(checkpoint_schema.dsn)
+    snapshot = await repository.scan_candidates(
+        cutoff=_old(48),
+        limit=10,
+        max_physical_rows=100,
+        max_estimated_logical_bytes=1024 * 1024,
+    )
+    candidate = snapshot.candidates[0]
+
+    checkpoint_schema.execute(mutate_to_empty, (thread_id,))
+
+    assert await repository.revalidate_candidate(candidate, plan=snapshot) is False
+
+
 async def test_delete_candidate_removes_real_checkpoint_rows_only(checkpoint_schema):
     await _valid_thread(
         checkpoint_schema.dsn,
@@ -564,11 +626,11 @@ async def test_delete_candidate_removes_real_checkpoint_rows_only(checkpoint_sch
         max_physical_rows=100,
         max_estimated_logical_bytes=1024 * 1024,
     )
-    candidate = next(item for item in snapshot.candidates if item.thread_id == "delete-me")
+    candidate = next(
+        item for item in snapshot.candidates if item.thread_id == "delete-me"
+    )
 
-    async with repository.execution_session(
-        plan=_execution_plan(snapshot)
-    ) as session:
+    async with repository.execution_session(plan=_execution_plan(snapshot)) as session:
         result = await session.delete_candidate(candidate)
 
     assert result.disposition == "deleted"
@@ -578,16 +640,25 @@ async def test_delete_candidate_removes_real_checkpoint_rows_only(checkpoint_sch
     assert result.checkpoint_blob_rows == candidate.checkpoint_blob_rows
     assert result.checkpoint_write_rows == candidate.checkpoint_write_rows
     assert result.estimated_logical_bytes == candidate.estimated_logical_bytes
-    assert checkpoint_schema.scalar(
-        "SELECT count(*) FROM emails_log WHERE id = 'delete-me'"
-    ) == 1
+    assert (
+        checkpoint_schema.scalar(
+            "SELECT count(*) FROM emails_log WHERE id = 'delete-me'"
+        )
+        == 1
+    )
     for table_name in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
-        assert checkpoint_schema.scalar(
-            f"SELECT count(*) FROM {table_name} WHERE thread_id = 'delete-me'"
-        ) == 0
-        assert checkpoint_schema.scalar(
-            f"SELECT count(*) FROM {table_name} WHERE thread_id = 'keep-me'"
-        ) > 0
+        assert (
+            checkpoint_schema.scalar(
+                f"SELECT count(*) FROM {table_name} WHERE thread_id = 'delete-me'"
+            )
+            == 0
+        )
+        assert (
+            checkpoint_schema.scalar(
+                f"SELECT count(*) FROM {table_name} WHERE thread_id = 'keep-me'"
+            )
+            > 0
+        )
 
 
 async def test_delete_candidate_returns_stale_without_deleting(checkpoint_schema):
@@ -604,9 +675,7 @@ async def test_delete_candidate_returns_stale_without_deleting(checkpoint_schema
         "UPDATE checkpoint_blobs SET type = 'mystery' WHERE thread_id = 'stale'"
     )
 
-    async with repository.execution_session(
-        plan=_execution_plan(snapshot)
-    ) as session:
+    async with repository.execution_session(plan=_execution_plan(snapshot)) as session:
         result = await session.delete_candidate(candidate)
 
     assert result.disposition == "stale"
@@ -616,9 +685,12 @@ async def test_delete_candidate_returns_stale_without_deleting(checkpoint_schema
     assert result.checkpoint_blob_rows == 0
     assert result.checkpoint_write_rows == 0
     assert result.estimated_logical_bytes == 0
-    assert checkpoint_schema.scalar(
-        "SELECT count(*) FROM checkpoints WHERE thread_id = 'stale'"
-    ) == 1
+    assert (
+        checkpoint_schema.scalar(
+            "SELECT count(*) FROM checkpoints WHERE thread_id = 'stale'"
+        )
+        == 1
+    )
 
 
 async def test_delete_error_rolls_back_first_table_deletion(checkpoint_schema):
@@ -653,12 +725,18 @@ async def test_delete_error_rolls_back_first_table_deletion(checkpoint_schema):
 
     assert error.value.code == "cleanup_delete_failed"
     assert str(error.value) == "cleanup_delete_failed"
-    assert checkpoint_schema.scalar(
-        "SELECT count(*) FROM checkpoints WHERE thread_id = 'rollback'"
-    ) == candidate.checkpoint_rows
-    assert checkpoint_schema.scalar(
-        "SELECT count(*) FROM checkpoint_blobs WHERE thread_id = 'rollback'"
-    ) == candidate.checkpoint_blob_rows
+    assert (
+        checkpoint_schema.scalar(
+            "SELECT count(*) FROM checkpoints WHERE thread_id = 'rollback'"
+        )
+        == candidate.checkpoint_rows
+    )
+    assert (
+        checkpoint_schema.scalar(
+            "SELECT count(*) FROM checkpoint_blobs WHERE thread_id = 'rollback'"
+        )
+        == candidate.checkpoint_blob_rows
+    )
 
 
 async def test_execution_session_fails_closed_when_advisory_lock_is_held(
@@ -681,6 +759,237 @@ async def test_execution_session_fails_closed_when_advisory_lock_is_held(
                 pass
 
     assert error.value.code == "cleanup_lock_unavailable"
+
+
+async def test_runtime_shared_fences_block_maintenance_until_all_release(
+    checkpoint_schema,
+):
+    await _valid_thread(checkpoint_schema.dsn, "runtime-fenced")
+    repository = PostgresCheckpointRepository(checkpoint_schema.maintenance_dsn)
+    snapshot = await repository.scan_candidates(
+        cutoff=_old(48),
+        limit=10,
+        max_physical_rows=100,
+        max_estimated_logical_bytes=1024 * 1024,
+    )
+    plan = _execution_plan(snapshot)
+
+    async def fail_stop(_reason: str) -> None:
+        pytest.fail("healthy runtime fence must not trigger fail-stop")
+
+    first_runtime = RuntimeCheckpointMaintenanceFence(
+        checkpoint_schema.runtime_dsn,
+        fail_stop=fail_stop,
+        monitor_interval_seconds=60,
+    )
+    second_runtime = RuntimeCheckpointMaintenanceFence(
+        checkpoint_schema.runtime_dsn,
+        fail_stop=fail_stop,
+        monitor_interval_seconds=60,
+    )
+
+    await first_runtime.start()
+    await second_runtime.start()
+    try:
+        with pytest.raises(CheckpointRepositoryError) as both_running:
+            async with repository.execution_session(plan=plan):
+                pass
+        assert both_running.value.code == "cleanup_lock_unavailable"
+
+        await first_runtime.close()
+        with pytest.raises(CheckpointRepositoryError) as one_running:
+            async with repository.execution_session(plan=plan):
+                pass
+        assert one_running.value.code == "cleanup_lock_unavailable"
+
+        await second_runtime.close()
+        async with repository.execution_session(plan=plan):
+            pass
+    finally:
+        await first_runtime.close()
+        await second_runtime.close()
+
+
+async def test_runtime_fence_connection_loss_triggers_fail_stop_once(
+    checkpoint_schema,
+):
+    fail_stop_called = asyncio.Event()
+    reasons: list[str] = []
+    exits: list[int] = []
+
+    async def fail_stop(reason: str) -> None:
+        reasons.append(reason)
+        fail_stop_called.set()
+
+    fence = RuntimeCheckpointMaintenanceFence(
+        checkpoint_schema.runtime_dsn,
+        fail_stop=fail_stop,
+        monitor_interval_seconds=0.01,
+        hard_exit=exits.append,
+    )
+    await fence.start()
+    try:
+        checkpoint_schema.admin_execute(
+            """
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s
+              AND usename = %s
+              AND backend_type = 'client backend'
+              AND pid <> pg_backend_pid()
+            """,
+            (checkpoint_schema.database_name, checkpoint_schema.runtime_role),
+        )
+        await asyncio.wait_for(fail_stop_called.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+    finally:
+        await fence.close()
+
+    assert reasons == ["checkpoint_maintenance_fence_connection_lost"]
+    assert exits == [70]
+
+
+async def test_maintenance_waits_for_runtime_fail_stop_after_fence_backend_loss(
+    checkpoint_schema,
+    monkeypatch,
+):
+    await _valid_thread(checkpoint_schema.dsn, "lost-fence-settle")
+    repository = PostgresCheckpointRepository(checkpoint_schema.maintenance_dsn)
+    snapshot = await repository.scan_candidates(
+        cutoff=_old(48),
+        limit=10,
+        max_physical_rows=100,
+        max_estimated_logical_bytes=1024 * 1024,
+    )
+    candidate = snapshot.candidates[0]
+    plan = _execution_plan(snapshot)
+
+    monitor_interval = 0.5
+    monitor_timeout = 0.1
+    monkeypatch.setattr(
+        checkpoint_repository_module,
+        "DEFAULT_MAINTENANCE_EXCLUSIVE_SETTLE_SECONDS",
+        0.75,
+    )
+
+    fail_stop_called = threading.Event()
+    maintenance_yielded = asyncio.Event()
+    exits: list[int] = []
+
+    async def fail_stop(_reason: str) -> None:
+        fail_stop_called.set()
+
+    fence = RuntimeCheckpointMaintenanceFence(
+        checkpoint_schema.runtime_dsn,
+        fail_stop=fail_stop,
+        monitor_interval_seconds=monitor_interval,
+        monitor_timeout_seconds=monitor_timeout,
+        hard_exit=exits.append,
+    )
+    await fence.start()
+    connection = fence._connection
+    assert connection is not None
+    runtime_pid_row = await (
+        await connection.execute("SELECT pg_backend_pid()")
+    ).fetchone()
+    assert runtime_pid_row is not None
+
+    async def execute_early() -> None:
+        async with repository.execution_session(plan=plan) as session:
+            maintenance_yielded.set()
+            await session.delete_candidate(candidate)
+
+    execution_task: asyncio.Task[None] | None = None
+    fail_stop_wait: asyncio.Task[bool] | None = None
+    try:
+        checkpoint_schema.admin_execute(
+            "SELECT pg_terminate_backend(%s)",
+            (int(runtime_pid_row[0]),),
+        )
+        execution_task = asyncio.create_task(execute_early())
+        fail_stop_wait = asyncio.create_task(
+            asyncio.to_thread(fail_stop_called.wait, 2.0)
+        )
+        completed, _pending = await asyncio.wait(
+            {execution_task, fail_stop_wait},
+            timeout=2.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        assert fail_stop_wait in completed
+        assert fail_stop_wait.result() is True
+        assert maintenance_yielded.is_set() is False
+        await asyncio.sleep(0.01)
+        assert exits == [70]
+
+        execution_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution_task
+        assert (
+            checkpoint_schema.scalar(
+                "SELECT count(*) FROM checkpoints WHERE thread_id = %s",
+                (candidate.thread_id,),
+            )
+            == candidate.checkpoint_rows
+        )
+
+        async with await psycopg.AsyncConnection.connect(
+            checkpoint_schema.maintenance_dsn,
+            autocommit=True,
+        ) as probe:
+            lock_row = await (
+                await probe.execute(
+                    "SELECT pg_try_advisory_lock(%s)",
+                    (CHECKPOINT_MAINTENANCE_LOCK_KEY,),
+                )
+            ).fetchone()
+            assert lock_row == (True,)
+            await probe.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (CHECKPOINT_MAINTENANCE_LOCK_KEY,),
+            )
+    finally:
+        if execution_task is not None and not execution_task.done():
+            execution_task.cancel()
+            await asyncio.gather(execution_task, return_exceptions=True)
+        if fail_stop_wait is not None and not fail_stop_wait.done():
+            fail_stop_wait.cancel()
+            await asyncio.gather(fail_stop_wait, return_exceptions=True)
+        await fence.close()
+
+
+async def test_runtime_fence_detects_shared_lock_loss_on_healthy_session(
+    checkpoint_schema,
+):
+    fail_stop_called = asyncio.Event()
+    exits: list[int] = []
+
+    async def fail_stop(_reason: str) -> None:
+        fail_stop_called.set()
+
+    fence = RuntimeCheckpointMaintenanceFence(
+        checkpoint_schema.runtime_dsn,
+        fail_stop=fail_stop,
+        monitor_interval_seconds=0.01,
+        hard_exit=exits.append,
+    )
+    await fence.start()
+    try:
+        connection = fence._connection
+        assert connection is not None
+        released = await (
+            await connection.execute(
+                "SELECT pg_advisory_unlock_shared(%s)",
+                (CHECKPOINT_MAINTENANCE_LOCK_KEY,),
+            )
+        ).fetchone()
+        assert released == (True,)
+        assert await (await connection.execute("SELECT 1")).fetchone() == (1,)
+        await asyncio.wait_for(fail_stop_called.wait(), timeout=2)
+    finally:
+        await fence.close()
+
+    assert exits == [70]
 
 
 async def test_scan_rejects_naive_or_too_recent_cutoff_without_connecting():
@@ -732,6 +1041,35 @@ async def test_execution_rejects_plan_metadata_from_another_database(
     assert error.value.code == "cleanup_plan_database_mismatch"
 
 
+async def test_execution_rechecks_plan_expiry_after_exclusive_settle(
+    checkpoint_schema,
+    monkeypatch,
+):
+    await _valid_thread(checkpoint_schema.dsn, "expires-during-settle")
+    repository = PostgresCheckpointRepository(checkpoint_schema.maintenance_dsn)
+    snapshot = await repository.scan_candidates(
+        cutoff=_old(48),
+        limit=10,
+        max_physical_rows=100,
+        max_estimated_logical_bytes=1024 * 1024,
+    )
+    monkeypatch.setattr(
+        checkpoint_repository_module,
+        "DEFAULT_MAINTENANCE_EXCLUSIVE_SETTLE_SECONDS",
+        0.1,
+    )
+    expiring_plan = _execution_plan(
+        snapshot,
+        expires_at=datetime.now(UTC) + timedelta(milliseconds=50),
+    )
+
+    with pytest.raises(CheckpointRepositoryError) as error:
+        async with repository.execution_session(plan=expiring_plan):
+            pytest.fail("an expired plan must never receive an execution session")
+
+    assert error.value.code == "cleanup_plan_expired"
+
+
 async def test_delete_rechecks_plan_expiry_inside_database_transaction(
     checkpoint_schema,
 ):
@@ -755,9 +1093,12 @@ async def test_delete_rechecks_plan_expiry_inside_database_transaction(
             await session.delete_candidate(candidate)
 
     assert error.value.code == "cleanup_plan_expired"
-    assert checkpoint_schema.scalar(
-        "SELECT count(*) FROM checkpoints WHERE thread_id = 'expired-in-database'"
-    ) == 1
+    assert (
+        checkpoint_schema.scalar(
+            "SELECT count(*) FROM checkpoints WHERE thread_id = 'expired-in-database'"
+        )
+        == 1
+    )
 
 
 async def test_scan_has_bounded_database_lock_wait(checkpoint_schema):

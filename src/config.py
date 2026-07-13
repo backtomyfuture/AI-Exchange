@@ -28,8 +28,9 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: SecretStr = SecretStr("password")
     POSTGRES_SCHEMA: str = "public"
     POSTGRES_MIGRATION_OWNER_ROLE: str = "ai_exchange_migration_owner"
+    POSTGRES_MAINTENANCE_ROLE: str = "ai_exchange_checkpoint_maintenance"
+    POSTGRES_CHECKPOINT_AUDITOR_ROLE: str = "ai_exchange_checkpoint_auditor"
     DATABASE_ROLE_SEPARATION_REQUIRED: bool = False
-    CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64: SecretStr = SecretStr("")
 
     # Durable ingestion rollout. The compatibility bridge accepts the current
     # and expand revisions only while every Phase 2 feature remains disabled.

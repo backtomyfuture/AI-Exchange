@@ -64,10 +64,20 @@ _FORBIDDEN_PRODUCTION_RUNTIME_ENVIRONMENT = frozenset(
     {
         "MIGRATION_DATABASE_URL",
         "MIGRATION_DATABASE_URL_FILE",
+        "CHECKPOINT_MAINTENANCE_DATABASE_URL",
+        "CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE",
+        "CHECKPOINT_AUDITOR_DATABASE_URL",
+        "CHECKPOINT_AUDITOR_DATABASE_URL_FILE",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_FILE",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_B64",
+        "CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64",
         "POSTGRES_ADMIN_USER",
         "POSTGRES_ADMIN_PASSWORD",
         "POSTGRES_MIGRATION_USER",
         "POSTGRES_MIGRATION_PASSWORD",
+        "POSTGRES_MAINTENANCE_PASSWORD",
+        "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD",
     }
 )
 
@@ -190,14 +200,22 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
         invalid.add("POSTGRES_SCHEMA")
 
     migration_role = _plain(settings, "POSTGRES_MIGRATION_OWNER_ROLE")
+    maintenance_role = _plain(settings, "POSTGRES_MAINTENANCE_ROLE")
     runtime_role = _plain(settings, "POSTGRES_USER")
     if not _POSTGRES_IDENTIFIER.fullmatch(runtime_role):
         invalid.add("POSTGRES_USER")
-    if (
-        not _POSTGRES_IDENTIFIER.fullmatch(migration_role)
-        or migration_role == runtime_role
-    ):
+    if not _POSTGRES_IDENTIFIER.fullmatch(migration_role):
         invalid.add("POSTGRES_MIGRATION_OWNER_ROLE")
+    if not _POSTGRES_IDENTIFIER.fullmatch(maintenance_role):
+        invalid.add("POSTGRES_MAINTENANCE_ROLE")
+    if len({runtime_role, migration_role, maintenance_role}) != 3:
+        invalid.update(
+            {
+                "POSTGRES_USER",
+                "POSTGRES_MIGRATION_OWNER_ROLE",
+                "POSTGRES_MAINTENANCE_ROLE",
+            }
+        )
 
     exchange_url = _plain(settings, "EXCHANGE_API_URL")
     if _is_placeholder(exchange_url) or not _is_https_url(exchange_url):

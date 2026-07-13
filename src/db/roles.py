@@ -10,6 +10,18 @@ from typing import Final, TypeVar
 import psycopg
 from psycopg.rows import dict_row
 
+from src.db.access_contract import (
+    AUDITOR_RELATION_ACCESS,
+    FOREIGN_KEY_SPECS,
+    MAINTENANCE_RELATION_ACCESS,
+    PHASE2_RELATIONS,
+    RUNTIME_RELATION_ACCESS,
+    RelationAccess,
+    TRIGGER_FUNCTIONS,
+    TRIGGER_FUNCTION_SOURCE_SHA256,
+    TRIGGER_SPECS,
+)
+
 
 _IDENTIFIER: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
 logger = logging.getLogger(__name__)
@@ -254,12 +266,14 @@ def _other_user_schema_usage_denied_sql(
 def _target_acl_exclusive_sql(
     migration_oid: str,
     runtime_oid: str,
+    maintenance_oid: str,
+    auditor_oid: str,
     schema_oid: str,
     database_oid: str,
 ) -> str:
-    """Allow target data-plane ACLs only for the two managed identities."""
+    """Allow target ACLs only for managed roles and the configured auditor."""
 
-    allowed = f"({migration_oid}, {runtime_oid})"
+    allowed = f"({migration_oid}, {runtime_oid}, {maintenance_oid})"
     return f"""NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_database AS object
@@ -271,6 +285,7 @@ def _target_acl_exclusive_sql(
         ) AS target_acl
         WHERE object.oid = {database_oid}
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_namespace AS object
@@ -282,6 +297,7 @@ def _target_acl_exclusive_sql(
         ) AS target_acl
         WHERE object.oid = {schema_oid}
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_class AS object
@@ -299,6 +315,7 @@ def _target_acl_exclusive_sql(
         ) AS target_acl
         WHERE object.relnamespace = {schema_oid}
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_attribute AS attribute
@@ -309,6 +326,7 @@ def _target_acl_exclusive_sql(
         ) AS target_acl
         WHERE object.relnamespace = {schema_oid}
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_proc AS object
@@ -320,6 +338,7 @@ def _target_acl_exclusive_sql(
         ) AS target_acl
         WHERE object.pronamespace = {schema_oid}
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_type AS object
@@ -337,6 +356,7 @@ def _target_acl_exclusive_sql(
               WHERE element_type.typarray = object.oid
           )
           AND target_acl.grantee NOT IN {allowed}
+          AND target_acl.grantee IS DISTINCT FROM {auditor_oid}
     )"""
 
 
@@ -445,6 +465,810 @@ def _large_object_creation_denied_sql(role_oid: str) -> str:
     )"""
 
 
+def _sql_text_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_nullable_text_literal(value: str | None) -> str:
+    if value is None:
+        return "NULL::pg_catalog.text"
+    return _sql_text_literal(value)
+
+
+def _sql_text_array(values: tuple[str, ...]) -> str:
+    members = ", ".join(_sql_text_literal(value) for value in values)
+    return f"ARRAY[{members}]::pg_catalog.text[]"
+
+
+def _phase2_relation_count_sql(schema_oid: str) -> str:
+    relation_names = ", ".join(map(_sql_text_literal, PHASE2_RELATIONS))
+    return f"""(
+        SELECT pg_catalog.count(*)
+        FROM pg_catalog.pg_class AS phase2_relation
+        WHERE phase2_relation.relnamespace = {schema_oid}
+          AND phase2_relation.relname IN ({relation_names})
+          AND phase2_relation.relkind = 'r'
+    )"""
+
+
+def _relation_access_contract_sql(
+    schema_oid: str,
+    role_oid: str,
+    manifest: dict[str, RelationAccess],
+    *,
+    allow_missing: bool = False,
+) -> str:
+    expected_rows: list[str] = []
+    for relation_name, access in manifest.items():
+        for privilege in access.table_privileges:
+            expected_rows.append(
+                "("
+                + ", ".join(
+                    (
+                        "'table'",
+                        _sql_text_literal(relation_name),
+                        "''",
+                        _sql_text_literal(privilege),
+                        "false",
+                    )
+                )
+                + ")"
+            )
+        if access.delete:
+            expected_rows.append(
+                "("
+                + ", ".join(
+                    (
+                        "'table'",
+                        _sql_text_literal(relation_name),
+                        "''",
+                        "'DELETE'",
+                        "false",
+                    )
+                )
+                + ")"
+            )
+        for privilege, columns in (
+            ("SELECT", access.select_columns),
+            ("INSERT", access.insert_columns),
+            ("UPDATE", access.update_columns),
+        ):
+            expected_rows.extend(
+                "("
+                + ", ".join(
+                    (
+                        "'column'",
+                        _sql_text_literal(relation_name),
+                        _sql_text_literal(column),
+                        _sql_text_literal(privilege),
+                        "false",
+                    )
+                )
+                + ")"
+                for column in columns
+            )
+    expected_values = ",\n".join(expected_rows)
+    phase2_relation_names = ", ".join(map(_sql_text_literal, PHASE2_RELATIONS))
+    return f"""(
+        WITH actual_access(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            SELECT
+                'table'::pg_catalog.text,
+                relation.relname::pg_catalog.text,
+                ''::pg_catalog.text,
+                grant_acl.privilege_type::pg_catalog.text,
+                grant_acl.is_grantable
+            FROM pg_catalog.pg_class AS relation
+            CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl)
+                AS grant_acl
+            WHERE relation.relnamespace = {schema_oid}
+              AND grant_acl.grantee = {role_oid}
+            UNION ALL
+            SELECT
+                'column'::pg_catalog.text,
+                relation.relname::pg_catalog.text,
+                attribute.attname::pg_catalog.text,
+                grant_acl.privilege_type::pg_catalog.text,
+                grant_acl.is_grantable
+            FROM pg_catalog.pg_attribute AS attribute
+            JOIN pg_catalog.pg_class AS relation
+              ON relation.oid = attribute.attrelid
+            CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl)
+                AS grant_acl
+            WHERE relation.relnamespace = {schema_oid}
+              AND grant_acl.grantee = {role_oid}
+        ),
+        expected_access(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            VALUES {expected_values}
+        ),
+        legacy_expected_access AS (
+            SELECT *
+            FROM expected_access
+            WHERE relation_name NOT IN ({phase2_relation_names})
+        ),
+        legacy_difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM legacy_expected_access
+            ) AS unexpected_legacy_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM legacy_expected_access
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_legacy_access
+        ),
+        unexpected_legacy_access AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM legacy_expected_access
+        ),
+        difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM expected_access
+            ) AS unexpected_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_access
+        ),
+        unexpected_access AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access
+        )
+        SELECT CASE
+            WHEN {_phase2_relation_count_sql(schema_oid)} = 0
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_class AS revision_relation
+                 WHERE revision_relation.relnamespace = {schema_oid}
+                   AND revision_relation.relname = 'alembic_version'
+                   AND revision_relation.relkind = 'r'
+             ) THEN NOT EXISTS (SELECT 1 FROM actual_access)
+            WHEN {_phase2_relation_count_sql(schema_oid)} = 0
+             AND EXISTS (
+                 SELECT 1
+                 FROM pg_catalog.pg_class AS revision_relation
+                 WHERE revision_relation.relnamespace = {schema_oid}
+                   AND revision_relation.relname = 'alembic_version'
+                   AND revision_relation.relkind = 'r'
+             ) THEN NOT EXISTS (
+                 SELECT 1 FROM {
+        "unexpected_legacy_access" if allow_missing else "legacy_difference"
+    }
+             )
+            WHEN {_phase2_relation_count_sql(schema_oid)} = {len(PHASE2_RELATIONS)}
+                THEN NOT EXISTS (
+                    SELECT 1 FROM {
+        "unexpected_access" if allow_missing else "difference"
+    }
+                )
+            ELSE false
+        END
+    )"""
+
+
+def _checkpoint_auditor_access_contract_sql(
+    auditor_oid: str,
+    schema_oid: str,
+    database_oid: str,
+    *,
+    allow_missing: bool = False,
+) -> str:
+    """Require one non-delegable auditor with only plan-required column grants."""
+
+    required_direct_access = (
+        "true"
+        if allow_missing
+        else f"""(
+        EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_database AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.datacl) AS grant_acl
+            WHERE object.oid = {database_oid}
+              AND grant_acl.grantee = {auditor_oid}
+              AND grant_acl.privilege_type = 'CONNECT'
+              AND NOT grant_acl.is_grantable
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_namespace AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.nspacl) AS grant_acl
+            WHERE object.oid = {schema_oid}
+              AND grant_acl.grantee = {auditor_oid}
+              AND grant_acl.privilege_type = 'USAGE'
+              AND NOT grant_acl.is_grantable
+        )
+    )"""
+    )
+    return f"""(
+        {auditor_oid} IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_roles AS auditor
+            WHERE auditor.oid = {auditor_oid}
+              AND auditor.rolcanlogin
+              AND NOT auditor.rolsuper
+              AND NOT auditor.rolcreatedb
+              AND NOT auditor.rolcreaterole
+              AND NOT auditor.rolreplication
+              AND NOT auditor.rolbypassrls
+              AND NOT auditor.rolinherit
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_auth_members AS membership
+            WHERE membership.member = {auditor_oid}
+               OR membership.roleid = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_database AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.datacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+              AND NOT (
+                  object.oid = {database_oid}
+                  AND grant_acl.privilege_type = 'CONNECT'
+                  AND NOT grant_acl.is_grantable
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_namespace AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.nspacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+              AND NOT (
+                  object.oid = {schema_oid}
+                  AND grant_acl.privilege_type = 'USAGE'
+                  AND NOT grant_acl.is_grantable
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.relacl) AS grant_acl
+            WHERE object.relnamespace IS DISTINCT FROM {schema_oid}
+              AND grant_acl.grantee = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_attribute AS attribute
+            JOIN pg_catalog.pg_class AS object
+              ON object.oid = attribute.attrelid
+            CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) AS grant_acl
+            WHERE object.relnamespace IS DISTINCT FROM {schema_oid}
+              AND grant_acl.grantee = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.proacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_type AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.typacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_largeobject_metadata AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.lomacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_language AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.lanacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_tablespace AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.spcacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_foreign_data_wrapper AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.fdwacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_foreign_server AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.srvacl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_parameter_acl AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.paracl) AS grant_acl
+            WHERE grant_acl.grantee = {auditor_oid}
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_user_mappings AS object
+            WHERE object.umuser = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_default_acl AS object
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object.defaclacl) AS grant_acl
+            WHERE object.defaclrole = {auditor_oid}
+               OR grant_acl.grantee = {auditor_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_namespace AS object
+            WHERE object.nspowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_class AS object
+            WHERE object.relowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_proc AS object
+            WHERE object.proowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_type AS object
+            WHERE object.typowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_database AS object
+            WHERE object.datdba = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_operator AS object
+            WHERE object.oprowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opclass AS object
+            WHERE object.opcowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_opfamily AS object
+            WHERE object.opfowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_collation AS object
+            WHERE object.collowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_conversion AS object
+            WHERE object.conowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_config AS object
+            WHERE object.cfgowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_ts_dict AS object
+            WHERE object.dictowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_statistic_ext AS object
+            WHERE object.stxowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_extension AS object
+            WHERE object.extowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_language AS object
+            WHERE object.lanowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_tablespace AS object
+            WHERE object.spcowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper AS object
+            WHERE object.fdwowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_foreign_server AS object
+            WHERE object.srvowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_largeobject_metadata AS object
+            WHERE object.lomowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_publication AS object
+            WHERE object.pubowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_subscription AS object
+            WHERE object.subowner = {auditor_oid}
+            UNION ALL
+            SELECT 1 FROM pg_catalog.pg_event_trigger AS object
+            WHERE object.evtowner = {auditor_oid}
+        )
+        AND {_other_database_connect_denied_sql(auditor_oid, database_oid)}
+        AND {_other_schema_create_denied_sql(auditor_oid, schema_oid)}
+        AND {_other_user_schema_usage_denied_sql(auditor_oid, schema_oid)}
+        AND {_role_and_database_settings_absent_sql(auditor_oid, database_oid)}
+        AND {_large_object_creation_denied_sql(auditor_oid)}
+        AND NOT pg_catalog.has_database_privilege(
+            {auditor_oid}, {database_oid}, 'CREATE'
+        )
+        AND NOT pg_catalog.has_database_privilege(
+            {auditor_oid}, {database_oid}, 'TEMPORARY'
+        )
+        AND NOT pg_catalog.has_schema_privilege(
+            {auditor_oid}, {schema_oid}, 'CREATE'
+        )
+        AND {required_direct_access}
+        AND {
+        _relation_access_contract_sql(
+            schema_oid,
+            auditor_oid,
+            AUDITOR_RELATION_ACCESS,
+            allow_missing=allow_missing,
+        )
+    }
+    )"""
+
+
+def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
+    expected_rows = ",\n".join(
+        "("
+        + ", ".join(
+            (
+                _sql_text_literal(spec.name),
+                f"{schema_oid}::pg_catalog.oid",
+                _sql_text_literal(spec.child_relation),
+                _sql_text_array(spec.child_columns),
+                f"{schema_oid}::pg_catalog.oid",
+                _sql_text_literal(spec.parent_relation),
+                _sql_text_array(spec.parent_columns),
+                _sql_text_literal(spec.match_type),
+                "'r'",
+                "'r'",
+                "false",
+                "false",
+                "true",
+                "0::pg_catalog.oid",
+            )
+        )
+        + ")"
+        for spec in FOREIGN_KEY_SPECS
+    )
+    return f"""(
+        WITH actual_foreign_keys AS (
+            SELECT
+                foreign_key.oid,
+                foreign_key.conname::pg_catalog.text AS constraint_name,
+                child.relnamespace AS child_schema_oid,
+                child.relname::pg_catalog.text AS child_relation,
+                ARRAY(
+                    SELECT attribute.attname::pg_catalog.text
+                    FROM pg_catalog.unnest(foreign_key.conkey)
+                         WITH ORDINALITY AS key_column(attnum, position)
+                    JOIN pg_catalog.pg_attribute AS attribute
+                      ON attribute.attrelid = child.oid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.position
+                ) AS child_columns,
+                parent.relnamespace AS parent_schema_oid,
+                parent.relname::pg_catalog.text AS parent_relation,
+                ARRAY(
+                    SELECT attribute.attname::pg_catalog.text
+                    FROM pg_catalog.unnest(foreign_key.confkey)
+                         WITH ORDINALITY AS key_column(attnum, position)
+                    JOIN pg_catalog.pg_attribute AS attribute
+                      ON attribute.attrelid = parent.oid
+                     AND attribute.attnum = key_column.attnum
+                    ORDER BY key_column.position
+                ) AS parent_columns,
+                foreign_key.confmatchtype::pg_catalog.text AS match_type,
+                foreign_key.confupdtype::pg_catalog.text AS update_action,
+                foreign_key.confdeltype::pg_catalog.text AS delete_action,
+                foreign_key.condeferrable AS is_deferrable,
+                foreign_key.condeferred AS is_deferred,
+                foreign_key.convalidated AS is_validated,
+                foreign_key.conparentid AS parent_constraint_oid
+            FROM pg_catalog.pg_constraint AS foreign_key
+            JOIN pg_catalog.pg_class AS child
+              ON child.oid = foreign_key.conrelid
+            JOIN pg_catalog.pg_class AS parent
+              ON parent.oid = foreign_key.confrelid
+            WHERE foreign_key.contype = 'f'
+              AND (
+                  child.relnamespace = {schema_oid}
+                  OR parent.relnamespace = {schema_oid}
+              )
+        ),
+        expected_foreign_keys(
+            constraint_name,
+            child_schema_oid,
+            child_relation,
+            child_columns,
+            parent_schema_oid,
+            parent_relation,
+            parent_columns,
+            match_type,
+            update_action,
+            delete_action,
+            is_deferrable,
+            is_deferred,
+            is_validated,
+            parent_constraint_oid
+        ) AS (
+            VALUES {expected_rows}
+        ),
+        difference AS (
+            SELECT * FROM (
+                SELECT
+                    constraint_name, child_schema_oid,
+                    child_relation, child_columns, parent_schema_oid,
+                    parent_relation, parent_columns, match_type,
+                    update_action, delete_action, is_deferrable,
+                    is_deferred, is_validated, parent_constraint_oid
+                FROM actual_foreign_keys
+                EXCEPT
+                SELECT * FROM expected_foreign_keys
+            ) AS unexpected_foreign_keys
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_foreign_keys
+                EXCEPT
+                SELECT
+                    constraint_name, child_schema_oid,
+                    child_relation, child_columns, parent_schema_oid,
+                    parent_relation, parent_columns, match_type,
+                    update_action, delete_action, is_deferrable,
+                    is_deferred, is_validated, parent_constraint_oid
+                FROM actual_foreign_keys
+            ) AS missing_foreign_keys
+        )
+        SELECT CASE {_phase2_relation_count_sql(schema_oid)}
+            WHEN 0 THEN NOT EXISTS (SELECT 1 FROM actual_foreign_keys)
+            WHEN {len(PHASE2_RELATIONS)} THEN NOT EXISTS (
+                SELECT 1 FROM difference
+            )
+            ELSE false
+        END
+    )"""
+
+
+def _target_trigger_contract_exact_sql(
+    schema_oid: str,
+    migration_oid: str,
+) -> str:
+    expected_trigger_rows = ",\n".join(
+        "("
+        + ", ".join(
+            (
+                _sql_text_literal(spec.name),
+                _sql_text_literal(spec.relation),
+                _sql_text_literal(spec.function),
+                f"{spec.trigger_type}::pg_catalog.int2",
+                "true" if spec.is_constraint else "false",
+                "'O'::pg_catalog.\"char\"",
+                "true",
+                "true",
+                "0::pg_catalog.oid",
+                "0::pg_catalog.oid",
+                "0::pg_catalog.oid",
+                "true" if spec.is_deferrable else "false",
+                "true" if spec.is_initially_deferred else "false",
+                f"{len(spec.arguments)}::pg_catalog.int2",
+                _sql_text_literal(
+                    " ".join(str(value) for value in spec.update_attribute_numbers)
+                ),
+                _sql_text_literal(
+                    b"".join(
+                        argument.encode("utf-8") + b"\x00"
+                        for argument in spec.arguments
+                    ).hex()
+                ),
+                _sql_nullable_text_literal(spec.when_clause_sha256),
+                _sql_nullable_text_literal(spec.old_transition_table),
+                _sql_nullable_text_literal(spec.new_transition_table),
+                "true",
+            )
+        )
+        + ")"
+        for spec in TRIGGER_SPECS
+    )
+    expected_function_rows = ",\n".join(
+        "("
+        + ", ".join(
+            (
+                _sql_text_literal(function_name),
+                _sql_text_literal(TRIGGER_FUNCTION_SOURCE_SHA256[function_name]),
+            )
+        )
+        + ")"
+        for function_name in TRIGGER_FUNCTIONS
+    )
+    return f"""(
+        WITH actual_user_triggers AS (
+            SELECT
+                trigger.tgname::pg_catalog.text AS trigger_name,
+                relation.relname::pg_catalog.text AS relation_name,
+                routine.proname::pg_catalog.text AS function_name,
+                trigger.tgtype,
+                trigger.tgconstraint <> 0 AS is_constraint,
+                trigger.tgenabled,
+                routine.pronamespace = {schema_oid}
+                    AS function_in_target_schema,
+                routine.proowner = {migration_oid}
+                    AS function_owned_by_migration,
+                trigger.tgparentid AS parent_trigger_oid,
+                trigger.tgconstrrelid AS constraint_relation_oid,
+                trigger.tgconstrindid AS constraint_index_oid,
+                trigger.tgdeferrable AS is_deferrable,
+                trigger.tginitdeferred AS is_initially_deferred,
+                trigger.tgnargs AS argument_count,
+                trigger.tgattr::pg_catalog.text AS update_attribute_numbers,
+                pg_catalog.encode(trigger.tgargs, 'hex')::pg_catalog.text
+                    AS arguments_hex,
+                CASE
+                    WHEN trigger.tgqual IS NULL THEN NULL::pg_catalog.text
+                    ELSE pg_catalog.encode(
+                        pg_catalog.sha256(
+                            pg_catalog.convert_to(
+                                pg_catalog.pg_get_expr(
+                                    trigger.tgqual,
+                                    trigger.tgrelid,
+                                    false
+                                ),
+                                'UTF8'
+                            )
+                        ),
+                        'hex'
+                    )::pg_catalog.text
+                END AS when_clause_sha256,
+                trigger.tgoldtable::pg_catalog.text AS old_transition_table,
+                trigger.tgnewtable::pg_catalog.text AS new_transition_table,
+                CASE
+                    WHEN trigger.tgconstraint = 0 THEN true
+                    ELSE (
+                        trigger_constraint.oid IS NOT NULL
+                        AND trigger_constraint.contype = 't'
+                        AND trigger_constraint.conname = trigger.tgname
+                        AND trigger_constraint.conrelid = trigger.tgrelid
+                        AND trigger_constraint.condeferrable =
+                            trigger.tgdeferrable
+                        AND trigger_constraint.condeferred =
+                            trigger.tginitdeferred
+                        AND trigger_constraint.convalidated
+                        AND trigger_constraint.connoinherit
+                        AND trigger_constraint.conparentid = 0
+                        AND trigger_constraint.coninhcount = 0
+                        AND trigger_constraint.conislocal
+                    )
+                END AS constraint_metadata_exact
+            FROM pg_catalog.pg_trigger AS trigger
+            JOIN pg_catalog.pg_class AS relation
+              ON relation.oid = trigger.tgrelid
+            JOIN pg_catalog.pg_proc AS routine
+              ON routine.oid = trigger.tgfoid
+            LEFT JOIN pg_catalog.pg_constraint AS trigger_constraint
+              ON trigger_constraint.oid = trigger.tgconstraint
+            WHERE relation.relnamespace = {schema_oid}
+              AND NOT trigger.tgisinternal
+        ),
+        expected_user_triggers(
+            trigger_name,
+            relation_name,
+            function_name,
+            tgtype,
+            is_constraint,
+            tgenabled,
+            function_in_target_schema,
+            function_owned_by_migration,
+            parent_trigger_oid,
+            constraint_relation_oid,
+            constraint_index_oid,
+            is_deferrable,
+            is_initially_deferred,
+            argument_count,
+            update_attribute_numbers,
+            arguments_hex,
+            when_clause_sha256,
+            old_transition_table,
+            new_transition_table,
+            constraint_metadata_exact
+        ) AS (
+            VALUES {expected_trigger_rows}
+        ),
+        trigger_difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_user_triggers
+                EXCEPT
+                SELECT * FROM expected_user_triggers
+            ) AS unexpected_user_triggers
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_user_triggers
+                EXCEPT
+                SELECT * FROM actual_user_triggers
+            ) AS missing_user_triggers
+        ),
+        actual_trigger_functions AS (
+            SELECT
+                routine.proname::pg_catalog.text AS function_name,
+                pg_catalog.encode(
+                    pg_catalog.sha256(
+                        pg_catalog.convert_to(routine.prosrc, 'UTF8')
+                    ),
+                    'hex'
+                )::pg_catalog.text AS source_sha256
+            FROM pg_catalog.pg_proc AS routine
+            JOIN pg_catalog.pg_language AS language
+              ON language.oid = routine.prolang
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine.prorettype =
+                  'pg_catalog.trigger'::pg_catalog.regtype
+              AND routine.proowner = {migration_oid}
+              AND language.lanname = 'plpgsql'
+              AND NOT routine.prosecdef
+              AND pg_catalog.pg_get_function_identity_arguments(routine.oid) = ''
+              AND routine.proconfig = ARRAY[
+                  'search_path=' || (
+                      SELECT schema.nspname
+                      FROM pg_catalog.pg_namespace AS schema
+                      WHERE schema.oid = {schema_oid}
+                  )
+              ]::pg_catalog.text[]
+        ),
+        expected_trigger_functions(function_name, source_sha256) AS (
+            VALUES {expected_function_rows}
+        ),
+        unapproved_trigger_functions AS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine.prorettype =
+                  'pg_catalog.trigger'::pg_catalog.regtype
+              AND (
+                  routine.proname NOT IN (
+                      {", ".join(_sql_text_literal(name) for name in TRIGGER_FUNCTIONS)}
+                  )
+                  OR pg_catalog.pg_get_function_identity_arguments(
+                      routine.oid
+                  ) <> ''
+              )
+        ),
+        function_difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_trigger_functions
+                EXCEPT
+                SELECT * FROM expected_trigger_functions
+            ) AS unexpected_trigger_functions
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_trigger_functions
+                EXCEPT
+                SELECT * FROM actual_trigger_functions
+            ) AS missing_trigger_functions
+        )
+        SELECT CASE {_phase2_relation_count_sql(schema_oid)}
+            WHEN 0 THEN
+                NOT EXISTS (SELECT 1 FROM actual_user_triggers)
+                AND NOT EXISTS (SELECT 1 FROM actual_trigger_functions)
+                AND NOT EXISTS (SELECT 1 FROM unapproved_trigger_functions)
+            WHEN {len(PHASE2_RELATIONS)} THEN
+                NOT EXISTS (SELECT 1 FROM trigger_difference)
+                AND NOT EXISTS (SELECT 1 FROM function_difference)
+                AND NOT EXISTS (SELECT 1 FROM unapproved_trigger_functions)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_trigger AS internal_trigger
+                    JOIN pg_catalog.pg_class AS relation
+                      ON relation.oid = internal_trigger.tgrelid
+                    LEFT JOIN pg_catalog.pg_constraint AS trigger_constraint
+                      ON trigger_constraint.oid = internal_trigger.tgconstraint
+                    WHERE relation.relnamespace = {schema_oid}
+                      AND internal_trigger.tgisinternal
+                      AND (
+                          trigger_constraint.contype IS DISTINCT FROM 'f'
+                          OR trigger_constraint.conname NOT IN (
+                              {", ".join(_sql_text_literal(spec.name) for spec in FOREIGN_KEY_SPECS)}
+                          )
+                          OR internal_trigger.tgenabled <> 'O'
+                      )
+                )
+            ELSE false
+        END
+    )"""
+
+
 def _runtime_relation_capability_sql(role_oid: str, relation_oid: str) -> str:
     """Return whether a role can exercise any data capability on a relation."""
 
@@ -479,33 +1303,18 @@ def _runtime_relation_capability_sql(role_oid: str, relation_oid: str) -> str:
 def _target_execution_hooks_denied_sql(
     schema_oid: str,
     runtime_oid: str,
+    migration_oid: str,
 ) -> str:
-    """Deny hidden target-schema execution paths until explicitly allowlisted."""
+    """Allow only the revisioned FK/trigger set and deny other hidden paths."""
 
-    return f"""NOT EXISTS (
+    return f"""(
+    {_target_foreign_keys_exact_sql(schema_oid)}
+    AND {_target_trigger_contract_exact_sql(schema_oid, migration_oid)}
+    AND NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_proc AS routine
         WHERE routine.pronamespace = {schema_oid}
           AND routine.prosecdef
-        UNION ALL
-        SELECT 1
-        FROM pg_catalog.pg_trigger AS trigger
-        JOIN pg_catalog.pg_class AS relation
-          ON relation.oid = trigger.tgrelid
-        WHERE relation.relnamespace = {schema_oid}
-          AND NOT trigger.tgisinternal
-        UNION ALL
-        SELECT 1
-        FROM pg_catalog.pg_constraint AS foreign_key
-        JOIN pg_catalog.pg_class AS referencing_relation
-          ON referencing_relation.oid = foreign_key.conrelid
-        JOIN pg_catalog.pg_class AS referenced_relation
-          ON referenced_relation.oid = foreign_key.confrelid
-        WHERE foreign_key.contype = 'f'
-          AND (
-              referencing_relation.relnamespace = {schema_oid}
-              OR referenced_relation.relnamespace = {schema_oid}
-          )
         UNION ALL
         SELECT 1
         FROM pg_catalog.pg_inherits AS inheritance
@@ -560,7 +1369,7 @@ def _target_execution_hooks_denied_sql(
         SELECT 1
         FROM pg_catalog.pg_event_trigger AS event_trigger
         WHERE event_trigger.evtenabled <> 'D'
-    )"""
+    ))"""
 
 
 def _system_initial_acl_unchanged_sql(role_oid: str, schema_oid: str) -> str:
@@ -910,6 +1719,82 @@ def _migration_counterpart_privileges_sql(
     )"""
 
 
+def _maintenance_counterpart_privileges_sql(
+    role_oid: str,
+    schema_oid: str,
+    database_oid: str,
+    *,
+    allow_missing_access: bool = False,
+) -> str:
+    """Prove the cleanup identity has only the revisioned delete boundary."""
+
+    return f"""(
+        {_unexpected_direct_grants_sql(role_oid, schema_oid, database_oid)}
+        AND {_unexpected_ownership_sql(role_oid, schema_oid, database_oid)}
+        AND {_other_schema_create_denied_sql(role_oid, schema_oid)}
+        AND {_other_database_connect_denied_sql(role_oid, database_oid)}
+        AND {_other_user_schema_usage_denied_sql(role_oid, schema_oid)}
+        AND {_delegation_denied_sql(role_oid, schema_oid, database_oid)}
+        AND {_role_and_database_settings_absent_sql(role_oid, database_oid)}
+        AND {_large_object_creation_denied_sql(role_oid)}
+        AND {_system_initial_acl_unchanged_sql(role_oid, schema_oid)}
+        AND {
+        _relation_access_contract_sql(
+            schema_oid,
+            role_oid,
+            MAINTENANCE_RELATION_ACCESS,
+            allow_missing=allow_missing_access,
+        )
+    }
+        AND pg_catalog.has_database_privilege(
+            {role_oid}, {database_oid}, 'CONNECT'
+        )
+        AND NOT pg_catalog.has_database_privilege(
+            {role_oid}, {database_oid}, 'CREATE'
+        )
+        AND NOT pg_catalog.has_database_privilege(
+            {role_oid}, {database_oid}, 'TEMPORARY'
+        )
+        AND pg_catalog.has_schema_privilege(
+            {role_oid}, {schema_oid}, 'USAGE'
+        )
+        AND NOT pg_catalog.has_schema_privilege(
+            {role_oid}, {schema_oid}, 'CREATE'
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS object
+            WHERE object.relnamespace = {schema_oid}
+              AND object.relowner = {role_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND (
+                  routine.proowner = {role_oid}
+                  OR pg_catalog.has_function_privilege(
+                      {role_oid}, routine.oid, 'EXECUTE'
+                  )
+              )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_type AS object_type
+            WHERE object_type.typnamespace = {schema_oid}
+              AND object_type.typowner = {role_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_type AS object_type
+            CROSS JOIN LATERAL pg_catalog.aclexplode(object_type.typacl)
+                AS type_acl
+            WHERE object_type.typnamespace = {schema_oid}
+              AND type_acl.grantee = {role_oid}
+        )
+    )"""
+
+
 class DatabaseRoleError(RuntimeError):
     """Safe failure raised when a database identity boundary is unproven."""
 
@@ -923,7 +1808,11 @@ class MigrationRoleSnapshot:
     runtime_role_exists: bool
     runtime_restricted_attributes: bool
     runtime_no_role_memberships: bool
+    maintenance_role_exists: bool
+    maintenance_restricted_attributes: bool
+    maintenance_no_role_memberships: bool
     roles_distinct: bool
+    roles_all_distinct: bool
     runtime_not_member: bool
     database_owned_by_migration: bool
     schema_owned_by_migration: bool
@@ -943,8 +1832,14 @@ class MigrationRoleSnapshot:
     other_database_connect_denied: bool
     other_user_schema_usage_denied: bool
     target_acl_exclusive: bool
+    auditor_access_contract_exact: bool
+    auditor_access_contract_reconcilable: bool
+    runtime_access_contract_exact: bool
+    runtime_access_contract_reconcilable: bool
     system_public_acl_unchanged: bool
     runtime_counterpart_privileges_safe: bool
+    maintenance_counterpart_privileges_safe: bool
+    maintenance_counterpart_privileges_reconcilable: bool
     search_path_matches: bool
 
 
@@ -957,7 +1852,11 @@ class RuntimeRoleSnapshot:
     migration_role_exists: bool
     migration_restricted_attributes: bool
     migration_no_role_memberships: bool
+    maintenance_role_exists: bool
+    maintenance_restricted_attributes: bool
+    maintenance_no_role_memberships: bool
     roles_distinct: bool
+    roles_all_distinct: bool
     runtime_not_member: bool
     database_owned_by_migration: bool
     schema_owned_by_migration: bool
@@ -978,9 +1877,12 @@ class RuntimeRoleSnapshot:
     other_database_connect_denied: bool
     other_user_schema_usage_denied: bool
     target_acl_exclusive: bool
+    auditor_access_contract_exact: bool
+    runtime_access_contract_exact: bool
     delegation_privileges_denied: bool
     system_public_acl_unchanged: bool
     migration_counterpart_privileges_safe: bool
+    maintenance_counterpart_privileges_safe: bool
     database_connect_allowed: bool
     database_create_denied: bool
     database_temp_denied: bool
@@ -992,11 +1894,36 @@ class RuntimeRoleSnapshot:
     search_path_matches: bool
 
 
+@dataclass(frozen=True)
+class MaintenanceRoleSnapshot:
+    direct_session: bool
+    expected_identity: bool
+    restricted_attributes: bool
+    no_role_memberships: bool
+    counterpart_roles_exist: bool
+    counterpart_roles_restricted: bool
+    counterpart_roles_have_no_memberships: bool
+    roles_all_distinct: bool
+    database_owned_by_migration: bool
+    schema_owned_by_migration: bool
+    target_objects_owned_by_migration: bool
+    trigger_semantics_safe: bool
+    session_security_settings_safe: bool
+    target_execution_hooks_denied: bool
+    target_acl_exclusive: bool
+    auditor_access_contract_exact: bool
+    runtime_access_contract_exact: bool
+    maintenance_privileges_safe: bool
+    search_path_matches: bool
+
+
 _MIGRATION_ROLE_QUERY: Final = f"""
 WITH role_context AS (
     SELECT
         role.oid AS current_oid,
         runtime_role.oid AS runtime_oid,
+        maintenance_role.oid AS maintenance_oid,
+        auditor_role.oid AS auditor_oid,
         database.oid AS database_oid,
         database.datdba,
         namespace.oid AS schema_oid,
@@ -1015,7 +1942,14 @@ WITH role_context AS (
         runtime_role.rolreplication AS runtime_rolreplication,
         runtime_role.rolbypassrls AS runtime_rolbypassrls,
         runtime_role.rolcanlogin AS runtime_rolcanlogin,
-        runtime_role.rolinherit AS runtime_rolinherit
+        runtime_role.rolinherit AS runtime_rolinherit,
+        maintenance_role.rolsuper AS maintenance_rolsuper,
+        maintenance_role.rolcreatedb AS maintenance_rolcreatedb,
+        maintenance_role.rolcreaterole AS maintenance_rolcreaterole,
+        maintenance_role.rolreplication AS maintenance_rolreplication,
+        maintenance_role.rolbypassrls AS maintenance_rolbypassrls,
+        maintenance_role.rolcanlogin AS maintenance_rolcanlogin,
+        maintenance_role.rolinherit AS maintenance_rolinherit
     FROM pg_catalog.pg_roles AS role
     JOIN pg_catalog.pg_database AS database
       ON database.datname = pg_catalog.current_database()
@@ -1023,6 +1957,10 @@ WITH role_context AS (
       ON namespace.nspname = %s
     LEFT JOIN pg_catalog.pg_roles AS runtime_role
       ON runtime_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS maintenance_role
+      ON maintenance_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS auditor_role
+      ON auditor_role.rolname = %s
     WHERE role.rolname = current_user
 )
 SELECT
@@ -1056,7 +1994,26 @@ SELECT
         WHERE membership.member = role.runtime_oid
            OR membership.roleid = role.runtime_oid
     ) AS runtime_no_role_memberships,
+    role.maintenance_oid IS NOT NULL AS maintenance_role_exists,
+    role.maintenance_oid IS NOT NULL
+      AND role.maintenance_rolcanlogin
+      AND NOT role.maintenance_rolsuper
+      AND NOT role.maintenance_rolcreatedb
+      AND NOT role.maintenance_rolcreaterole
+      AND NOT role.maintenance_rolreplication
+      AND NOT role.maintenance_rolbypassrls
+      AND NOT role.maintenance_rolinherit AS maintenance_restricted_attributes,
+    role.maintenance_oid IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.member = role.maintenance_oid
+           OR membership.roleid = role.maintenance_oid
+    ) AS maintenance_no_role_memberships,
     role.current_oid IS DISTINCT FROM role.runtime_oid AS roles_distinct,
+    role.maintenance_oid IS NOT NULL
+      AND role.current_oid IS DISTINCT FROM role.maintenance_oid
+      AND role.runtime_oid IS DISTINCT FROM role.maintenance_oid
+      AS roles_all_distinct,
     role.runtime_oid IS NOT NULL
       AND NOT pg_catalog.pg_has_role(
           role.runtime_oid, role.current_oid, 'MEMBER'
@@ -1198,15 +2155,31 @@ SELECT
     pg_catalog.current_setting('lo_compat_privileges') = 'off'
       AND pg_catalog.current_setting('row_security') = 'on'
       AND pg_catalog.current_setting('local_preload_libraries') = ''
-      AND {_role_and_database_settings_absent_sql("role.current_oid", "role.database_oid")}
+      AND {
+    _role_and_database_settings_absent_sql("role.current_oid", "role.database_oid")
+}
       AS session_security_settings_safe,
     {_large_object_creation_denied_sql("role.current_oid")}
       AS large_object_creation_denied,
-    {_target_execution_hooks_denied_sql("role.schema_oid", "role.runtime_oid")}
+    {
+    _target_execution_hooks_denied_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        "role.current_oid",
+    )
+}
       AS target_execution_hooks_denied,
-    {_unexpected_direct_grants_sql("role.current_oid", "role.schema_oid", "role.database_oid")}
+    {
+    _unexpected_direct_grants_sql(
+        "role.current_oid", "role.schema_oid", "role.database_oid"
+    )
+}
       AS unexpected_direct_grants_denied,
-    {_unexpected_ownership_sql("role.current_oid", "role.schema_oid", "role.database_oid")}
+    {
+    _unexpected_ownership_sql(
+        "role.current_oid", "role.schema_oid", "role.database_oid"
+    )
+}
       AS unexpected_object_ownership_denied,
     {_other_schema_create_denied_sql("role.current_oid", "role.schema_oid")}
       AS other_schema_create_denied,
@@ -1214,14 +2187,83 @@ SELECT
       AS other_database_connect_denied,
     {_other_user_schema_usage_denied_sql("role.current_oid", "role.schema_oid")}
       AS other_user_schema_usage_denied,
-    role.runtime_oid IS NOT NULL AND
-      {_target_acl_exclusive_sql("role.current_oid", "role.runtime_oid", "role.schema_oid", "role.database_oid")}
+    role.runtime_oid IS NOT NULL
+      AND role.maintenance_oid IS NOT NULL AND
+      {
+    _target_acl_exclusive_sql(
+        "role.current_oid",
+        "role.runtime_oid",
+        "role.maintenance_oid",
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
       AS target_acl_exclusive,
+    {
+    _checkpoint_auditor_access_contract_sql(
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS auditor_access_contract_exact,
+    {
+    _checkpoint_auditor_access_contract_sql(
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+        allow_missing=True,
+    )
+}
+      AS auditor_access_contract_reconcilable,
+    role.runtime_oid IS NOT NULL AND
+      {
+    _relation_access_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_RELATION_ACCESS,
+    )
+}
+      AS runtime_access_contract_exact,
+    role.runtime_oid IS NOT NULL AND
+      {
+    _relation_access_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_RELATION_ACCESS,
+        allow_missing=True,
+    )
+}
+      AS runtime_access_contract_reconcilable,
     {_system_initial_acl_unchanged_sql("role.current_oid", "role.schema_oid")}
       AS system_public_acl_unchanged,
     role.runtime_oid IS NOT NULL AND
-      {_runtime_counterpart_privileges_sql("role.runtime_oid", "role.schema_oid", "role.database_oid")}
-      AS runtime_counterpart_privileges_safe
+      {
+    _runtime_counterpart_privileges_sql(
+        "role.runtime_oid", "role.schema_oid", "role.database_oid"
+    )
+}
+      AS runtime_counterpart_privileges_safe,
+    role.maintenance_oid IS NOT NULL AND
+      {
+    _maintenance_counterpart_privileges_sql(
+        "role.maintenance_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS maintenance_counterpart_privileges_safe,
+    role.maintenance_oid IS NOT NULL AND
+      {
+    _maintenance_counterpart_privileges_sql(
+        "role.maintenance_oid",
+        "role.schema_oid",
+        "role.database_oid",
+        allow_missing_access=True,
+    )
+}
+      AS maintenance_counterpart_privileges_reconcilable
 FROM role_context AS role
 """
 
@@ -1231,6 +2273,8 @@ WITH role_context AS (
     SELECT
         role.oid AS current_oid,
         migration_role.oid AS migration_oid,
+        maintenance_role.oid AS maintenance_oid,
+        auditor_role.oid AS auditor_oid,
         database.oid AS database_oid,
         database.datdba,
         namespace.oid AS schema_oid,
@@ -1249,7 +2293,14 @@ WITH role_context AS (
         migration_role.rolreplication AS migration_rolreplication,
         migration_role.rolbypassrls AS migration_rolbypassrls,
         migration_role.rolcanlogin AS migration_rolcanlogin,
-        migration_role.rolinherit AS migration_rolinherit
+        migration_role.rolinherit AS migration_rolinherit,
+        maintenance_role.rolsuper AS maintenance_rolsuper,
+        maintenance_role.rolcreatedb AS maintenance_rolcreatedb,
+        maintenance_role.rolcreaterole AS maintenance_rolcreaterole,
+        maintenance_role.rolreplication AS maintenance_rolreplication,
+        maintenance_role.rolbypassrls AS maintenance_rolbypassrls,
+        maintenance_role.rolcanlogin AS maintenance_rolcanlogin,
+        maintenance_role.rolinherit AS maintenance_rolinherit
     FROM pg_catalog.pg_roles AS role
     JOIN pg_catalog.pg_database AS database
       ON database.datname = pg_catalog.current_database()
@@ -1257,6 +2308,10 @@ WITH role_context AS (
       ON namespace.nspname = %s
     LEFT JOIN pg_catalog.pg_roles AS migration_role
       ON migration_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS maintenance_role
+      ON maintenance_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS auditor_role
+      ON auditor_role.rolname = %s
     WHERE role.rolname = current_user
 )
 SELECT
@@ -1290,7 +2345,26 @@ SELECT
         WHERE membership.member = role.migration_oid
            OR membership.roleid = role.migration_oid
     ) AS migration_no_role_memberships,
+    role.maintenance_oid IS NOT NULL AS maintenance_role_exists,
+    role.maintenance_oid IS NOT NULL
+      AND role.maintenance_rolcanlogin
+      AND NOT role.maintenance_rolsuper
+      AND NOT role.maintenance_rolcreatedb
+      AND NOT role.maintenance_rolcreaterole
+      AND NOT role.maintenance_rolreplication
+      AND NOT role.maintenance_rolbypassrls
+      AND NOT role.maintenance_rolinherit AS maintenance_restricted_attributes,
+    role.maintenance_oid IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.member = role.maintenance_oid
+           OR membership.roleid = role.maintenance_oid
+    ) AS maintenance_no_role_memberships,
     role.current_oid IS DISTINCT FROM role.migration_oid AS roles_distinct,
+    role.maintenance_oid IS NOT NULL
+      AND role.current_oid IS DISTINCT FROM role.maintenance_oid
+      AND role.migration_oid IS DISTINCT FROM role.maintenance_oid
+      AS roles_all_distinct,
     role.migration_oid IS NOT NULL
       AND NOT pg_catalog.pg_has_role(
           role.current_oid, role.migration_oid, 'MEMBER'
@@ -1442,15 +2516,31 @@ SELECT
     pg_catalog.current_setting('lo_compat_privileges') = 'off'
       AND pg_catalog.current_setting('row_security') = 'on'
       AND pg_catalog.current_setting('local_preload_libraries') = ''
-      AND {_role_and_database_settings_absent_sql("role.current_oid", "role.database_oid")}
+      AND {
+    _role_and_database_settings_absent_sql("role.current_oid", "role.database_oid")
+}
       AS session_security_settings_safe,
     {_large_object_creation_denied_sql("role.current_oid")}
       AS large_object_creation_denied,
-    {_target_execution_hooks_denied_sql("role.schema_oid", "role.current_oid")}
+    {
+    _target_execution_hooks_denied_sql(
+        "role.schema_oid",
+        "role.current_oid",
+        "role.migration_oid",
+    )
+}
       AS target_execution_hooks_denied,
-    {_unexpected_direct_grants_sql("role.current_oid", "role.schema_oid", "role.database_oid")}
+    {
+    _unexpected_direct_grants_sql(
+        "role.current_oid", "role.schema_oid", "role.database_oid"
+    )
+}
       AS unexpected_direct_grants_denied,
-    {_unexpected_ownership_sql("role.current_oid", "role.schema_oid", "role.database_oid")}
+    {
+    _unexpected_ownership_sql(
+        "role.current_oid", "role.schema_oid", "role.database_oid"
+    )
+}
       AS unexpected_object_ownership_denied,
     {_other_schema_create_denied_sql("role.current_oid", "role.schema_oid")}
       AS other_schema_create_denied,
@@ -1458,16 +2548,55 @@ SELECT
       AS other_database_connect_denied,
     {_other_user_schema_usage_denied_sql("role.current_oid", "role.schema_oid")}
       AS other_user_schema_usage_denied,
-    role.migration_oid IS NOT NULL AND
-      {_target_acl_exclusive_sql("role.migration_oid", "role.current_oid", "role.schema_oid", "role.database_oid")}
+    role.migration_oid IS NOT NULL
+      AND role.maintenance_oid IS NOT NULL AND
+      {
+    _target_acl_exclusive_sql(
+        "role.migration_oid",
+        "role.current_oid",
+        "role.maintenance_oid",
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
       AS target_acl_exclusive,
+    {
+    _checkpoint_auditor_access_contract_sql(
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS auditor_access_contract_exact,
+    {
+    _relation_access_contract_sql(
+        "role.schema_oid",
+        "role.current_oid",
+        RUNTIME_RELATION_ACCESS,
+    )
+}
+      AS runtime_access_contract_exact,
     {_delegation_denied_sql("role.current_oid", "role.schema_oid", "role.database_oid")}
       AS delegation_privileges_denied,
     {_system_initial_acl_unchanged_sql("role.current_oid", "role.schema_oid")}
       AS system_public_acl_unchanged,
     role.migration_oid IS NOT NULL AND
-      {_migration_counterpart_privileges_sql("role.migration_oid", "role.schema_oid", "role.database_oid")}
+      {
+    _migration_counterpart_privileges_sql(
+        "role.migration_oid", "role.schema_oid", "role.database_oid"
+    )
+}
       AS migration_counterpart_privileges_safe,
+    role.maintenance_oid IS NOT NULL AND
+      {
+    _maintenance_counterpart_privileges_sql(
+        "role.maintenance_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS maintenance_counterpart_privileges_safe,
     pg_catalog.has_database_privilege(
         role.current_oid, role.database_oid, 'CONNECT'
     ) AS database_connect_allowed,
@@ -1508,11 +2637,11 @@ SELECT
         WHERE audit_relation.relnamespace = role.schema_oid
           AND audit_relation.relname = 'audit_events'
           AND (
-              audit_relation.relkind NOT IN ('r', 'p')
+              audit_relation.relkind <> 'r'
               OR NOT pg_catalog.has_table_privilege(
                   role.current_oid, audit_relation.oid, 'SELECT'
               )
-              OR NOT pg_catalog.has_table_privilege(
+              OR NOT pg_catalog.has_any_column_privilege(
                   role.current_oid, audit_relation.oid, 'INSERT'
               )
               OR pg_catalog.has_table_privilege(
@@ -1556,7 +2685,193 @@ FROM role_context AS role
 """
 
 
-SnapshotT = TypeVar("SnapshotT", MigrationRoleSnapshot, RuntimeRoleSnapshot)
+_MAINTENANCE_ROLE_QUERY: Final = f"""
+WITH role_context AS (
+    SELECT
+        role.oid AS current_oid,
+        migration_role.oid AS migration_oid,
+        runtime_role.oid AS runtime_oid,
+        auditor_role.oid AS auditor_oid,
+        database.oid AS database_oid,
+        database.datdba,
+        namespace.oid AS schema_oid,
+        namespace.nspowner,
+        role.rolsuper,
+        role.rolcreatedb,
+        role.rolcreaterole,
+        role.rolreplication,
+        role.rolbypassrls,
+        role.rolcanlogin,
+        role.rolinherit,
+        migration_role.rolsuper AS migration_rolsuper,
+        migration_role.rolcreatedb AS migration_rolcreatedb,
+        migration_role.rolcreaterole AS migration_rolcreaterole,
+        migration_role.rolreplication AS migration_rolreplication,
+        migration_role.rolbypassrls AS migration_rolbypassrls,
+        migration_role.rolcanlogin AS migration_rolcanlogin,
+        migration_role.rolinherit AS migration_rolinherit,
+        runtime_role.rolsuper AS runtime_rolsuper,
+        runtime_role.rolcreatedb AS runtime_rolcreatedb,
+        runtime_role.rolcreaterole AS runtime_rolcreaterole,
+        runtime_role.rolreplication AS runtime_rolreplication,
+        runtime_role.rolbypassrls AS runtime_rolbypassrls,
+        runtime_role.rolcanlogin AS runtime_rolcanlogin,
+        runtime_role.rolinherit AS runtime_rolinherit
+    FROM pg_catalog.pg_roles AS role
+    JOIN pg_catalog.pg_database AS database
+      ON database.datname = pg_catalog.current_database()
+    LEFT JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.nspname = %s
+    LEFT JOIN pg_catalog.pg_roles AS migration_role
+      ON migration_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS runtime_role
+      ON runtime_role.rolname = %s
+    LEFT JOIN pg_catalog.pg_roles AS auditor_role
+      ON auditor_role.rolname = %s
+    WHERE role.rolname = current_user
+)
+SELECT
+    session_user = current_user AS direct_session,
+    current_user = %s AS expected_identity,
+    role.rolcanlogin
+      AND NOT role.rolsuper
+      AND NOT role.rolcreatedb
+      AND NOT role.rolcreaterole
+      AND NOT role.rolreplication
+      AND NOT role.rolbypassrls
+      AND NOT role.rolinherit AS restricted_attributes,
+    NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.member = role.current_oid
+           OR membership.roleid = role.current_oid
+    ) AS no_role_memberships,
+    role.migration_oid IS NOT NULL
+      AND role.runtime_oid IS NOT NULL AS counterpart_roles_exist,
+    role.migration_oid IS NOT NULL
+      AND role.migration_rolcanlogin
+      AND NOT role.migration_rolsuper
+      AND NOT role.migration_rolcreatedb
+      AND NOT role.migration_rolcreaterole
+      AND NOT role.migration_rolreplication
+      AND NOT role.migration_rolbypassrls
+      AND NOT role.migration_rolinherit
+      AND role.runtime_oid IS NOT NULL
+      AND role.runtime_rolcanlogin
+      AND NOT role.runtime_rolsuper
+      AND NOT role.runtime_rolcreatedb
+      AND NOT role.runtime_rolcreaterole
+      AND NOT role.runtime_rolreplication
+      AND NOT role.runtime_rolbypassrls
+      AND NOT role.runtime_rolinherit AS counterpart_roles_restricted,
+    role.migration_oid IS NOT NULL
+      AND role.runtime_oid IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_auth_members AS membership
+          WHERE membership.member IN (role.migration_oid, role.runtime_oid)
+             OR membership.roleid IN (role.migration_oid, role.runtime_oid)
+      ) AS counterpart_roles_have_no_memberships,
+    role.migration_oid IS NOT NULL
+      AND role.runtime_oid IS NOT NULL
+      AND role.current_oid IS DISTINCT FROM role.migration_oid
+      AND role.current_oid IS DISTINCT FROM role.runtime_oid
+      AND role.migration_oid IS DISTINCT FROM role.runtime_oid
+      AS roles_all_distinct,
+    role.migration_oid IS NOT NULL
+      AND role.datdba = role.migration_oid AS database_owned_by_migration,
+    role.migration_oid IS NOT NULL
+      AND role.nspowner = role.migration_oid AS schema_owned_by_migration,
+    role.migration_oid IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_class AS relation
+          WHERE relation.relnamespace = role.schema_oid
+            AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'i', 'I')
+            AND relation.relowner IS DISTINCT FROM role.migration_oid
+          UNION ALL
+          SELECT 1
+          FROM pg_catalog.pg_proc AS routine
+          WHERE routine.pronamespace = role.schema_oid
+            AND routine.proowner IS DISTINCT FROM role.migration_oid
+          UNION ALL
+          SELECT 1
+          FROM pg_catalog.pg_type AS owned_type
+          WHERE owned_type.typnamespace = role.schema_oid
+            AND owned_type.typowner IS DISTINCT FROM role.migration_oid
+      ) AS target_objects_owned_by_migration,
+    pg_catalog.current_setting('session_replication_role') = 'origin'
+      AND NOT pg_catalog.has_parameter_privilege(
+          role.current_oid, 'session_replication_role', 'SET'
+      )
+      AND NOT pg_catalog.has_parameter_privilege(
+          role.current_oid, 'session_replication_role', 'ALTER SYSTEM'
+      ) AS trigger_semantics_safe,
+    pg_catalog.current_setting('lo_compat_privileges') = 'off'
+      AND pg_catalog.current_setting('row_security') = 'on'
+      AND pg_catalog.current_setting('local_preload_libraries') = ''
+      AND {
+    _role_and_database_settings_absent_sql(
+        "role.current_oid",
+        "role.database_oid",
+    )
+}
+      AS session_security_settings_safe,
+    {
+    _target_execution_hooks_denied_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        "role.migration_oid",
+    )
+}
+      AS target_execution_hooks_denied,
+    role.migration_oid IS NOT NULL
+      AND role.runtime_oid IS NOT NULL
+      AND {
+    _target_acl_exclusive_sql(
+        "role.migration_oid",
+        "role.runtime_oid",
+        "role.current_oid",
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS target_acl_exclusive,
+    {
+    _checkpoint_auditor_access_contract_sql(
+        "role.auditor_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS auditor_access_contract_exact,
+    {
+    _relation_access_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_RELATION_ACCESS,
+    )
+}
+      AS runtime_access_contract_exact,
+    {
+    _maintenance_counterpart_privileges_sql(
+        "role.current_oid",
+        "role.schema_oid",
+        "role.database_oid",
+    )
+}
+      AS maintenance_privileges_safe
+FROM role_context AS role
+"""
+
+
+SnapshotT = TypeVar(
+    "SnapshotT",
+    MigrationRoleSnapshot,
+    RuntimeRoleSnapshot,
+    MaintenanceRoleSnapshot,
+)
 
 
 def _safe_failure() -> DatabaseRoleError:
@@ -1566,16 +2881,30 @@ def _safe_failure() -> DatabaseRoleError:
 def _valid_contract(
     expected_runtime_role: object,
     expected_migration_role: object,
+    expected_maintenance_role: object,
+    expected_auditor_role: object,
     target_schema: object,
 ) -> bool:
     return (
         isinstance(expected_runtime_role, str)
         and isinstance(expected_migration_role, str)
+        and isinstance(expected_maintenance_role, str)
+        and isinstance(expected_auditor_role, str)
         and isinstance(target_schema, str)
         and bool(_IDENTIFIER.fullmatch(expected_runtime_role))
         and bool(_IDENTIFIER.fullmatch(expected_migration_role))
+        and bool(_IDENTIFIER.fullmatch(expected_maintenance_role))
+        and bool(_IDENTIFIER.fullmatch(expected_auditor_role))
         and bool(_IDENTIFIER.fullmatch(target_schema))
-        and expected_runtime_role != expected_migration_role
+        and len(
+            {
+                expected_runtime_role,
+                expected_migration_role,
+                expected_maintenance_role,
+                expected_auditor_role,
+            }
+        )
+        == 4
     )
 
 
@@ -1663,6 +2992,8 @@ async def _read_migration_role_snapshot(
     *,
     expected_migration_role: str,
     expected_runtime_role: str,
+    expected_maintenance_role: str,
+    expected_auditor_role: str,
     target_schema: str,
 ) -> MigrationRoleSnapshot:
     return await _fetch_snapshot(
@@ -1671,6 +3002,8 @@ async def _read_migration_role_snapshot(
         (
             target_schema,
             expected_runtime_role,
+            expected_maintenance_role,
+            expected_auditor_role,
             expected_migration_role,
         ),
         MigrationRoleSnapshot,
@@ -1683,6 +3016,8 @@ async def _read_runtime_role_snapshot(
     *,
     expected_runtime_role: str,
     expected_migration_role: str,
+    expected_maintenance_role: str,
+    expected_auditor_role: str,
     target_schema: str,
 ) -> RuntimeRoleSnapshot:
     return await _fetch_snapshot(
@@ -1691,9 +3026,35 @@ async def _read_runtime_role_snapshot(
         (
             target_schema,
             expected_migration_role,
+            expected_maintenance_role,
+            expected_auditor_role,
             expected_runtime_role,
         ),
         RuntimeRoleSnapshot,
+        expected_search_path=f"pg_catalog,{target_schema}",
+    )
+
+
+async def _read_maintenance_role_snapshot(
+    dsn: str,
+    *,
+    expected_maintenance_role: str,
+    expected_runtime_role: str,
+    expected_migration_role: str,
+    expected_auditor_role: str,
+    target_schema: str,
+) -> MaintenanceRoleSnapshot:
+    return await _fetch_snapshot(
+        dsn,
+        _MAINTENANCE_ROLE_QUERY,
+        (
+            target_schema,
+            expected_migration_role,
+            expected_runtime_role,
+            expected_auditor_role,
+            expected_maintenance_role,
+        ),
+        MaintenanceRoleSnapshot,
         expected_search_path=f"pg_catalog,{target_schema}",
     )
 
@@ -1703,12 +3064,19 @@ async def require_migration_database_role(
     *,
     expected_migration_role: str,
     expected_runtime_role: str,
+    expected_maintenance_role: str,
+    expected_auditor_role: str,
     target_schema: str,
+    allow_acl_reconciliation: bool = False,
 ) -> None:
     """Fail before DDL unless the connection is the restricted schema owner."""
 
     if not _valid_contract(
-        expected_runtime_role, expected_migration_role, target_schema
+        expected_runtime_role,
+        expected_migration_role,
+        expected_maintenance_role,
+        expected_auditor_role,
+        target_schema,
     ):
         raise _safe_failure()
     try:
@@ -1716,15 +3084,31 @@ async def require_migration_database_role(
             dsn,
             expected_migration_role=expected_migration_role,
             expected_runtime_role=expected_runtime_role,
+            expected_maintenance_role=expected_maintenance_role,
+            expected_auditor_role=expected_auditor_role,
             target_schema=target_schema,
         )
     except Exception:
         raise _safe_failure() from None
-    _reject_failed_invariants(
-        snapshot,
-        MigrationRoleSnapshot,
-        "migration",
-    )
+    failed = _failed_invariants(snapshot, MigrationRoleSnapshot)
+    if allow_acl_reconciliation:
+        failed = tuple(
+            invariant
+            for invariant in failed
+            if invariant
+            not in {
+                "runtime_access_contract_exact",
+                "maintenance_counterpart_privileges_safe",
+                "auditor_access_contract_exact",
+            }
+        )
+    if failed:
+        logger.error(
+            "Database role preflight rejected: identity_plane=%s failed_invariants=%s",
+            "migration",
+            ",".join(failed),
+        )
+        raise _safe_failure()
 
 
 async def require_runtime_database_role(
@@ -1732,12 +3116,18 @@ async def require_runtime_database_role(
     *,
     expected_runtime_role: str,
     expected_migration_role: str,
+    expected_maintenance_role: str,
+    expected_auditor_role: str,
     target_schema: str,
 ) -> None:
     """Fail unless the runtime session is restricted and cannot perform DDL."""
 
     if not _valid_contract(
-        expected_runtime_role, expected_migration_role, target_schema
+        expected_runtime_role,
+        expected_migration_role,
+        expected_maintenance_role,
+        expected_auditor_role,
+        target_schema,
     ):
         raise _safe_failure()
     try:
@@ -1745,6 +3135,8 @@ async def require_runtime_database_role(
             dsn,
             expected_runtime_role=expected_runtime_role,
             expected_migration_role=expected_migration_role,
+            expected_maintenance_role=expected_maintenance_role,
+            expected_auditor_role=expected_auditor_role,
             target_schema=target_schema,
         )
     except Exception:
@@ -1753,4 +3145,41 @@ async def require_runtime_database_role(
         snapshot,
         RuntimeRoleSnapshot,
         "runtime",
+    )
+
+
+async def require_maintenance_database_role(
+    dsn: str,
+    *,
+    expected_maintenance_role: str,
+    expected_runtime_role: str,
+    expected_migration_role: str,
+    expected_auditor_role: str,
+    target_schema: str,
+) -> None:
+    """Fail unless checkpoint cleanup uses its exact restricted identity."""
+
+    if not _valid_contract(
+        expected_runtime_role,
+        expected_migration_role,
+        expected_maintenance_role,
+        expected_auditor_role,
+        target_schema,
+    ):
+        raise _safe_failure()
+    try:
+        snapshot = await _read_maintenance_role_snapshot(
+            dsn,
+            expected_maintenance_role=expected_maintenance_role,
+            expected_runtime_role=expected_runtime_role,
+            expected_migration_role=expected_migration_role,
+            expected_auditor_role=expected_auditor_role,
+            target_schema=target_schema,
+        )
+    except Exception:
+        raise _safe_failure() from None
+    _reject_failed_invariants(
+        snapshot,
+        MaintenanceRoleSnapshot,
+        "maintenance",
     )

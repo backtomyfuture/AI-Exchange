@@ -31,7 +31,7 @@ class ReadinessPreflightError(RuntimeError):
     """Safe cached failure for a recently failed database preflight."""
 
 
-_ReadinessContract = tuple[bytes, bool, bool, bool, bool, str, str, str]
+_ReadinessContract = tuple[bytes, bool, bool, bool, bool, str, str, str, str, str]
 
 
 @dataclass
@@ -58,6 +58,8 @@ def _readiness_contract(settings, database_url: str) -> _ReadinessContract:
         bool(getattr(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False)),
         str(getattr(settings, "POSTGRES_USER", "")),
         str(getattr(settings, "POSTGRES_MIGRATION_OWNER_ROLE", "")),
+        str(getattr(settings, "POSTGRES_MAINTENANCE_ROLE", "")),
+        str(getattr(settings, "POSTGRES_CHECKPOINT_AUDITOR_ROLE", "")),
         str(getattr(settings, "POSTGRES_SCHEMA", "public")),
     )
 
@@ -113,7 +115,9 @@ async def _require_cached_runtime_database(settings) -> None:
                     role_separation_required=contract[4],
                     expected_runtime_role=contract[5],
                     expected_migration_role=contract[6],
-                    target_schema=contract[7],
+                    expected_maintenance_role=contract[7],
+                    expected_auditor_role=contract[8],
+                    target_schema=contract[9],
                 )
         except Exception:
             state.contract = contract

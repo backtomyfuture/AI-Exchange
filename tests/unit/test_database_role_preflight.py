@@ -7,11 +7,14 @@ from dataclasses import fields, replace
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
+import psycopg
 import pytest
 
 
 RUNTIME_DSN = "postgresql://runtime_user:runtime-secret@db/email_agent"
 MIGRATION_DSN = "postgresql://migration_owner:migration-secret@db/email_agent"
+MAINTENANCE_DSN = "postgresql://maintenance_user:maintenance-secret@db/email_agent"
+AUDITOR_ROLE = "checkpoint_auditor"
 
 
 def _module():
@@ -22,7 +25,7 @@ def _valid_snapshot(snapshot_type):
     return snapshot_type(**{field.name: True for field in fields(snapshot_type)})
 
 
-def test_role_snapshots_prove_both_identities_have_no_role_memberships():
+def test_role_snapshots_prove_all_identities_have_no_role_memberships():
     module = _module()
 
     assert "no_role_memberships" in {
@@ -32,6 +35,15 @@ def test_role_snapshots_prove_both_identities_have_no_role_memberships():
         field.name for field in fields(module.MigrationRoleSnapshot)
     }
     assert "runtime_no_role_memberships" in {
+        field.name for field in fields(module.MigrationRoleSnapshot)
+    }
+    assert "maintenance_no_role_memberships" in {
+        field.name for field in fields(module.MigrationRoleSnapshot)
+    }
+    assert "auditor_access_contract_exact" in {
+        field.name for field in fields(module.MigrationRoleSnapshot)
+    }
+    assert "auditor_access_contract_reconcilable" in {
         field.name for field in fields(module.MigrationRoleSnapshot)
     }
     assert "extended_objects_owned_by_migration" in {
@@ -55,6 +67,12 @@ def test_role_snapshots_prove_both_identities_have_no_role_memberships():
     assert "migration_no_role_memberships" in {
         field.name for field in fields(module.RuntimeRoleSnapshot)
     }
+    assert "maintenance_no_role_memberships" in {
+        field.name for field in fields(module.RuntimeRoleSnapshot)
+    }
+    assert "auditor_access_contract_exact" in {
+        field.name for field in fields(module.RuntimeRoleSnapshot)
+    }
     assert "extended_objects_owned_by_migration" in {
         field.name for field in fields(module.RuntimeRoleSnapshot)
     }
@@ -69,6 +87,15 @@ def test_role_snapshots_prove_both_identities_have_no_role_memberships():
     }
     assert "migration_counterpart_privileges_safe" in {
         field.name for field in fields(module.RuntimeRoleSnapshot)
+    }
+    assert "counterpart_roles_have_no_memberships" in {
+        field.name for field in fields(module.MaintenanceRoleSnapshot)
+    }
+    assert "maintenance_privileges_safe" in {
+        field.name for field in fields(module.MaintenanceRoleSnapshot)
+    }
+    assert "auditor_access_contract_exact" in {
+        field.name for field in fields(module.MaintenanceRoleSnapshot)
     }
 
 
@@ -109,6 +136,8 @@ async def test_migration_role_preflight_accepts_only_a_complete_snapshot():
             MIGRATION_DSN,
             expected_migration_role="migration_owner",
             expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -116,8 +145,61 @@ async def test_migration_role_preflight_accepts_only_a_complete_snapshot():
         MIGRATION_DSN,
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role=AUDITOR_ROLE,
         target_schema="public",
     )
+
+
+@pytest.mark.asyncio
+async def test_migration_recovery_allows_only_safe_missing_managed_acl():
+    module = _module()
+    snapshot = replace(
+        _valid_snapshot(module.MigrationRoleSnapshot),
+        runtime_access_contract_exact=False,
+        maintenance_counterpart_privileges_safe=False,
+        auditor_access_contract_exact=False,
+    )
+    reader = AsyncMock(return_value=snapshot)
+
+    with patch.object(module, "_read_migration_role_snapshot", new=reader):
+        await module.require_migration_database_role(
+            MIGRATION_DSN,
+            expected_migration_role="migration_owner",
+            expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
+            target_schema="public",
+            allow_acl_reconciliation=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_migration_recovery_rejects_unreconcilable_acl():
+    module = _module()
+    snapshot = replace(
+        _valid_snapshot(module.MigrationRoleSnapshot),
+        runtime_access_contract_exact=False,
+        runtime_access_contract_reconcilable=False,
+    )
+
+    with (
+        patch.object(
+            module,
+            "_read_migration_role_snapshot",
+            new=AsyncMock(return_value=snapshot),
+        ),
+        pytest.raises(module.DatabaseRoleError),
+    ):
+        await module.require_migration_database_role(
+            MIGRATION_DSN,
+            expected_migration_role="migration_owner",
+            expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
+            target_schema="public",
+            allow_acl_reconciliation=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -131,7 +213,11 @@ async def test_migration_role_preflight_accepts_only_a_complete_snapshot():
         "runtime_role_exists",
         "runtime_restricted_attributes",
         "runtime_no_role_memberships",
+        "maintenance_role_exists",
+        "maintenance_restricted_attributes",
+        "maintenance_no_role_memberships",
         "roles_distinct",
+        "roles_all_distinct",
         "runtime_not_member",
         "database_owned_by_migration",
         "schema_owned_by_migration",
@@ -151,8 +237,14 @@ async def test_migration_role_preflight_accepts_only_a_complete_snapshot():
         "other_database_connect_denied",
         "other_user_schema_usage_denied",
         "target_acl_exclusive",
+        "auditor_access_contract_exact",
+        "auditor_access_contract_reconcilable",
+        "runtime_access_contract_exact",
+        "runtime_access_contract_reconcilable",
         "system_public_acl_unchanged",
         "runtime_counterpart_privileges_safe",
+        "maintenance_counterpart_privileges_safe",
+        "maintenance_counterpart_privileges_reconcilable",
         "search_path_matches",
     ],
 )
@@ -175,6 +267,8 @@ async def test_migration_role_preflight_fails_closed_for_each_invariant(
             MIGRATION_DSN,
             expected_migration_role="migration_owner",
             expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -190,6 +284,8 @@ async def test_runtime_role_preflight_accepts_only_a_complete_snapshot():
             RUNTIME_DSN,
             expected_runtime_role="runtime_user",
             expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -197,6 +293,8 @@ async def test_runtime_role_preflight_accepts_only_a_complete_snapshot():
         RUNTIME_DSN,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role=AUDITOR_ROLE,
         target_schema="public",
     )
 
@@ -212,7 +310,11 @@ async def test_runtime_role_preflight_accepts_only_a_complete_snapshot():
         "migration_role_exists",
         "migration_restricted_attributes",
         "migration_no_role_memberships",
+        "maintenance_role_exists",
+        "maintenance_restricted_attributes",
+        "maintenance_no_role_memberships",
         "roles_distinct",
+        "roles_all_distinct",
         "runtime_not_member",
         "database_owned_by_migration",
         "schema_owned_by_migration",
@@ -233,9 +335,12 @@ async def test_runtime_role_preflight_accepts_only_a_complete_snapshot():
         "other_database_connect_denied",
         "other_user_schema_usage_denied",
         "target_acl_exclusive",
+        "auditor_access_contract_exact",
+        "runtime_access_contract_exact",
         "delegation_privileges_denied",
         "system_public_acl_unchanged",
         "migration_counterpart_privileges_safe",
+        "maintenance_counterpart_privileges_safe",
         "database_connect_allowed",
         "database_create_denied",
         "database_temp_denied",
@@ -266,6 +371,84 @@ async def test_runtime_role_preflight_fails_closed_for_each_invariant(
             RUNTIME_DSN,
             expected_runtime_role="runtime_user",
             expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
+            target_schema="public",
+        )
+
+
+@pytest.mark.asyncio
+async def test_maintenance_role_preflight_accepts_only_a_complete_snapshot():
+    module = _module()
+    snapshot = _valid_snapshot(module.MaintenanceRoleSnapshot)
+    reader = AsyncMock(return_value=snapshot)
+
+    with patch.object(module, "_read_maintenance_role_snapshot", new=reader):
+        await module.require_maintenance_database_role(
+            MAINTENANCE_DSN,
+            expected_maintenance_role="maintenance_user",
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_auditor_role=AUDITOR_ROLE,
+            target_schema="public",
+        )
+
+    reader.assert_awaited_once_with(
+        MAINTENANCE_DSN,
+        expected_maintenance_role="maintenance_user",
+        expected_runtime_role="runtime_user",
+        expected_migration_role="migration_owner",
+        expected_auditor_role=AUDITOR_ROLE,
+        target_schema="public",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_field",
+    [
+        "direct_session",
+        "expected_identity",
+        "restricted_attributes",
+        "no_role_memberships",
+        "counterpart_roles_exist",
+        "counterpart_roles_restricted",
+        "counterpart_roles_have_no_memberships",
+        "roles_all_distinct",
+        "database_owned_by_migration",
+        "schema_owned_by_migration",
+        "target_objects_owned_by_migration",
+        "trigger_semantics_safe",
+        "session_security_settings_safe",
+        "target_execution_hooks_denied",
+        "target_acl_exclusive",
+        "auditor_access_contract_exact",
+        "runtime_access_contract_exact",
+        "maintenance_privileges_safe",
+        "search_path_matches",
+    ],
+)
+async def test_maintenance_role_preflight_fails_closed_for_each_invariant(
+    failed_field: str,
+):
+    module = _module()
+    valid = _valid_snapshot(module.MaintenanceRoleSnapshot)
+    snapshot = replace(valid, **{failed_field: False})
+
+    with (
+        patch.object(
+            module,
+            "_read_maintenance_role_snapshot",
+            new=AsyncMock(return_value=snapshot),
+        ),
+        pytest.raises(module.DatabaseRoleError, match="database_role_preflight_failed"),
+    ):
+        await module.require_maintenance_database_role(
+            MAINTENANCE_DSN,
+            expected_maintenance_role="maintenance_user",
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -296,6 +479,8 @@ async def test_role_preflight_logs_only_fixed_failed_invariant_names(caplog):
             private_dsn,
             expected_runtime_role=private_role,
             expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -307,7 +492,7 @@ async def test_role_preflight_logs_only_fixed_failed_invariant_names(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["migration", "runtime"])
+@pytest.mark.parametrize("kind", ["migration", "runtime", "maintenance"])
 async def test_role_preflight_cuts_off_reader_errors_and_private_values(kind: str):
     module = _module()
     private = f"private-{kind}-catalog-error {MIGRATION_DSN}"
@@ -317,18 +502,33 @@ async def test_role_preflight_cuts_off_reader_errors_and_private_values(kind: st
         kwargs = {
             "expected_migration_role": "migration_owner",
             "expected_runtime_role": "runtime_user",
+            "expected_maintenance_role": "maintenance_user",
+            "expected_auditor_role": AUDITOR_ROLE,
             "target_schema": "public",
         }
         dsn = MIGRATION_DSN
-    else:
+    elif kind == "runtime":
         function = module.require_runtime_database_role
         reader_name = "_read_runtime_role_snapshot"
         kwargs = {
             "expected_runtime_role": "runtime_user",
             "expected_migration_role": "migration_owner",
+            "expected_maintenance_role": "maintenance_user",
+            "expected_auditor_role": AUDITOR_ROLE,
             "target_schema": "public",
         }
         dsn = RUNTIME_DSN
+    else:
+        function = module.require_maintenance_database_role
+        reader_name = "_read_maintenance_role_snapshot"
+        kwargs = {
+            "expected_maintenance_role": "maintenance_user",
+            "expected_runtime_role": "runtime_user",
+            "expected_migration_role": "migration_owner",
+            "expected_auditor_role": AUDITOR_ROLE,
+            "target_schema": "public",
+        }
+        dsn = MAINTENANCE_DSN
 
     with (
         patch.object(
@@ -346,49 +546,154 @@ async def test_role_preflight_cuts_off_reader_errors_and_private_values(kind: st
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["migration", "runtime"])
+async def test_checkpoint_auditor_rejects_unsafe_identity_before_connecting():
+    module = importlib.import_module("src.db.auditor")
+    connect = AsyncMock()
+    private_role = "unsafe-auditor-private-value"
+    private_dsn = "postgresql://auditor:private-password@db/email_agent"
+
+    with (
+        patch.object(module.psycopg.AsyncConnection, "connect", new=connect),
+        pytest.raises(module.CheckpointAuditorRoleError) as caught,
+    ):
+        await module.require_checkpoint_auditor_database_role(
+            private_dsn,
+            expected_auditor_role=private_role,
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            target_schema="public",
+        )
+
+    connect.assert_not_awaited()
+    assert str(caught.value) == "checkpoint_auditor_role_preflight_failed"
+    assert private_role not in str(caught.value)
+    assert private_dsn not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_auditor_cuts_off_driver_error_and_private_values(caplog):
+    module = importlib.import_module("src.db.auditor")
+    private = "private-driver-error private-password"
+    private_dsn = "postgresql://auditor:private-password@db/email_agent"
+    connect = AsyncMock(side_effect=psycopg.OperationalError(private))
+
+    with (
+        patch.object(module.psycopg.AsyncConnection, "connect", new=connect),
+        caplog.at_level("ERROR", logger="src.db.auditor"),
+        pytest.raises(module.CheckpointAuditorRoleError) as caught,
+    ):
+        await module.require_checkpoint_auditor_database_role(
+            private_dsn,
+            expected_auditor_role="checkpoint_auditor",
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            target_schema="public",
+        )
+
+    connect.assert_awaited_once_with(
+        private_dsn,
+        autocommit=True,
+        prepare_threshold=0,
+    )
+    assert str(caught.value) == "checkpoint_auditor_role_preflight_failed"
+    assert private not in str(caught.value)
+    assert private_dsn not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert "error_type=OperationalError" in caplog.text
+    assert private not in caplog.text
+    assert private_dsn not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["migration", "runtime", "maintenance"])
 @pytest.mark.parametrize(
-    ("expected_runtime_role", "expected_migration_role", "target_schema"),
+    (
+        "expected_runtime_role",
+        "expected_migration_role",
+        "expected_maintenance_role",
+        "expected_auditor_role",
+        "target_schema",
+    ),
     [
-        ("same_role", "same_role", "public"),
-        ("bad-role!", "migration_owner", "public"),
-        ("runtime_user", "bad-role!", "public"),
-        ("runtime_user", "migration_owner", "bad-schema!"),
-        (None, "migration_owner", "public"),
-        ("runtime_user", 1, "public"),
-        ("runtime_user", "migration_owner", None),
+        ("same_role", "same_role", "maintenance_user", AUDITOR_ROLE, "public"),
+        ("same_role", "migration_owner", "same_role", AUDITOR_ROLE, "public"),
+        ("runtime_user", "same_role", "same_role", AUDITOR_ROLE, "public"),
+        ("same_role", "migration_owner", "maintenance_user", "same_role", "public"),
+        ("runtime_user", "same_role", "maintenance_user", "same_role", "public"),
+        ("runtime_user", "migration_owner", "same_role", "same_role", "public"),
+        ("bad-role!", "migration_owner", "maintenance_user", AUDITOR_ROLE, "public"),
+        ("runtime_user", "bad-role!", "maintenance_user", AUDITOR_ROLE, "public"),
+        ("runtime_user", "migration_owner", "bad-role!", AUDITOR_ROLE, "public"),
+        ("runtime_user", "migration_owner", "maintenance_user", "bad-role!", "public"),
+        (
+            "runtime_user",
+            "migration_owner",
+            "maintenance_user",
+            AUDITOR_ROLE,
+            "bad-schema!",
+        ),
+        (None, "migration_owner", "maintenance_user", AUDITOR_ROLE, "public"),
+        ("runtime_user", 1, "maintenance_user", AUDITOR_ROLE, "public"),
+        ("runtime_user", "migration_owner", None, AUDITOR_ROLE, "public"),
+        ("runtime_user", "migration_owner", "maintenance_user", None, "public"),
+        ("runtime_user", "migration_owner", "maintenance_user", 1, "public"),
+        (
+            "runtime_user",
+            "migration_owner",
+            "maintenance_user",
+            AUDITOR_ROLE,
+            None,
+        ),
     ],
 )
 async def test_role_preflight_rejects_invalid_contract_before_database_access(
     kind: str,
     expected_runtime_role: object,
     expected_migration_role: object,
+    expected_maintenance_role: object,
+    expected_auditor_role: object,
     target_schema: object,
 ):
     module = _module()
     migration_reader = AsyncMock()
     runtime_reader = AsyncMock()
+    maintenance_reader = AsyncMock()
     if kind == "migration":
         function = module.require_migration_database_role
         dsn = MIGRATION_DSN
-    else:
+    elif kind == "runtime":
         function = module.require_runtime_database_role
         dsn = RUNTIME_DSN
+    else:
+        function = module.require_maintenance_database_role
+        dsn = MAINTENANCE_DSN
 
     with (
         patch.object(module, "_read_migration_role_snapshot", new=migration_reader),
         patch.object(module, "_read_runtime_role_snapshot", new=runtime_reader),
+        patch.object(
+            module,
+            "_read_maintenance_role_snapshot",
+            new=maintenance_reader,
+        ),
         pytest.raises(module.DatabaseRoleError, match="database_role_preflight_failed"),
     ):
         await function(
             dsn,
             expected_runtime_role=expected_runtime_role,
             expected_migration_role=expected_migration_role,
+            expected_maintenance_role=expected_maintenance_role,
+            expected_auditor_role=expected_auditor_role,
             target_schema=target_schema,
         )
 
     migration_reader.assert_not_awaited()
     runtime_reader.assert_not_awaited()
+    maintenance_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -417,6 +722,8 @@ async def test_bootstrap_checks_migration_role_before_any_schema_write():
             MIGRATION_DSN,
             expected_migration_role="migration_owner",
             expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
@@ -424,7 +731,10 @@ async def test_bootstrap_checks_migration_role_before_any_schema_write():
         MIGRATION_DSN,
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role=AUDITOR_ROLE,
         target_schema="public",
+        allow_acl_reconciliation=True,
     )
     upgrade.assert_not_called()
 
@@ -437,6 +747,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
     postflight_error = module.DatabaseRoleError("database_role_preflight_failed")
     role_gate = AsyncMock(side_effect=[None, postflight_error])
     schema_contract = AsyncMock()
+    access_contract = AsyncMock()
 
     with (
         patch.object(
@@ -448,13 +759,18 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         patch.object(
             bootstrap_module,
             "get_current_database_revision",
-            new=AsyncMock(return_value="20260710_0002"),
+            new=AsyncMock(return_value="20260710_0003"),
         ),
         patch.object(
             bootstrap_module,
             "_apply_checkpoint_migrations",
             new=AsyncMock(return_value=0),
         ) as checkpoint_migrations,
+        patch.object(
+            bootstrap_module,
+            "_apply_database_access_contract",
+            new=access_contract,
+        ),
         patch.object(
             bootstrap_module,
             "require_database_schema_contract",
@@ -466,12 +782,35 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             MIGRATION_DSN,
             expected_migration_role="migration_owner",
             expected_runtime_role="runtime_user",
+            expected_maintenance_role="maintenance_user",
+            expected_auditor_role=AUDITOR_ROLE,
             target_schema="public",
         )
 
     assert role_gate.await_count == 2
     checkpoint_migrations.assert_awaited_once_with(MIGRATION_DSN, "public")
+    access_contract.assert_awaited_once_with(
+        MIGRATION_DSN,
+        target_schema="public",
+        runtime_role="runtime_user",
+        maintenance_role="maintenance_user",
+        auditor_role=AUDITOR_ROLE,
+    )
     assert schema_contract.await_args_list == [
-        ((MIGRATION_DSN,), {"target_schema": "public", "require_complete": False}),
-        ((MIGRATION_DSN,), {"target_schema": "public", "require_complete": True}),
+        (
+            (MIGRATION_DSN,),
+            {
+                "target_schema": "public",
+                "require_complete": False,
+                "expected_revision": "20260710_0003",
+            },
+        ),
+        (
+            (MIGRATION_DSN,),
+            {
+                "target_schema": "public",
+                "require_complete": True,
+                "expected_revision": "20260710_0003",
+            },
+        ),
     ]

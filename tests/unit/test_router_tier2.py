@@ -115,12 +115,18 @@ async def test_apply_tier2_hits_returns_delta(engine_with_skill_pool):
     }
 
     fake_skill = MagicMock()
-    fake_skill.execute = AsyncMock(return_value={
-        "system_prompt_modifier": "be polite",
-    })
-    with patch.object(engine.skill_manager, "get_skill", return_value=fake_skill), \
-         patch("src.router.dependency.resolve_skill_order",
-               return_value=["skill_leadership_tone"]):
+    fake_skill.execute = AsyncMock(
+        return_value={
+            "system_prompt_modifier": "be polite",
+        }
+    )
+    with (
+        patch.object(engine.skill_manager, "get_skill", return_value=fake_skill),
+        patch(
+            "src.router.dependency.resolve_skill_order",
+            return_value=["skill_leadership_tone"],
+        ),
+    ):
         delta = await engine.apply_tier2_hits(state, hits)
 
     assert delta["active_skills"] == ["skill_leadership_tone"]
@@ -150,12 +156,19 @@ async def test_retriever_node_integrates_tier2(monkeypatch, graph_node_harness):
     monkeypatch.setattr(retriever_node, "get_retriever", lambda: fake_retriever)
 
     fake_engine = MagicMock()
-    fake_engine.apply_tier2_hits = AsyncMock(return_value={
-        "active_skills": ["skill_vip_handling"],
-        "routing_log": ["Tier 2 Match: ['skill_vip_handling']"],
-        "tool_calls": [{"id": "new-call", "name": "new-tool"}],
-    })
+    fake_engine.apply_tier2_hits = AsyncMock(
+        return_value={
+            "active_skills": ["skill_vip_handling"],
+            "routing_log": ["Tier 2 Match: ['skill_vip_handling']"],
+            "tool_calls": [{"id": "new-call", "name": "new-tool"}],
+        }
+    )
     monkeypatch.setattr(retriever_node, "get_routing_engine", lambda: fake_engine)
+    monkeypatch.setattr(
+        retriever_node,
+        "_generate_thread_summary",
+        AsyncMock(return_value="Thread summary"),
+    )
 
     state = graph_node_harness.state(
         {
@@ -232,6 +245,11 @@ async def test_real_mutating_forward_skill_projects_recipients_and_draft_store(
         retriever_node,
         "_retrieve_user_preferences",
         AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        retriever_node,
+        "_generate_thread_summary",
+        AsyncMock(return_value="Thread summary"),
     )
 
     state = graph_node_harness.state(

@@ -3,15 +3,22 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from base64 import urlsafe_b64decode
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from src.maintenance.cleanup_backup import (
+    ED25519_BACKUP_RECEIPT_VERSION,
+    ED25519_SIGNATURE_ALGORITHM,
     MAX_BACKUP_RECEIPT_BYTES,
     BackupReceiptError,
+    Ed25519BackupReceiptVerifier,
     HmacBackupReceiptVerifier,
+    create_ed25519_signed_backup_receipt,
     create_signed_backup_receipt,
 )
 
@@ -25,6 +32,12 @@ ALEMBIC_REVISION = "20260710_0002"
 CHECKPOINT_REVISION = 9
 PLAN_CREATED_AT = datetime(2026, 7, 12, 1, 0, tzinfo=timezone.utc)
 COMPLETED_AT = datetime(2026, 7, 12, 1, 5, tzinfo=timezone.utc)
+ED25519_PRIVATE_SEED = bytes.fromhex(
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+)
+ED25519_PUBLIC_KEY = bytes.fromhex(
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+)
 
 
 def _canonical(payload: dict[str, object]) -> bytes:
@@ -75,6 +88,43 @@ def _assert_error(raw: str | bytes, code: str) -> BackupReceiptError:
         _verify(raw)
     assert caught.value.code == code
     assert str(caught.value) == code
+    return caught.value
+
+
+def _ed25519_receipt(**overrides: object) -> str:
+    values: dict[str, object] = {
+        "plan_id": PLAN_ID,
+        "database_fingerprint": DATABASE_FINGERPRINT,
+        "alembic_revision": ALEMBIC_REVISION,
+        "checkpoint_revision": CHECKPOINT_REVISION,
+        "backup_id": BACKUP_ID,
+        "completed_at": COMPLETED_AT,
+        "manifest_sha256": MANIFEST_SHA256,
+    }
+    values.update(overrides)
+    return create_ed25519_signed_backup_receipt(
+        private_seed=ED25519_PRIVATE_SEED,
+        **values,  # type: ignore[arg-type]
+    )
+
+
+def _verify_ed25519(raw: str | bytes):
+    return Ed25519BackupReceiptVerifier(ED25519_PUBLIC_KEY).verify(
+        raw,
+        expected_plan_id=PLAN_ID,
+        expected_database_fingerprint=DATABASE_FINGERPRINT,
+        expected_alembic_revision=ALEMBIC_REVISION,
+        expected_checkpoint_revision=CHECKPOINT_REVISION,
+        plan_created_at=PLAN_CREATED_AT,
+    )
+
+
+def _assert_ed25519_error(raw: str | bytes, code: str) -> BackupReceiptError:
+    with pytest.raises(BackupReceiptError) as caught:
+        _verify_ed25519(raw)
+    assert caught.value.code == code
+    assert str(caught.value) == code
+    assert caught.value.__cause__ is None
     return caught.value
 
 
@@ -322,7 +372,9 @@ def test_receipt_requires_sha256_database_fingerprint(
     )
 
 
-@pytest.mark.parametrize("backup_id", [" backup-1", "backup-1 ", "bad\nvalue", "bad\x00value"])
+@pytest.mark.parametrize(
+    "backup_id", [" backup-1", "backup-1 ", "bad\nvalue", "bad\x00value"]
+)
 def test_receipt_rejects_noncanonical_or_controlled_backup_ids(
     backup_id: object,
 ) -> None:
@@ -380,3 +432,210 @@ def test_generator_rejects_invalid_inputs_with_safe_error_codes() -> None:
 
     assert caught.value.code == "backup_receipt_backup_id_invalid"
     assert str(caught.value) == "backup_receipt_backup_id_invalid"
+
+
+def test_ed25519_receipt_api_is_available() -> None:
+    assert ED25519_BACKUP_RECEIPT_VERSION == 2
+    assert ED25519_SIGNATURE_ALGORITHM == "Ed25519"
+    assert Ed25519BackupReceiptVerifier is not None
+    assert create_ed25519_signed_backup_receipt is not None
+
+
+def test_create_and_verify_canonical_ed25519_v2_receipt() -> None:
+    raw = _ed25519_receipt()
+    payload = json.loads(raw)
+
+    assert raw == _canonical(payload).decode("utf-8")
+    assert payload["version"] == ED25519_BACKUP_RECEIPT_VERSION == 2
+    assert payload["signature_algorithm"] == ED25519_SIGNATURE_ALGORITHM == "Ed25519"
+    assert len(payload["signature"]) == 86
+    assert "=" not in payload["signature"]
+
+    verified = _verify_ed25519(raw)
+
+    assert verified.version == 2
+    assert verified.plan_id == PLAN_ID
+    assert verified.database_fingerprint == DATABASE_FINGERPRINT
+    assert verified.alembic_revision == ALEMBIC_REVISION
+    assert verified.checkpoint_revision == CHECKPOINT_REVISION
+    assert verified.backup_id == BACKUP_ID
+    assert verified.completed_at == COMPLETED_AT
+    assert verified.scope == "full_database"
+    assert verified.manifest_sha256 == MANIFEST_SHA256
+    assert verified.status == "completed"
+
+
+def test_ed25519_signature_covers_canonical_json_for_every_unsigned_claim() -> None:
+    payload = json.loads(_ed25519_receipt())
+    signature = urlsafe_b64decode(f"{payload.pop('signature')}==")
+    public_key = Ed25519PublicKey.from_public_bytes(ED25519_PUBLIC_KEY)
+
+    public_key.verify(signature, _canonical(payload))
+
+    replacements: dict[str, object] = {
+        "version": 3,
+        "signature_algorithm": "Ed25519ph",
+        "plan_id": "3" * 64,
+        "database_fingerprint": "4" * 64,
+        "alembic_revision": "20260710_0003",
+        "checkpoint_revision": 10,
+        "backup_id": "backup-20260712-002",
+        "completed_at": "2026-07-12T01:06:00Z",
+        "scope": "checkpoint",
+        "manifest_sha256": "b" * 64,
+        "status": "verified",
+    }
+    for field, replacement in replacements.items():
+        tampered = dict(payload)
+        tampered[field] = replacement
+        with pytest.raises(InvalidSignature):
+            public_key.verify(signature, _canonical(tampered))
+
+
+@pytest.mark.parametrize(
+    "public_key",
+    [
+        b"",
+        b"k" * 31,
+        b"k" * 33,
+        "k" * 32,
+        bytearray(b"k" * 32),
+    ],
+)
+def test_ed25519_verifier_accepts_only_raw_32_byte_public_key(
+    public_key: object,
+) -> None:
+    with pytest.raises(BackupReceiptError) as caught:
+        Ed25519BackupReceiptVerifier(public_key)  # type: ignore[arg-type]
+
+    assert caught.value.code == "backup_receipt_key_invalid"
+    assert str(caught.value) == "backup_receipt_key_invalid"
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "private_seed",
+    [
+        b"",
+        b"k" * 31,
+        b"k" * 33,
+        "k" * 32,
+        bytearray(b"k" * 32),
+    ],
+)
+def test_ed25519_signer_accepts_only_raw_32_byte_private_seed(
+    private_seed: object,
+) -> None:
+    with pytest.raises(BackupReceiptError) as caught:
+        create_ed25519_signed_backup_receipt(
+            private_seed=private_seed,  # type: ignore[arg-type]
+            plan_id=PLAN_ID,
+            database_fingerprint=DATABASE_FINGERPRINT,
+            alembic_revision=ALEMBIC_REVISION,
+            checkpoint_revision=CHECKPOINT_REVISION,
+            backup_id=BACKUP_ID,
+            completed_at=COMPLETED_AT,
+            manifest_sha256=MANIFEST_SHA256,
+        )
+
+    assert caught.value.code == "backup_receipt_key_invalid"
+    assert str(caught.value) == "backup_receipt_key_invalid"
+    assert caught.value.__cause__ is None
+
+
+def test_ed25519_v2_and_hmac_v1_cannot_be_confused() -> None:
+    _assert_ed25519_error(_signed_receipt(), "backup_receipt_version_invalid")
+
+    with pytest.raises(BackupReceiptError) as caught:
+        _verify(_ed25519_receipt())
+
+    assert caught.value.code == "backup_receipt_version_invalid"
+    assert str(caught.value) == "backup_receipt_version_invalid"
+
+
+@pytest.mark.parametrize(
+    "signature_algorithm",
+    ["ed25519", "ED25519", "Ed25519ph", "HMAC-SHA256", "", 1, None],
+)
+def test_ed25519_v2_requires_exact_signature_algorithm(
+    signature_algorithm: object,
+) -> None:
+    payload = json.loads(_ed25519_receipt())
+    payload["signature_algorithm"] = signature_algorithm
+
+    _assert_ed25519_error(
+        _canonical(payload).decode("utf-8"),
+        "backup_receipt_algorithm_invalid",
+    )
+
+
+def test_ed25519_v2_requires_signature_algorithm_field() -> None:
+    payload = json.loads(_ed25519_receipt())
+    del payload["signature_algorithm"]
+
+    _assert_ed25519_error(
+        _canonical(payload).decode("utf-8"),
+        "backup_receipt_schema_invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "",
+        "0" * 64,
+        "0" * 128,
+        "A" * 85,
+        "A" * 87,
+        ("A" * 86) + "==",
+        ("A" * 85) + "+",
+        ("A" * 85) + "/",
+        1,
+        None,
+    ],
+)
+def test_ed25519_v2_requires_unpadded_base64url_64_byte_signature(
+    signature: object,
+) -> None:
+    payload = json.loads(_ed25519_receipt())
+    payload["signature"] = signature
+
+    _assert_ed25519_error(
+        _canonical(payload).decode("utf-8"),
+        "backup_receipt_signature_invalid",
+    )
+
+
+def test_ed25519_v2_rejects_well_formed_but_incorrect_signature() -> None:
+    payload = json.loads(_ed25519_receipt())
+    payload["signature"] = "A" * 86
+
+    _assert_ed25519_error(
+        _canonical(payload).decode("utf-8"),
+        "backup_receipt_signature_invalid",
+    )
+
+
+def test_ed25519_v2_rejects_noncanonical_json() -> None:
+    payload = json.loads(_ed25519_receipt())
+
+    _assert_ed25519_error(
+        json.dumps(payload, indent=2),
+        "backup_receipt_not_canonical",
+    )
+
+
+def test_ed25519_error_does_not_echo_receipt_or_key_material() -> None:
+    payload = json.loads(_ed25519_receipt())
+    payload["signature"] = "A" * 86
+    sensitive = _canonical(payload).decode("utf-8")
+
+    caught = _assert_ed25519_error(
+        sensitive,
+        "backup_receipt_signature_invalid",
+    )
+
+    rendered = f"{caught!s} {caught!r}"
+    assert BACKUP_ID not in rendered
+    assert ED25519_PRIVATE_SEED.hex() not in rendered
+    assert ED25519_PUBLIC_KEY.hex() not in rendered

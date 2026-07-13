@@ -49,47 +49,54 @@ async def require_runtime_database(
     role_separation_required: bool = False,
     expected_runtime_role: str = "",
     expected_migration_role: str = "",
+    expected_maintenance_role: str = "",
+    expected_auditor_role: str = "",
     target_schema: str = "public",
 ) -> None:
-    """Accept the expand bridge only while all Phase 2 features are disabled."""
+    """Apply the revision gate and reject unverified reconciliation activation."""
+    if sync_reconciliation_enabled:
+        raise DatabaseRevisionError("sync_reconciliation_capability_unavailable")
+
     phase_2_enabled = any(
         (
             durable_inbox_enabled,
             ingestion_shadow_enabled,
-            sync_reconciliation_enabled,
         )
     )
     if phase_2_enabled and not role_separation_required:
         raise DatabaseRoleError("database_role_preflight_failed")
-    if role_separation_required:
-        await require_runtime_database_role(
-            dsn,
-            expected_runtime_role=expected_runtime_role,
-            expected_migration_role=expected_migration_role,
-            target_schema=target_schema,
-        )
     allowed = (
         frozenset({PHASE_2_DATABASE_REVISION})
         if phase_2_enabled
         else RUNTIME_COMPATIBLE_DATABASE_REVISIONS
     )
-    await _require_database_revision(dsn, allowed)
+    if role_separation_required:
+        await require_runtime_database_role(
+            dsn,
+            expected_runtime_role=expected_runtime_role,
+            expected_migration_role=expected_migration_role,
+            expected_maintenance_role=expected_maintenance_role,
+            expected_auditor_role=expected_auditor_role,
+            target_schema=target_schema,
+        )
+    current_revision = await _require_database_revision(dsn, allowed)
     if role_separation_required:
         await require_database_schema_contract(
             dsn,
             target_schema=target_schema,
             require_complete=True,
+            expected_revision=current_revision,
         )
 
 
 async def _require_database_revision(
     dsn: str,
     allowed_revisions: frozenset[str],
-) -> None:
+) -> str:
     """Fail closed unless the database has one exact allowed Alembic head."""
     current_revision = await get_current_database_revision(dsn)
     if current_revision in allowed_revisions:
-        return
+        return current_revision
 
     found = current_revision or "unversioned"
     expected = ", ".join(sorted(allowed_revisions))

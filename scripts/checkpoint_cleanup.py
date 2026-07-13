@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -26,7 +27,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from src.config import get_settings, resolve_secret  # noqa: E402
+from src.db.auditor import require_checkpoint_auditor_database_role  # noqa: E402
+from src.db.maintenance_settings import (  # noqa: E402
+    CheckpointPlanSettings,
+    MaintenanceSettings,
+    load_checkpoint_plan_settings,
+    load_maintenance_settings,
+)
+from src.db.migration_settings import (  # noqa: E402
+    MigrationSettingsError,
+    _read_secret_file,
+)
+from src.db.roles import require_maintenance_database_role  # noqa: E402
 from src.maintenance.checkpoint_cleanup import (  # noqa: E402
     CleanupAuthorizationError,
     CleanupPlanError,
@@ -35,11 +47,11 @@ from src.maintenance.checkpoint_cleanup import (  # noqa: E402
 from src.maintenance.cleanup_backup import (  # noqa: E402
     MAX_BACKUP_RECEIPT_BYTES,
     BackupReceiptError,
-    HmacBackupReceiptVerifier,
+    Ed25519BackupReceiptVerifier,
 )
 
 
-RECEIPT_KEY_ENV = "CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64"
+RECEIPT_PUBLIC_KEY_FILE_ENV = "CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE"
 _CLI_ERROR_CODES = frozenset(
     {
         "plan_confirmation_mismatch",
@@ -102,13 +114,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     execute = subparsers.add_parser(
         "execute",
-        help="execute one exact plan after backup and quiescence proof",
+        help=(
+            "execute one exact plan after backup verification and an operator "
+            "quiescence attestation"
+        ),
     )
     execute.add_argument("--plan-id", required=True)
     execute.add_argument("--confirm-plan-id", required=True)
     execute.add_argument("--backup-id", required=True)
     execute.add_argument("--backup-receipt", type=Path, required=True)
-    execute.add_argument("--service-quiesced", action="store_true", required=True)
+    execute.add_argument(
+        "--operator-attests-service-quiesced",
+        dest="service_quiesced",
+        action="store_true",
+        required=True,
+    )
     execute.add_argument("--limit", type=_positive_int, required=True)
     execute.add_argument(
         "--state-dir",
@@ -119,9 +139,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _read_private_receipt(path: Path) -> bytes:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow == 0:
+        raise CliSafetyError("backup_receipt_file_unsafe")
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except (OSError, TypeError, ValueError):
@@ -148,25 +174,31 @@ def _read_private_receipt(path: Path) -> bytes:
     return raw
 
 
-def _load_receipt_key(settings: object) -> bytes:
-    encoded = resolve_secret(
-        getattr(settings, RECEIPT_KEY_ENV, "")
-    )
-    if not encoded:
+def _load_receipt_public_key(
+    environment: Mapping[str, str] | None = None,
+) -> bytes:
+    values = os.environ if environment is None else environment
+    key_path = values.get(RECEIPT_PUBLIC_KEY_FILE_ENV, "")
+    if not isinstance(key_path, str) or not key_path:
         raise CliSafetyError("backup_receipt_key_unavailable")
     try:
-        key = base64.b64decode(encoded, validate=True)
+        encoded = _read_secret_file(key_path)
+    except MigrationSettingsError:
+        raise CliSafetyError("backup_receipt_key_invalid") from None
+    try:
+        public_key = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError):
         raise CliSafetyError("backup_receipt_key_invalid") from None
-    if len(key) < 32:
+    if len(public_key) != 32:
         raise CliSafetyError("backup_receipt_key_invalid")
-    return key
+    return public_key
 
 
 def _build_cleaner(
     *,
     state_dir: Path,
     require_backup_verifier: bool,
+    maintenance_settings: MaintenanceSettings | CheckpointPlanSettings | None = None,
 ) -> CheckpointCleaner:
     # Imports remain local so argument/confirmation failures cannot initialize
     # a database path, and this command never initializes AppContext.
@@ -175,14 +207,56 @@ def _build_cleaner(
     )
     from src.maintenance.cleanup_artifacts import PlanArtifactStore
 
-    settings = get_settings()
+    if maintenance_settings is None:
+        maintenance_settings = load_maintenance_settings()
     verifier = None
     if require_backup_verifier:
-        verifier = HmacBackupReceiptVerifier(_load_receipt_key(settings))
+        verifier = Ed25519BackupReceiptVerifier(_load_receipt_public_key())
     return CheckpointCleaner(
-        repository=PostgresCheckpointRepository(settings.database_url),
+        repository=PostgresCheckpointRepository(
+            maintenance_settings.database_url.get_secret_value()
+        ),
         artifact_store=PlanArtifactStore(state_dir),
         backup_verifier=verifier,
+    )
+
+
+async def _build_preflighted_cleaner(
+    *,
+    state_dir: Path,
+    require_backup_verifier: bool,
+) -> CheckpointCleaner:
+    if not require_backup_verifier:
+        plan_settings = load_checkpoint_plan_settings()
+        plan_dsn = plan_settings.database_url.get_secret_value()
+        await require_checkpoint_auditor_database_role(
+            plan_dsn,
+            expected_auditor_role=plan_settings.expected_auditor_role,
+            expected_maintenance_role=plan_settings.expected_maintenance_role,
+            expected_runtime_role=plan_settings.expected_runtime_role,
+            expected_migration_role=plan_settings.expected_migration_role,
+            target_schema=plan_settings.target_schema,
+        )
+        return _build_cleaner(
+            state_dir=state_dir,
+            require_backup_verifier=False,
+            maintenance_settings=plan_settings,
+        )
+
+    maintenance_settings = load_maintenance_settings()
+    dsn = maintenance_settings.database_url.get_secret_value()
+    await require_maintenance_database_role(
+        dsn,
+        expected_maintenance_role=(maintenance_settings.expected_maintenance_role),
+        expected_runtime_role=maintenance_settings.expected_runtime_role,
+        expected_migration_role=maintenance_settings.expected_migration_role,
+        expected_auditor_role=maintenance_settings.expected_auditor_role,
+        target_schema=maintenance_settings.target_schema,
+    )
+    return _build_cleaner(
+        state_dir=state_dir,
+        require_backup_verifier=require_backup_verifier,
+        maintenance_settings=maintenance_settings,
     )
 
 
@@ -215,9 +289,7 @@ def _safe_error_code(exc: BaseException) -> str:
 def _normalize_error_code(code: object) -> str:
     if isinstance(code, str) and code and len(code) <= 128:
         if all(
-            character.islower()
-            or character.isdigit()
-            or character == "_"
+            character.islower() or character.isdigit() or character == "_"
             for character in code
         ):
             return code
@@ -233,13 +305,11 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "plan":
-            cleaner = _build_cleaner(
+            cleaner = await _build_preflighted_cleaner(
                 state_dir=args.state_dir,
                 require_backup_verifier=False,
             )
-            cutoff = datetime.now(UTC) - timedelta(
-                hours=args.older_than_hours
-            )
+            cutoff = datetime.now(UTC) - timedelta(hours=args.older_than_hours)
             plan = await cleaner.plan(older_than=cutoff, limit=args.limit)
             report = await cleaner.run(
                 plan.plan_id,
@@ -261,7 +331,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
             return 0 if error_code is None else 1
 
         receipt = _read_private_receipt(args.backup_receipt)
-        cleaner = _build_cleaner(
+        cleaner = await _build_preflighted_cleaner(
             state_dir=args.state_dir,
             require_backup_verifier=True,
         )

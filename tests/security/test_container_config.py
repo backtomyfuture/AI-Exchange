@@ -12,12 +12,34 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
+DOCKERFILE = PROJECT_ROOT / "Dockerfile"
+BOOTSTRAP_REQUIREMENTS = PROJECT_ROOT / "requirements.bootstrap.txt"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 RUNTIME_ENV_EXAMPLE = PROJECT_ROOT / ".env.runtime.example"
 DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
 GITIGNORE = PROJECT_ROOT / ".gitignore"
 POSTGRES_PEER_ACL_INIT = (
     PROJECT_ROOT / "docker" / "postgres" / "010-peer-database-acl.sql"
+)
+PINNED_PYTHON_IMAGE = (
+    "python:3.12-slim@"
+    "sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf"
+)
+PINNED_POSTGRES_IMAGE = (
+    "postgres:15@"
+    "sha256:f30e3de0ac9cc938dac627ef2231099867c694b5f949fadb924c8c977428c399"
+)
+PINNED_QDRANT_IMAGE = (
+    "qdrant/qdrant:v1.17.0@"
+    "sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb"
+)
+PINNED_UV_WHEEL_HASHES = {
+    "041e4b80bebc58d7142ac9394370cacd73185fd8d066d6675d14707d83408f6d",
+    "49fe42df9f42056037473f3876adec1615709b57d3470ed39178ff420f3afb9f",
+}
+PINNED_DEBIAN_SNAPSHOT = "https://snapshot.debian.org/archive/debian/20260623T000000Z"
+PINNED_DEBIAN_SECURITY_SNAPSHOT = (
+    "https://snapshot.debian.org/archive/debian-security/20260623T000000Z"
 )
 
 
@@ -58,6 +80,79 @@ def _read_env_example() -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip()
     return values
+
+
+def test_production_application_base_image_is_digest_pinned():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert dockerfile.splitlines()[0] == f"FROM {PINNED_PYTHON_IMAGE}"
+
+
+def test_production_data_service_images_are_digest_pinned():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+
+    assert compose["services"]["postgres"]["image"] == PINNED_POSTGRES_IMAGE
+    assert compose["services"]["qdrant"]["image"] == PINNED_QDRANT_IMAGE
+
+
+def test_production_container_inputs_do_not_use_latest_tags():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    compose = PRODUCTION_COMPOSE.read_text(encoding="utf-8")
+
+    assert ":latest" not in dockerfile
+    assert ":latest" not in compose
+
+
+def test_docker_bootstrap_does_not_upgrade_unlocked_build_tools():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "--upgrade" not in dockerfile
+    assert "pip setuptools wheel Cython" not in dockerfile
+
+
+def test_uv_bootstrap_requirement_is_hash_locked_for_supported_linux_architectures():
+    assert BOOTSTRAP_REQUIREMENTS.is_file()
+    requirements = BOOTSTRAP_REQUIREMENTS.read_text(encoding="utf-8")
+    hashes = {
+        token.removeprefix("--hash=sha256:")
+        for token in requirements.replace("\\", " ").split()
+        if token.startswith("--hash=sha256:")
+    }
+
+    assert "uv==0.11.28" in requirements
+    assert hashes == PINNED_UV_WHEEL_HASHES
+
+
+def test_docker_installs_uv_only_from_hash_locked_bootstrap():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "COPY pyproject.toml uv.lock requirements.bootstrap.txt ./" in dockerfile
+    assert "--only-binary=:all: --require-hashes --no-deps" in dockerfile
+    assert "-r requirements.bootstrap.txt" in dockerfile
+    assert "uv==0.11.28" not in dockerfile
+
+
+def test_docker_installs_runtime_dependencies_from_hashed_wheels_only():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert dockerfile.count("--only-binary=:all:") == 2
+    assert (
+        "pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "
+        "--only-binary=:all: --require-hashes -r /tmp/requirements.lock"
+    ) in " ".join(dockerfile.split())
+
+
+def test_docker_resolves_debian_packages_from_the_pinned_snapshot_only():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert PINNED_DEBIAN_SNAPSHOT in dockerfile
+    assert PINNED_DEBIAN_SECURITY_SNAPSHOT in dockerfile
+    assert "Check-Valid-Until: no" in dockerfile
+    assert "Acquire::Check-Valid-Until" not in dockerfile
+    assert dockerfile.index(PINNED_DEBIAN_SNAPSHOT) < dockerfile.index("apt-get update")
+    assert dockerfile.index(PINNED_DEBIAN_SECURITY_SNAPSHOT) < dockerfile.index(
+        "apt-get update"
+    )
 
 
 @pytest.mark.parametrize("service_name", ["postgres", "qdrant"])
@@ -124,6 +219,12 @@ def test_production_application_publishes_one_webhook_port():
     assert ports == ("${APP_PORT:-8000}:8000",)
 
 
+def test_production_shutdown_budget_covers_worker_and_lark_drains():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+
+    assert compose["services"]["ai-assistant-service"]["stop_grace_period"] == "90s"
+
+
 def test_production_does_not_expose_host_gateway_to_application():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     service = compose["services"]["ai-assistant-service"]
@@ -174,7 +275,13 @@ def test_production_application_uses_an_explicit_runtime_allowlist_only():
 
     assert "env_file" not in service
     assert "secrets" not in service
-    forbidden_fragments = ("MIGRATION_DATABASE", "POSTGRES_ADMIN", "MIGRATION_PASSWORD")
+    forbidden_fragments = (
+        "MIGRATION_DATABASE",
+        "POSTGRES_ADMIN",
+        "MIGRATION_PASSWORD",
+        "MAINTENANCE_DATABASE",
+        "MAINTENANCE_RECEIPT",
+    )
     for key, value in service["environment"].items():
         rendered = f"{key}={value}"
         assert not any(fragment in rendered for fragment in forbidden_fragments)
@@ -209,7 +316,78 @@ def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
         "POSTGRES_RUNTIME_PASSWORD",
         "POSTGRES_PASSWORD",
     }.intersection(service["environment"])
-    assert set(compose["secrets"]) == {"migration_database_url"}
+    assert set(compose["secrets"]) == {
+        "migration_database_url",
+        "checkpoint_auditor_database_url",
+        "checkpoint_maintenance_database_url",
+        "checkpoint_maintenance_receipt_ed25519_public_key",
+    }
+
+
+def test_checkpoint_maintenance_plan_is_manual_and_cannot_sign_receipts():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["checkpoint-maintenance"]
+
+    assert service["profiles"] == ["checkpoint-maintenance"]
+    assert service["restart"] == "no"
+    assert service["entrypoint"] == ["python", "scripts/checkpoint_cleanup.py"]
+    assert service["command"] == ["--help"]
+    assert "ports" not in service
+    assert _network_names(service) == {"backend"}
+    assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["cap_add"] == ["DAC_READ_SEARCH"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["secrets"] == [
+        {
+            "source": "checkpoint_auditor_database_url",
+            "target": "checkpoint_auditor_database_url",
+        },
+    ]
+    assert service["environment"]["CHECKPOINT_AUDITOR_DATABASE_URL_FILE"] == (
+        "/run/secrets/checkpoint_auditor_database_url"
+    )
+    assert "CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE" not in service["environment"]
+    assert (
+        "CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE"
+        not in service["environment"]
+    )
+    assert "MIGRATION_DATABASE_URL_FILE" not in service["environment"]
+    assert "POSTGRES_PASSWORD" not in service["environment"]
+
+
+def test_checkpoint_maintenance_execute_isolated_from_plan_and_can_verify_receipts():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["checkpoint-maintenance-execute"]
+
+    assert service["profiles"] == ["checkpoint-maintenance-execute"]
+    assert service["restart"] == "no"
+    assert service["entrypoint"] == ["python", "scripts/checkpoint_cleanup.py"]
+    assert service["command"] == ["execute", "--help"]
+    assert "ports" not in service
+    assert _network_names(service) == {"backend"}
+    assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["cap_add"] == ["DAC_READ_SEARCH"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["secrets"] == [
+        {
+            "source": "checkpoint_maintenance_database_url",
+            "target": "checkpoint_maintenance_database_url",
+        },
+        {
+            "source": "checkpoint_maintenance_receipt_ed25519_public_key",
+            "target": "checkpoint_maintenance_receipt_ed25519_public_key",
+        },
+    ]
+    assert (
+        service["environment"]["CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE"]
+        == "/run/secrets/checkpoint_maintenance_receipt_ed25519_public_key"
+    )
+    assert "MIGRATION_DATABASE_URL_FILE" not in service["environment"]
+    assert "POSTGRES_PASSWORD" not in service["environment"]
 
 
 def test_build_and_vcs_ignore_all_environment_and_local_secret_files():
@@ -224,6 +402,45 @@ def test_build_and_vcs_ignore_all_environment_and_local_secret_files():
     assert "!.env.runtime.example" in gitignore
 
 
+def test_build_context_excludes_generated_test_and_lint_artifacts():
+    dockerignore = set(DOCKERIGNORE.read_text(encoding="utf-8").splitlines())
+
+    assert {".coverage*", ".pytest_cache/", "htmlcov/", ".ruff_cache/"} <= dockerignore
+
+
+def test_build_context_excludes_non_runtime_and_message_artifacts():
+    dockerignore = set(DOCKERIGNORE.read_text(encoding="utf-8").splitlines())
+
+    assert {
+        "tests/",
+        "docs/",
+        ".agent/",
+        ".superpowers/",
+        "*.eml",
+        "*.pdf",
+    } <= dockerignore
+
+
+def test_dockerfile_copies_only_the_explicit_runtime_allowlist():
+    dockerfile_lines = set(DOCKERFILE.read_text(encoding="utf-8").splitlines())
+
+    assert "COPY . ." not in dockerfile_lines
+    assert {
+        "COPY src ./src",
+        "COPY scripts ./scripts",
+        "COPY alembic ./alembic",
+        "COPY alembic.ini ./alembic.ini",
+        "COPY skills_registry ./skills_registry",
+    } <= dockerfile_lines
+
+
+def test_vcs_ignores_coverage_artifacts_and_keeps_bootstrap_lockfile():
+    gitignore = set(GITIGNORE.read_text(encoding="utf-8").splitlines())
+
+    assert ".coverage*" in gitignore
+    assert "!requirements.bootstrap.txt" in gitignore
+
+
 def test_runtime_environment_template_excludes_control_plane_credentials():
     values: dict[str, str] = {}
     for raw_line in RUNTIME_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
@@ -236,6 +453,14 @@ def test_runtime_environment_template_excludes_control_plane_credentials():
     assert not {
         "MIGRATION_DATABASE_URL",
         "MIGRATION_DATABASE_URL_FILE",
+        "CHECKPOINT_MAINTENANCE_DATABASE_URL",
+        "CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE",
+        "CHECKPOINT_AUDITOR_DATABASE_URL",
+        "CHECKPOINT_AUDITOR_DATABASE_URL_FILE",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_B64",
+        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_FILE",
+        "CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64",
         "POSTGRES_ADMIN_USER",
         "POSTGRES_ADMIN_PASSWORD",
         "POSTGRES_MIGRATION_USER",

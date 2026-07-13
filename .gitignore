@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.coverage*
 .pytest_cache/
 
 # Local data (Databases)
@@ -30,3 +31,7 @@ processed_emails.json
 # Docker logs
 *.log
 *.txt
+!requirements.bootstrap.txt
+
+# Generated local verification artifacts
+artifacts/

@@ -25,6 +25,8 @@ class MigrationSettings:
     database_url: SecretStr
     expected_migration_role: str
     expected_runtime_role: str
+    expected_maintenance_role: str
+    expected_auditor_role: str
     target_schema: str
 
 
@@ -128,8 +130,13 @@ def load_migration_settings(
         database_url = _read_secret_file(values.get("MIGRATION_DATABASE_URL_FILE", ""))
         migration_role = _read_identifier(values, "POSTGRES_MIGRATION_OWNER_ROLE")
         runtime_role = _read_identifier(values, "POSTGRES_RUNTIME_ROLE")
+        maintenance_role = _read_identifier(values, "POSTGRES_MAINTENANCE_ROLE")
+        auditor_role = _read_identifier(
+            values,
+            "POSTGRES_CHECKPOINT_AUDITOR_ROLE",
+        )
         target_schema = _read_identifier(values, "POSTGRES_SCHEMA")
-        if migration_role == runtime_role:
+        if len({migration_role, runtime_role, maintenance_role, auditor_role}) != 4:
             raise _reject()
 
         parsed = conninfo_to_dict(database_url)
@@ -150,5 +157,7 @@ def load_migration_settings(
         database_url=SecretStr(database_url),
         expected_migration_role=migration_role,
         expected_runtime_role=runtime_role,
+        expected_maintenance_role=maintenance_role,
+        expected_auditor_role=auditor_role,
         target_schema=target_schema,
     )

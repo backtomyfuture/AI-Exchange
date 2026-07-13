@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import base64
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from pydantic import SecretStr
+
+
+pytestmark = pytest.mark.asyncio
+
+
+async def test_setup_async_rejects_unbound_checkpoint_write_guard_before_io() -> None:
+    from src.db.checkpoint_saver import CheckpointWriteFenceConfigurationError
+    from src.init_app import AppContext
+
+    context = AppContext()
+    context.db_manager = MagicMock()
+    context.db_manager.open = AsyncMock()
+    context.pool = MagicMock()
+    context.pool.open = AsyncMock()
+    context.exchange_client = MagicMock()
+    context.exchange_client.get_all_folders = AsyncMock(return_value=[])
+
+    with (
+        patch("src.init_app.get_settings", return_value=MagicMock()),
+        pytest.raises(
+            CheckpointWriteFenceConfigurationError,
+            match="^checkpoint_write_fence_not_bound$",
+        ),
+    ):
+        await context.setup_async()
+
+    context.db_manager.open.assert_not_awaited()
+    context.pool.open.assert_not_awaited()
+    context.exchange_client.get_all_folders.assert_not_awaited()
+
+
+async def test_write_guard_cannot_be_bound_after_graph_creation() -> None:
+    from src.db.checkpoint_saver import CheckpointWriteFenceConfigurationError
+    from src.init_app import AppContext
+
+    context = AppContext()
+    context.graph = object()
+
+    with pytest.raises(
+        CheckpointWriteFenceConfigurationError,
+        match="^checkpoint_write_fence_binding_closed$",
+    ):
+        context.bind_checkpoint_write_guard(AsyncMock())
+
+    assert context._checkpoint_write_guard is None
+
+
+async def test_initialize_configures_every_checkpoint_pool_session_with_shared_lock(
+    tmp_path,
+) -> None:
+    from src.db.checkpoint_saver import configure_checkpoint_pool_connection
+    from src.init_app import AppContext
+
+    settings = SimpleNamespace(
+        CONTENT_STORE_ROOT=str(tmp_path / "content"),
+        CONTENT_STORE_KEY=SecretStr(base64.b64encode(bytes(range(32))).decode("ascii")),
+        CONTENT_STORE_KEY_VERSION="v1",
+        database_url="postgresql://runtime:PRIVATE@localhost/email_agent",
+    )
+    context = AppContext()
+    pool_factory = MagicMock()
+
+    with (
+        patch("src.init_app.get_settings", return_value=settings),
+        patch("src.init_app.ExchangeClient"),
+        patch("src.init_app.EmailProcessor"),
+        patch("src.init_app.AsyncDatabaseManager"),
+        patch("src.init_app.AsyncConnectionPool", pool_factory),
+    ):
+        context.initialize()
+
+    pool_factory.assert_called_once_with(
+        conninfo=settings.database_url,
+        max_size=20,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+        configure=configure_checkpoint_pool_connection,
+        open=False,
+    )
+
+
+async def test_setup_async_builds_graph_with_bound_fenced_saver() -> None:
+    from src.init_app import AppContext
+
+    context = AppContext()
+    context.db_manager = MagicMock()
+    context.db_manager.open = AsyncMock()
+    context.pool = MagicMock()
+    context.pool.open = AsyncMock()
+    context.exchange_client = MagicMock()
+    context.exchange_client.get_all_folders = AsyncMock(return_value=[])
+    context.graph_dependencies = object()
+    guard = AsyncMock()
+    context.bind_checkpoint_write_guard(guard)
+    settings = SimpleNamespace(
+        EXCHANGE_FOLDERS_FULL="",
+        EXCHANGE_FOLDERS_ARCHIVE="",
+    )
+    saver = object()
+    graph = object()
+
+    with (
+        patch("src.init_app.get_settings", return_value=settings),
+        patch("src.init_app.FencedAsyncPostgresSaver", return_value=saver) as factory,
+        patch("src.init_app.build_graph", return_value=graph) as build,
+    ):
+        await context.setup_async()
+
+    factory.assert_called_once_with(context.pool, write_guard=guard)
+    build.assert_called_once_with(
+        checkpointer=saver,
+        dependencies=context.graph_dependencies,
+    )
+    assert context.graph is graph

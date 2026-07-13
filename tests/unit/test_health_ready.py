@@ -47,6 +47,8 @@ def test_ready_checks_database_revision_and_returns_minimal_success():
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
         POSTGRES_SCHEMA="public",
     )
     cached_gate = AsyncMock()
@@ -92,6 +94,8 @@ def test_ready_failure_is_generic_and_never_logs_or_returns_exception_text(caplo
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
         POSTGRES_SCHEMA="public",
     )
     runtime_gate = AsyncMock(side_effect=RuntimeError(secret))
@@ -128,6 +132,8 @@ def test_ready_failure_is_generic_and_never_logs_or_returns_exception_text(caplo
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
     legacy_gate.assert_not_awaited()
@@ -177,6 +183,8 @@ async def test_ready_database_preflight_coalesces_concurrent_requests():
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
         POSTGRES_SCHEMA="public",
     )
     entered = asyncio.Event()
@@ -217,6 +225,8 @@ async def test_ready_database_preflight_coalesces_concurrent_requests():
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
 
@@ -233,6 +243,8 @@ async def test_ready_database_preflight_caches_failure_and_has_timeout(
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
+        POSTGRES_MAINTENANCE_ROLE="maintenance_user",
+        POSTGRES_CHECKPOINT_AUDITOR_ROLE="checkpoint_auditor",
         POSTGRES_SCHEMA="public",
     )
 

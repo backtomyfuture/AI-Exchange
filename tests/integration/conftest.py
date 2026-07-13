@@ -38,15 +38,21 @@ class SchemaProbe:
     dsn: str
     admin_dsn: str
     runtime_dsn: str
+    maintenance_dsn: str
+    auditor_dsn: str
     database_name: str
     migration_role: str
     runtime_role: str
+    maintenance_role: str
+    auditor_role: str
 
     @property
     def bootstrap_identity(self) -> dict[str, str]:
         return {
             "expected_migration_role": self.migration_role,
             "expected_runtime_role": self.runtime_role,
+            "expected_maintenance_role": self.maintenance_role,
+            "expected_auditor_role": self.auditor_role,
             "target_schema": "public",
         }
 
@@ -55,6 +61,18 @@ class SchemaProbe:
         return {
             "expected_runtime_role": self.runtime_role,
             "expected_migration_role": self.migration_role,
+            "expected_maintenance_role": self.maintenance_role,
+            "expected_auditor_role": self.auditor_role,
+            "target_schema": "public",
+        }
+
+    @property
+    def maintenance_identity(self) -> dict[str, str]:
+        return {
+            "expected_maintenance_role": self.maintenance_role,
+            "expected_runtime_role": self.runtime_role,
+            "expected_migration_role": self.migration_role,
+            "expected_auditor_role": self.auditor_role,
             "target_schema": "public",
         }
 
@@ -73,6 +91,10 @@ class SchemaProbe:
 
     def runtime_execute(self, statement, params=None) -> None:
         with psycopg.connect(self.runtime_dsn, autocommit=True) as conn:
+            conn.execute(statement, params)
+
+    def maintenance_execute(self, statement, params=None) -> None:
+        with psycopg.connect(self.maintenance_dsn, autocommit=True) as conn:
             conn.execute(statement, params)
 
     def grant_runtime_readiness(self) -> None:
@@ -127,7 +149,7 @@ class MigrationHarness:
 class PostgresDatabaseFactory:
     def __init__(self, admin_url: str):
         self.admin_url = admin_url
-        self._resources: list[tuple[str, str, str]] = []
+        self._resources: list[tuple[str, str, str, str, str]] = []
 
     def _role_database_url(
         self,
@@ -164,9 +186,21 @@ class PostgresDatabaseFactory:
         database_name = f"ai_exchange_test_{token}"
         migration_role = f"ai_exchange_test_m_{token}"
         runtime_role = f"ai_exchange_test_r_{token}"
+        maintenance_role = f"ai_exchange_test_k_{token}"
+        auditor_role = f"ai_exchange_test_a_{token}"
         migration_password = f"Migration-{token}"
         runtime_password = f"Runtime-{token}"
-        self._resources.append((database_name, runtime_role, migration_role))
+        maintenance_password = f"Maintenance-{token}"
+        auditor_password = f"Auditor-{token}"
+        self._resources.append(
+            (
+                database_name,
+                runtime_role,
+                maintenance_role,
+                auditor_role,
+                migration_role,
+            )
+        )
         with psycopg.connect(self.admin_url, autocommit=True) as conn:
             conn.execute(
                 sql.SQL(
@@ -176,6 +210,26 @@ class PostgresDatabaseFactory:
                 ).format(
                     sql.Identifier(migration_role),
                     sql.Literal(migration_password),
+                )
+            )
+            conn.execute(
+                sql.SQL(
+                    "CREATE ROLE {} WITH LOGIN PASSWORD {} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                    "NOREPLICATION NOBYPASSRLS NOINHERIT"
+                ).format(
+                    sql.Identifier(auditor_role),
+                    sql.Literal(auditor_password),
+                )
+            )
+            conn.execute(
+                sql.SQL(
+                    "CREATE ROLE {} WITH LOGIN PASSWORD {} "
+                    "NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                    "NOREPLICATION NOBYPASSRLS NOINHERIT"
+                ).format(
+                    sql.Identifier(maintenance_role),
+                    sql.Literal(maintenance_password),
                 )
             )
             conn.execute(
@@ -200,10 +254,12 @@ class PostgresDatabaseFactory:
                 )
             )
             conn.execute(
-                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}, {}").format(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}, {}, {}, {}").format(
                     sql.Identifier(database_name),
                     sql.Identifier(migration_role),
                     sql.Identifier(runtime_role),
+                    sql.Identifier(maintenance_role),
+                    sql.Identifier(auditor_role),
                 )
             )
 
@@ -216,8 +272,9 @@ class PostgresDatabaseFactory:
             )
             conn.execute("REVOKE ALL ON SCHEMA public FROM PUBLIC")
             conn.execute(
-                sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(
-                    sql.Identifier(runtime_role)
+                sql.SQL("GRANT USAGE ON SCHEMA public TO {}, {}").format(
+                    sql.Identifier(runtime_role),
+                    sql.Identifier(maintenance_role),
                 )
             )
             conn.execute(
@@ -260,20 +317,44 @@ class PostgresDatabaseFactory:
                 password=runtime_password,
                 search_path="pg_catalog,public",
             ),
+            maintenance_dsn=self._role_database_url(
+                database_name=database_name,
+                role=maintenance_role,
+                password=maintenance_password,
+                search_path="pg_catalog,public",
+            ),
+            auditor_dsn=self._role_database_url(
+                database_name=database_name,
+                role=auditor_role,
+                password=auditor_password,
+                search_path="pg_catalog,public",
+            ),
             database_name=database_name,
             migration_role=migration_role,
             runtime_role=runtime_role,
+            maintenance_role=maintenance_role,
+            auditor_role=auditor_role,
         )
 
     def close(self) -> None:
         with psycopg.connect(self.admin_url, autocommit=True) as conn:
-            for database_name, runtime_role, migration_role in reversed(
-                self._resources
-            ):
+            for (
+                database_name,
+                runtime_role,
+                maintenance_role,
+                auditor_role,
+                migration_role,
+            ) in reversed(self._resources):
                 if not database_name.startswith("ai_exchange_test_"):
                     raise RuntimeError("unsafe test database cleanup identifier")
                 if not runtime_role.startswith("ai_exchange_test_r_"):
                     raise RuntimeError("unsafe test runtime-role cleanup identifier")
+                if not maintenance_role.startswith("ai_exchange_test_k_"):
+                    raise RuntimeError(
+                        "unsafe test maintenance-role cleanup identifier"
+                    )
+                if not auditor_role.startswith("ai_exchange_test_a_"):
+                    raise RuntimeError("unsafe test auditor-role cleanup identifier")
                 if not migration_role.startswith("ai_exchange_test_m_"):
                     raise RuntimeError("unsafe test migration-role cleanup identifier")
                 conn.execute(
@@ -290,11 +371,16 @@ class PostgresDatabaseFactory:
                     row[0]
                     for row in conn.execute(
                         "SELECT rolname FROM pg_catalog.pg_roles "
-                        "WHERE rolname IN (%s, %s)",
-                        (runtime_role, migration_role),
+                        "WHERE rolname IN (%s, %s, %s, %s)",
+                        (runtime_role, maintenance_role, auditor_role, migration_role),
                     ).fetchall()
                 }
-                for role_name in (runtime_role, migration_role):
+                for role_name in (
+                    runtime_role,
+                    maintenance_role,
+                    auditor_role,
+                    migration_role,
+                ):
                     if role_name not in existing_roles:
                         continue
                     conn.execute(
@@ -308,6 +394,14 @@ class PostgresDatabaseFactory:
                 if runtime_role in existing_roles:
                     conn.execute(
                         sql.SQL("DROP ROLE {}").format(sql.Identifier(runtime_role))
+                    )
+                if maintenance_role in existing_roles:
+                    conn.execute(
+                        sql.SQL("DROP ROLE {}").format(sql.Identifier(maintenance_role))
+                    )
+                if auditor_role in existing_roles:
+                    conn.execute(
+                        sql.SQL("DROP ROLE {}").format(sql.Identifier(auditor_role))
                     )
                 if migration_role in existing_roles:
                     conn.execute(

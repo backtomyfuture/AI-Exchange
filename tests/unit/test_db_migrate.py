@@ -20,6 +20,8 @@ def _migration_settings() -> MigrationSettings:
         database_url=SecretStr(MIGRATION_DSN),
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
 
@@ -49,6 +51,8 @@ async def test_run_migrations_delegates_to_explicit_bootstrap():
         MIGRATION_DSN,
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
 
@@ -84,6 +88,8 @@ async def test_compatibility_wrapper_never_reads_filesystem_sql(tmp_path):
         MIGRATION_DSN,
         expected_migration_role="migration_owner",
         expected_runtime_role="runtime_user",
+        expected_maintenance_role="maintenance_user",
+        expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
 

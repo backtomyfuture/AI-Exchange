@@ -29,6 +29,8 @@ def test_factory_cleanup_tolerates_setup_failure_before_roles_exist(
         (
             f"ai_exchange_test_{token}",
             f"ai_exchange_test_r_{token}",
+            f"ai_exchange_test_k_{token}",
+            f"ai_exchange_test_a_{token}",
             f"ai_exchange_test_m_{token}",
         )
     )
@@ -1131,7 +1133,7 @@ async def test_both_gates_reject_runtime_sequence_setval_capability(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_bootstrap_ignores_target_schema_catalog_shadow(empty_schema):
+async def test_bootstrap_rejects_target_schema_catalog_shadow_before_ddl(empty_schema):
     empty_schema.execute(
         "CREATE FUNCTION public.current_schema() RETURNS name "
         "LANGUAGE sql IMMUTABLE AS 'SELECT ''pg_catalog''::name'"
@@ -1140,13 +1142,17 @@ async def test_bootstrap_ignores_target_schema_catalog_shadow(empty_schema):
         "CREATE VIEW public.pg_class AS SELECT 0::pg_catalog.oid AS oid"
     )
 
-    summary = await bootstrap_database(
-        empty_schema.dsn,
-        **empty_schema.bootstrap_identity,
-    )
+    with pytest.raises(
+        DatabaseSchemaContractError,
+        match="database_schema_contract_invalid",
+    ):
+        await bootstrap_database(
+            empty_schema.dsn,
+            **empty_schema.bootstrap_identity,
+        )
 
-    assert summary["alembic"] == "20260710_0002"
-    assert empty_schema.table_exists("checkpoint_migrations")
+    assert not empty_schema.table_exists("alembic_version")
+    assert not empty_schema.table_exists("checkpoint_migrations")
 
 
 @pytest.mark.integration
@@ -1173,7 +1179,7 @@ async def test_bootstrap_resolves_builtin_types_before_target_domains(empty_sche
         **empty_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260710_0002"
+    assert summary["alembic"] == "20260710_0003"
     shadowed_columns = empty_schema.scalar(
         "SELECT count(*) "
         "FROM pg_catalog.pg_attribute AS attribute "
@@ -1387,6 +1393,7 @@ async def test_role_gates_reject_security_definer_trigger_path(separated_schema)
     [
         "security_definer",
         "user_trigger",
+        "orphan_trigger_function",
         "rewrite_rule",
         "event_trigger",
     ],
@@ -1411,6 +1418,12 @@ async def test_role_gates_reject_each_hidden_execution_hook(
             "CREATE TRIGGER hidden_trigger_probe "
             "BEFORE INSERT ON public.emails_log "
             "FOR EACH ROW EXECUTE FUNCTION public.hidden_trigger_probe()"
+        )
+    elif execution_hook == "orphan_trigger_function":
+        separated_schema.execute(
+            "CREATE FUNCTION public.orphan_trigger_probe() "
+            "RETURNS pg_catalog.trigger LANGUAGE plpgsql "
+            "AS 'BEGIN RETURN NEW; END'"
         )
     elif execution_hook == "rewrite_rule":
         separated_schema.execute(
@@ -1498,32 +1511,36 @@ async def test_role_gates_reject_foreign_key_internal_actions(separated_schema):
 @pytest.mark.asyncio
 async def test_role_gates_reject_target_relation_inheritance(separated_schema):
     separated_schema.execute(
-        "CREATE TABLE public.audit_events ("
+        "CREATE TABLE public.runtime_inheritance_probe ("
         "id pg_catalog.int4 PRIMARY KEY, payload pg_catalog.text)"
     )
     separated_schema.execute(
-        "CREATE TABLE public.audit_events_2026 () INHERITS (public.audit_events)"
-    )
-    separated_schema.execute(
-        sql.SQL("GRANT SELECT, INSERT ON public.audit_events TO {}").format(
-            sql.Identifier(separated_schema.runtime_role)
-        )
+        "CREATE TABLE public.runtime_inheritance_probe_child () "
+        "INHERITS (public.runtime_inheritance_probe)"
     )
     separated_schema.execute(
         sql.SQL(
-            "GRANT SELECT, INSERT, UPDATE ON public.audit_events_2026 TO {}"
+            "GRANT SELECT, INSERT ON public.runtime_inheritance_probe TO {}"
+        ).format(sql.Identifier(separated_schema.runtime_role))
+    )
+    separated_schema.execute(
+        sql.SQL(
+            "GRANT SELECT, INSERT, UPDATE ON "
+            "public.runtime_inheritance_probe_child TO {}"
         ).format(sql.Identifier(separated_schema.runtime_role))
     )
 
     separated_schema.runtime_execute(
-        "INSERT INTO public.audit_events_2026(id, payload) VALUES (1, 'original')"
+        "INSERT INTO public.runtime_inheritance_probe_child(id, payload) "
+        "VALUES (1, 'original')"
     )
     separated_schema.runtime_execute(
-        "UPDATE public.audit_events_2026 SET payload = 'changed' WHERE id = 1"
+        "UPDATE public.runtime_inheritance_probe_child "
+        "SET payload = 'changed' WHERE id = 1"
     )
     assert (
         separated_schema.scalar(
-            "SELECT payload FROM public.audit_events_2026 WHERE id = 1"
+            "SELECT payload FROM public.runtime_inheritance_probe_child WHERE id = 1"
         )
         == "changed"
     )
@@ -1573,33 +1590,35 @@ async def test_role_gates_allow_disabled_event_trigger(separated_schema):
 @pytest.mark.asyncio
 async def test_role_gates_reject_owner_rights_updatable_view(separated_schema):
     separated_schema.execute(
-        "CREATE TABLE public.audit_events ("
+        "CREATE TABLE public.runtime_owner_probe ("
         "id pg_catalog.int4 PRIMARY KEY, payload pg_catalog.text)"
     )
     separated_schema.execute(
-        sql.SQL("GRANT SELECT, INSERT ON public.audit_events TO {}").format(
+        sql.SQL("GRANT SELECT, INSERT ON public.runtime_owner_probe TO {}").format(
             sql.Identifier(separated_schema.runtime_role)
         )
     )
     separated_schema.execute(
-        "CREATE VIEW public.audit_events_owner_view AS "
-        "SELECT id, payload FROM public.audit_events"
+        "CREATE VIEW public.runtime_owner_probe_view AS "
+        "SELECT id, payload FROM public.runtime_owner_probe"
     )
     separated_schema.execute(
-        sql.SQL("GRANT SELECT, UPDATE ON public.audit_events_owner_view TO {}").format(
+        sql.SQL("GRANT SELECT, UPDATE ON public.runtime_owner_probe_view TO {}").format(
             sql.Identifier(separated_schema.runtime_role)
         )
     )
 
     separated_schema.runtime_execute(
-        "INSERT INTO public.audit_events(id, payload) VALUES (1, 'original')"
+        "INSERT INTO public.runtime_owner_probe(id, payload) VALUES (1, 'original')"
     )
     separated_schema.runtime_execute(
-        "UPDATE public.audit_events_owner_view "
+        "UPDATE public.runtime_owner_probe_view "
         "SET payload = 'owner-rights-bypass' WHERE id = 1"
     )
     assert (
-        separated_schema.scalar("SELECT payload FROM public.audit_events WHERE id = 1")
+        separated_schema.scalar(
+            "SELECT payload FROM public.runtime_owner_probe WHERE id = 1"
+        )
         == "owner-rights-bypass"
     )
 
@@ -1676,7 +1695,7 @@ async def test_bootstrap_accepts_inaccessible_legacy_processed_view(
         **separated_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260710_0002"
+    assert summary["alembic"] == "20260710_0003"
     await require_runtime_database_role(
         separated_schema.runtime_dsn,
         **separated_schema.runtime_identity,
@@ -1721,40 +1740,35 @@ async def test_runtime_gate_rejects_audit_mutation_or_delegation(
     separated_schema,
     capability,
 ):
-    separated_schema.execute(
-        "CREATE TABLE public.audit_events (id integer, payload text)"
-    )
     if capability == "missing_select":
-        baseline_privileges = "INSERT"
-    elif capability == "missing_insert":
-        baseline_privileges = "SELECT"
-    else:
-        baseline_privileges = "SELECT, INSERT"
-    separated_schema.execute(
-        sql.SQL("GRANT {} ON public.audit_events TO {}").format(
-            sql.SQL(baseline_privileges), sql.Identifier(separated_schema.runtime_role)
+        mutation = sql.SQL("REVOKE SELECT ON public.audit_events FROM {}").format(
+            sql.Identifier(separated_schema.runtime_role)
         )
-    )
-    if capability in {"missing_select", "missing_insert"}:
-        grant = None
+    elif capability == "missing_insert":
+        mutation = sql.SQL(
+            "REVOKE INSERT (id, event_key, account_id, email_id, object_type, "
+            "object_fingerprint, action, result, actor, reason, safe_metadata) "
+            "ON public.audit_events FROM {}"
+        ).format(
+            sql.Identifier(separated_schema.runtime_role),
+        )
     elif capability == "table_update":
-        grant = sql.SQL("GRANT UPDATE ON public.audit_events TO {}").format(
+        mutation = sql.SQL("GRANT UPDATE ON public.audit_events TO {}").format(
             sql.Identifier(separated_schema.runtime_role)
         )
     elif capability == "column_update":
-        grant = sql.SQL("GRANT UPDATE (payload) ON public.audit_events TO {}").format(
-            sql.Identifier(separated_schema.runtime_role)
-        )
+        mutation = sql.SQL(
+            "GRANT UPDATE (safe_metadata) ON public.audit_events TO {}"
+        ).format(sql.Identifier(separated_schema.runtime_role))
     elif capability == "select_grant_option":
-        grant = sql.SQL(
+        mutation = sql.SQL(
             "GRANT SELECT ON public.audit_events TO {} WITH GRANT OPTION"
         ).format(sql.Identifier(separated_schema.runtime_role))
     else:
-        grant = sql.SQL(
+        mutation = sql.SQL(
             "GRANT INSERT ON public.audit_events TO {} WITH GRANT OPTION"
         ).format(sql.Identifier(separated_schema.runtime_role))
-    if grant is not None:
-        separated_schema.execute(grant)
+    separated_schema.execute(mutation)
 
     with pytest.raises(DatabaseRoleError, match="database_role_preflight_failed"):
         await require_runtime_database_role(

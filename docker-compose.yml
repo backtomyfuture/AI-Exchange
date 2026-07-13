@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
     restart: always
     expose:
       - "6333"
@@ -10,7 +10,7 @@ services:
       - backend
 
   postgres:
-    image: postgres:15
+    image: postgres:15@sha256:f30e3de0ac9cc938dac627ef2231099867c694b5f949fadb924c8c977428c399
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
@@ -50,11 +50,88 @@ services:
       MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
       POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
       POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
       POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
       TZ: Asia/Shanghai
     secrets:
       - source: migration_database_url
         target: migration_database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  checkpoint-maintenance:
+    profiles: ["checkpoint-maintenance"]
+    build: .
+    restart: "no"
+    entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
+    command: ["--help"]
+    # Compose file-backed secrets retain their host ownership/mode. Keep the
+    # auditor DSN at 0600; this manual one-shot gets only read-DAC override.
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      XDG_STATE_HOME: /var/lib
+      CHECKPOINT_AUDITOR_DATABASE_URL_FILE: /run/secrets/checkpoint_auditor_database_url
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      TZ: Asia/Shanghai
+    secrets:
+      - source: checkpoint_auditor_database_url
+        target: checkpoint_auditor_database_url
+    volumes:
+      - checkpoint_maintenance_state:/var/lib/ai-exchange/checkpoint-cleanup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  checkpoint-maintenance-execute:
+    profiles: ["checkpoint-maintenance-execute"]
+    build: .
+    restart: "no"
+    entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
+    command: ["execute", "--help"]
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      XDG_STATE_HOME: /var/lib
+      CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE: /run/secrets/checkpoint_maintenance_database_url
+      CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE: /run/secrets/checkpoint_maintenance_receipt_ed25519_public_key
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      TZ: Asia/Shanghai
+    secrets:
+      - source: checkpoint_maintenance_database_url
+        target: checkpoint_maintenance_database_url
+      - source: checkpoint_maintenance_receipt_ed25519_public_key
+        target: checkpoint_maintenance_receipt_ed25519_public_key
+    volumes:
+      - checkpoint_maintenance_state:/var/lib/ai-exchange/checkpoint-cleanup
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +157,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
       POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
       DATABASE_ROLE_SEPARATION_REQUIRED: "true"
       DURABLE_INBOX_ENABLED: ${DURABLE_INBOX_ENABLED:-false}
       INGESTION_SHADOW_ENABLED: ${INGESTION_SHADOW_ENABLED:-false}
@@ -154,7 +233,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    stop_grace_period: 30s
+    stop_grace_period: 90s
     deploy:
       resources:
         limits:
@@ -170,10 +249,17 @@ networks:
   edge: {}
 
 volumes:
+  checkpoint_maintenance_state:
   content_data:
   postgres_data:
   qdrant_data:
 
 secrets:
+  checkpoint_auditor_database_url:
+    file: ${CHECKPOINT_AUDITOR_DATABASE_URL_FILE:-./secrets/checkpoint_auditor_database_url}
+  checkpoint_maintenance_database_url:
+    file: ${CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE:-./secrets/checkpoint_maintenance_database_url}
+  checkpoint_maintenance_receipt_ed25519_public_key:
+    file: ${CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE:-./secrets/checkpoint_maintenance_receipt_ed25519_public_key}
   migration_database_url:
     file: ${MIGRATION_DATABASE_URL_FILE:-./secrets/migration_database_url}
