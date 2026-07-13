@@ -12,6 +12,20 @@ class ErrorKind(StrEnum):
     INTERNAL_INVARIANT = "internal_invariant_error"
 
 
+class StaleFence(RuntimeError):
+    """Fixed, privacy-safe rejection for a non-authoritative pipeline stamp."""
+
+    kind = ErrorKind.INTERNAL_INVARIANT
+    safe_code = "pipeline.stale_fence"
+    safe_summary = "Pipeline fence is stale"
+
+    def __init__(self) -> None:
+        super().__init__(self.safe_summary)
+
+    def __repr__(self) -> str:
+        return f"StaleFence(safe_code={self.safe_code!r})"
+
+
 class IngressValidationCode(StrEnum):
     INVALID_BODY = "ingress.invalid_body"
     BODY_PAYLOAD_MISMATCH = "ingress.body_payload_mismatch"

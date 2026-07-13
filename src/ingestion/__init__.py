@@ -5,6 +5,12 @@ from src.ingestion.normalization import (
     normalize_webhook_event,
     validate_sync_change_contract,
 )
+from src.ingestion.ownership import (
+    PipelineOwnershipRepository,
+    PipelineRetirementBlocked,
+    RetirementBlockCode,
+    RetirementGuard,
+)
 from src.ingestion.models import (
     ChangeKind,
     InboxDisposition,
@@ -35,7 +41,11 @@ __all__ = [
     "NormalizedIngressEvent",
     "PipelineGeneration",
     "PipelineGenerationState",
+    "PipelineOwnershipRepository",
+    "PipelineRetirementBlocked",
     "ProcessingPolicy",
+    "RetirementBlockCode",
+    "RetirementGuard",
     "SyncBatch",
     "SyncChange",
     "SyncCursorStatus",

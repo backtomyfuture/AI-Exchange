@@ -71,7 +71,7 @@ async def test_inbox_dedupe_key_is_unique(db):
 - [ ] **Step 2: Run and confirm missing migration**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/ingestion/test_schema.py -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/integration/ingestion/test_schema.py -q
 ```
 
 - [ ] **Step 3: Add the migration**
@@ -183,12 +183,12 @@ class IngressReceipt:
     duplicate: bool
 ```
 
-The two `conftest.py` files define `db`, `ownership`, `repo`, `repo_a`, `repo_b`, `inbox_lease`, `leased_event`, `seeded_events`, `coordinator`, `exchange`, `worker`, `inbox`, `fault`, `crash`, `ingress`, `client`, `runtime`, `cutover`, deterministic `EVENT`, raw-body/payload fixtures, HMAC helper and seed methods referenced below. `InjectedFailure(RuntimeError)` and the fault/crash injectors expose only the named booleans used by tests. Integration setup reads `TEST_DATABASE_URL`, creates a unique schema, upgrades Alembic to head, yields the pool and drops the schema in `finally`; a session fixture creates the test database through the maintenance database when it does not exist.
+The two `conftest.py` files define `db`, `ownership`, `repo`, `repo_a`, `repo_b`, `inbox_lease`, `leased_event`, `seeded_events`, `coordinator`, `exchange`, `worker`, `inbox`, `fault`, `crash`, `ingress`, `client`, `runtime`, `cutover`, deterministic `EVENT`, raw-body/payload fixtures, HMAC helper and seed methods referenced below. `InjectedFailure(RuntimeError)` and the fault/crash injectors expose only the named booleans used by tests. Integration setup reads `TEST_POSTGRES_ADMIN_URL` and requires `TEST_POSTGRES_ROLE_DDL=1`; the factory creates an isolated database plus migration/runtime/maintenance/auditor roles, upgrades Alembic to head, yields role-specific DSNs/pools and drops the database and roles in `finally`. Missing real-PostgreSQL prerequisites must be reported as a skip in local exploratory runs and are forbidden in release gates.
 
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/ingestion/test_schema.py -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/integration/ingestion/test_schema.py -q
 git add alembic/versions/20260710_0003_durable_ingestion.py src/ingestion tests/integration/ingestion/conftest.py tests/unit/ingestion/conftest.py tests/integration/ingestion/test_schema.py
 git commit -m "feat: add durable ingestion schema and types"
 ```
@@ -318,10 +318,12 @@ git commit -m "feat: normalize and deduplicate ingestion events"
 - Create: `src/ingestion/ownership.py`
 - Create: `tests/unit/ingestion/test_ownership.py`
 - Create: `tests/integration/ingestion/test_pipeline_fencing.py`
+- Create: `tests/architecture/test_pipeline_ownership_boundary.py`
 - Modify: `src/domain/errors.py`
+- Modify: `src/ingestion/__init__.py`
 
 **Interfaces:**
-- Produces: `StaleFence(ErrorKind.INTERNAL_INVARIANT)`; `bootstrap(account_id, pipeline_name)`, `get(account_id, generation)`, `current_ingress(account_id)`, `assert_fence(account_id, generation, fencing_token)`, `can_execute(lease)`, `quiesce()`, `retire()` and transaction-local ownership primitives consumed only by Phase 3 activation
+- Produces: `StaleFence(ErrorKind.INTERNAL_INVARIANT)`; `bootstrap(account_id, pipeline_name)`, `get(account_id, generation)`, `current_ingress(account_id)`, `assert_fence(account_id, generation, fencing_token)`, `can_execute(lease)`, `quiesce()`, guarded `retire()`, and transaction-local ownership primitives consumed only by Phase 3 activation. Retirement is fail-closed unless a later task supplies complete Inbox/Outbox/high-water evidence through the mandatory guard.
 
 - [ ] **Step 1: Write current/draining/retired tests**
 
@@ -342,25 +344,47 @@ async def test_phase2_quiesce_never_creates_a_new_current_generation(ownership):
 
 
 @pytest.mark.integration
-async def test_quiesced_fence_cannot_claim_new_work(ownership, repo, inbox_lease):
-    stale_lease = inbox_lease
-    assert await repo.complete(stale_lease) is True
-    await ownership.quiesce(
-        8, stale_lease.generation, stale_lease.fencing_token, "test", "drain"
+async def test_quiesced_fence_allows_only_existing_stamped_work(
+    ownership, inbox_lease
+):
+    current = await ownership.bootstrap(8, "legacy_compat")
+    assert (
+        inbox_lease.account_id,
+        inbox_lease.generation,
+        inbox_lease.fencing_token,
+    ) == (
+        current.account_id,
+        current.generation,
+        current.fencing_token,
     )
-    assert await repo.try_claim_new(8) is None
-    assert await ownership.can_execute(stale_lease) is True
+    await ownership.quiesce(
+        account_id=8,
+        expected_generation=current.generation,
+        expected_fencing_token=current.fencing_token,
+        actor="test",
+        reason="drain",
+    )
+    assert await ownership.current_ingress(8) is None
+    assert await ownership.can_execute(inbox_lease) is True
 ```
+
+The immutable `InboxLease` value object already exists, but Task 4 owns its repository lifecycle and therefore owns the new-claim, lease renewal and completion CAS tests. Those SQL mutations must repeat the exact generation/fence predicate in the same statement or locked transaction; a prior `assert_fence()` result is never sufficient authorization.
 
 - [ ] **Step 2: Implement transactional generation changes**
 
-Lock the current row with `FOR UPDATE`; compare expected generation/token. `quiesce()` is the only Phase-2 production transition from `current_ingress -> quiescing` and forbids new claims while existing stamped work finishes. Phase 2 exposes no public generation switch. The repository provides transaction-local insert/state primitives, but they require the caller's already-open unit of work and are reachable in production only from Phase 3 `ActivationService`, which atomically moves the old generation to draining and creates the new current generation together with authority/barrier/receipt/audit facts. `retire()` requires zero unresolved Inbox (`pending`, `retry_wait`, `leased`, `manual_review`), zero nonterminal or `send_unknown` Outbox, and matching high-water reconciliation. Historical terminal Inbox/Outbox rows remain append-only and may retain the ownership foreign key after retirement; `completed`/accounted dead-letter facts are not required to be deleted. `assert_fence()` is used by claim, effect-start and completion. Architecture tests fail if any Phase-2 runtime/CLI calls the transaction-local handoff primitives.
+Take a stable per-account transaction advisory lock, configure bounded local lock/statement/idle-in-transaction timeouts, lock the exact ownership row with `FOR UPDATE`, and compare expected generation/token. `bootstrap()` is concurrent and idempotent only when no ownership history exists; `quiesce()` is the only Phase-2 production transition from `current_ingress -> quiescing`, appends one bounded audit fact, and forbids new claims while existing stamped work finishes. Phase 2 exposes no public generation switch.
+
+The repository provides private transaction-local insert/state primitives, but they require the caller's already-open connection and transaction and are reachable in production only from Phase 3 `ActivationService`. The helper binds itself to the database's top-level transaction identity, rejects reuse across commits, and every mutating step reacquires the account lock and re-reads the exact persisted predecessor state; Python object state is never authority. A nested savepoint rollback therefore cannot leave a phantom draining state that later inserts a current generation. That later service atomically moves the old generation to draining and creates/promotes the reserved target together with authority/barrier/receipt/audit facts. Rollback must leave both ownership rows and audits unchanged. The runtime role's temporary raw ownership mutation privilege is tolerated only through `0006`; Task 10/`0007` must revoke it before any activation path is enabled and replace it with narrow database-enforced operations.
+
+Standalone `assert_fence()`/`can_execute()` are diagnostic and permit continuation of already-stamped work in `current_ingress`, `quiescing`, or `draining`; they reject retired/stale identity. They never authorize a later claim, effect start, lease renewal or completion across a transaction boundary. Each such mutation must repeat the exact generation/fence/state predicate inside its own CAS statement or locked transaction.
+
+`retire()` first rejects every unresolved state visible at this schema head, then invokes a mandatory retirement guard in the same transaction. The exact Inbox blocker set is `pending/retry_wait/leased/manual_review/dead_letter`; the exact email blocker set is `ingested/processing/retry_wait/manual_review/waiting_approval/send_queued/sending/accepted/send_unknown/dead_letter`. Email `send_failed` and `delivery_failed` are outcome-known terminal projections and do not block by themselves, while a recoverable, unaccounted `dead_letter` does. The default guard always denies because Outbox and high-water evidence do not exist at `0004`; successful retirement is enabled only after later tasks can prove zero nonterminal or `send_unknown` Outbox and matching high-water reconciliation. Missing future tables/evidence are never interpreted as zero. Historical terminal Inbox/Outbox rows remain append-only and may retain the ownership foreign key after retirement. Architecture tests fail if any Phase-2 runtime/CLI calls the transaction-local handoff primitives.
 
 - [ ] **Step 3: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py -q
-git add src/ingestion/ownership.py src/domain/errors.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py tests/architecture/test_pipeline_ownership_boundary.py -q
+git add src/ingestion/ownership.py src/ingestion/__init__.py src/domain/errors.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py tests/architecture/test_pipeline_ownership_boundary.py
 git commit -m "feat: add pipeline generations and fencing"
 ```
 
@@ -522,7 +546,7 @@ Before the effect marker, retryable errors increment attempts and set `retry_wai
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/ingestion/test_inbox_repository.py -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/integration/ingestion/test_inbox_repository.py -q
 git add src/ingestion/repository.py tests/integration/ingestion/test_inbox_repository.py
 git commit -m "feat: add leased durable inbox repository"
 ```
@@ -1194,7 +1218,7 @@ Task 2 deliberately emits `source_event_at=None` for Sync, so the preview cannot
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/ingestion/test_policy.py tests/unit/ingestion/test_sync_coordinator.py tests/integration/ingestion/test_sync_atomicity.py tests/unit/ingestion/test_cold_start.py tests/integration/ingestion/test_command_receipts.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_policy.py tests/unit/ingestion/test_sync_coordinator.py tests/integration/ingestion/test_sync_atomicity.py tests/unit/ingestion/test_cold_start.py tests/integration/ingestion/test_command_receipts.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
 git add alembic/versions/20260713_0005_sync_reconciliation_control.py src/ingestion/policy.py src/ingestion/sync.py src/ingestion/cold_start.py src/ingestion/command_receipts.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/ingestion/test_policy.py tests/unit/ingestion/test_sync_coordinator.py tests/integration/ingestion/test_sync_atomicity.py tests/unit/ingestion/test_cold_start.py tests/integration/ingestion/test_command_receipts.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py
 git commit -m "feat: add atomic sync reconciliation and cold start"
 ```
@@ -1361,7 +1385,7 @@ For executable work, the adapter applies the event state decision and invokes th
 - [ ] **Step 3: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/unit/test_exchange_service_refactor.py -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/unit/test_exchange_service_refactor.py -q
 git add src/ingestion/processing.py src/ingestion/legacy_adapter.py src/ingestion/worker.py src/exchange_service.py tests/unit/ingestion/test_worker.py tests/integration/ingestion/test_webhook_crash_recovery.py tests/unit/test_exchange_service_refactor.py
 git commit -m "feat: add recoverable durable inbox workers"
 ```
@@ -1666,6 +1690,8 @@ git commit -m "feat: accept Exchange webhooks into durable inbox"
 - Modify: `src/server.py`
 - Modify: `src/scheduler/polling.py`
 - Modify: `src/utils/self_healing.py`
+- Modify: `src/domain/email_state.py`
+- Modify: `src/ingestion/ownership.py`
 - Modify: `src/db/access_contract.py`
 - Modify: `src/db/bootstrap.py`
 - Modify: `src/db/schema.py`
@@ -1677,6 +1703,9 @@ git commit -m "feat: accept Exchange webhooks into durable inbox"
 - Modify: `tests/unit/test_alembic_offline.py`
 - Modify: `tests/integration/ingestion/test_schema.py`
 - Modify: `tests/integration/ingestion/test_access_roles.py`
+- Modify: `tests/unit/ingestion/test_ownership.py`
+- Modify: `tests/integration/ingestion/test_pipeline_fencing.py`
+- Modify: `tests/architecture/test_pipeline_ownership_boundary.py`
 - Modify: `tests/integration/test_checkpoint_cleanup.py`
 
 **Interfaces:**
@@ -1878,12 +1907,14 @@ Migration `20260713_0007` is linear from `20260713_0006`; Phase 3 therefore star
 
 - `pipeline_runtime_authority`: one versioned row per account with mode (`legacy_authoritative/shadow/quiescing/durable_active`), monotonic `authority_epoch`, ownership generation/fence/pipeline FK, policy readiness/config hash, minimum numeric build, minimum protocol, actor/reason and CAS version.
 - `pipeline_runtime_instances`: per-account process lease with instance/workload/deployment IDs, numeric build plus display build ID, protocol/config/profile, lifecycle (`standby/active/draining`), observed epoch, legacy queue/in-flight/effect counts, heartbeat and lease deadline. Build ordering uses a CI-produced integer; Git SHA is never ordered lexically.
-- `pipeline_target_reservations`: one active reservation per account/live barrier with an immutable target pipeline name, preallocated generation/fencing token, build/protocol/config hash, zero-work standby roster hash, expiry, state (`reserved/promoted/cancelled/expired`) and its reserved `pipeline_ownership` FK. `prepare_target()` takes the account advisory lock, creates the ownership row in non-current standby/quiescing state and allocates the final generation/fence exactly once. Folder plans and the live barrier reference this row by FK. Promotion never rotates the fence. Cancel/expiry under the same lock retires the unused ownership row and releases only the active-reservation slot; generation/fence are never reused.
+- `pipeline_target_reservations`: one active reservation per account/live barrier with an immutable target pipeline name, preallocated generation/fencing token, build/protocol/config hash, zero-work standby roster hash, expiry, state (`reserved/promoted/cancelled/expired`) and its reserved `pipeline_ownership` FK. Migration `0007` extends the ownership state contract with an explicit non-executable `reserved` state; it must never overload `quiescing`. `prepare_target()` takes the account advisory lock, creates exactly one `reserved` ownership row and allocates the final generation/fence exactly once. The only ownership exits are `reserved -> current_ingress` during the atomic promotion or `reserved -> retired` during cancellation/expiry; direct `reserved -> quiescing|draining` is rejected. Folder plans and the live barrier reference this row by FK. Promotion never rotates the fence. Cancel/expiry under the same lock retires the unused ownership row and releases only the active-reservation slot; generation/fence are never reused.
 - `pipeline_legacy_effects`: account/event-key/authority-epoch/generation/fence/instance/effect-kind/deterministic-ordinal/target-hash registrations with immutable identity, state (`started/completed/unknown/reconciled`), reconciliation disposition, idempotency/evidence hashes and timestamps. A UNIQUE constraint covers `(account_id,event_key,authority_epoch,effect_kind,ordinal,target_hash)`; ordinal identifies an intended distinct effect in the deterministic pipeline, never a retry attempt. The only transitions are `started -> completed|unknown` and maintenance-only `unknown -> reconciled`; completed/reconciled are terminal. UPDATE of identity/effect kind/ordinal/target/initial token, DELETE and TRUNCATE are rejected. A crash never deletes or auto-expires a started/unknown outcome.
 - `pipeline_cutover_barriers` and `pipeline_cutover_barrier_members`: immutable predecessor barrier, target mode/config/build/protocol, exact external deployment roster and revision/hash, expected instance count, exact completed backfill-plan and sealed Shadow-evidence FKs plus their source/cutoff/high-water/build/config/count/hash facts, legacy nonterminal/quarantine counts and hash, versioned `exchange_sync_contract_v2` build/profile/page/continuation/read-flag probe hash, the complete configured `FolderScope` manifest plus one exact target-bound active cursor or unexpired approved cold-start boundary per folder and its rolling hash, expiring LB isolation, effect-secret rotation and legacy-DB-connection isolation proof hashes, and nullable Phase-3 approval/outbox/legacy-card/adapter-manifest evidence hashes that are mandatory for a `durable_active` target row. Barrier state is the strict sequence `planned -> fence_verified -> quiesced -> drained -> evidence_frozen -> target_standby -> legacy_isolated -> proof_fresh -> ready -> consumed`, with only pre-ready cancellation allowed.
 - `legacy_backfill_plans`: account, ownership generation/fence, mapping/config versions, source count/high-water/rolling hash, legacy-nonterminal count, exact quarantine count/hash, target count/reconciliation hash, applied cursor/hash/counts, status, actor/reason and timestamps; it stores no email body, draft, response or raw identifier sample. Idempotency lives in the shared append-only command receipts, not a mutable key column on the plan.
 
-All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Runtime receives SELECT on authority/barriers, INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations, INSERT on `pipeline_legacy_effects`, and only `state/evidence_hash/completed_at` UPDATE needed to close its own `started -> completed|unknown`; it has no reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance may classify a provably stale/crashed `started -> unknown`, performs `unknown -> reconciled` with actor/reason/evidence, and owns cutover/backfill transitions; it cannot rewrite identity or reopen a terminal row. Auditor has SELECT only; migration owns DDL. Real-role tests prove every allowed and forbidden operation. The same task updates exact schema digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
+All hashes are exact lowercase SHA-256, counters are bounded BIGINT, metadata is a bounded object, open barrier/backfill identities are unique, and forward-only state/identity guards prevent history rewrite. Before any activation API exists, `0007` revokes runtime's direct `INSERT`/`UPDATE` authority over `pipeline_ownership`. Bootstrap, quiesce, target preparation/promotion/cancellation and evidence-backed retirement then use only source-digest-locked, fixed-`search_path`, narrowly granted database functions. `PipelineOwnershipRepository` is updated in this task to call those governed entry points; its Phase-2 direct DML and transaction-local handoff implementation cannot remain reachable after the revoke. Each function takes the account advisory lock and revalidates the exact caller-visible authority epoch where applicable, barrier, reservation, generation/fence, state and append-only command receipt inside one transaction. General runtime DML, ad-hoc SQL, or a Python-only `ActivationService` cannot create a second current row, promote an unreserved target, rotate a reserved fence, skip an audit/receipt, or retire without evidence. If a separate control credential is introduced instead, it must be explicit in the ACL/bootstrap contract and no broader than those same operations; it cannot inherit migration/maintenance power.
+
+Runtime otherwise receives SELECT on authority/barriers, INSERT plus only heartbeat/lease/counter UPDATE columns on its own instance registrations, INSERT on `pipeline_legacy_effects`, and only `state/evidence_hash/completed_at` UPDATE needed to close its own `started -> completed|unknown`; it has no reconcile, DELETE, TRUNCATE, barrier or authority mutation privilege. Maintenance may classify a provably stale/crashed `started -> unknown`, performs `unknown -> reconciled` with actor/reason/evidence, and owns cutover/backfill transitions; it cannot rewrite identity or reopen a terminal row. Auditor has SELECT only; migration owns DDL. Real-role tests prove every allowed and forbidden raw operation plus every allowed and rejected governed function transition, including concurrent promotion, replay, stale reservation/fence, wrong barrier/epoch, and rollback. Architecture scans are supplementary and cannot substitute for database ACL/behavior tests. The same task updates exact schema/function-source digests, all four ACL manifests, checkpoint revision allowlists, bootstrap/offline SQL and proves a code-first real-PostgreSQL `0006 -> 0007` bridge with all activation profiles disabled.
 
 - [ ] **Step 3: Implement the authority state machine and mandatory legacy fence**
 
@@ -1904,8 +1935,8 @@ Every legacy source nonterminal row must either be absent at the frozen source h
 - [ ] **Step 4: Verify and commit**
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/unit/ingestion/test_runtime_authority.py tests/integration/ingestion/test_runtime_activation.py tests/architecture/test_phase2_activation_boundary.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
-git add alembic/versions/20260713_0007_runtime_activation.py src/ingestion/runtime_authority.py src/ingestion/cutover_barrier.py src/exchange_service.py src/server.py src/scheduler/polling.py src/utils/self_healing.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/ingestion/test_runtime_authority.py tests/integration/ingestion/test_runtime_activation.py tests/architecture/test_phase2_activation_boundary.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/unit/ingestion/test_runtime_authority.py tests/integration/ingestion/test_runtime_activation.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_pipeline_fencing.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py -q
+git add alembic/versions/20260713_0007_runtime_activation.py src/domain/email_state.py src/ingestion/ownership.py src/ingestion/runtime_authority.py src/ingestion/cutover_barrier.py src/exchange_service.py src/server.py src/scheduler/polling.py src/utils/self_healing.py src/db/access_contract.py src/db/bootstrap.py src/db/schema.py src/db/schema_contract.py src/maintenance/checkpoint_repository.py tests/unit/ingestion/test_runtime_authority.py tests/unit/ingestion/test_ownership.py tests/integration/ingestion/test_runtime_activation.py tests/integration/ingestion/test_pipeline_fencing.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_pipeline_ownership_boundary.py tests/unit/test_database_revision.py tests/unit/test_database_schema_contract.py tests/unit/test_checkpoint_repository_safety.py tests/unit/test_alembic_offline.py tests/integration/ingestion/test_schema.py tests/integration/ingestion/test_access_roles.py tests/integration/test_checkpoint_cleanup.py
 git commit -m "feat: add database-authoritative ingestion readiness"
 ```
 
@@ -2145,7 +2176,7 @@ Before opening a **live** cutover barrier, the CLI requires version-matched, pro
 
 ```bash
 .venv/bin/python -m pytest tests/unit/ingestion tests/contracts/test_exchange_sync_contract.py tests/contracts/test_shadow_decision_contract.py tests/architecture/test_phase2_activation_boundary.py tests/architecture/test_phase2_runtime_stays_standby.py -q
-TEST_DATABASE_URL=postgresql://user:password@localhost:5432/ai_exchange_test .venv/bin/python -m pytest tests/integration/ingestion -q
+TEST_POSTGRES_ADMIN_URL=postgresql://user:password@localhost:5432/postgres TEST_POSTGRES_ROLE_DDL=1 .venv/bin/python -m pytest tests/integration/ingestion -q
 .venv/bin/python -m pytest --cov=src.ingestion --cov-report=term-missing --cov-fail-under=90
 .venv/bin/ruff check src/ tests/
 .venv/bin/python -m pytest -q

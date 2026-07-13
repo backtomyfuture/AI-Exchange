@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+from psycopg.pq import TransactionStatus
+from psycopg_pool import PoolTimeout
+
+from src.domain.errors import DatabaseOperationError, ErrorKind, StaleFence
+from src.domain.email_state import PipelineGenerationState
+from src.ingestion.models import (
+    ChangeKind,
+    InboxLease,
+    IngressSource,
+    NormalizedIngressEvent,
+    PipelineGeneration,
+    ProcessingPolicy,
+)
+from src.ingestion.ownership import (
+    PipelineOwnershipRepository,
+    PipelineOwnershipTransaction,
+    PipelineRetirementBlocked,
+    RetirementBlockCode,
+    _generation_from_row,
+)
+
+
+class _NeverPool:
+    def connection(self):
+        raise AssertionError("database access must not occur")
+
+
+class _FailingConnectionContext:
+    async def __aenter__(self):
+        raise PoolTimeout("database-secret-must-not-escape")
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FailingPool:
+    def connection(self):
+        return _FailingConnectionContext()
+
+
+class _FailingTransactionConnection:
+    def __init__(self) -> None:
+        self.info = SimpleNamespace(transaction_status=TransactionStatus.INTRANS)
+
+    async def execute(self, *_args, **_kwargs):
+        raise PoolTimeout("database-secret-must-not-escape")
+
+
+def _lease() -> InboxLease:
+    now = datetime.now(UTC)
+    event = NormalizedIngressEvent(
+        account_id=8,
+        source=IngressSource.WEBHOOK,
+        raw_event_type="NewMailEvent",
+        kind=ChangeKind.CREATE,
+        external_email_id="message-1",
+        folder="INBOX",
+        source_version="version-1",
+        dedupe_key="a" * 64,
+        payload={"id": "message-1"},
+        processing_policy=ProcessingPolicy.FULL,
+        source_event_at=now,
+    )
+    return InboxLease(
+        id=str(uuid4()),
+        account_id=8,
+        generation=1,
+        fencing_token=1,
+        lease_owner="worker-1",
+        attempts=1,
+        event=event,
+        received_at=now,
+        lease_until=now + timedelta(minutes=5),
+    )
+
+
+def test_stale_fence_is_a_fixed_safe_internal_invariant() -> None:
+    error = StaleFence()
+
+    assert error.kind is ErrorKind.INTERNAL_INVARIANT
+    assert error.safe_code == "pipeline.stale_fence"
+    assert error.safe_summary == "Pipeline fence is stale"
+    assert str(error) == error.safe_summary
+    assert repr(error) == "StaleFence(safe_code='pipeline.stale_fence')"
+    assert error.__cause__ is None
+
+
+def test_retirement_block_is_fixed_and_type_checked() -> None:
+    error = PipelineRetirementBlocked(RetirementBlockCode.EVIDENCE_UNAVAILABLE)
+
+    assert error.safe_code is RetirementBlockCode.EVIDENCE_UNAVAILABLE
+    assert error.safe_summary == "Pipeline retirement evidence is unavailable"
+    assert str(error) == error.safe_summary
+    assert repr(error) == (
+        "PipelineRetirementBlocked("
+        "safe_code='pipeline.retirement_evidence_unavailable')"
+    )
+    with pytest.raises(TypeError, match="RetirementBlockCode"):
+        PipelineRetirementBlocked("pipeline.retirement_evidence_unavailable")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        None,
+        (8, 1),
+        (8, 1, "legacy_compat", "not-a-state", 1),
+    ],
+)
+def test_invalid_database_rows_fail_with_a_fixed_error(row: object) -> None:
+    with pytest.raises(DatabaseOperationError) as caught:
+        _generation_from_row(row)
+
+    assert caught.value.operation == "read_pipeline_ownership"
+    assert caught.value.retryable is False
+    assert str(caught.value) == "pipeline ownership row is invalid"
+
+
+def test_invalid_schema_text_is_rejected_without_database_access() -> None:
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        PipelineOwnershipRepository(_NeverPool(), target_schema="\ud800")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("bootstrap", (True, "legacy_compat")),
+        ("bootstrap", (0, "legacy_compat")),
+        ("bootstrap", (2**63, "legacy_compat")),
+        ("bootstrap", (8, " legacy_compat")),
+        ("bootstrap", (8, "x" * 65)),
+        ("get", (8, False)),
+        ("get", (8, 0)),
+        ("assert_fence", (8, 1, 0)),
+        ("assert_fence", (8, 1, 2**63)),
+        ("quiesce", (8, 1, 1, " bad", "safe reason")),
+        ("quiesce", (8, 1, 1, "actor", "bad\nreason")),
+    ],
+)
+async def test_public_inputs_are_rejected_before_database_access(
+    method_name: str,
+    args: tuple[object, ...],
+) -> None:
+    ownership = PipelineOwnershipRepository(_NeverPool())
+
+    with pytest.raises(ValueError):
+        await getattr(ownership, method_name)(*args)
+
+
+def test_phase2_exposes_no_public_generation_switch() -> None:
+    public_repository_methods = {
+        name
+        for name in PipelineOwnershipRepository.__dict__
+        if not name.startswith("_")
+    }
+    transaction_methods = set(PipelineOwnershipTransaction.__dict__)
+
+    assert {"switch", "promote", "create_next"}.isdisjoint(public_repository_methods)
+    assert "transaction" in public_repository_methods
+    assert {"_lock_quiesced", "_mark_draining", "_insert_current"}.issubset(
+        transaction_methods
+    )
+    assert not {
+        "lock_quiesced",
+        "mark_draining",
+        "insert_current",
+    }.intersection(transaction_methods)
+
+
+def test_ingestion_boundary_exports_ownership_contract() -> None:
+    import src.ingestion as ingestion
+
+    assert ingestion.PipelineOwnershipRepository is PipelineOwnershipRepository
+    assert ingestion.PipelineRetirementBlocked is PipelineRetirementBlocked
+    assert ingestion.RetirementBlockCode is RetirementBlockCode
+    assert not hasattr(ingestion, "PipelineOwnershipTransaction")
+
+
+@pytest.mark.asyncio
+async def test_can_execute_returns_false_only_for_a_stale_fence(monkeypatch) -> None:
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    lease = _lease()
+
+    async def stale(*_args, **_kwargs):
+        raise StaleFence()
+
+    monkeypatch.setattr(ownership, "assert_fence", stale)
+    assert await ownership.can_execute(lease) is False
+
+    outage = DatabaseOperationError(
+        operation="assert_pipeline_fence",
+        retryable=True,
+        message="pipeline ownership read failed",
+    )
+
+    async def unavailable(*_args, **_kwargs):
+        raise outage
+
+    monkeypatch.setattr(ownership, "assert_fence", unavailable)
+    with pytest.raises(DatabaseOperationError) as caught:
+        await ownership.can_execute(lease)
+
+    assert caught.value is outage
+
+
+@pytest.mark.asyncio
+async def test_can_execute_rejects_an_untyped_lease() -> None:
+    ownership = PipelineOwnershipRepository(_NeverPool())
+
+    with pytest.raises(ValueError, match="InboxLease"):
+        await ownership.can_execute(object())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "args", "operation"),
+    [
+        (
+            "bootstrap",
+            (8, "legacy_compat"),
+            "bootstrap_pipeline_ownership",
+        ),
+        ("get", (8, 1), "get_pipeline_ownership"),
+        ("current_ingress", (8,), "get_current_pipeline_ownership"),
+        ("next_generation", (8,), "next_pipeline_generation"),
+        ("assert_fence", (8, 1, 1), "assert_pipeline_fence"),
+        (
+            "quiesce",
+            (8, 1, 1, "operator", "prepare cutover"),
+            "quiesce_pipeline_ownership",
+        ),
+        (
+            "retire",
+            (8, 1, 1, "operator", "retire generation"),
+            "retire_pipeline_ownership",
+        ),
+    ],
+)
+async def test_public_database_failures_are_fixed_and_retryable(
+    method_name: str,
+    args: tuple[object, ...],
+    operation: str,
+) -> None:
+    ownership = PipelineOwnershipRepository(_FailingPool())
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        await getattr(ownership, method_name)(*args)
+
+    assert caught.value.operation == operation
+    assert caught.value.retryable is True
+    assert str(caught.value) == "pipeline ownership database operation failed"
+    assert "database-secret" not in str(caught.value)
+
+
+def _generation(state: PipelineGenerationState) -> PipelineGeneration:
+    return PipelineGeneration(
+        account_id=8,
+        generation=1,
+        pipeline_name="legacy_compat",
+        state=state,
+        fencing_token=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_transaction_lock_database_failure_is_safely_wrapped(monkeypatch) -> None:
+    connection = _FailingTransactionConnection()
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    transaction = ownership.transaction(connection)  # type: ignore[arg-type]
+
+    async def fail_configuration(_connection) -> None:
+        raise PoolTimeout("database-secret-must-not-escape")
+
+    monkeypatch.setattr(ownership, "_configure_transaction", fail_configuration)
+    with pytest.raises(DatabaseOperationError) as caught:
+        await transaction._lock_quiesced(8, 1, 1)
+
+    assert caught.value.operation == "lock_pipeline_handoff"
+    assert caught.value.retryable is True
+    assert "database-secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_transaction_mark_database_failure_is_safely_wrapped() -> None:
+    connection = _FailingTransactionConnection()
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    transaction = ownership.transaction(connection)  # type: ignore[arg-type]
+    transaction._locked = _generation(PipelineGenerationState.QUIESCING)
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        await transaction._mark_draining(
+            transaction._locked,
+            actor="operator",
+            reason="handoff",
+        )
+
+    assert caught.value.operation == "mark_pipeline_draining"
+    assert caught.value.retryable is True
+    assert "database-secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_transaction_insert_database_failure_is_safely_wrapped() -> None:
+    connection = _FailingTransactionConnection()
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    transaction = ownership.transaction(connection)  # type: ignore[arg-type]
+    transaction._draining = _generation(PipelineGenerationState.DRAINING)
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        await transaction._insert_current(
+            account_id=8,
+            pipeline_name="durable_v1",
+            generation=2,
+            fencing_token=2,
+            actor="operator",
+            reason="handoff",
+        )
+
+    assert caught.value.operation == "insert_current_pipeline"
+    assert caught.value.retryable is True
+    assert "database-secret" not in str(caught.value)
