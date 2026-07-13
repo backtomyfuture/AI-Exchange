@@ -5,7 +5,9 @@ import re
 from pathlib import Path
 
 
-_SQL_EXECUTION_METHODS = frozenset({"execute", "executemany", "exec_driver_sql"})
+_SQL_EXECUTION_METHODS = frozenset(
+    {"copy", "copy_expert", "execute", "executemany", "exec_driver_sql"}
+)
 _SQL_TEXT_CONSTRUCTORS = frozenset({"SQL", "text"})
 _SQL_IDENTIFIER_CONSTRUCTORS = frozenset({"Identifier", "_table"})
 _EVENT_INBOX_MUTATION = re.compile(
@@ -224,6 +226,12 @@ async def mutate_rows(cursor, sql, _table):
     await cursor.execute(sql.SQL("TRUNCATE TABLE {}").format(_table("event_inbox")))
     await cursor.execute('COPY "runtime"."event_inbox" (id) FROM STDIN')
     await cursor.execute('COPY "runtime"."event_inbox" (id) TO STDOUT')
+    async with cursor.copy('COPY "runtime"."event_inbox" (id) FROM STDIN') as writer:
+        await writer.write_row((1,))
+    async with cursor.copy('COPY "runtime"."event_inbox" (id) TO STDOUT') as reader:
+        await reader.read_row()
+    await cursor.copy_expert('COPY "runtime"."event_inbox" (id) FROM STDIN')
+    await cursor.copy_expert('COPY "runtime"."event_inbox" (id) TO STDOUT')
 """
 
     assert _find_event_inbox_mutations(source, filename="<mutation-contract>") == [
@@ -231,6 +239,8 @@ async def mutate_rows(cursor, sql, _table):
         4,
         5,
         6,
+        8,
+        12,
     ]
 
 

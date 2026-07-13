@@ -1259,7 +1259,7 @@ async def test_effect_first_and_expiry_reaper_linearize_on_the_database_row(
     lease = (await repo.claim_batch("worker", {"durable_v1"}, 1, 2))[0]
     effect_updated = asyncio.Event()
     release_effect = asyncio.Event()
-    reaper_select_started = asyncio.Event()
+    reaper_select_completed = asyncio.Event()
     effect_repo = InboxRepository(
         _ProbedPool(
             inbox_runtime.pool,
@@ -1272,7 +1272,7 @@ async def test_effect_first_and_expiry_reaper_linearize_on_the_database_row(
         _ProbedPool(
             inbox_runtime.pool,
             match=lambda statement: "FOR UPDATE OF e SKIP LOCKED LIMIT" in statement,
-            before=reaper_select_started,
+            after=reaper_select_completed,
         )
     )
 
@@ -1290,7 +1290,7 @@ async def test_effect_first_and_expiry_reaper_linearize_on_the_database_row(
         await asyncio.sleep(0.01)
 
     reaper_task = asyncio.create_task(reaper_repo.recover_expired_leases(1))
-    await asyncio.wait_for(reaper_select_started.wait(), timeout=5)
+    await asyncio.wait_for(reaper_select_completed.wait(), timeout=5)
     release_effect.set()
 
     assert await asyncio.wait_for(effect_task, timeout=5) is True
