@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +14,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from src.db.bootstrap import bootstrap_database
+from src.domain.email_state import PipelineGenerationState
 from src.domain.errors import (
     DatabaseOperationError,
     ErrorKind,
@@ -32,6 +33,7 @@ from src.ingestion.models import (
 )
 from src.ingestion.ownership import (
     PipelineOwnershipRepository,
+    PipelineRetirementBlocked,
     ownership_advisory_lock_key,
 )
 from src.ingestion.repository import InboxRepository
@@ -49,6 +51,111 @@ class _TypedFailure(RuntimeError):
     def __init__(self, kind: ErrorKind) -> None:
         self.kind = kind
         super().__init__("private exception content must never be persisted")
+
+
+class _ExplodingKindFailure(RuntimeError):
+    @property
+    def kind(self):
+        raise RuntimeError("private kind getter content")
+
+
+class _AllowRetirement:
+    async def assert_ready(self, _connection, _generation) -> None:
+        return None
+
+
+async def _configure_repeatable_read(connection) -> None:
+    await connection.execute(
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    )
+
+
+class _ProbedConnection:
+    def __init__(
+        self,
+        connection,
+        *,
+        match,
+        before: asyncio.Event | None = None,
+        after: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        self._connection = connection
+        self._match = match
+        self._before = before
+        self._after = after
+        self._release = release
+        self._matched = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+    def transaction(self, *args, **kwargs):
+        return self._connection.transaction(*args, **kwargs)
+
+    async def execute(self, statement, params=None):
+        try:
+            rendered = statement.as_string(self._connection)
+        except AttributeError:
+            rendered = str(statement)
+        matched = not self._matched and self._match(rendered)
+        if matched:
+            self._matched = True
+            if self._before is not None:
+                self._before.set()
+        cursor = await self._connection.execute(statement, params)
+        if matched:
+            if self._after is not None:
+                self._after.set()
+            if self._release is not None:
+                await self._release.wait()
+        return cursor
+
+
+class _ProbedConnectionContext:
+    def __init__(self, context, **probe) -> None:
+        self._context = context
+        self._probe = probe
+
+    async def __aenter__(self):
+        connection = await self._context.__aenter__()
+        return _ProbedConnection(connection, **self._probe)
+
+    async def __aexit__(self, *args):
+        return await self._context.__aexit__(*args)
+
+
+class _ProbedPool:
+    def __init__(self, pool, **probe) -> None:
+        self._pool = pool
+        self._probe = probe
+
+    def connection(self):
+        return _ProbedConnectionContext(
+            self._pool.connection(),
+            **self._probe,
+        )
+
+
+async def _mark_generation_draining(runtime: _InboxRuntime) -> None:
+    quiesced = await runtime.ownership.quiesce(
+        8,
+        1,
+        1,
+        "test",
+        "prepare deterministic retirement race",
+    )
+    assert quiesced.state is PipelineGenerationState.QUIESCING
+    async with runtime.pool.connection() as connection:
+        async with connection.transaction():
+            transaction = runtime.ownership.transaction(connection)
+            locked = await transaction._lock_quiesced(8, 1, 1)
+            draining = await transaction._mark_draining(
+                locked,
+                actor="test",
+                reason="run deterministic retirement race",
+            )
+    assert draining.state is PipelineGenerationState.DRAINING
 
 
 @pytest_asyncio.fixture
@@ -328,11 +435,14 @@ async def test_global_dedupe_collision_across_accounts_fails_closed(
     assert caught.value.operation == "insert_event_inbox"
     assert caught.value.retryable is False
     assert str(caught.value) == "event inbox dedupe identity conflict"
-    assert await _scalar(
-        inbox_runtime.pool,
-        "SELECT pg_catalog.count(*) FROM event_inbox WHERE dedupe_key = %s",
-        (key,),
-    ) == 1
+    assert (
+        await _scalar(
+            inbox_runtime.pool,
+            "SELECT pg_catalog.count(*) FROM event_inbox WHERE dedupe_key = %s",
+            (key,),
+        )
+        == 1
+    )
 
 
 @pytest.mark.integration
@@ -377,11 +487,24 @@ async def test_skip_locked_claims_are_disjoint_and_complete_the_batch(
 @pytest.mark.asyncio
 async def test_quiesce_is_a_real_insert_and_claim_barrier(
     inbox_runtime: _InboxRuntime,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = inbox_runtime.repository
     existing = await repo.insert(_event("before-barrier"), 1, 1)
     waiting_event = _event("loses-to-barrier")
     key = ownership_advisory_lock_key(8)
+    lock_attempts = 0
+    both_waiting = asyncio.Event()
+    original_lock = repo._acquire_account_lock
+
+    async def observed_lock(connection, account_id: int) -> None:
+        nonlocal lock_attempts
+        lock_attempts += 1
+        if lock_attempts == 2:
+            both_waiting.set()
+        await original_lock(connection, account_id)
+
+    monkeypatch.setattr(repo, "_acquire_account_lock", observed_lock)
 
     async with inbox_runtime.pool.connection() as connection:
         async with connection.transaction():
@@ -392,7 +515,7 @@ async def test_quiesce_is_a_real_insert_and_claim_barrier(
             claim_task = asyncio.create_task(
                 repo.claim_batch("worker", {"durable_v1"}, 10, 60)
             )
-            await asyncio.sleep(0)
+            await asyncio.wait_for(both_waiting.wait(), timeout=5)
             await connection.execute(
                 "UPDATE pipeline_ownership "
                 "SET state = 'quiescing', reason = 'test barrier', "
@@ -406,10 +529,149 @@ async def test_quiesce_is_a_real_insert_and_claim_barrier(
     assert await repo.insert(_event("before-barrier"), 1, 1) == IngressReceipt(
         existing.inbox_id, True
     )
-    assert await _scalar(
+    assert (
+        await _scalar(
+            inbox_runtime.pool,
+            "SELECT pg_catalog.count(*) FROM event_inbox",
+        )
+        == 1
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_first_commits_before_quiesce_can_return(
+    inbox_runtime: _InboxRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("claim-first-barrier"), 1, 1)
+    claim_has_lock = asyncio.Event()
+    release_claim = asyncio.Event()
+    quiesce_attempted = asyncio.Event()
+    original_claim_lock = repo._acquire_account_lock
+    original_control_lock = inbox_runtime.ownership._acquire_account_lock
+
+    async def hold_claim_lock(connection, account_id: int) -> None:
+        await original_claim_lock(connection, account_id)
+        claim_has_lock.set()
+        await release_claim.wait()
+
+    async def observe_control_lock(connection, account_id: int) -> None:
+        quiesce_attempted.set()
+        await original_control_lock(connection, account_id)
+
+    monkeypatch.setattr(repo, "_acquire_account_lock", hold_claim_lock)
+    monkeypatch.setattr(
+        inbox_runtime.ownership,
+        "_acquire_account_lock",
+        observe_control_lock,
+    )
+    claim_task = asyncio.create_task(repo.claim_batch("worker", {"durable_v1"}, 1, 60))
+    await asyncio.wait_for(claim_has_lock.wait(), timeout=5)
+    quiesce_task = asyncio.create_task(
+        inbox_runtime.ownership.quiesce(
+            8,
+            1,
+            1,
+            "test",
+            "claim-first barrier",
+        )
+    )
+    await asyncio.wait_for(quiesce_attempted.wait(), timeout=5)
+    assert quiesce_task.done() is False
+
+    release_claim.set()
+    leases = await asyncio.wait_for(claim_task, timeout=5)
+    quiesced = await asyncio.wait_for(quiesce_task, timeout=5)
+
+    assert len(leases) == 1
+    assert quiesced.state is PipelineGenerationState.QUIESCING
+    assert (
+        await _scalar(
+            inbox_runtime.pool,
+            "SELECT status FROM event_inbox WHERE id = %s",
+            (leases[0].id,),
+        )
+        == InboxStatus.LEASED.value
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_repeatable_read_session_cannot_claim_across_quiesce_barrier(
+    inbox_runtime: _InboxRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await inbox_runtime.repository.insert(_event("repeatable-barrier"), 1, 1)
+    repeatable_pool = AsyncConnectionPool(
+        conninfo=inbox_runtime.schema.runtime_dsn,
+        min_size=1,
+        max_size=2,
+        open=False,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+        configure=_configure_repeatable_read,
+    )
+    await repeatable_pool.open()
+    repository = InboxRepository(repeatable_pool)
+    lock_attempted = asyncio.Event()
+    original_lock = repository._acquire_account_lock
+
+    async def observed_lock(connection, account_id: int) -> None:
+        lock_attempted.set()
+        await original_lock(connection, account_id)
+
+    monkeypatch.setattr(repository, "_acquire_account_lock", observed_lock)
+    key = ownership_advisory_lock_key(8)
+    try:
+        assert (
+            await _scalar(repeatable_pool, "SHOW default_transaction_isolation")
+            == "repeatable read"
+        )
+        async with inbox_runtime.pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_catalog.pg_advisory_xact_lock(%s)", (key,)
+                )
+                claim_task = asyncio.create_task(
+                    repository.claim_batch("worker", {"durable_v1"}, 1, 60)
+                )
+                await asyncio.wait_for(lock_attempted.wait(), timeout=5)
+                await connection.execute(
+                    "UPDATE pipeline_ownership SET state = 'quiescing', "
+                    "reason = 'repeatable read barrier', "
+                    "updated_at = pg_catalog.clock_timestamp() "
+                    "WHERE account_id = 8 AND generation = 1"
+                )
+
+        assert await asyncio.wait_for(claim_task, timeout=5) == []
+    finally:
+        await repeatable_pool.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_claim_uses_one_statement_timestamp_for_all_lease_markers(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    await inbox_runtime.repository.insert(_event("claim-timestamp"), 1, 1)
+
+    lease = (
+        await inbox_runtime.repository.claim_batch(
+            "worker", {"durable_v1"}, 1, lease_seconds=60
+        )
+    )[0]
+
+    row = await _fetchone(
         inbox_runtime.pool,
-        "SELECT pg_catalog.count(*) FROM event_inbox",
-    ) == 1
+        "SELECT lease_until, processing_started_at, updated_at "
+        "FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    )
+    assert row is not None
+    statement_time = row["lease_until"] - timedelta(seconds=60)
+    assert row["processing_started_at"] == statement_time
+    assert row["updated_at"] == statement_time
 
 
 @pytest.mark.integration
@@ -437,9 +699,7 @@ async def test_renewal_and_reclaim_close_same_worker_aba(
         "- pg_catalog.make_interval(secs => 1) WHERE id = %s",
         (old.id,),
     )
-    replacement = (
-        await repo.claim_batch("same-worker", {"durable_v1"}, 1, 60)
-    )[0]
+    replacement = (await repo.claim_batch("same-worker", {"durable_v1"}, 1, 60))[0]
 
     assert replacement.attempts == old.attempts + 1
     assert replacement.lease_until != old.lease_until
@@ -473,6 +733,26 @@ async def test_renewal_never_shortens_a_long_existing_deadline(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_renew_after_effect_rotates_token_and_preserves_effect_authority(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("renew-after-effect"), 1, 1)
+    original = (await repo.claim_batch("worker", {"durable_v1"}, 1, 60))[0]
+    assert await repo.begin_effect(original) is True
+
+    renewed = await repo.renew(original, 60)
+
+    assert renewed is not None
+    assert renewed.lease_until > original.lease_until
+    assert await repo.begin_effect(original) is False
+    assert await repo.begin_effect(renewed) is True
+    assert await repo.complete(original) is False
+    assert await repo.complete(renewed) is True
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_retry_claim_clears_safe_error_and_preserves_first_processing_marker(
     inbox_runtime: _InboxRuntime,
 ) -> None:
@@ -492,9 +772,7 @@ async def test_retry_claim_clears_safe_error_and_preserves_first_processing_mark
         (first.id,),
     )
 
-    replacement = (
-        await repo.claim_batch("worker-b", {"durable_v1"}, 1, 60)
-    )[0]
+    replacement = (await repo.claim_batch("worker-b", {"durable_v1"}, 1, 60))[0]
 
     assert replacement.attempts == 1
     assert await _fetchone(
@@ -573,6 +851,92 @@ async def test_already_leased_work_can_finish_while_ownership_is_quiescing(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["reaper", "retirement"])
+async def test_reaper_and_retirement_use_account_lock_first_linearization(
+    inbox_runtime: _InboxRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    winner: str,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event(f"retirement-race-{winner}"), 1, 1)
+    lease = (await repo.claim_batch("worker", {"durable_v1"}, 1, 60))[0]
+    await _mark_generation_draining(inbox_runtime)
+    await _execute(
+        inbox_runtime.pool,
+        "UPDATE event_inbox SET lease_until = pg_catalog.clock_timestamp() "
+        "- INTERVAL '1 second' WHERE id = %s",
+        (lease.id,),
+    )
+    guarded = PipelineOwnershipRepository(
+        inbox_runtime.pool,
+        retirement_guard=_AllowRetirement(),
+    )
+    reaper_has_lock = asyncio.Event()
+    release_reaper = asyncio.Event()
+    reaper_attempted = asyncio.Event()
+    retirement_has_lock = asyncio.Event()
+    release_retirement = asyncio.Event()
+    retirement_attempted = asyncio.Event()
+    original_reaper_lock = repo._acquire_account_lock
+    original_retirement_lock = guarded._acquire_account_lock
+
+    async def reaper_lock(connection, account_id: int) -> None:
+        reaper_attempted.set()
+        await original_reaper_lock(connection, account_id)
+        reaper_has_lock.set()
+        if winner == "reaper":
+            await release_reaper.wait()
+
+    async def retirement_lock(connection, account_id: int) -> None:
+        retirement_attempted.set()
+        await original_retirement_lock(connection, account_id)
+        retirement_has_lock.set()
+        if winner == "retirement":
+            await release_retirement.wait()
+
+    monkeypatch.setattr(repo, "_acquire_account_lock", reaper_lock)
+    monkeypatch.setattr(guarded, "_acquire_account_lock", retirement_lock)
+
+    if winner == "reaper":
+        reaper_task = asyncio.create_task(repo.recover_expired_leases(1))
+        await asyncio.wait_for(reaper_has_lock.wait(), timeout=5)
+        retirement_task = asyncio.create_task(
+            guarded.retire(8, 1, 1, "test", "race with reaper")
+        )
+        await asyncio.wait_for(retirement_attempted.wait(), timeout=5)
+        assert retirement_has_lock.is_set() is False
+        release_reaper.set()
+    else:
+        retirement_task = asyncio.create_task(
+            guarded.retire(8, 1, 1, "test", "race with reaper")
+        )
+        await asyncio.wait_for(retirement_has_lock.wait(), timeout=5)
+        reaper_task = asyncio.create_task(repo.recover_expired_leases(1))
+        await asyncio.wait_for(reaper_attempted.wait(), timeout=5)
+        assert reaper_has_lock.is_set() is False
+        release_retirement.set()
+
+    with pytest.raises(PipelineRetirementBlocked, match="unresolved work"):
+        await asyncio.wait_for(retirement_task, timeout=5)
+    assert await asyncio.wait_for(reaper_task, timeout=5) == 1
+    assert (await inbox_runtime.ownership.get(8, 1)).state is (
+        PipelineGenerationState.DRAINING
+    )
+    assert await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, attempts, lease_owner, safe_error_code "
+        "FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    ) == {
+        "status": InboxStatus.RETRY_WAIT.value,
+        "attempts": 1,
+        "lease_owner": None,
+        "safe_error_code": "inbox.lease_expired",
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
@@ -599,17 +963,23 @@ async def test_concurrent_terminal_failure_writes_one_disposition_and_one_audit(
 
     assert sum(not isinstance(result, BaseException) for result in results) == 1
     assert sum(isinstance(result, StaleFence) for result in results) == 1
-    assert await _scalar(
-        inbox_runtime.pool,
-        "SELECT attempts FROM event_inbox WHERE id = %s",
-        (lease.id,),
-    ) == 1
-    assert await _scalar(
-        inbox_runtime.pool,
-        "SELECT pg_catalog.count(*) FROM audit_events "
-        "WHERE object_fingerprint = %s AND object_type = 'event_inbox'",
-        (hashlib.sha256(lease.id.encode()).hexdigest(),),
-    ) == 1
+    assert (
+        await _scalar(
+            inbox_runtime.pool,
+            "SELECT attempts FROM event_inbox WHERE id = %s",
+            (lease.id,),
+        )
+        == 1
+    )
+    assert (
+        await _scalar(
+            inbox_runtime.pool,
+            "SELECT pg_catalog.count(*) FROM audit_events "
+            "WHERE object_fingerprint = %s AND object_type = 'event_inbox'",
+            (hashlib.sha256(lease.id.encode()).hexdigest(),),
+        )
+        == 1
+    )
 
 
 @pytest.mark.integration
@@ -765,6 +1135,39 @@ async def test_failure_classification_is_closed_and_never_persists_exception_tex
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_kind_getter_failure_dead_letters_without_leak_or_stuck_lease(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("exploding-kind"), 1, 1)
+    lease = (await repo.claim_batch("worker", {"durable_v1"}, 1, 60))[0]
+
+    disposition = await repo.fail(
+        lease,
+        _ExplodingKindFailure("private outer content"),
+    )
+
+    assert disposition.status is InboxDispositionStatus.DEAD_LETTER
+    assert disposition.safe_error_code == "inbox.internal_invariant"
+    row = await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, attempts, lease_owner, lease_until, "
+        "safe_error_code, safe_error_summary FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    )
+    assert row == {
+        "status": InboxStatus.DEAD_LETTER.value,
+        "attempts": 1,
+        "lease_owner": None,
+        "lease_until": None,
+        "safe_error_code": "inbox.internal_invariant",
+        "safe_error_summary": "Inbox processing invariant failed",
+    }
+    assert "private" not in repr(row).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_after_effect_every_unproven_failure_requires_manual_review(
     inbox_runtime: _InboxRuntime,
 ) -> None:
@@ -844,6 +1247,132 @@ async def test_expired_leases_recover_before_effect_and_quarantine_after_effect(
     assert after_row["attempts"] == 1
     assert after_row["effect_started_at"] is not None
     assert after_row["safe_error_code"] == "inbox.effect_outcome_unknown"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_effect_first_and_expiry_reaper_linearize_on_the_database_row(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("effect-first-race"), 1, 1)
+    lease = (await repo.claim_batch("worker", {"durable_v1"}, 1, 2))[0]
+    effect_updated = asyncio.Event()
+    release_effect = asyncio.Event()
+    reaper_select_started = asyncio.Event()
+    effect_repo = InboxRepository(
+        _ProbedPool(
+            inbox_runtime.pool,
+            match=lambda statement: "effect_started_at = COALESCE" in statement,
+            after=effect_updated,
+            release=release_effect,
+        )
+    )
+    reaper_repo = InboxRepository(
+        _ProbedPool(
+            inbox_runtime.pool,
+            match=lambda statement: "FOR UPDATE OF e SKIP LOCKED LIMIT" in statement,
+            before=reaper_select_started,
+        )
+    )
+
+    effect_task = asyncio.create_task(effect_repo.begin_effect(lease))
+    await asyncio.wait_for(effect_updated.wait(), timeout=5)
+    deadline = asyncio.get_running_loop().time() + 5
+    while not await _scalar(
+        inbox_runtime.pool,
+        "SELECT pg_catalog.clock_timestamp() >= lease_until "
+        "FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    ):
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("lease did not reach its database expiry boundary")
+        await asyncio.sleep(0.01)
+
+    reaper_task = asyncio.create_task(reaper_repo.recover_expired_leases(1))
+    await asyncio.wait_for(reaper_select_started.wait(), timeout=5)
+    release_effect.set()
+
+    assert await asyncio.wait_for(effect_task, timeout=5) is True
+    assert await asyncio.wait_for(reaper_task, timeout=5) == 0
+    intermediate = await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, effect_started_at, attempts FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    )
+    assert intermediate is not None
+    assert intermediate["status"] == InboxStatus.LEASED.value
+    assert intermediate["effect_started_at"] is not None
+    assert intermediate["attempts"] == 0
+    assert await repo.recover_expired_leases(1) == 1
+    row = await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, effect_started_at, attempts, safe_error_code "
+        "FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    )
+    assert row is not None
+    assert row["status"] == InboxStatus.MANUAL_REVIEW.value
+    assert row["effect_started_at"] is not None
+    assert row["attempts"] == 1
+    assert row["safe_error_code"] == "inbox.effect_outcome_unknown"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reaper_first_invalidates_concurrent_begin_effect_token(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("reaper-first-race"), 1, 1)
+    lease = (await repo.claim_batch("worker", {"durable_v1"}, 1, 60))[0]
+    await _execute(
+        inbox_runtime.pool,
+        "UPDATE event_inbox SET lease_until = pg_catalog.clock_timestamp() "
+        "- INTERVAL '1 second' WHERE id = %s",
+        (lease.id,),
+    )
+    reaper_updated = asyncio.Event()
+    release_reaper = asyncio.Event()
+    effect_update_started = asyncio.Event()
+    reaper_repo = InboxRepository(
+        _ProbedPool(
+            inbox_runtime.pool,
+            match=lambda statement: (
+                statement.lstrip().startswith("UPDATE")
+                and "effect_started_at IS NOT DISTINCT FROM" in statement
+            ),
+            after=reaper_updated,
+            release=release_reaper,
+        )
+    )
+    effect_repo = InboxRepository(
+        _ProbedPool(
+            inbox_runtime.pool,
+            match=lambda statement: "effect_started_at = COALESCE" in statement,
+            before=effect_update_started,
+        )
+    )
+
+    reaper_task = asyncio.create_task(reaper_repo.recover_expired_leases(1))
+    await asyncio.wait_for(reaper_updated.wait(), timeout=5)
+    effect_task = asyncio.create_task(effect_repo.begin_effect(lease))
+    await asyncio.wait_for(effect_update_started.wait(), timeout=5)
+    release_reaper.set()
+
+    assert await asyncio.wait_for(reaper_task, timeout=5) == 1
+    assert await asyncio.wait_for(effect_task, timeout=5) is False
+    assert await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, effect_started_at, attempts, safe_error_code "
+        "FROM event_inbox WHERE id = %s",
+        (lease.id,),
+    ) == {
+        "status": InboxStatus.RETRY_WAIT.value,
+        "effect_started_at": None,
+        "attempts": 1,
+        "safe_error_code": "inbox.lease_expired",
+    }
 
 
 @pytest.mark.integration
@@ -942,6 +1471,132 @@ async def test_audit_conflict_rolls_back_terminal_transition(
         "lease_owner": "worker",
         "lease_until": lease.lease_until,
     }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_poisoned_reaper_audit_isolated_and_limit_one_still_makes_progress(
+    inbox_runtime: _InboxRuntime,
+) -> None:
+    repo = inbox_runtime.repository
+    for name in ("poison", "normal-a", "normal-b"):
+        await repo.insert(_event(f"reaper-{name}"), 1, 1)
+    leases = await repo.claim_batch("worker", {"durable_v1"}, 3, 60)
+    by_email = {lease.event.external_email_id: lease for lease in leases}
+    poison = by_email["exchange-message-reaper-poison"]
+    normals = [
+        by_email["exchange-message-reaper-normal-a"],
+        by_email["exchange-message-reaper-normal-b"],
+    ]
+    await _execute(
+        inbox_runtime.pool,
+        "UPDATE event_inbox SET attempts = 5, "
+        "lease_until = pg_catalog.clock_timestamp() - INTERVAL '30 seconds' "
+        "WHERE id = %s",
+        (poison.id,),
+    )
+    for offset, normal in enumerate(normals, start=20):
+        await _execute(
+            inbox_runtime.pool,
+            "UPDATE event_inbox SET lease_until = pg_catalog.clock_timestamp() "
+            "- pg_catalog.make_interval(secs => %s) WHERE id = %s",
+            (offset, normal.id),
+        )
+
+    await _execute(
+        inbox_runtime.pool,
+        "INSERT INTO audit_events ("
+        "id, event_key, account_id, email_id, object_type, object_fingerprint, "
+        "action, result, actor, reason, safe_metadata"
+        ") VALUES (%s, %s, %s, NULL, 'event_inbox', %s, "
+        "'ingress.tampered', 'tampered', 'attacker', 'tampered', %s)",
+        (
+            str(uuid4()),
+            _audit_event_key(poison.id, "ingress.dead_letter", 6),
+            poison.account_id,
+            hashlib.sha256(poison.id.encode()).hexdigest(),
+            Jsonb({"secret-conflict-content": True}),
+        ),
+    )
+
+    for _ in normals:
+        with pytest.raises(DatabaseOperationError) as caught:
+            await repo.recover_expired_leases(limit=1)
+        assert caught.value.operation == "event_inbox_invariant"
+        assert caught.value.retryable is False
+        assert str(caught.value) == "event inbox audit invariant failed"
+        assert "secret-conflict-content" not in str(caught.value)
+
+    assert await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, attempts, lease_owner FROM event_inbox WHERE id = %s",
+        (poison.id,),
+    ) == {
+        "status": InboxStatus.LEASED.value,
+        "attempts": 5,
+        "lease_owner": "worker",
+    }
+    for normal in normals:
+        assert await _fetchone(
+            inbox_runtime.pool,
+            "SELECT status, attempts, lease_owner, safe_error_code "
+            "FROM event_inbox WHERE id = %s",
+            (normal.id,),
+        ) == {
+            "status": InboxStatus.RETRY_WAIT.value,
+            "attempts": 1,
+            "lease_owner": None,
+            "safe_error_code": "inbox.lease_expired",
+        }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reaper_only_isolates_compare_mismatch_not_other_audit_errors(
+    inbox_runtime: _InboxRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = inbox_runtime.repository
+    await repo.insert(_event("reaper-generic-audit-error"), 1, 1)
+    await repo.insert(_event("reaper-generic-audit-normal"), 1, 1)
+    leases = await repo.claim_batch("worker", {"durable_v1"}, 2, 60)
+    terminal, normal = leases
+    await _execute(
+        inbox_runtime.pool,
+        "UPDATE event_inbox SET attempts = 5, "
+        "lease_until = pg_catalog.clock_timestamp() - INTERVAL '30 seconds' "
+        "WHERE id = %s",
+        (terminal.id,),
+    )
+    await _execute(
+        inbox_runtime.pool,
+        "UPDATE event_inbox SET lease_until = pg_catalog.clock_timestamp() "
+        "- INTERVAL '20 seconds' WHERE id = %s",
+        (normal.id,),
+    )
+
+    async def fail_audit(*_args, **_kwargs) -> None:
+        raise DatabaseOperationError(
+            operation="injected_audit_failure",
+            retryable=False,
+            message="fixed injected audit failure",
+        )
+
+    monkeypatch.setattr(repo, "_append_audit", fail_audit)
+    with pytest.raises(DatabaseOperationError) as caught:
+        await repo.recover_expired_leases(2)
+
+    assert caught.value.operation == "injected_audit_failure"
+    assert await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, attempts FROM event_inbox WHERE id = %s",
+        (terminal.id,),
+    ) == {"status": InboxStatus.LEASED.value, "attempts": 5}
+    assert await _fetchone(
+        inbox_runtime.pool,
+        "SELECT status, attempts FROM event_inbox WHERE id = %s",
+        (normal.id,),
+    ) == {"status": InboxStatus.LEASED.value, "attempts": 0}
 
 
 @pytest.mark.integration

@@ -100,6 +100,17 @@ class _FailureDecision:
     safe_summary: str
 
 
+class _AuditInvariantError(DatabaseOperationError):
+    """Private marker for an append-and-compare audit collision."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            operation="event_inbox_invariant",
+            retryable=False,
+            message="event inbox audit invariant failed",
+        )
+
+
 _FAILURE_DECISIONS: Final[dict[ErrorKind, _FailureDecision]] = {
     ErrorKind.TRANSIENT_DEPENDENCY: _FailureDecision(
         InboxDispositionStatus.RETRY_WAIT,
@@ -260,7 +271,9 @@ def _row_values(row: object, columns: tuple[str, ...]) -> tuple[object, ...]:
 
 def _lease_from_row(row: object) -> InboxLease:
     try:
-        values = dict(zip(_LEASE_COLUMNS, _row_values(row, _LEASE_COLUMNS), strict=True))
+        values = dict(
+            zip(_LEASE_COLUMNS, _row_values(row, _LEASE_COLUMNS), strict=True)
+        )
         payload = values["payload"]
         if not isinstance(payload, Mapping):
             raise ValueError
@@ -313,7 +326,10 @@ def _failure_decision(error: BaseException) -> _FailureDecision:
         return _MANUAL_REVIEW
     if isinstance(error, DatabaseOperationError):
         return _DATABASE_TRANSIENT if error.retryable else _DATABASE_FAILURE
-    kind = getattr(error, "kind", None)
+    try:
+        kind = getattr(error, "kind", None)
+    except Exception:
+        return _UNKNOWN_FAILURE
     if isinstance(kind, ErrorKind):
         return _FAILURE_DECISIONS[kind]
     return _UNKNOWN_FAILURE
@@ -345,6 +361,7 @@ class InboxRepository:
         self,
         connection: psycopg.AsyncConnection[Any],
     ) -> None:
+        await connection.execute("SET LOCAL TRANSACTION ISOLATION LEVEL READ COMMITTED")
         await connection.execute(
             "SELECT "
             "pg_catalog.set_config('lock_timeout', %s, true), "
@@ -418,21 +435,25 @@ class InboxRepository:
             reason,
             metadata,
         )
-        if row is None or _row_values(
-            row,
-            (
-                "account_id",
-                "email_id",
-                "object_type",
-                "object_fingerprint",
-                "action",
-                "result",
-                "actor",
-                "reason",
-                "safe_metadata",
-            ),
-        ) != expected:
-            raise _invariant_error("event inbox audit invariant failed")
+        if (
+            row is None
+            or _row_values(
+                row,
+                (
+                    "account_id",
+                    "email_id",
+                    "object_type",
+                    "object_fingerprint",
+                    "action",
+                    "result",
+                    "actor",
+                    "reason",
+                    "safe_metadata",
+                ),
+            )
+            != expected
+        ):
+            raise _AuditInvariantError()
 
     async def _duplicate_receipt(
         self,
@@ -524,9 +545,7 @@ class InboxRepository:
                         ("pipeline_name",),
                     )[0]
                     if not isinstance(pipeline_name, str):
-                        raise _invariant_error(
-                            "event inbox ownership row is invalid"
-                        )
+                        raise _invariant_error("event inbox ownership row is invalid")
 
                     suppressed = event.processing_policy in _SUPPRESSED_POLICIES
                     status = "completed" if suppressed else "pending"
@@ -671,12 +690,12 @@ class InboxRepository:
                         "FOR UPDATE OF e SKIP LOCKED LIMIT %s"
                         ") UPDATE {} AS e SET "
                         "status = 'leased', lease_owner = %s, "
-                        "lease_until = pg_catalog.clock_timestamp() "
+                        "lease_until = pg_catalog.statement_timestamp() "
                         "+ pg_catalog.make_interval(secs => %s), "
                         "processing_started_at = COALESCE("
-                        "e.processing_started_at, pg_catalog.clock_timestamp()), "
+                        "e.processing_started_at, pg_catalog.statement_timestamp()), "
                         "safe_error_code = NULL, safe_error_summary = NULL, "
-                        "updated_at = pg_catalog.clock_timestamp() "
+                        "updated_at = pg_catalog.statement_timestamp() "
                         "FROM claimable AS c WHERE e.id = c.id RETURNING {}"
                     ).format(
                         self._table("event_inbox"),
@@ -696,7 +715,9 @@ class InboxRepository:
                             lease_seconds,
                         ),
                     )
-                    leases = [_lease_from_row(row) for row in await claimed_cursor.fetchall()]
+                    leases = [
+                        _lease_from_row(row) for row in await claimed_cursor.fetchall()
+                    ]
                     leases.sort(key=lambda item: (item.received_at, item.id))
                     return leases
         except (DatabaseOperationError, ValueError):
@@ -1007,10 +1028,35 @@ class InboxRepository:
 
     async def recover_expired_leases(self, limit: int) -> int:
         limit = _require_bounded_int("limit", limit, maximum=_MAX_BATCH)
+        audit_error: _AuditInvariantError | None = None
+        recovered = 0
         try:
             async with self._pool.connection() as connection:
                 async with connection.transaction():
                     await self._configure_transaction(connection)
+                    candidate_accounts = sql.SQL(
+                        "SELECT candidate.account_id FROM ("
+                        "SELECT e.account_id, e.lease_until, e.id FROM {} AS e "
+                        "WHERE e.status = 'leased' "
+                        "AND e.lease_until <= pg_catalog.clock_timestamp() "
+                        "ORDER BY e.lease_until, e.id LIMIT %s"
+                        ") AS candidate GROUP BY candidate.account_id "
+                        "ORDER BY candidate.account_id"
+                    ).format(self._table("event_inbox"))
+                    candidate_cursor = await connection.execute(
+                        candidate_accounts,
+                        (_MAX_BATCH,),
+                    )
+                    account_ids: list[int] = []
+                    for row in await candidate_cursor.fetchall():
+                        value = _row_values(row, ("account_id",))[0]
+                        account_ids.append(_require_bigint("account_id", value))
+                    locked_accounts = sorted(set(account_ids))
+                    for account_id in locked_accounts:
+                        await self._acquire_account_lock(connection, account_id)
+                    if not locked_accounts:
+                        return 0
+
                     select = sql.SQL(
                         "SELECT e.id, e.account_id, e.lease_owner, e.lease_until, "
                         "e.attempts, e.effect_started_at, p.state "
@@ -1021,16 +1067,21 @@ class InboxRepository:
                         "AND p.pipeline_name = e.pipeline_name "
                         "WHERE e.status = 'leased' "
                         "AND e.lease_until <= pg_catalog.clock_timestamp() "
+                        "AND e.account_id = ANY(%s::pg_catalog.int8[]) "
                         "ORDER BY e.lease_until, e.id "
                         "FOR UPDATE OF e SKIP LOCKED LIMIT %s"
                     ).format(
                         self._table("event_inbox"),
                         self._table("pipeline_ownership"),
                     )
-                    cursor = await connection.execute(select, (limit,))
+                    cursor = await connection.execute(
+                        select,
+                        (locked_accounts, _MAX_BATCH),
+                    )
                     rows = await cursor.fetchall()
-                    recovered = 0
                     for row in rows:
+                        if recovered >= limit:
+                            break
                         (
                             inbox_id,
                             account_id,
@@ -1071,58 +1122,72 @@ class InboxRepository:
                             if decision.status is InboxDispositionStatus.RETRY_WAIT
                             else 0
                         )
-                        update = sql.SQL(
-                            "UPDATE {} AS e SET status = %s, lease_owner = NULL, "
-                            "lease_until = NULL, attempts = %s, "
-                            "available_at = CASE WHEN %s = 'retry_wait' "
-                            "THEN pg_catalog.clock_timestamp() "
-                            "+ pg_catalog.make_interval(secs => %s) "
-                            "ELSE e.available_at END, safe_error_code = %s, "
-                            "safe_error_summary = %s, "
-                            "updated_at = pg_catalog.clock_timestamp() "
-                            "WHERE e.id = %s AND e.status = 'leased' "
-                            "AND e.lease_owner = %s AND e.lease_until = %s "
-                            "AND e.attempts = %s "
-                            "AND e.effect_started_at IS NOT DISTINCT FROM %s "
-                            "AND e.lease_until <= pg_catalog.clock_timestamp() "
-                            "RETURNING e.id"
-                        ).format(self._table("event_inbox"))
-                        updated_cursor = await connection.execute(
-                            update,
-                            (
-                                decision.status.value,
-                                new_attempts,
-                                decision.status.value,
-                                backoff,
-                                decision.safe_code,
-                                decision.safe_summary,
-                                inbox_id,
-                                lease_owner,
-                                lease_until,
-                                attempts,
-                                effect_started_at,
-                            ),
-                        )
-                        if await updated_cursor.fetchone() is None:
+                        updated = False
+                        try:
+                            async with connection.transaction():
+                                update = sql.SQL(
+                                    "UPDATE {} AS e SET status = %s, "
+                                    "lease_owner = NULL, lease_until = NULL, "
+                                    "attempts = %s, available_at = CASE "
+                                    "WHEN %s = 'retry_wait' "
+                                    "THEN pg_catalog.clock_timestamp() "
+                                    "+ pg_catalog.make_interval(secs => %s) "
+                                    "ELSE e.available_at END, safe_error_code = %s, "
+                                    "safe_error_summary = %s, "
+                                    "updated_at = pg_catalog.clock_timestamp() "
+                                    "WHERE e.id = %s AND e.status = 'leased' "
+                                    "AND e.lease_owner = %s AND e.lease_until = %s "
+                                    "AND e.attempts = %s "
+                                    "AND e.effect_started_at IS NOT DISTINCT FROM %s "
+                                    "AND e.lease_until <= "
+                                    "pg_catalog.clock_timestamp() RETURNING e.id"
+                                ).format(self._table("event_inbox"))
+                                updated_cursor = await connection.execute(
+                                    update,
+                                    (
+                                        decision.status.value,
+                                        new_attempts,
+                                        decision.status.value,
+                                        backoff,
+                                        decision.safe_code,
+                                        decision.safe_summary,
+                                        inbox_id,
+                                        lease_owner,
+                                        lease_until,
+                                        attempts,
+                                        effect_started_at,
+                                    ),
+                                )
+                                updated = await updated_cursor.fetchone() is not None
+                                if (
+                                    updated
+                                    and decision.status
+                                    is not InboxDispositionStatus.RETRY_WAIT
+                                ):
+                                    action = _terminal_action(decision)
+                                    await self._append_audit(
+                                        connection,
+                                        inbox_id=str(inbox_id),
+                                        account_id=account_id,  # type: ignore[arg-type]
+                                        action=action,
+                                        result=decision.status.value,
+                                        reason=decision.safe_code,
+                                        attempts=new_attempts,
+                                        safe_metadata={
+                                            "attempts": new_attempts,
+                                            "safe_error_code": decision.safe_code,
+                                            "status": decision.status.value,
+                                        },
+                                    )
+                        except _AuditInvariantError as error:
+                            if audit_error is None:
+                                audit_error = error
                             continue
-                        recovered += 1
-                        if decision.status is not InboxDispositionStatus.RETRY_WAIT:
-                            action = _terminal_action(decision)
-                            await self._append_audit(
-                                connection,
-                                inbox_id=str(inbox_id),
-                                account_id=account_id,  # type: ignore[arg-type]
-                                action=action,
-                                result=decision.status.value,
-                                reason=decision.safe_code,
-                                attempts=new_attempts,
-                                safe_metadata={
-                                    "attempts": new_attempts,
-                                    "safe_error_code": decision.safe_code,
-                                    "status": decision.status.value,
-                                },
-                            )
-                    return recovered
+                        if updated:
+                            recovered += 1
+            if audit_error is not None:
+                raise audit_error
+            return recovered
         except (DatabaseOperationError, ValueError):
             raise
         except _DATABASE_EXCEPTIONS as error:

@@ -8,7 +8,11 @@ from psycopg_pool import PoolTimeout
 
 from src.domain.errors import DatabaseOperationError
 from src.ingestion.models import InboxLease
-from src.ingestion.repository import InboxRepository, _lease_from_row
+from src.ingestion.repository import (
+    InboxRepository,
+    _failure_decision,
+    _lease_from_row,
+)
 
 
 class _NeverPool:
@@ -27,6 +31,26 @@ class _FailingConnectionContext:
 class _FailingPool:
     def connection(self):
         return _FailingConnectionContext()
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    async def execute(self, statement, _params=None):
+        self.statements.append(str(statement))
+
+
+class _ExplodingKindFailure(RuntimeError):
+    @property
+    def kind(self):
+        raise RuntimeError("private kind getter content")
+
+
+class _ControlFlowKindFailure(RuntimeError):
+    @property
+    def kind(self):
+        raise KeyboardInterrupt("must propagate")
 
 
 def _lease(normalized_event) -> InboxLease:
@@ -75,6 +99,31 @@ def test_ingestion_boundary_exports_only_the_production_repository() -> None:
 def test_invalid_schema_text_is_rejected_without_database_access() -> None:
     with pytest.raises(ValueError, match="valid UTF-8"):
         InboxRepository(_NeverPool(), target_schema="\ud800")
+
+
+@pytest.mark.asyncio
+async def test_transaction_configuration_sets_read_committed_before_timeouts() -> None:
+    connection = _RecordingConnection()
+
+    await InboxRepository(_NeverPool())._configure_transaction(connection)
+
+    assert connection.statements[0] == (
+        "SET LOCAL TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    )
+    assert "set_config('lock_timeout'" in connection.statements[1]
+
+
+def test_kind_getter_failure_is_fixed_unknown_without_leaking_exception() -> None:
+    decision = _failure_decision(_ExplodingKindFailure("private outer content"))
+
+    assert decision.status.value == "dead_letter"
+    assert decision.safe_code == "inbox.internal_invariant"
+    assert decision.safe_summary == "Inbox processing invariant failed"
+
+
+def test_kind_getter_does_not_swallow_base_exception_control_flow() -> None:
+    with pytest.raises(KeyboardInterrupt, match="must propagate"):
+        _failure_decision(_ControlFlowKindFailure("private outer content"))
 
 
 @pytest.mark.asyncio

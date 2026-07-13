@@ -5,23 +5,32 @@ import re
 from pathlib import Path
 
 
-_SQL_EXECUTION_METHODS = frozenset(
-    {"execute", "executemany", "exec_driver_sql"}
-)
+_SQL_EXECUTION_METHODS = frozenset({"execute", "executemany", "exec_driver_sql"})
 _SQL_TEXT_CONSTRUCTORS = frozenset({"SQL", "text"})
 _SQL_IDENTIFIER_CONSTRUCTORS = frozenset({"Identifier", "_table"})
 _EVENT_INBOX_MUTATION = re.compile(
     r"""
-    \b(?:
-        insert\s+into
-        |
-        update\s+(?:only\s+)?
-    )
-    \s*
     (?:
-        (?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*
-    )?
-    (?:"event_inbox"|event_inbox\b)
+        \b(?:
+            insert\s+into
+            |
+            update\s+(?:only\s+)?
+            |
+            delete\s+from\s+(?:only\s+)?
+            |
+            merge\s+into\s+(?:only\s+)?
+            |
+            truncate\s+(?:table\s+)?(?:only\s+)?
+        )
+        \s*
+        (?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?
+        (?:"event_inbox"|event_inbox\b)
+        |
+        \bcopy\s+
+        (?:(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*)?
+        (?:"event_inbox"|event_inbox\b)
+        (?:\s*\([^)]*\))?\s+from\b
+    )
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -207,6 +216,24 @@ async def write_rows(cursor, sql, _table):
     ]
 
 
+def test_detector_covers_every_runtime_mutation_form_and_ignores_copy_to() -> None:
+    source = """
+async def mutate_rows(cursor, sql, _table):
+    await cursor.execute('DELETE FROM ONLY "runtime"."event_inbox" WHERE id = %s')
+    await cursor.execute(sql.SQL("MERGE INTO {} USING source ON false WHEN NOT MATCHED THEN INSERT DEFAULT VALUES").format(sql.Identifier("runtime", "event_inbox")))
+    await cursor.execute(sql.SQL("TRUNCATE TABLE {}").format(_table("event_inbox")))
+    await cursor.execute('COPY "runtime"."event_inbox" (id) FROM STDIN')
+    await cursor.execute('COPY "runtime"."event_inbox" (id) TO STDOUT')
+"""
+
+    assert _find_event_inbox_mutations(source, filename="<mutation-contract>") == [
+        3,
+        4,
+        5,
+        6,
+    ]
+
+
 def test_event_inbox_mutations_are_owned_by_the_repository() -> None:
     project_root = Path(__file__).resolve().parents[2]
     allowed = project_root / "src" / "ingestion" / "repository.py"
@@ -226,6 +253,6 @@ def test_event_inbox_mutations_are_owned_by_the_repository() -> None:
         )
 
     assert violations == [], (
-        "event_inbox INSERT/UPDATE statements are reserved for "
+        "event_inbox mutations are reserved for "
         f"src/ingestion/repository.py: {violations}"
     )
