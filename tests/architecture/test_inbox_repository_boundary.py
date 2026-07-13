@@ -158,7 +158,7 @@ def _execution_query(call: ast.Call) -> ast.expr | None:
     if call.args:
         return call.args[0]
     for keyword in call.keywords:
-        if keyword.arg in {"query", "statement"}:
+        if keyword.arg in {"query", "sql", "statement"}:
             return keyword.value
     return None
 
@@ -232,6 +232,8 @@ async def mutate_rows(cursor, sql, _table):
         await reader.read_row()
     await cursor.copy_expert('COPY "runtime"."event_inbox" (id) FROM STDIN')
     await cursor.copy_expert('COPY "runtime"."event_inbox" (id) TO STDOUT')
+    await cursor.copy_expert(sql='COPY "runtime"."event_inbox" (id) FROM STDIN', file=stream)
+    await cursor.copy_expert(sql='COPY "runtime"."event_inbox" (id) TO STDOUT', file=stream)
 """
 
     assert _find_event_inbox_mutations(source, filename="<mutation-contract>") == [
@@ -241,6 +243,7 @@ async def mutate_rows(cursor, sql, _table):
         6,
         8,
         12,
+        14,
     ]
 
 
