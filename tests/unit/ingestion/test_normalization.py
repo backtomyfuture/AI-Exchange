@@ -877,6 +877,22 @@ def test_sync_contract_validator_builds_change_from_transport_mapping() -> None:
     assert validated.item["has_attachments"] is True
 
 
+@pytest.mark.parametrize("external_email_id", ["message\x1f", "message\x7f", "message\x80"])
+def test_sync_contract_validator_rejects_c0_c1_transport_identifiers(
+    external_email_id: str,
+) -> None:
+    with pytest.raises(IngressValidationError) as caught:
+        validate_sync_change_contract(
+            {
+                "change_type": "create",
+                "id": external_email_id,
+                "item": _sync_transport_item(id=external_email_id),
+            }
+        )
+
+    assert caught.value.safe_code is IngressValidationCode.EMAIL_ID_INVALID
+
+
 @pytest.mark.parametrize(
     "received_time",
     [

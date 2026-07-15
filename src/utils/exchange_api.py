@@ -1,14 +1,267 @@
-import httpx
-import re
 import logging
-from typing import List, Dict, Any, Optional
+import math
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
+
+import httpx
+
+from src.domain.errors import (
+    SyncAuthorizationError,
+    SyncContractError,
+    SyncCursorInvalidError,
+    SyncTransientError,
+)
+from src.ingestion.models import (
+    MAX_SYNC_CHANGES_PER_BATCH,
+    POSTGRES_BIGINT_MAX,
+    SyncBatch,
+)
+from src.ingestion.normalization import validate_sync_change_contract
 from src.safety.http_response import read_json_limited
 from src.safety.input_limits import input_limits_from_settings
 from src.security.redaction import fingerprint_identifier
+
 logger = logging.getLogger("ExchangeClient")
 
 SENTITEMS_FOLDER_ALIASES = {"已发送邮件", "已发送", "sent items", "sentitems", "sent"}
 DRAFTS_FOLDER_ALIASES = {"草稿", "drafts", "draft"}
+
+_SYNC_CONTRACT_VERSION = "exchange_sync_contract_v2"
+_SYNC_CONTRACT_HEADER = "X-Exchange-Sync-Contract"
+_SYNC_CURSOR_ERROR_HEADER = "X-Exchange-Sync-Error"
+_SYNC_CURSOR_ERROR_VALUE = "exchange_sync_cursor_invalid_v2"
+_SYNC_ONLY_FIELDS = [
+    "id",
+    "subject",
+    "sender",
+    "datetime_received",
+    "is_read",
+    "has_attachments",
+]
+_SYNC_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=135.0,
+    write=10.0,
+    pool=10.0,
+)
+_ASCII_DECIMAL = re.compile(r"[0-9]+\Z")
+_HTTP_MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+_HTTP_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_HTTP_WEEKDAYS_LONG = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+_IMF_FIXDATE = re.compile(
+    r"(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
+    r"(?P<day>[0-9]{2}) "
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?P<year>[0-9]{4}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) GMT"
+)
+_RFC850_DATE = re.compile(
+    r"(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"(?P<day>[0-9]{2})-"
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
+    r"(?P<year>[0-9]{2}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) GMT"
+)
+_ASCTIME_DATE = re.compile(
+    r"(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?P<day> [0-9]|[0-9]{2}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) "
+    r"(?P<year>[0-9]{4})"
+)
+_SYNC_ROOT_PATH = "/api/v1/exchange"
+_SYNC_EMAILS_PATH = "/api/v1/exchange/emails"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _header_is_exact(response: httpx.Response, name: str, expected: str) -> bool:
+    return response.headers.get_list(name, split_commas=False) == [expected]
+
+
+def _content_encoding_is_safe(response: httpx.Response) -> bool:
+    values = response.headers.get_list("content-encoding", split_commas=False)
+    return not values or values == ["identity"]
+
+
+def _parse_exact_http_date(raw: str, *, now: datetime) -> datetime | None:
+    match = _IMF_FIXDATE.fullmatch(raw)
+    long_weekday = False
+    obsolete_year = False
+    if match is None:
+        match = _RFC850_DATE.fullmatch(raw)
+        long_weekday = match is not None
+        obsolete_year = match is not None
+    if match is None:
+        match = _ASCTIME_DATE.fullmatch(raw)
+    if match is None or now.tzinfo is None or now.utcoffset() is None:
+        return None
+
+    try:
+        current = now.astimezone(UTC)
+        month = _HTTP_MONTHS[match.group("month")]
+        day = int(match.group("day"))
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        second = int(match.group("second"))
+        if second > 60:
+            return None
+        year = int(match.group("year"))
+        if obsolete_year:
+            year += current.year - (current.year % 100)
+            candidate_clock = (month, day, hour, minute, second, 0)
+            current_clock = (
+                current.month,
+                current.day,
+                current.hour,
+                current.minute,
+                current.second,
+                current.microsecond,
+            )
+            if year < current.year - 50 or (
+                year == current.year - 50 and candidate_clock < current_clock
+            ):
+                year += 100
+            elif year > current.year + 50 or (
+                year == current.year + 50 and candidate_clock > current_clock
+            ):
+                year -= 100
+        parsed = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            min(second, 59),
+            tzinfo=UTC,
+        )
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+    weekdays = _HTTP_WEEKDAYS_LONG if long_weekday else _HTTP_WEEKDAYS
+    if match.group("weekday") != weekdays[parsed.weekday()]:
+        return None
+    return parsed + timedelta(seconds=1) if second == 60 else parsed
+
+
+def _retry_after_seconds(response: httpx.Response) -> int | None:
+    values = response.headers.get_list("retry-after", split_commas=False)
+    if len(values) != 1:
+        return None
+    raw = values[0]
+    if _ASCII_DECIMAL.fullmatch(raw) is not None:
+        significant = raw.lstrip("0") or "0"
+        if len(significant) > 4:
+            return 3600
+        return min(int(significant), 3600)
+    try:
+        now = _utc_now()
+        retry_at = _parse_exact_http_date(raw, now=now)
+        if retry_at is None:
+            return None
+        delta = (retry_at - now).total_seconds()
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return min(math.ceil(max(0.0, delta)), 3600)
+
+
+def _valid_exact_text(value: object, *, max_length: int) -> bool:
+    if type(value) is not str or not value or len(value) > max_length:
+        return False
+    if value != value.strip() or any(
+        ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _derive_emails_base_url(configured_url: str) -> str:
+    if (
+        type(configured_url) is not str
+        or not configured_url
+        or "?" in configured_url
+        or "#" in configured_url
+        or any(character.isspace() for character in configured_url)
+        or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in configured_url
+        )
+    ):
+        raise ValueError("invalid Exchange Sync URL")
+    parsed = urlsplit(configured_url)
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        raise ValueError("unsupported Exchange Sync URL")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid Exchange Sync URL")
+    _ = parsed.port
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    if path == _SYNC_ROOT_PATH:
+        path = _SYNC_EMAILS_PATH
+    elif path != _SYNC_EMAILS_PATH:
+        raise ValueError("invalid Exchange Sync URL path")
+    return f"{parsed.scheme.casefold()}://{parsed.netloc}{path}"
+
+
+def _sync_batch_from_payload(payload: object, *, limit: int) -> SyncBatch:
+    if not isinstance(payload, dict) or set(payload) != {"code", "msg", "data"}:
+        raise ValueError("invalid Exchange Sync wrapper")
+    if type(payload["code"]) is not int or payload["code"] != 200:
+        raise ValueError("invalid Exchange Sync wrapper code")
+    if payload["msg"] != "OK" or type(payload["msg"]) is not str:
+        raise ValueError("invalid Exchange Sync wrapper message")
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != {
+        "sync_state",
+        "includes_last",
+        "items",
+    }:
+        raise ValueError("invalid Exchange Sync data")
+    items = data["items"]
+    if not isinstance(items, list) or len(items) > limit:
+        raise ValueError("invalid Exchange Sync item count")
+    changes = tuple(validate_sync_change_contract(item) for item in items)
+    return SyncBatch(
+        contract_version=_SYNC_CONTRACT_VERSION,
+        cursor=data["sync_state"],
+        changes=changes,
+        includes_last=data["includes_last"],
+    )
 
 
 def _normalize_folder_name(name: str | None) -> str:
@@ -53,7 +306,8 @@ class ExchangeClient:
             from src.config import get_settings
             settings = get_settings()
             
-        self.api_url = settings.EXCHANGE_API_URL.rstrip("/")
+        configured_api_url = settings.EXCHANGE_API_URL
+        self.api_url = configured_api_url.rstrip("/")
         from src.config import resolve_secret
         self.api_key = resolve_secret(settings.EXCHANGE_API_KEY)
         self.account_id = settings.EXCHANGE_ACCOUNT_ID
@@ -64,6 +318,10 @@ class ExchangeClient:
 
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
+            configured_api_url = self.api_url
+
+        self._sync_configured_api_url = configured_api_url
+        self._sync_emails_base_url: str | None = None
 
         self._http_client: httpx.AsyncClient | None = None
 
@@ -93,6 +351,121 @@ class ExchangeClient:
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()
             self._http_client = None
+
+    def _sync_endpoint(self) -> str:
+        if self._sync_emails_base_url is None:
+            self._sync_emails_base_url = _derive_emails_base_url(
+                self._sync_configured_api_url
+            )
+        return f"{self._sync_emails_base_url}/sync"
+
+    async def sync_emails(
+        self,
+        account_id: int,
+        folder: str,
+        sync_state: str,
+        limit: int,
+    ) -> SyncBatch:
+        """Fetch exactly one authenticated, bounded Exchange Sync v2 page."""
+
+        endpoint: str | None = None
+        invalid_input = not (
+            type(account_id) is int
+            and 1 <= account_id <= POSTGRES_BIGINT_MAX
+            and _valid_exact_text(folder, max_length=512)
+            and _valid_exact_text(sync_state, max_length=8192)
+            and type(limit) is int
+            and 1 <= limit <= MAX_SYNC_CHANGES_PER_BATCH
+        )
+        if not invalid_input:
+            try:
+                endpoint = self._sync_endpoint()
+            except Exception:
+                invalid_input = True
+        if invalid_input or endpoint is None:
+            raise SyncContractError()
+
+        payload = {
+            "account_id": account_id,
+            "folder": folder,
+            "sync_state": sync_state,
+            "limit": limit,
+            "only_fields": _SYNC_ONLY_FIELDS,
+        }
+        failure: Exception | None = None
+        batch: SyncBatch | None = None
+        try:
+            client = self.http_client
+            async with client.stream(
+                "POST",
+                endpoint,
+                json=payload,
+                headers={"Accept-Encoding": "identity"},
+                timeout=_SYNC_TIMEOUT,
+                follow_redirects=False,
+            ) as response:
+                status = response.status_code
+                if status in {401, 403}:
+                    failure = SyncAuthorizationError()
+                elif status == 400:
+                    if _header_is_exact(
+                        response,
+                        _SYNC_CONTRACT_HEADER,
+                        _SYNC_CONTRACT_VERSION,
+                    ) and _header_is_exact(
+                        response,
+                        _SYNC_CURSOR_ERROR_HEADER,
+                        _SYNC_CURSOR_ERROR_VALUE,
+                    ):
+                        failure = SyncCursorInvalidError()
+                    else:
+                        failure = SyncContractError()
+                elif status in {408, 429} or 500 <= status <= 599:
+                    failure = SyncTransientError(
+                        retry_after_seconds=_retry_after_seconds(response)
+                    )
+                elif status != 200:
+                    failure = SyncContractError()
+                elif not _header_is_exact(
+                    response,
+                    _SYNC_CONTRACT_HEADER,
+                    _SYNC_CONTRACT_VERSION,
+                ) or not _content_encoding_is_safe(response):
+                    failure = SyncContractError()
+                else:
+                    try:
+                        response_payload = await read_json_limited(
+                            response,
+                            max_bytes=self._input_limits.exchange_response_bytes,
+                            max_structure_tokens=32 + (21 * limit),
+                        )
+                        batch = _sync_batch_from_payload(response_payload, limit=limit)
+                    except httpx.DecodingError:
+                        failure = SyncContractError()
+                    except httpx.TimeoutException:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except httpx.TransportError:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except Exception:
+                        failure = SyncContractError()
+        except httpx.DecodingError:
+            failure = SyncContractError()
+        except httpx.TimeoutException:
+            failure = SyncTransientError()
+        except httpx.TransportError:
+            failure = SyncTransientError()
+        except Exception:
+            failure = SyncContractError()
+
+        if failure is not None:
+            raise failure
+        if batch is None:
+            raise SyncContractError()
+        return batch
 
     async def get_all_folders(self, force_refresh: bool = False) -> dict:
         """

@@ -250,7 +250,10 @@ def _require_exact_text(
         not value
         or value != value.strip()
         or len(value) > max_length
-        or any(character in value for character in ("\x00", "\r", "\n"))
+        or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in value
+        )
     ):
         _raise(code)
     try:

@@ -152,7 +152,7 @@ _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256 = {
         "f6171bcd68eab46b13ce3590ada575780f93389bb0790092d669d8adca38e6a5"
     ),
     "src/domain/errors.py": (
-        "4397b6f94d28bcc29d298b6282d37eed0aa31931d543438b3d49bbe881f94c0c"
+        "d7019263f9325f7628f382205c2f3ce9177b4d82187ec4f717ad1c4f328a6236"
     ),
     "src/ingestion/repository.py": (
         "a5b01672ba755da251a6fa6b54f7611e3e89555712ecba318e3f6dfc067fa969"
@@ -164,7 +164,7 @@ _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256 = {
         "15ef5d20aba66b3f773d7a6988c4648fde06a3d031b56388ae7ea03603da58d1"
     ),
     "src/ingestion/models.py": (
-        "b5328a09b0ad63fd7cf283d74a8e938e19e02ea3551c48fce160db3b27128c2f"
+        "de539221ec5f9829fde3f9078127c91b074d1ce4479233982de6414eebb2f2ab"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {

@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from pydantic import SecretStr
@@ -7,10 +8,17 @@ from src.utils.exchange_api import ExchangeClient
 
 
 class StreamingResponse:
-    def __init__(self, status_code: int, chunks: list[bytes]) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        chunks: list[bytes],
+        *,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._chunks = chunks
         self.chunks_consumed = 0
+        self.headers = httpx.Headers(headers or [])
 
     async def aiter_bytes(self):
         for chunk in self._chunks:
@@ -258,10 +266,11 @@ async def test_create_draft_success(mock_settings):
         endpoint = mock_http.post.call_args[0][0]
         assert "/drafts" in endpoint
 
-def test_sync_api_removed(mock_settings):
-    """sync_emails has been removed after webhook migration."""
+def test_sync_api_is_available_as_a_dormant_explicit_client_method(mock_settings):
     client = ExchangeClient(settings=mock_settings)
-    assert not hasattr(client, "sync_emails")
+
+    assert callable(getattr(client, "sync_emails", None))
+    assert not hasattr(client, "validate_sync_permission")
 
 
 @pytest.mark.asyncio

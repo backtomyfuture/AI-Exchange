@@ -78,3 +78,70 @@ class ManualReviewRequired(RuntimeError):
         super().__init__(safe_summary)
         self.reason = reason
         self.safe_summary = safe_summary
+
+
+class _ExchangeSyncError(RuntimeError):
+    """Fixed-shape error for the untrusted Exchange Sync boundary."""
+
+    safe_code = "exchange.sync.failure"
+    safe_summary = "Exchange sync failed"
+    kind = ErrorKind.PERMANENT_DEPENDENCY
+    _retryable = False
+    _instance_fields: frozenset[str] = frozenset()
+
+    def __init__(self) -> None:
+        super().__init__(self.safe_summary)
+
+    @property
+    def retryable(self) -> bool:
+        return self._retryable
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "__traceback__":
+            super().__setattr__(name, value)
+            return
+        if name not in self._instance_fields or name in vars(self):
+            raise AttributeError("Exchange sync errors are immutable")
+        super().__setattr__(name, value)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(safe_code={self.safe_code!r})"
+
+
+class SyncAuthorizationError(_ExchangeSyncError):
+    safe_code = "exchange.sync.authorization_failed"
+    safe_summary = "Exchange sync authorization failed"
+    kind = ErrorKind.AUTHENTICATION
+
+
+class SyncCursorInvalidError(_ExchangeSyncError):
+    safe_code = "exchange.sync.cursor_invalid"
+    safe_summary = "Exchange sync cursor is invalid"
+
+
+class SyncTransientError(_ExchangeSyncError):
+    safe_code = "exchange.sync.transient_failure"
+    safe_summary = "Exchange sync is temporarily unavailable"
+    kind = ErrorKind.TRANSIENT_DEPENDENCY
+    _retryable = True
+    _instance_fields = frozenset({"retry_after_seconds"})
+
+    def __init__(self, *, retry_after_seconds: int | None = None) -> None:
+        if retry_after_seconds is not None and (
+            type(retry_after_seconds) is not int
+            or not 0 <= retry_after_seconds <= 3600
+        ):
+            raise TypeError("invalid retry_after_seconds")
+        super().__init__()
+        self.retry_after_seconds = retry_after_seconds
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(safe_code={self.safe_code!r}, "
+            f"retry_after_seconds={self.retry_after_seconds!r})"
+        )
+
+
+class SyncContractError(_ExchangeSyncError):
+    safe_code = "exchange.sync.contract_invalid"
+    safe_summary = "Exchange sync contract is invalid"

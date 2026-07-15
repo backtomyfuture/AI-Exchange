@@ -15,14 +15,16 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
 from enum import StrEnum
+from itertools import islice
 from types import MappingProxyType
-from typing import Any, Final, TypeVar
+from typing import Any, Final, Literal, TypeVar
 from uuid import UUID
 
 from src.domain.email_state import PipelineGenerationState
 
 
 MAX_INBOX_PAYLOAD_BYTES: Final = 256 * 1024
+MAX_SYNC_CHANGES_PER_BATCH: Final = 500
 POSTGRES_BIGINT_MAX: Final = 2**63 - 1
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -389,16 +391,23 @@ class SyncChange:
     source_version: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.external_email_id) is not str:
+            raise ValueError("external_email_id must be an exact string")
         object.__setattr__(
             self,
             "kind",
             _require_enum("kind", self.kind, ChangeKind),
         )
-        _require_text(
+        external_email_id = _require_text(
             "external_email_id",
             self.external_email_id,
             max_length=1024,
         )
+        if any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in external_email_id
+        ):
+            raise ValueError("external_email_id contains forbidden control characters")
         if self.item is not None:
             object.__setattr__(
                 self,
@@ -414,24 +423,52 @@ class SyncChange:
 
 @dataclass(frozen=True, slots=True)
 class SyncBatch:
+    contract_version: Literal["exchange_sync_contract_v2"]
     cursor: str
     changes: Sequence[SyncChange]
-    is_full: bool
+    includes_last: bool
 
     def __post_init__(self) -> None:
-        cursor = _require_text("cursor", self.cursor, max_length=8192)
-        if cursor != cursor.strip():
-            raise ValueError("cursor must not contain leading or trailing whitespace")
-        if isinstance(self.changes, (str, bytes, bytearray)):
-            raise ValueError("changes must be a sequence of SyncChange")
+        if (
+            type(self.contract_version) is not str
+            or self.contract_version != "exchange_sync_contract_v2"
+        ):
+            raise ValueError("contract_version must be exchange_sync_contract_v2")
+        if type(self.cursor) is not str or not self.cursor or len(self.cursor) > 8192:
+            raise ValueError("cursor must be an exact non-empty bounded string")
+        if self.cursor != self.cursor.strip() or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in self.cursor
+        ):
+            raise ValueError("cursor contains forbidden whitespace or controls")
         try:
-            changes = tuple(self.changes)
-        except TypeError:
-            raise ValueError("changes must be a sequence of SyncChange") from None
-        if any(not isinstance(change, SyncChange) for change in changes):
+            self.cursor.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("cursor must contain valid Unicode scalar text") from None
+        if not isinstance(self.changes, Sequence) or isinstance(
+            self.changes,
+            (str, bytes, bytearray),
+        ):
+            raise ValueError("changes must be a sequence of SyncChange")
+        if len(self.changes) > MAX_SYNC_CHANGES_PER_BATCH:
+            raise ValueError(
+                f"changes must contain at most {MAX_SYNC_CHANGES_PER_BATCH} values"
+            )
+        changes = tuple(islice(self.changes, MAX_SYNC_CHANGES_PER_BATCH + 1))
+        if len(changes) > MAX_SYNC_CHANGES_PER_BATCH:
+            raise ValueError(
+                f"changes must contain at most {MAX_SYNC_CHANGES_PER_BATCH} values"
+            )
+        if any(type(change) is not SyncChange for change in changes):
             raise ValueError("changes must contain only SyncChange values")
+        identities = [
+            (change.kind, change.external_email_id)
+            for change in changes
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("changes must not contain duplicate page identities")
         object.__setattr__(self, "changes", changes)
-        _require_bool("is_full", self.is_full)
+        _require_bool("includes_last", self.includes_last)
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +596,7 @@ __all__ = [
     "IngressReceipt",
     "IngressSource",
     "MAX_INBOX_PAYLOAD_BYTES",
+    "MAX_SYNC_CHANGES_PER_BATCH",
     "NormalizedIngressEvent",
     "PipelineGeneration",
     "PipelineGenerationState",
