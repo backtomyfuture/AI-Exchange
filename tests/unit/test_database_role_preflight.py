@@ -99,6 +99,34 @@ def test_role_snapshots_prove_all_identities_have_no_role_memberships():
     }
 
 
+def test_legacy_relation_access_sql_expands_one_manifest_revision_aware() -> None:
+    module = _module()
+    manifest = module.RUNTIME_RELATION_ACCESS
+    explicit_manifests = {
+        "20260710_0002": {
+            name: access
+            for name, access in manifest.items()
+            if name not in module.PHASE2_RELATIONS
+        },
+        "20260713_0004": manifest,
+        "20260713_0005": manifest,
+    }
+
+    legacy_sql = module._relation_access_contract_sql(
+        "schema_oid",
+        "role_oid",
+        manifest,
+    )
+    explicit_sql = module._relation_access_contract_sql(
+        "schema_oid",
+        "role_oid",
+        manifest,
+        manifests_by_revision=explicit_manifests,
+    )
+
+    assert legacy_sql == explicit_sql
+
+
 def test_role_test_dsn_preserves_admin_transport_parameters():
     from tests.integration.conftest import PostgresDatabaseFactory
 
@@ -740,6 +768,33 @@ async def test_bootstrap_checks_migration_role_before_any_schema_write():
 
 
 @pytest.mark.asyncio
+async def test_access_contract_rejects_an_unreviewed_business_revision_before_connect():
+    from src.db import bootstrap as bootstrap_module
+
+    with (
+        patch.object(
+            bootstrap_module.psycopg.AsyncConnection,
+            "connect",
+            side_effect=AssertionError("database connection reached"),
+        ) as connect,
+        pytest.raises(
+            RuntimeError,
+            match="Database access contract revision is unavailable",
+        ),
+    ):
+        await bootstrap_module._apply_database_access_contract(
+            MIGRATION_DSN,
+            target_schema="public",
+            runtime_role="runtime_user",
+            maintenance_role="maintenance_user",
+            auditor_role=AUDITOR_ROLE,
+            business_revision="unreviewed_revision",
+        )
+
+    connect.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
     from src.db import bootstrap as bootstrap_module
 
@@ -805,6 +860,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         runtime_role="runtime_user",
         maintenance_role="maintenance_user",
         auditor_role=AUDITOR_ROLE,
+        business_revision="20260713_0004",
     )
     assert schema_contract.await_args_list == [
         (

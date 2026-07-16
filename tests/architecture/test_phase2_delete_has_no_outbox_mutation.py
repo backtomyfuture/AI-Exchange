@@ -11,6 +11,7 @@ from tests.architecture.test_email_state_repository_boundary import (
     _TRUSTED_TABLE_MARKER_ATTRIBUTE,
     _execution_query,
     _is_sql_execution,
+    _normalized_ast_dump,
     _render_sql,
     _scope_bindings,
     _scope_nodes,
@@ -160,6 +161,14 @@ _BUILTIN_SAFE_NAME_CALLS = frozenset(
         "zip",
     }
 )
+_TRUSTED_OWNER_BUILTIN_NAME_CALLS = frozenset(
+    {
+        ("InboxRepository.transaction", "type"),
+    }
+)
+_PROVENANCE_GUARDED_BUILTIN_NAME_CALLS = _BUILTIN_SAFE_NAME_CALLS | frozenset(
+    name for _, name in _TRUSTED_OWNER_BUILTIN_NAME_CALLS
+)
 _TRUSTED_SAFE_IMPORT_SOURCES = {
     "DatabaseOperationError": "src.domain.errors",
     "EmailEventApplication": "src.ingestion.email_events",
@@ -193,6 +202,7 @@ _IDENTITY_BREAKING_CALL_PATHS = frozenset(
         "repr",
         "str",
         "sum",
+        "type",
     }
 )
 _SAFE_ATTRIBUTE_CALL_PATHS = frozenset(
@@ -959,7 +969,7 @@ def _untrusted_safe_module_names(tree: ast.Module) -> frozenset[str]:
     binding_nodes = [node for node in nodes if not isinstance(node, ast.comprehension)]
     untrusted = {
         name
-        for name in _BUILTIN_SAFE_NAME_CALLS
+        for name in _PROVENANCE_GUARDED_BUILTIN_NAME_CALLS
         if has_star_import
         or any(name in _node_binding_names(node) for node in binding_nodes)
     }
@@ -1706,7 +1716,11 @@ def _side_effect_violations(source: str, *, filename: str) -> list[str]:
                 isinstance(node.func, ast.Name)
                 and node.func.id not in definitions
                 and (
-                    node.func.id not in _SAFE_NAME_CALLS
+                    (
+                        node.func.id not in _SAFE_NAME_CALLS
+                        and (owner, node.func.id)
+                        not in _TRUSTED_OWNER_BUILTIN_NAME_CALLS
+                    )
                     or node.func.id in call_bindings
                     or node.func.id in function_bound_names
                     or node.func.id in untrusted_safe_module_names
@@ -2429,6 +2443,56 @@ class EmailEventTransaction:
     assert sum("call:all" in item for item in violations) == 4
 
 
+def test_repository_transaction_type_guard_requires_exact_builtin_provenance() -> None:
+    clean = """
+class InboxRepository:
+    def transaction(self, value):
+        return type(value)
+
+    async def apply_email_event(self):
+        return self.transaction(True)
+
+class EmailEventTransaction:
+    async def apply_email_event(self):
+        return None
+"""
+    module_shadow = "type = forged\n" + clean
+    local_rebind = clean.replace(
+        "    def transaction(self, value):\n        return type(value)",
+        (
+            "    def transaction(self, value):\n"
+            "        type = forged\n"
+            "        return type(value)"
+        ),
+    )
+    wrong_owner = clean.replace(
+        "    async def apply_email_event(self):\n        return None",
+        (
+            "    def _probe(self, value):\n"
+            "        return type(value)\n\n"
+            "    async def apply_email_event(self):\n"
+            "        return self._probe(True)"
+        ),
+    )
+
+    clean_violations = _side_effect_violations(
+        clean,
+        filename="<trusted-owner-builtin-type>",
+    )
+    assert not any("call:type" in item for item in clean_violations)
+
+    for label, source in (
+        ("module-shadow", module_shadow),
+        ("local-rebind", local_rebind),
+        ("wrong-owner", wrong_owner),
+    ):
+        violations = _side_effect_violations(
+            source,
+            filename=f"<trusted-owner-builtin-type-{label}>",
+        )
+        assert any("call:type" in item for item in violations), label
+
+
 def test_safe_callable_allowlist_rejects_untrusted_module_binders() -> None:
     cases = (
         (
@@ -2517,6 +2581,12 @@ def test_project_local_safe_callables_have_structural_ratchet_coverage() -> None
         | set(_BUILTIN_SAFE_NAME_CALLS)
         | set(_TRUSTED_SAFE_LOCAL_CLASSES)
     )
+    assert _TRUSTED_OWNER_BUILTIN_NAME_CALLS == {
+        ("InboxRepository.transaction", "type")
+    }
+    assert _PROVENANCE_GUARDED_BUILTIN_NAME_CALLS == (
+        _BUILTIN_SAFE_NAME_CALLS | {"type"}
+    )
     reviewed_sources = set(callable_sources.values()) | set(
         class_exemption_sources.values()
     )
@@ -2530,7 +2600,7 @@ def test_project_local_safe_callables_have_structural_ratchet_coverage() -> None
             filename=relative,
         )
         tree.body.append(ast.Pass())
-        mutated = ast.dump(tree, include_attributes=False)
+        mutated = _normalized_ast_dump(tree)
         mutated_digest = hashlib.sha256(mutated.encode("utf-8")).hexdigest()
         assert mutated_digest != _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256[relative]
 

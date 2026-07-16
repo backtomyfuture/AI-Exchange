@@ -19,6 +19,30 @@ def test_phase2_manifest_tracks_ignored_policy_revision() -> None:
     )
 
 
+def test_sync_control_manifest_is_revision_aware_and_pins_filtered_view() -> None:
+    revision = "20260713_0005"
+
+    assert access_contract.SYNC_RECONCILIATION_DATABASE_REVISION == revision
+    assert access_contract.PHASE2_RELATIONS_BY_REVISION["20260713_0004"] == (
+        "audit_events",
+        "emails",
+        "event_inbox",
+        "pipeline_ownership",
+        "pipeline_shadow_comparisons",
+        "sync_cursors",
+    )
+    assert set(access_contract.PHASE2_RELATIONS_BY_REVISION[revision]) == {
+        *access_contract.PHASE2_RELATIONS_BY_REVISION["20260713_0004"],
+        "pipeline_command_receipts",
+        "sync_cold_start_plans",
+    }
+    view = access_contract.PHASE2_VIEW_SPECS_BY_REVISION[revision][0]
+    assert view.name == "cold_start_command_receipts"
+    assert view.relation_kind == "v"
+    assert view.check_option == "CASCADED"
+    assert len(view.definition_sha256) == 64
+
+
 class _ContractCursor:
     def __init__(self, result_batches):
         self.result_batches = list(result_batches)
@@ -102,6 +126,7 @@ class _ContractConnection:
                 "p",
                 False,
                 False,
+                True,
                 True,
                 "heap" if relation_kind in {"r", "p"} else None,
             )

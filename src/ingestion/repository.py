@@ -650,8 +650,16 @@ class InboxRepository:
     def transaction(
         self,
         connection: psycopg.AsyncConnection[Any],
+        *,
+        for_key_share: bool = True,
     ) -> EmailEventTransaction:
-        return EmailEventTransaction(self, connection)
+        if type(for_key_share) is not bool:
+            raise ValueError("for_key_share must be an exact boolean")
+        return EmailEventTransaction(
+            self,
+            connection,
+            for_key_share=for_key_share,
+        )
 
     async def apply_email_event(
         self,
@@ -806,106 +814,32 @@ class InboxRepository:
         generation: int,
         fencing_token: int,
     ) -> IngressReceipt:
-        if not isinstance(event, NormalizedIngressEvent):
-            raise ValueError("event must be a NormalizedIngressEvent")
-        generation = _require_bigint("generation", generation)
-        fencing_token = _require_bigint("fencing_token", fencing_token)
-        payload = event.payload_for_storage()
+        self._validate_insert_inputs(event, generation, fencing_token)
         try:
             async with self._pool.connection() as connection:
                 async with connection.transaction():
                     await self._configure_transaction(connection)
-                    await self._acquire_account_lock(connection, event.account_id)
-                    duplicate = await self._duplicate_receipt(connection, event)
-                    if duplicate is not None:
-                        return duplicate
-
-                    ownership_query = sql.SQL(
-                        "SELECT pipeline_name FROM {} "
-                        "WHERE account_id = %s AND generation = %s "
-                        "AND fencing_token = %s AND state = 'current_ingress' "
-                        "FOR KEY SHARE"
-                    ).format(self._table("pipeline_ownership"))
-                    ownership_cursor = await connection.execute(
-                        ownership_query,
-                        (event.account_id, generation, fencing_token),
+                    return await self.transaction(connection).insert(
+                        event,
+                        generation,
+                        fencing_token,
                     )
-                    ownership_row = await ownership_cursor.fetchone()
-                    if ownership_row is None:
-                        raise StaleFence()
-                    pipeline_name = _row_values(
-                        ownership_row,
-                        ("pipeline_name",),
-                    )[0]
-                    if not isinstance(pipeline_name, str):
-                        raise _invariant_error("event inbox ownership row is invalid")
-
-                    suppressed = event.processing_policy in _SUPPRESSED_POLICIES
-                    status = "completed" if suppressed else "pending"
-                    inbox_id = str(uuid4())
-                    insert = sql.SQL(
-                        "INSERT INTO {} ("
-                        "id, account_id, external_email_id, folder_key, source, "
-                        "raw_event_type, change_kind, dedupe_key, source_version, "
-                        "source_event_at, payload, processing_policy, pipeline_name, "
-                        "generation, fencing_token, status, available_at"
-                        ") VALUES ("
-                        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                        "%s, %s, %s, pg_catalog.clock_timestamp()"
-                        ") ON CONFLICT (dedupe_key) DO NOTHING RETURNING id"
-                    ).format(self._table("event_inbox"))
-                    inserted_cursor = await connection.execute(
-                        insert,
-                        (
-                            inbox_id,
-                            event.account_id,
-                            event.external_email_id,
-                            event.folder,
-                            event.source.value,
-                            event.raw_event_type,
-                            event.kind.value,
-                            event.dedupe_key,
-                            event.source_version,
-                            event.source_event_at,
-                            Jsonb(payload),
-                            event.processing_policy.value,
-                            pipeline_name,
-                            generation,
-                            fencing_token,
-                            status,
-                        ),
-                    )
-                    inserted_row = await inserted_cursor.fetchone()
-                    if inserted_row is None:
-                        winner = await self._duplicate_receipt(connection, event)
-                        if winner is None:
-                            raise _invariant_error(
-                                "event inbox dedupe winner is unavailable"
-                            )
-                        return winner
-                    inserted_id = str(_row_values(inserted_row, ("id",))[0])
-                    if inserted_id != inbox_id:
-                        raise _invariant_error("event inbox insert row is invalid")
-                    if suppressed:
-                        await self._append_audit(
-                            connection,
-                            inbox_id=inbox_id,
-                            account_id=event.account_id,
-                            action="ingress.policy_suppressed",
-                            result=status,
-                            reason="inbox.policy_suppressed",
-                            attempts=0,
-                            safe_metadata={
-                                "attempts": 0,
-                                "processing_policy": event.processing_policy.value,
-                                "status": status,
-                            },
-                        )
-                    return IngressReceipt(inbox_id=inbox_id, duplicate=False)
-        except (StaleFence, DatabaseOperationError, ValueError):
+        except (StaleFence, DatabaseOperationError, ValueError, RuntimeError):
             raise
         except _DATABASE_EXCEPTIONS as error:
             raise _database_error("insert_event_inbox", error) from None
+
+    @staticmethod
+    def _validate_insert_inputs(
+        event: object,
+        generation: object,
+        fencing_token: object,
+    ) -> tuple[NormalizedIngressEvent, int, int]:
+        if type(event) is not NormalizedIngressEvent:
+            raise ValueError("event must be an exact NormalizedIngressEvent")
+        generation = _require_bigint("generation", generation)
+        fencing_token = _require_bigint("fencing_token", fencing_token)
+        return event, generation, fencing_token
 
     async def claim_batch(
         self,
@@ -1563,9 +1497,14 @@ class EmailEventTransaction:
         self,
         repository: InboxRepository,
         connection: psycopg.AsyncConnection[Any],
+        *,
+        for_key_share: bool,
     ) -> None:
+        if type(for_key_share) is not bool:
+            raise ValueError("for_key_share must be an exact boolean")
         self._repository = repository
         self._connection = connection
+        self._for_key_share = for_key_share
         self._transaction_id: str | None = None
 
     def _require_transaction(self) -> None:
@@ -1600,6 +1539,124 @@ class EmailEventTransaction:
             self._transaction_id = transaction_id
         elif self._transaction_id != transaction_id:
             raise StaleFence()
+
+    async def insert(
+        self,
+        event: NormalizedIngressEvent,
+        generation: int,
+        fencing_token: int,
+    ) -> IngressReceipt:
+        for_key_share = self._for_key_share
+        if type(for_key_share) is not bool:
+            raise ValueError("for_key_share must be an exact boolean")
+        event, generation, fencing_token = self._repository._validate_insert_inputs(
+            event,
+            generation,
+            fencing_token,
+        )
+        payload = event.payload_for_storage()
+        try:
+            await self._assert_transaction_identity()
+            await self._repository._acquire_account_lock(
+                self._connection,
+                event.account_id,
+            )
+            duplicate = await self._repository._duplicate_receipt(
+                self._connection,
+                event,
+            )
+            if duplicate is not None:
+                return duplicate
+
+            ownership_query = sql.SQL(
+                "SELECT pipeline_name FROM {} "
+                "WHERE account_id = %s AND generation = %s "
+                "AND fencing_token = %s AND state = 'current_ingress'{}"
+            ).format(
+                self._repository._table("pipeline_ownership"),
+                sql.SQL(" FOR KEY SHARE") if for_key_share else sql.SQL(""),
+            )
+            ownership_cursor = await self._connection.execute(
+                ownership_query,
+                (event.account_id, generation, fencing_token),
+            )
+            ownership_row = await ownership_cursor.fetchone()
+            if ownership_row is None:
+                raise StaleFence()
+            pipeline_name = _row_values(
+                ownership_row,
+                ("pipeline_name",),
+            )[0]
+            if not isinstance(pipeline_name, str):
+                raise _invariant_error("event inbox ownership row is invalid")
+
+            suppressed = event.processing_policy in _SUPPRESSED_POLICIES
+            status = "completed" if suppressed else "pending"
+            inbox_id = str(uuid4())
+            insert = sql.SQL(
+                "INSERT INTO {} ("
+                "id, account_id, external_email_id, folder_key, source, "
+                "raw_event_type, change_kind, dedupe_key, source_version, "
+                "source_event_at, payload, processing_policy, pipeline_name, "
+                "generation, fencing_token, status, available_at"
+                ") VALUES ("
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s, pg_catalog.clock_timestamp()"
+                ") ON CONFLICT (dedupe_key) DO NOTHING RETURNING id"
+            ).format(self._repository._table("event_inbox"))
+            inserted_cursor = await self._connection.execute(
+                insert,
+                (
+                    inbox_id,
+                    event.account_id,
+                    event.external_email_id,
+                    event.folder,
+                    event.source.value,
+                    event.raw_event_type,
+                    event.kind.value,
+                    event.dedupe_key,
+                    event.source_version,
+                    event.source_event_at,
+                    Jsonb(payload),
+                    event.processing_policy.value,
+                    pipeline_name,
+                    generation,
+                    fencing_token,
+                    status,
+                ),
+            )
+            inserted_row = await inserted_cursor.fetchone()
+            if inserted_row is None:
+                winner = await self._repository._duplicate_receipt(
+                    self._connection,
+                    event,
+                )
+                if winner is None:
+                    raise _invariant_error("event inbox dedupe winner is unavailable")
+                return winner
+            inserted_id = str(_row_values(inserted_row, ("id",))[0])
+            if inserted_id != inbox_id:
+                raise _invariant_error("event inbox insert row is invalid")
+            if suppressed:
+                await self._repository._append_audit(
+                    self._connection,
+                    inbox_id=inbox_id,
+                    account_id=event.account_id,
+                    action="ingress.policy_suppressed",
+                    result=status,
+                    reason="inbox.policy_suppressed",
+                    attempts=0,
+                    safe_metadata={
+                        "attempts": 0,
+                        "processing_policy": event.processing_policy.value,
+                        "status": status,
+                    },
+                )
+            return IngressReceipt(inbox_id=inbox_id, duplicate=False)
+        except (StaleFence, DatabaseOperationError, ValueError, RuntimeError):
+            raise
+        except _DATABASE_EXCEPTIONS as error:
+            raise _database_error("insert_event_inbox", error) from None
 
     async def _insert_neutral_shell(
         self,

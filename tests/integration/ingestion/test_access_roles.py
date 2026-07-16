@@ -329,12 +329,206 @@ _EXPECTED_AUDITOR_ACL = {
     for column in columns
 }
 
+_RUNTIME_0005_INSERT_COLUMNS = {
+    **_RUNTIME_INSERT_COLUMNS,
+    "sync_cursors": (
+        *_RUNTIME_INSERT_COLUMNS["sync_cursors"],
+        "transient_failures",
+        "retry_after_at",
+    ),
+}
+_RUNTIME_0005_UPDATE_COLUMNS = {
+    **_RUNTIME_UPDATE_COLUMNS,
+    "sync_cursors": (
+        *_RUNTIME_UPDATE_COLUMNS["sync_cursors"],
+        "transient_failures",
+        "retry_after_at",
+    ),
+}
+
+
+def _expected_runtime_acl_0005() -> set[tuple[str, str, str, str, bool]]:
+    expected = {
+        ("table", relation, "", privilege, False)
+        for relation, privileges in _RUNTIME_TABLE_PRIVILEGES.items()
+        for privilege in privileges
+    }
+    for privilege, manifest in (
+        ("INSERT", _RUNTIME_0005_INSERT_COLUMNS),
+        ("UPDATE", _RUNTIME_0005_UPDATE_COLUMNS),
+    ):
+        expected.update(
+            ("column", relation, column, privilege, False)
+            for relation, columns in manifest.items()
+            for column in columns
+        )
+    return expected
+
+
+_MAINTENANCE_0005_TABLE_PRIVILEGES = {
+    **{
+        relation: privileges
+        for relation, privileges in {
+            "alembic_version": ("SELECT",),
+            "checkpoint_migrations": ("SELECT",),
+            "emails_log": ("SELECT",),
+            "checkpoints": ("SELECT", "DELETE"),
+            "checkpoint_blobs": ("SELECT", "DELETE"),
+            "checkpoint_writes": ("SELECT", "DELETE"),
+        }.items()
+    },
+    "pipeline_ownership": ("SELECT",),
+    "event_inbox": ("SELECT",),
+    "sync_cursors": ("SELECT",),
+    "audit_events": ("SELECT",),
+    "sync_cold_start_plans": ("SELECT",),
+    "cold_start_command_receipts": ("SELECT", "INSERT"),
+}
+_MAINTENANCE_0005_INSERT_COLUMNS = {
+    "event_inbox": tuple(
+        column
+        for column in _RUNTIME_INSERT_COLUMNS["event_inbox"]
+        if column != "received_at"
+    ),
+    "sync_cursors": (
+        *_RUNTIME_0005_INSERT_COLUMNS["sync_cursors"],
+        "cold_start_plan_id",
+        "cold_start_plan_state",
+    ),
+    "audit_events": _RUNTIME_INSERT_COLUMNS["audit_events"],
+    "sync_cold_start_plans": (
+        "plan_id",
+        "account_id",
+        "folder_key",
+        "expected_cursor_status",
+        "expected_cursor",
+        "expected_cursor_version",
+        "pipeline_name",
+        "generation",
+        "fencing_token",
+        "state",
+        "version",
+        "preview_cursor",
+        "preview_cursor_version",
+        "boundary_cursor",
+        "boundary_cursor_version",
+        "apply_cursor",
+        "apply_cursor_version",
+        "rolling_hash",
+        "page_count",
+        "item_count",
+        "redacted_samples",
+        "contract_fingerprint",
+        "folder_scope_config_hash",
+        "plan_hash",
+        "actor",
+        "reason",
+        "blocked_reason_code",
+        "blocked_fingerprint",
+        "expires_at",
+        "ready_at",
+        "approved_at",
+        "completed_at",
+        "blocked_at",
+        "created_at",
+        "updated_at",
+    ),
+}
+_MAINTENANCE_0005_UPDATE_COLUMNS = {
+    "sync_cursors": (
+        *_RUNTIME_0005_UPDATE_COLUMNS["sync_cursors"],
+        "cold_start_plan_id",
+        "cold_start_plan_state",
+    ),
+    "sync_cold_start_plans": (
+        "state",
+        "version",
+        "preview_cursor",
+        "preview_cursor_version",
+        "boundary_cursor",
+        "boundary_cursor_version",
+        "apply_cursor",
+        "apply_cursor_version",
+        "rolling_hash",
+        "page_count",
+        "item_count",
+        "redacted_samples",
+        "plan_hash",
+        "blocked_reason_code",
+        "blocked_fingerprint",
+        "ready_at",
+        "approved_at",
+        "completed_at",
+        "blocked_at",
+        "updated_at",
+    ),
+}
+
+
+def _expected_maintenance_acl_0005() -> set[tuple[str, str, str, str, bool]]:
+    expected = {
+        ("table", relation, "", privilege, False)
+        for relation, privileges in _MAINTENANCE_0005_TABLE_PRIVILEGES.items()
+        for privilege in privileges
+    }
+    for privilege, manifest in (
+        ("INSERT", _MAINTENANCE_0005_INSERT_COLUMNS),
+        ("UPDATE", _MAINTENANCE_0005_UPDATE_COLUMNS),
+    ):
+        expected.update(
+            ("column", relation, column, privilege, False)
+            for relation, columns in manifest.items()
+            for column in columns
+        )
+    return expected
+
+
+_EXPECTED_AUDITOR_ACL_0005 = _EXPECTED_AUDITOR_ACL | {
+    ("table", "pipeline_command_receipts", "", "SELECT", False)
+}
+_MIGRATION_0005_RELATIONS = {
+    "alembic_version",
+    "app_kv_store",
+    "audit_events",
+    "checkpoint_blobs",
+    "checkpoint_migrations",
+    "checkpoint_writes",
+    "checkpoints",
+    "cold_start_command_receipts",
+    "emails",
+    "emails_log",
+    "event_inbox",
+    "pipeline_command_receipts",
+    "pipeline_ownership",
+    "pipeline_shadow_comparisons",
+    "processed_emails",
+    "sync_cold_start_plans",
+    "sync_cursors",
+}
+_EXPECTED_MIGRATION_ACL_0005 = {
+    ("table", relation, "", privilege, False)
+    for relation in _MIGRATION_0005_RELATIONS
+    for privilege in (
+        "DELETE",
+        "INSERT",
+        "REFERENCES",
+        "SELECT",
+        "TRIGGER",
+        "TRUNCATE",
+        "UPDATE",
+    )
+}
+
 
 async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
-    if revision == "20260713_0004":
+    if revision == "20260713_0005":
         await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
         return
-    if revision not in {"20260710_0002", "20260710_0003"}:
+    if revision not in {
+        "20260710_0002",
+        "20260710_0003",
+        "20260713_0004",
+    }:
         raise AssertionError("unsupported test revision")
     alembic_runner.upgrade(schema, revision)
     await _apply_checkpoint_migrations(schema.dsn, "public")
@@ -391,9 +585,10 @@ def _direct_relation_acl(schema, role_name: str):
 @pytest.mark.asyncio
 async def test_0004_managed_role_acls_match_independent_manifests(
     postgres_database_factory,
+    alembic_runner,
 ):
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+    await _prepare_revision(schema, alembic_runner, "20260713_0004")
 
     assert _direct_relation_acl(schema, schema.runtime_role) == (
         _expected_runtime_acl()
@@ -402,6 +597,121 @@ async def test_0004_managed_role_acls_match_independent_manifests(
         _EXPECTED_MAINTENANCE_ACL
     )
     assert _direct_relation_acl(schema, schema.auditor_role) == _EXPECTED_AUDITOR_ACL
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0005_managed_role_acls_match_independent_manifests(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260713_0005")
+
+    runtime_acl = _direct_relation_acl(schema, schema.runtime_role)
+    maintenance_acl = _direct_relation_acl(schema, schema.maintenance_role)
+    auditor_acl = _direct_relation_acl(schema, schema.auditor_role)
+    migration_acl = _direct_relation_acl(schema, schema.migration_role)
+
+    assert runtime_acl == _expected_runtime_acl_0005()
+    assert len(runtime_acl) == 185
+    assert maintenance_acl == _expected_maintenance_acl_0005()
+    assert len(maintenance_acl) == 125
+    assert auditor_acl == _EXPECTED_AUDITOR_ACL_0005
+    assert len(auditor_acl) == 28
+    assert migration_acl == _EXPECTED_MIGRATION_ACL_0005
+    assert len(migration_acl) == 119
+    owner_rows = schema.scalar(
+        "SELECT pg_catalog.jsonb_object_agg("
+        "relation.relname, owner.rolname) "
+        "FROM pg_catalog.pg_class AS relation "
+        "JOIN pg_catalog.pg_namespace AS relation_schema "
+        "ON relation_schema.oid = relation.relnamespace "
+        "JOIN pg_catalog.pg_roles AS owner ON owner.oid = relation.relowner "
+        "WHERE relation_schema.nspname = 'public' "
+        "AND relation.relname IN ("
+        "'sync_cold_start_plans', 'pipeline_command_receipts', "
+        "'cold_start_command_receipts')"
+    )
+    assert owner_rows == {
+        "sync_cold_start_plans": schema.migration_role,
+        "pipeline_command_receipts": schema.migration_role,
+        "cold_start_command_receipts": schema.migration_role,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0005_adjacent_role_capabilities_are_denied(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260713_0005")
+
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        schema.maintenance_execute(
+            "INSERT INTO event_inbox ("
+            "id, account_id, external_email_id, folder_key, source, "
+            "raw_event_type, change_kind, dedupe_key, payload, "
+            "processing_policy, pipeline_name, generation, fencing_token, "
+            "status, available_at, received_at"
+            ") VALUES ("
+            f"'{uuid4()}', 8, 'forged-received-at', 'INBOX', 'sync', "
+            "'create', 'create', '1'::pg_catalog.bpchar(64), "
+            "'{}'::pg_catalog.jsonb, 'full', 'durable', 1, 1, 'pending', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+
+    for statement in (
+        "UPDATE cold_start_command_receipts SET outcome = 'succeeded'",
+        "DELETE FROM cold_start_command_receipts",
+        "SELECT id FROM pipeline_command_receipts",
+        f"INSERT INTO pipeline_command_receipts (id) VALUES ('{uuid4()}')",
+        "DELETE FROM pipeline_command_receipts",
+        "UPDATE event_inbox SET status = 'pending'",
+        "DELETE FROM event_inbox",
+        "UPDATE audit_events SET action = 'forged'",
+        "DELETE FROM audit_events",
+        "DELETE FROM sync_cold_start_plans",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            schema.maintenance_execute(statement)
+    with pytest.raises(
+        (psycopg.errors.InsufficientPrivilege, psycopg.errors.WrongObjectType)
+    ):
+        schema.maintenance_execute("TRUNCATE cold_start_command_receipts")
+
+    for statement in (
+        "SELECT plan_id FROM sync_cold_start_plans",
+        "SELECT id FROM cold_start_command_receipts",
+        "SELECT id FROM pipeline_command_receipts",
+        f"INSERT INTO sync_cold_start_plans (plan_id) VALUES ('{uuid4()}')",
+        "UPDATE sync_cold_start_plans SET state = 'blocked'",
+        f"INSERT INTO cold_start_command_receipts (id) VALUES ('{uuid4()}')",
+        "UPDATE cold_start_command_receipts SET outcome = 'succeeded'",
+        "DELETE FROM sync_cold_start_plans",
+        "DELETE FROM cold_start_command_receipts",
+        "DELETE FROM pipeline_command_receipts",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            schema.runtime_execute(statement)
+
+    with pytest.raises(
+        (psycopg.errors.InsufficientPrivilege, psycopg.errors.GeneratedAlways)
+    ):
+        schema.maintenance_execute(
+            "UPDATE sync_cold_start_plans SET cursor_binding_plan_id = NULL"
+        )
+
+    for statement in (
+        "UPDATE pipeline_command_receipts SET outcome = 'succeeded'",
+        "DELETE FROM pipeline_command_receipts",
+        "TRUNCATE pipeline_command_receipts",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with psycopg.connect(schema.auditor_dsn, autocommit=True) as connection:
+                connection.execute(statement)
 
 
 async def _put_runtime_checkpoint(schema, thread_id: str, updated_at: datetime) -> None:

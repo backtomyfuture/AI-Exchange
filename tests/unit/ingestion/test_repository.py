@@ -1,17 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg.pq import TransactionStatus
 from psycopg_pool import PoolTimeout
 
 from src.domain.errors import DatabaseOperationError
-from src.ingestion.models import InboxLease
+from src.ingestion.models import (
+    ChangeKind,
+    InboxLease,
+    IngressReceipt,
+    NormalizedIngressEvent,
+)
 from src.ingestion.repository import (
+    EmailEventTransaction,
     InboxRepository,
+    _email_from_row,
     _failure_decision,
+    _json_values_equal,
     _lease_from_row,
+    _require_pipeline_names,
+    _row_values,
+    _source_is_read,
 )
 
 
@@ -41,6 +56,125 @@ class _RecordingConnection:
         self.statements.append(str(statement))
 
 
+class _AsyncContext:
+    def __init__(self, value) -> None:
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _DelegatingConnection(_RecordingConnection):
+    def transaction(self):
+        return _AsyncContext(self)
+
+
+class _DelegatingPool:
+    def __init__(self, connection: _DelegatingConnection) -> None:
+        self.connection_value = connection
+        self.checkouts = 0
+
+    def connection(self):
+        self.checkouts += 1
+        return _AsyncContext(self.connection_value)
+
+
+class _InsertSpy:
+    def __init__(self, receipt: IngressReceipt) -> None:
+        self.receipt = receipt
+        self.calls: list[tuple[object, int, int]] = []
+
+    async def insert(self, event, generation: int, fencing_token: int):
+        self.calls.append((event, generation, fencing_token))
+        return self.receipt
+
+
+class _IdentityCursor:
+    async def fetchone(self):
+        return ("123", "read committed")
+
+
+class _CallerConnection:
+    def __init__(self) -> None:
+        self.info = SimpleNamespace(transaction_status=TransactionStatus.INTRANS)
+
+    async def execute(self, statement, _params=None):
+        assert "pg_current_xact_id" in str(statement)
+        return _IdentityCursor()
+
+
+class _PayloadProbeConnection(_DelegatingConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.info = SimpleNamespace(transaction_status=TransactionStatus.INTRANS)
+
+    async def execute(self, statement, _params=None):
+        self.statements.append(str(statement))
+        return _IdentityCursor()
+
+
+class _OwnershipModeCursor:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    async def fetchone(self):
+        return self._row
+
+
+class _OwnershipModeConnection:
+    def __init__(self) -> None:
+        self.info = SimpleNamespace(transaction_status=TransactionStatus.INTRANS)
+        self.events: list[str] = []
+        self.statements: list[str] = []
+
+    async def execute(self, statement, params=None):
+        rendered = (
+            statement.as_string() if hasattr(statement, "as_string") else str(statement)
+        )
+        self.statements.append(rendered)
+        if "pg_current_xact_id" in rendered:
+            self.events.append("xid.identity")
+            return _OwnershipModeCursor(("123", "read committed"))
+        if "pg_advisory_xact_lock_shared" in rendered:
+            self.events.append("ownership.shared_lock")
+            return _OwnershipModeCursor(None)
+        if 'FROM "public"."pipeline_ownership"' in rendered:
+            self.events.append("ownership.read")
+            return _OwnershipModeCursor(("durable_v1",))
+        if 'INSERT INTO "public"."event_inbox"' in rendered:
+            self.events.append("inbox.insert")
+            assert type(params) is tuple
+            return _OwnershipModeCursor((params[0],))
+        raise AssertionError(f"unexpected SQL: {rendered}")
+
+
+class _BarrierOwnershipModeConnection(_OwnershipModeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.identity_entered = asyncio.Event()
+        self.identity_release = asyncio.Event()
+
+    async def execute(self, statement, params=None):
+        rendered = (
+            statement.as_string() if hasattr(statement, "as_string") else str(statement)
+        )
+        if "pg_current_xact_id" in rendered:
+            self.statements.append(rendered)
+            self.events.append("xid.identity")
+            self.identity_entered.set()
+            await self.identity_release.wait()
+            return _OwnershipModeCursor(("123", "read committed"))
+        return await super().execute(statement, params)
+
+
+class _HostileIngressEvent(NormalizedIngressEvent):
+    def payload_for_storage(self):
+        raise AssertionError("hostile event method must not execute")
+
+
 class _ExplodingKindFailure(RuntimeError):
     @property
     def kind(self):
@@ -51,6 +185,15 @@ class _ControlFlowKindFailure(RuntimeError):
     @property
     def kind(self):
         raise KeyboardInterrupt("must propagate")
+
+
+class _HostileBool:
+    def __init__(self) -> None:
+        self.truthiness_calls = 0
+
+    def __bool__(self) -> bool:
+        self.truthiness_calls += 1
+        raise AssertionError("hostile truthiness must not execute")
 
 
 def _lease(normalized_event) -> InboxLease:
@@ -67,6 +210,61 @@ def _lease(normalized_event) -> InboxLease:
         received_at=now,
         lease_until=now + timedelta(minutes=1),
     )
+
+
+def _lease_database_row(
+    normalized_event: NormalizedIngressEvent,
+    **overrides: object,
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    values: dict[str, object] = {
+        "id": str(uuid4()),
+        "account_id": normalized_event.account_id,
+        "external_email_id": normalized_event.external_email_id,
+        "folder_key": normalized_event.folder,
+        "source": normalized_event.source.value,
+        "raw_event_type": normalized_event.raw_event_type,
+        "change_kind": normalized_event.kind.value,
+        "dedupe_key": normalized_event.dedupe_key,
+        "source_version": normalized_event.source_version,
+        "source_event_at": normalized_event.source_event_at,
+        "payload": normalized_event.payload_for_storage(),
+        "processing_policy": normalized_event.processing_policy.value,
+        "pipeline_name": "durable_v1",
+        "generation": 1,
+        "fencing_token": 1,
+        "lease_owner": "worker",
+        "lease_until": now + timedelta(seconds=60),
+        "attempts": 0,
+        "received_at": now,
+    }
+    values.update(overrides)
+    return values
+
+
+def _email_database_row(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "id": str(uuid4()),
+        "account_id": 8,
+        "external_email_id": "message-1",
+        "source_folder_key": "INBOX",
+        "status": "ingested",
+        "version": 0,
+        "owner_generation": 1,
+        "owner_fencing_token": 1,
+        "processing_inbox_id": None,
+        "create_seen_at": datetime.now(UTC),
+        "processing_started_at": None,
+        "source_deleted_at": None,
+        "external_effects_started_at": None,
+        "safe_error_code": None,
+        "safe_error_summary": None,
+        "is_read": None,
+        "is_read_refresh_required": False,
+        "updated_at": datetime.now(UTC),
+    }
+    values.update(overrides)
+    return values
 
 
 def test_ingestion_boundary_exports_only_the_production_repository() -> None:
@@ -99,6 +297,181 @@ def test_ingestion_boundary_exports_only_the_production_repository() -> None:
 def test_invalid_schema_text_is_rejected_without_database_access() -> None:
     with pytest.raises(ValueError, match="valid UTF-8"):
         InboxRepository(_NeverPool(), target_schema="\ud800")
+
+
+@pytest.mark.asyncio
+async def test_transaction_ownership_mode_keeps_default_lock_and_plain_shared_xid(
+    normalized_event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+
+    async def no_duplicate(_connection, _event):
+        return None
+
+    monkeypatch.setattr(repository, "_duplicate_receipt", no_duplicate)
+    default_connection = _OwnershipModeConnection()
+    plain_connection = _OwnershipModeConnection()
+
+    await repository.transaction(default_connection).insert(normalized_event, 1, 1)
+    await repository.transaction(
+        plain_connection,
+        for_key_share=False,
+    ).insert(normalized_event, 1, 1)
+
+    default_ownership_sql = next(
+        statement
+        for statement in default_connection.statements
+        if "pipeline_ownership" in statement
+    )
+    plain_ownership_sql = next(
+        statement
+        for statement in plain_connection.statements
+        if "pipeline_ownership" in statement
+    )
+    assert default_ownership_sql.endswith("FOR KEY SHARE")
+    assert "FOR KEY SHARE" not in plain_ownership_sql
+    assert (
+        default_connection.events
+        == plain_connection.events
+        == [
+            "xid.identity",
+            "ownership.shared_lock",
+            "ownership.read",
+            "inbox.insert",
+        ]
+    )
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false", object()])
+def test_transaction_rejects_non_exact_ownership_mode_without_query(
+    invalid: object,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+    connection = _OwnershipModeConnection()
+
+    with pytest.raises(ValueError, match="for_key_share"):
+        repository.transaction(connection, for_key_share=invalid)
+
+    assert connection.statements == []
+    assert connection.events == []
+
+
+def test_transaction_ownership_mode_is_keyword_only_and_defaults_locked() -> None:
+    parameter = inspect.signature(InboxRepository.transaction).parameters[
+        "for_key_share"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is True
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [None, 0, 1, "false", object(), _HostileBool()],
+)
+def test_direct_transaction_constructor_rejects_non_exact_mode_without_query(
+    invalid: object,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+    connection = _OwnershipModeConnection()
+
+    with pytest.raises(ValueError, match="for_key_share"):
+        EmailEventTransaction(
+            repository,
+            connection,
+            for_key_share=invalid,
+        )
+
+    assert connection.statements == []
+    assert connection.events == []
+
+
+@pytest.mark.parametrize("mode", [False, True])
+def test_direct_transaction_constructor_accepts_only_exact_boolean_modes(
+    mode: bool,
+) -> None:
+    transaction = EmailEventTransaction(
+        InboxRepository(_NeverPool()),
+        _OwnershipModeConnection(),
+        for_key_share=mode,
+    )
+
+    assert transaction._for_key_share is mode
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [None, 0, 1, "false", object(), _HostileBool()],
+)
+async def test_transaction_insert_revalidates_mutated_mode_before_payload_or_query(
+    invalid: object,
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+    connection = _OwnershipModeConnection()
+    transaction = EmailEventTransaction(
+        repository,
+        connection,
+        for_key_share=True,
+    )
+    transaction._for_key_share = invalid  # type: ignore[assignment]
+    original = NormalizedIngressEvent.payload_for_storage
+    payload_calls = 0
+
+    def count_payload(event: NormalizedIngressEvent):
+        nonlocal payload_calls
+        payload_calls += 1
+        return original(event)
+
+    monkeypatch.setattr(NormalizedIngressEvent, "payload_for_storage", count_payload)
+
+    with pytest.raises(ValueError, match="for_key_share"):
+        await transaction.insert(normalized_event, 1, 1)
+
+    assert payload_calls == 0
+    assert connection.statements == []
+    assert connection.events == []
+    if isinstance(invalid, _HostileBool):
+        assert invalid.truthiness_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [False, True])
+async def test_transaction_insert_uses_one_pre_await_lock_mode_snapshot(
+    mode: bool,
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+    connection = _BarrierOwnershipModeConnection()
+
+    async def no_duplicate(_connection, _event):
+        return None
+
+    monkeypatch.setattr(repository, "_duplicate_receipt", no_duplicate)
+    transaction = EmailEventTransaction(
+        repository,
+        connection,
+        for_key_share=mode,
+    )
+
+    pending = asyncio.create_task(transaction.insert(normalized_event, 1, 1))
+    await connection.identity_entered.wait()
+    transaction._for_key_share = not mode
+    connection.identity_release.set()
+    receipt = await pending
+
+    ownership_sql = next(
+        statement
+        for statement in connection.statements
+        if "pipeline_ownership" in statement
+    )
+    assert ownership_sql.endswith("FOR KEY SHARE") is mode
+    assert receipt.duplicate is False
+    assert transaction._for_key_share is not mode
 
 
 @pytest.mark.asyncio
@@ -147,6 +520,105 @@ async def test_insert_inputs_are_validated_before_database_access(
             await call()
 
 
+def _hostile_event(event: NormalizedIngressEvent) -> _HostileIngressEvent:
+    return _HostileIngressEvent(
+        account_id=event.account_id,
+        source=event.source,
+        raw_event_type=event.raw_event_type,
+        kind=event.kind,
+        external_email_id=event.external_email_id,
+        folder=event.folder,
+        source_version=event.source_version,
+        dedupe_key=event.dedupe_key,
+        payload=event.payload,
+        processing_policy=event.processing_policy,
+        source_event_at=event.source_event_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_insert_rejects_hostile_event_subclass_before_pool_or_xid(
+    normalized_event,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+    hostile = _hostile_event(normalized_event)
+
+    with pytest.raises(ValueError, match="exact NormalizedIngressEvent"):
+        await repository.insert(hostile, 1, 1)
+    with pytest.raises(ValueError, match="exact NormalizedIngressEvent"):
+        await repository.transaction(_CallerConnection()).insert(hostile, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_pool_owned_insert_materializes_payload_once(
+    normalized_event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _PayloadProbeConnection()
+    repository = InboxRepository(_DelegatingPool(connection))
+    original = NormalizedIngressEvent.payload_for_storage
+    calls = 0
+
+    def count_payload(event: NormalizedIngressEvent):
+        nonlocal calls
+        calls += 1
+        return original(event)
+
+    async def cancel_after_identity(_connection, _account_id: int) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(NormalizedIngressEvent, "payload_for_storage", count_payload)
+    monkeypatch.setattr(repository, "_acquire_account_lock", cancel_after_identity)
+
+    with pytest.raises(asyncio.CancelledError):
+        await repository.insert(normalized_event, 1, 1)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_transaction_insert_propagates_cancellation_without_pool_checkout(
+    normalized_event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InboxRepository(_NeverPool())
+
+    async def cancel_at_account_lock(_connection, _account_id: int) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(repository, "_acquire_account_lock", cancel_at_account_lock)
+
+    with pytest.raises(asyncio.CancelledError):
+        await repository.transaction(_CallerConnection()).insert(
+            normalized_event,
+            generation=1,
+            fencing_token=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pool_owned_insert_only_delegates_after_configuring_transaction(
+    normalized_event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _DelegatingConnection()
+    pool = _DelegatingPool(connection)
+    repository = InboxRepository(pool)
+    expected = IngressReceipt(inbox_id=str(uuid4()), duplicate=False)
+    transaction = _InsertSpy(expected)
+    monkeypatch.setattr(repository, "transaction", lambda value: transaction)
+
+    assert await repository.insert(normalized_event, 1, 1) == expected
+    assert pool.checkouts == 1
+    assert transaction.calls == [(normalized_event, 1, 1)]
+    assert connection.statements == [
+        "SET LOCAL TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SELECT pg_catalog.set_config('lock_timeout', %s, true), "
+        "pg_catalog.set_config('statement_timeout', %s, true), "
+        "pg_catalog.set_config('idle_in_transaction_session_timeout', %s, true)",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_claim_inputs_are_bounded_before_database_access() -> None:
     repository = InboxRepository(_NeverPool())
@@ -171,6 +643,21 @@ async def test_claim_inputs_are_bounded_before_database_access() -> None:
             await call()
 
 
+@pytest.mark.parametrize("pipeline_names", ("durable_v1", object()))
+def test_pipeline_collection_rejects_scalar_and_noniterable_inputs_without_io(
+    pipeline_names: object,
+) -> None:
+    with pytest.raises(ValueError, match="bounded collection"):
+        _require_pipeline_names(pipeline_names)
+
+
+def test_pipeline_collection_deduplicates_then_sorts_exact_names() -> None:
+    assert _require_pipeline_names(["zeta", "alpha", "zeta"]) == (
+        "alpha",
+        "zeta",
+    )
+
+
 @pytest.mark.asyncio
 async def test_lease_and_reaper_inputs_are_bounded_before_database_access(
     normalized_event,
@@ -192,6 +679,29 @@ async def test_lease_and_reaper_inputs_are_bounded_before_database_access(
     for call in invalid_calls:
         with pytest.raises(ValueError):
             await call()
+
+
+@pytest.mark.asyncio
+async def test_fail_rejects_nonexception_before_validating_lease_or_using_pool() -> (
+    None
+):
+    repository = InboxRepository(_NeverPool())
+
+    with pytest.raises(ValueError, match="error must be an exception"):
+        await repository.fail(object(), object())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fail_propagates_baseexception_control_flow_before_lease_or_pool() -> (
+    None
+):
+    repository = InboxRepository(_NeverPool())
+    control_flow = KeyboardInterrupt("stop")
+
+    with pytest.raises(KeyboardInterrupt, match="stop") as caught:
+        await repository.fail(object(), control_flow)  # type: ignore[arg-type]
+
+    assert caught.value is control_flow
 
 
 @pytest.mark.asyncio
@@ -273,6 +783,79 @@ def test_tuple_and_dict_rows_decode_to_the_same_lease(normalized_event) -> None:
     )
 
     assert _lease_from_row(values) == _lease_from_row(dict(zip(columns, values)))
+
+
+def test_row_values_rejects_mapping_with_missing_columns_as_fixed_invariant() -> None:
+    with pytest.raises(DatabaseOperationError) as caught:
+        _row_values({"id": "only"}, ("id", "missing"))
+
+    assert caught.value.operation == "event_inbox_invariant"
+    assert caught.value.retryable is False
+    assert str(caught.value) == "event inbox database row is invalid"
+
+
+def test_lease_decoder_rejects_nonmapping_payload_as_fixed_invariant(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    row = _lease_database_row(normalized_event, payload=[])
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        _lease_from_row(row)
+
+    assert caught.value.operation == "event_inbox_invariant"
+    assert caught.value.retryable is False
+    assert str(caught.value) == "event inbox database row is invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("version", True), ("is_read", 1), ("is_read_refresh_required", 1)),
+)
+def test_email_decoder_rejects_nonexact_scalar_types_as_fixed_invariant(
+    field: str,
+    value: object,
+) -> None:
+    row = _email_database_row(**{field: value})
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        _email_from_row(row)
+
+    assert caught.value.operation == "event_inbox_invariant"
+    assert caught.value.retryable is False
+    assert str(caught.value) == "email aggregate database row is invalid"
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    (
+        (None, None, True),
+        (None, 0, False),
+        (True, 1, False),
+        ({"key": 1}, [], False),
+        ({"key": 1}, {"other": 1}, False),
+        ({"key": [1, True]}, {"key": [1.0, True]}, True),
+        ([], object(), False),
+        ([1], [1, 2], False),
+        ([{"key": 1}], [{"key": 1.0}], True),
+        (object(), object(), False),
+    ),
+)
+def test_json_equality_is_recursive_and_preserves_json_type_boundaries(
+    left: object,
+    right: object,
+    expected: bool,
+) -> None:
+    assert _json_values_equal(left, right) is expected
+
+
+def test_read_projection_fails_closed_for_unknown_ingress_source() -> None:
+    event = SimpleNamespace(
+        kind=ChangeKind.CREATE,
+        source=object(),
+        payload={"is_read": True},
+    )
+
+    assert _source_is_read(event) is None  # type: ignore[arg-type]
 
 
 def test_invalid_database_row_is_a_fixed_nonretryable_error() -> None:

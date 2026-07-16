@@ -15,7 +15,7 @@ from src.db.roles import (
 # This manifest is deliberately test-owned.  Importing the production trigger
 # manifest here would allow the role gate and its regression test to drift in
 # lockstep.
-EXPECTED_TRIGGER_DEFINITIONS = (
+EXPECTED_0004_TRIGGER_DEFINITIONS = (
     (
         "trg_audit_events_guard_row",
         "CREATE TRIGGER trg_audit_events_guard_row BEFORE DELETE OR UPDATE "
@@ -65,11 +65,31 @@ EXPECTED_TRIGGER_DEFINITIONS = (
         "guard_pipeline_shadow_comparison()",
     ),
 )
+_EXPECTED_0005_TRIGGER_ADDITIONS = (
+    (
+        "trg_pipeline_command_receipts_guard_row",
+        "CREATE TRIGGER trg_pipeline_command_receipts_guard_row BEFORE DELETE OR "
+        "UPDATE ON public.pipeline_command_receipts FOR EACH ROW EXECUTE FUNCTION "
+        "reject_pipeline_command_receipts_mutation()",
+    ),
+    (
+        "trg_pipeline_command_receipts_guard_truncate",
+        "CREATE TRIGGER trg_pipeline_command_receipts_guard_truncate BEFORE TRUNCATE "
+        "ON public.pipeline_command_receipts FOR EACH STATEMENT EXECUTE FUNCTION "
+        "reject_pipeline_command_receipts_mutation()",
+    ),
+)
+EXPECTED_0005_TRIGGER_DEFINITIONS = tuple(
+    sorted(
+        (*EXPECTED_0004_TRIGGER_DEFINITIONS, *_EXPECTED_0005_TRIGGER_ADDITIONS),
+        key=lambda item: item[0],
+    )
+)
 
 
 # Namespace OIDs are intentionally represented by their names in this
 # independent manifest.  Every approved FK must remain wholly inside public.
-EXPECTED_FOREIGN_KEYS = (
+EXPECTED_0004_FOREIGN_KEYS = (
     (
         "fk_audit_events_email",
         "public",
@@ -156,6 +176,90 @@ EXPECTED_FOREIGN_KEYS = (
         True,
         0,
     ),
+)
+_EXPECTED_0005_FOREIGN_KEY_ADDITIONS = (
+    (
+        "fk_sync_cold_start_plan_active_cursor",
+        "public",
+        "sync_cold_start_plans",
+        (
+            "cursor_binding_plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "public",
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "s",
+        "a",
+        "r",
+        True,
+        True,
+        True,
+        0,
+    ),
+    (
+        "fk_sync_cold_start_plan_ownership",
+        "public",
+        "sync_cold_start_plans",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "public",
+        "pipeline_ownership",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "f",
+        "r",
+        "r",
+        False,
+        False,
+        True,
+        0,
+    ),
+    (
+        "fk_sync_cursors_cold_start_plan",
+        "public",
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "public",
+        "sync_cold_start_plans",
+        (
+            "plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "s",
+        "a",
+        "r",
+        True,
+        True,
+        True,
+        0,
+    ),
+)
+EXPECTED_0005_FOREIGN_KEYS = tuple(
+    sorted(
+        (*EXPECTED_0004_FOREIGN_KEYS, *_EXPECTED_0005_FOREIGN_KEY_ADDITIONS),
+        key=lambda item: item[0],
+    )
 )
 
 
@@ -296,16 +400,31 @@ async def _accepted_role_gates(schema) -> list[str]:
     return accepted
 
 
+def test_0005_test_owned_manifests_preserve_the_exact_0004_predecessor() -> None:
+    assert set(EXPECTED_0005_TRIGGER_DEFINITIONS) - set(
+        EXPECTED_0004_TRIGGER_DEFINITIONS
+    ) == set(_EXPECTED_0005_TRIGGER_ADDITIONS)
+    assert len(EXPECTED_0005_TRIGGER_DEFINITIONS) == (
+        len(EXPECTED_0004_TRIGGER_DEFINITIONS) + len(_EXPECTED_0005_TRIGGER_ADDITIONS)
+    )
+    assert set(EXPECTED_0005_FOREIGN_KEYS) - set(EXPECTED_0004_FOREIGN_KEYS) == set(
+        _EXPECTED_0005_FOREIGN_KEY_ADDITIONS
+    )
+    assert len(EXPECTED_0005_FOREIGN_KEYS) == (
+        len(EXPECTED_0004_FOREIGN_KEYS) + len(_EXPECTED_0005_FOREIGN_KEY_ADDITIONS)
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_fresh_0004_matches_test_owned_trigger_and_fk_manifests(
+async def test_fresh_0005_matches_test_owned_trigger_and_fk_manifests(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert _trigger_definitions(schema.dsn) == EXPECTED_TRIGGER_DEFINITIONS
-    assert _foreign_keys(schema.dsn) == EXPECTED_FOREIGN_KEYS
+    assert _trigger_definitions(schema.dsn) == EXPECTED_0005_TRIGGER_DEFINITIONS
+    assert _foreign_keys(schema.dsn) == EXPECTED_0005_FOREIGN_KEYS
 
 
 @pytest.mark.integration
@@ -317,11 +436,11 @@ async def test_all_role_gates_reject_trigger_semantic_drift(
 ):
     schema = postgres_database_factory()
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
-    assert _trigger_definitions(schema.dsn) == EXPECTED_TRIGGER_DEFINITIONS
+    assert _trigger_definitions(schema.dsn) == EXPECTED_0005_TRIGGER_DEFINITIONS
 
     schema.execute(TRIGGER_DRIFT_DDL[drift])
 
-    assert _trigger_definitions(schema.dsn) != EXPECTED_TRIGGER_DEFINITIONS
+    assert _trigger_definitions(schema.dsn) != EXPECTED_0005_TRIGGER_DEFINITIONS
     assert await _accepted_role_gates(schema) == []
 
 
@@ -332,7 +451,7 @@ async def test_all_role_gates_reject_cross_schema_foreign_key_substitution(
 ):
     schema = postgres_database_factory()
     await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
-    assert _foreign_keys(schema.dsn) == EXPECTED_FOREIGN_KEYS
+    assert _foreign_keys(schema.dsn) == EXPECTED_0005_FOREIGN_KEYS
 
     schema.admin_execute(
         """
@@ -357,5 +476,5 @@ async def test_all_role_gates_reject_cross_schema_foreign_key_substitution(
         """
     )
 
-    assert _foreign_keys(schema.dsn) != EXPECTED_FOREIGN_KEYS
+    assert _foreign_keys(schema.dsn) != EXPECTED_0005_FOREIGN_KEYS
     assert await _accepted_role_gates(schema) == []

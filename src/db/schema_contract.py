@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Final
 
 import psycopg
 
 from src.db.access_contract import (
-    PHASE2_CHECK_CONSTRAINT_SHA256,
-    PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION,
-    PHASE2_DEFAULT_EXPRESSIONS,
-    PHASE2_INDEX_SPECS,
+    PHASE2_CHECK_CONSTRAINT_SHA256,  # noqa: F401 - compatibility export
+    PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION,
+    PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION,  # noqa: F401
+    PHASE2_DEFAULT_EXPRESSIONS,  # noqa: F401 - compatibility export
+    PHASE2_DEFAULT_EXPRESSIONS_BY_REVISION,
+    PHASE2_GENERATED_EXPRESSION_SHA256_BY_REVISION,
+    PHASE2_INDEX_SPECS,  # noqa: F401 - compatibility export
+    PHASE2_INDEX_SPECS_BY_REVISION,
     PHASE2_RELATIONS,
-    PHASE2_UNIQUE_CONSTRAINTS,
+    PHASE2_RELATIONS_BY_REVISION,
+    PHASE2_UNIQUE_CONSTRAINTS,  # noqa: F401 - compatibility export
+    PHASE2_UNIQUE_CONSTRAINTS_BY_REVISION,
+    PHASE2_VIEW_SPECS_BY_REVISION,
+    SYNC_RECONCILIATION_DATABASE_REVISION,
 )
 
 
@@ -180,6 +189,73 @@ _EXPECTED_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
     ("checkpoint_writes", "task_path"): "text",
 }
 
+_SYNC_RECONCILIATION_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
+    ("sync_cursors", "transient_failures"): "int8",
+    ("sync_cursors", "retry_after_at"): "timestamptz",
+    ("sync_cursors", "cold_start_plan_id"): "uuid",
+    ("sync_cursors", "cold_start_plan_state"): "text",
+    ("sync_cold_start_plans", "plan_id"): "uuid",
+    ("sync_cold_start_plans", "account_id"): "int8",
+    ("sync_cold_start_plans", "folder_key"): "text",
+    ("sync_cold_start_plans", "expected_cursor_status"): "text",
+    ("sync_cold_start_plans", "expected_cursor"): "text",
+    ("sync_cold_start_plans", "expected_cursor_version"): "int8",
+    ("sync_cold_start_plans", "pipeline_name"): "text",
+    ("sync_cold_start_plans", "generation"): "int8",
+    ("sync_cold_start_plans", "fencing_token"): "int8",
+    ("sync_cold_start_plans", "state"): "text",
+    ("sync_cold_start_plans", "version"): "int8",
+    ("sync_cold_start_plans", "preview_cursor"): "text",
+    ("sync_cold_start_plans", "preview_cursor_version"): "int8",
+    ("sync_cold_start_plans", "boundary_cursor"): "text",
+    ("sync_cold_start_plans", "boundary_cursor_version"): "int8",
+    ("sync_cold_start_plans", "apply_cursor"): "text",
+    ("sync_cold_start_plans", "apply_cursor_version"): "int8",
+    ("sync_cold_start_plans", "cursor_binding_plan_id"): "uuid",
+    ("sync_cold_start_plans", "rolling_hash"): "bpchar",
+    ("sync_cold_start_plans", "page_count"): "int8",
+    ("sync_cold_start_plans", "item_count"): "int8",
+    ("sync_cold_start_plans", "redacted_samples"): "jsonb",
+    ("sync_cold_start_plans", "contract_fingerprint"): "bpchar",
+    ("sync_cold_start_plans", "folder_scope_config_hash"): "bpchar",
+    ("sync_cold_start_plans", "plan_hash"): "bpchar",
+    ("sync_cold_start_plans", "actor"): "text",
+    ("sync_cold_start_plans", "reason"): "text",
+    ("sync_cold_start_plans", "blocked_reason_code"): "text",
+    ("sync_cold_start_plans", "blocked_fingerprint"): "bpchar",
+    ("sync_cold_start_plans", "expires_at"): "timestamptz",
+    ("sync_cold_start_plans", "ready_at"): "timestamptz",
+    ("sync_cold_start_plans", "approved_at"): "timestamptz",
+    ("sync_cold_start_plans", "completed_at"): "timestamptz",
+    ("sync_cold_start_plans", "blocked_at"): "timestamptz",
+    ("sync_cold_start_plans", "created_at"): "timestamptz",
+    ("sync_cold_start_plans", "updated_at"): "timestamptz",
+    ("pipeline_command_receipts", "id"): "uuid",
+    ("pipeline_command_receipts", "account_id"): "int8",
+    ("pipeline_command_receipts", "command_name"): "text",
+    ("pipeline_command_receipts", "idempotency_key_hash"): "bpchar",
+    ("pipeline_command_receipts", "canonical_payload_hash"): "bpchar",
+    ("pipeline_command_receipts", "outcome"): "text",
+    ("pipeline_command_receipts", "result_type"): "text",
+    ("pipeline_command_receipts", "result_id"): "text",
+    ("pipeline_command_receipts", "result_hash"): "bpchar",
+    ("pipeline_command_receipts", "authority_epoch"): "int8",
+    ("pipeline_command_receipts", "created_at"): "timestamptz",
+}
+
+_PHASE2_COLUMN_TYPES_BY_REVISION: Final[dict[str, dict[tuple[str, str], str]]] = {
+    revision: {
+        column: type_name
+        for column, type_name in _EXPECTED_COLUMN_TYPES.items()
+        if column[0] in relations
+    }
+    for revision, relations in PHASE2_RELATIONS_BY_REVISION.items()
+}
+_PHASE2_COLUMN_TYPES_BY_REVISION[SYNC_RECONCILIATION_DATABASE_REVISION] = {
+    **_PHASE2_COLUMN_TYPES_BY_REVISION[SYNC_RECONCILIATION_DATABASE_REVISION],
+    **_SYNC_RECONCILIATION_COLUMN_TYPES,
+}
+
 _PHASE2_NULLABLE_COLUMNS: Final = frozenset(
     {
         ("pipeline_ownership", "reason"),
@@ -239,6 +315,61 @@ _PHASE2_DEFAULTED_COLUMNS: Final = frozenset(
     }
 )
 
+_SYNC_RECONCILIATION_NULLABLE_COLUMNS: Final = frozenset(
+    {
+        ("sync_cursors", "retry_after_at"),
+        ("sync_cursors", "cold_start_plan_id"),
+        ("sync_cursors", "cold_start_plan_state"),
+        ("sync_cold_start_plans", "expected_cursor"),
+        ("sync_cold_start_plans", "preview_cursor"),
+        ("sync_cold_start_plans", "boundary_cursor"),
+        ("sync_cold_start_plans", "boundary_cursor_version"),
+        ("sync_cold_start_plans", "apply_cursor"),
+        ("sync_cold_start_plans", "apply_cursor_version"),
+        ("sync_cold_start_plans", "cursor_binding_plan_id"),
+        ("sync_cold_start_plans", "rolling_hash"),
+        ("sync_cold_start_plans", "plan_hash"),
+        ("sync_cold_start_plans", "blocked_reason_code"),
+        ("sync_cold_start_plans", "blocked_fingerprint"),
+        ("sync_cold_start_plans", "ready_at"),
+        ("sync_cold_start_plans", "approved_at"),
+        ("sync_cold_start_plans", "completed_at"),
+        ("sync_cold_start_plans", "blocked_at"),
+    }
+)
+
+_SYNC_RECONCILIATION_DEFAULTED_COLUMNS: Final = frozenset(
+    {
+        ("sync_cursors", "transient_failures"),
+        ("sync_cold_start_plans", "version"),
+        ("sync_cold_start_plans", "preview_cursor_version"),
+        ("sync_cold_start_plans", "page_count"),
+        ("sync_cold_start_plans", "item_count"),
+        ("sync_cold_start_plans", "redacted_samples"),
+        ("sync_cold_start_plans", "created_at"),
+        ("sync_cold_start_plans", "updated_at"),
+        ("pipeline_command_receipts", "created_at"),
+    }
+)
+
+_PHASE2_NULLABLE_COLUMNS_BY_REVISION: Final = {
+    "20260710_0002": frozenset(),
+    "20260710_0003": _PHASE2_NULLABLE_COLUMNS,
+    "20260713_0004": _PHASE2_NULLABLE_COLUMNS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        _PHASE2_NULLABLE_COLUMNS | _SYNC_RECONCILIATION_NULLABLE_COLUMNS
+    ),
+}
+
+_PHASE2_DEFAULTED_COLUMNS_BY_REVISION: Final = {
+    "20260710_0002": frozenset(),
+    "20260710_0003": _PHASE2_DEFAULTED_COLUMNS,
+    "20260713_0004": _PHASE2_DEFAULTED_COLUMNS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        _PHASE2_DEFAULTED_COLUMNS | _SYNC_RECONCILIATION_DEFAULTED_COLUMNS
+    ),
+}
+
 _BASE_RELATION_KINDS: Final = {
     "alembic_version": "r",
     "emails_log": "r",
@@ -252,6 +383,16 @@ _BASE_RELATION_KINDS: Final = {
 _PHASE2_RELATION_KINDS: Final = {
     relation_name: "r" for relation_name in PHASE2_RELATIONS
 }
+_PHASE2_RELATION_KINDS_BY_REVISION: Final = {
+    revision: {
+        **{relation_name: "r" for relation_name in relations},
+        **{
+            view.name: view.relation_kind
+            for view in PHASE2_VIEW_SPECS_BY_REVISION[revision]
+        },
+    }
+    for revision, relations in PHASE2_RELATIONS_BY_REVISION.items()
+}
 
 _RELATION_KIND_QUERY: Final = """
 SELECT
@@ -260,6 +401,7 @@ SELECT
     relation.relpersistence::pg_catalog.text,
     relation.relrowsecurity,
     relation.relforcerowsecurity,
+    relation.relowner = relation_schema.nspowner,
     NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_policy AS policy
@@ -273,6 +415,28 @@ LEFT JOIN pg_catalog.pg_am AS access_method
   ON access_method.oid = relation.relam
 WHERE relation_schema.nspname = %s
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+ORDER BY relation.relname
+"""
+
+_VIEW_CONTRACT_QUERY: Final = """
+SELECT
+    relation.relname::pg_catalog.text,
+    relation.relkind::pg_catalog.text,
+    pg_catalog.encode(
+        pg_catalog.sha256(
+            pg_catalog.convert_to(
+                pg_catalog.pg_get_viewdef(relation.oid, false),
+                'UTF8'
+            )
+        ),
+        'hex'
+    )::pg_catalog.text,
+    COALESCE(relation.reloptions, ARRAY[]::pg_catalog.text[])
+FROM pg_catalog.pg_class AS relation
+JOIN pg_catalog.pg_namespace AS relation_schema
+  ON relation_schema.oid = relation.relnamespace
+WHERE relation_schema.nspname = %s
+  AND relation.relname = ANY(%s::pg_catalog.text[])
 ORDER BY relation.relname
 """
 
@@ -522,7 +686,26 @@ async def require_database_schema_contract(
 ) -> None:
     """Reject physical drift while allowing bootstrap to repair checkpoints."""
 
-    relation_names = sorted({key[0] for key in _EXPECTED_COLUMN_TYPES})
+    all_phase2_relations = frozenset(
+        relation_name
+        for relations in PHASE2_RELATIONS_BY_REVISION.values()
+        for relation_name in relations
+    )
+    all_phase2_views = tuple(
+        sorted(
+            {
+                view.name
+                for views in PHASE2_VIEW_SPECS_BY_REVISION.values()
+                for view in views
+            }
+        )
+    )
+    all_column_types = {
+        **_EXPECTED_COLUMN_TYPES,
+        **_SYNC_RECONCILIATION_COLUMN_TYPES,
+    }
+    relation_names = sorted({key[0] for key in all_column_types})
+    view_contract_rows: list[tuple[object, ...]] = []
     try:
         async with await psycopg.AsyncConnection.connect(
             dsn,
@@ -542,19 +725,28 @@ async def require_database_schema_contract(
                 rows = await cursor.fetchall()
                 await cursor.execute(
                     _CHECK_CONSTRAINT_QUERY,
-                    (target_schema, list(PHASE2_RELATIONS)),
+                    (target_schema, list(all_phase2_relations)),
                 )
                 check_constraint_rows = await cursor.fetchall()
                 await cursor.execute(
                     _UNIQUE_CONSTRAINT_QUERY,
-                    (target_schema, list(PHASE2_RELATIONS)),
+                    (target_schema, list(all_phase2_relations)),
                 )
                 unique_constraint_rows = await cursor.fetchall()
                 await cursor.execute(
                     _INDEX_QUERY,
-                    (target_schema, list(PHASE2_RELATIONS)),
+                    (target_schema, list(all_phase2_relations)),
                 )
                 index_rows = await cursor.fetchall()
+                deployed_view_names = {
+                    row[0] for row in relation_kind_rows if row[0] in all_phase2_views
+                }
+                if deployed_view_names:
+                    await cursor.execute(
+                        _VIEW_CONTRACT_QUERY,
+                        (target_schema, list(all_phase2_views)),
+                    )
+                    view_contract_rows = await cursor.fetchall()
     except Exception:
         raise _invalid_contract() from None
 
@@ -588,32 +780,40 @@ async def require_database_schema_contract(
             compression,
         ) in rows
     }
-    deployed_phase2_relations = {
-        relation_name
-        for relation_name, _ in actual
-        if relation_name in PHASE2_RELATIONS
+    deployed_phase2_relation_kinds = {
+        relation_name: relation_kind
+        for relation_name, relation_kind, *_rest in relation_kind_rows
+        if relation_name in all_phase2_relations or relation_name in all_phase2_views
     }
-    if expected_revision == "20260710_0002":
-        expected_phase2_relations: set[str] = set()
-    elif expected_revision in {"20260710_0003", "20260713_0004"}:
-        expected_phase2_relations = set(PHASE2_RELATIONS)
-    elif expected_revision is None:
-        if deployed_phase2_relations not in (set(), set(PHASE2_RELATIONS)):
-            raise _invalid_contract()
-        expected_phase2_relations = deployed_phase2_relations
+    if expected_revision is None:
+        revision_candidates = tuple(
+            revision
+            for revision, relation_kinds in (_PHASE2_RELATION_KINDS_BY_REVISION.items())
+            if deployed_phase2_relation_kinds == relation_kinds
+        )
+    elif expected_revision in PHASE2_RELATIONS_BY_REVISION:
+        revision_candidates = (expected_revision,)
     else:
         raise _invalid_contract()
-    if deployed_phase2_relations != expected_phase2_relations:
+    if not revision_candidates:
+        raise _invalid_contract()
+    structural_revision = revision_candidates[0]
+    if (
+        deployed_phase2_relation_kinds
+        != _PHASE2_RELATION_KINDS_BY_REVISION[structural_revision]
+    ):
         raise _invalid_contract()
     expected_relation_kinds = dict(_BASE_RELATION_KINDS)
-    if expected_phase2_relations:
-        expected_relation_kinds.update(_PHASE2_RELATION_KINDS)
+    expected_relation_kinds.update(
+        _PHASE2_RELATION_KINDS_BY_REVISION[structural_revision]
+    )
     expected_relation_contract = {
         name: (
             relation_kind,
             "p",
             False,
             False,
+            True,
             True,
             "heap" if relation_kind in {"r", "p"} else None,
         )
@@ -625,6 +825,7 @@ async def require_database_schema_contract(
             persistence,
             row_security_enabled,
             row_security_forced,
+            owner_matches_schema_owner,
             has_no_policies,
             access_method,
         )
@@ -634,6 +835,7 @@ async def require_database_schema_contract(
             persistence,
             row_security_enabled,
             row_security_forced,
+            owner_matches_schema_owner,
             has_no_policies,
             access_method,
         ) in relation_kind_rows
@@ -664,11 +866,16 @@ async def require_database_schema_contract(
         for name, relation_contract in actual_relation_contract.items()
     ):
         raise _invalid_contract()
-    expected_columns = {
-        column
-        for column in _EXPECTED_COLUMN_TYPES
-        if expected_phase2_relations or column[0] not in PHASE2_RELATIONS
+    base_column_types = {
+        column: type_name
+        for column, type_name in _EXPECTED_COLUMN_TYPES.items()
+        if column[0] not in all_phase2_relations
     }
+    expected_column_types = {
+        **base_column_types,
+        **_PHASE2_COLUMN_TYPES_BY_REVISION[structural_revision],
+    }
+    expected_columns = set(expected_column_types)
     if require_complete:
         if set(actual) != expected_columns:
             raise _invalid_contract()
@@ -683,7 +890,7 @@ async def require_database_schema_contract(
         }
         if actual_business_columns != expected_business_columns:
             raise _invalid_contract()
-    for column, expected_type in _EXPECTED_COLUMN_TYPES.items():
+    for column, expected_type in expected_column_types.items():
         if column not in expected_columns:
             continue
         deployed_type = actual.get(column)
@@ -696,7 +903,7 @@ async def require_database_schema_contract(
         if deployed_type[:2] != ("pg_catalog", expected_type):
             raise _invalid_contract()
         relation_name, _ = column
-        if relation_name not in PHASE2_RELATIONS:
+        if relation_name not in all_phase2_relations:
             continue
         (
             _,
@@ -711,13 +918,36 @@ async def require_database_schema_contract(
             uses_default_storage,
             compression,
         ) = deployed_type
-        if is_nullable is not (column in _PHASE2_NULLABLE_COLUMNS):
+        nullable_columns = _PHASE2_NULLABLE_COLUMNS_BY_REVISION[structural_revision]
+        defaulted_columns = _PHASE2_DEFAULTED_COLUMNS_BY_REVISION[structural_revision]
+        default_expressions = PHASE2_DEFAULT_EXPRESSIONS_BY_REVISION.get(
+            structural_revision,
+            {},
+        )
+        generated_expressions = PHASE2_GENERATED_EXPRESSION_SHA256_BY_REVISION.get(
+            structural_revision,
+            {},
+        )
+        generated_expression_sha256 = generated_expressions.get(column)
+        if is_nullable is not (column in nullable_columns):
             raise _invalid_contract()
-        if has_default is not (column in _PHASE2_DEFAULTED_COLUMNS):
-            raise _invalid_contract()
-        if default_expression != PHASE2_DEFAULT_EXPRESSIONS.get(column):
-            raise _invalid_contract()
-        if identity_kind or generated_kind:
+        if generated_expression_sha256 is None:
+            if has_default is not (column in defaulted_columns):
+                raise _invalid_contract()
+            if default_expression != default_expressions.get(column):
+                raise _invalid_contract()
+            if generated_kind:
+                raise _invalid_contract()
+        else:
+            if (
+                has_default is not True
+                or type(default_expression) is not str
+                or generated_kind != "s"
+                or hashlib.sha256(default_expression.encode("utf-8")).hexdigest()
+                != generated_expression_sha256
+            ):
+                raise _invalid_contract()
+        if identity_kind:
             raise _invalid_contract()
         if uses_default_collation is not True:
             raise _invalid_contract()
@@ -728,15 +958,6 @@ async def require_database_schema_contract(
         if expected_type == "bpchar" and type_modifier != 68:
             raise _invalid_contract()
 
-    expected_checks = dict(PHASE2_CHECK_CONSTRAINT_SHA256)
-    expected_checks.update(
-        PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION.get(
-            expected_revision or "",
-            {},
-        )
-    )
-    if not expected_phase2_relations:
-        expected_checks = {}
     actual_checks = {
         (relation_name, constraint_name): (
             source_sha256,
@@ -751,40 +972,71 @@ async def require_database_schema_contract(
             is_inheritable,
         ) in check_constraint_rows
     }
-    expected_check_contract = {
-        key: (source_sha256, True, False)
-        for key, source_sha256 in expected_checks.items()
+    matching_revisions = tuple(
+        revision
+        for revision in revision_candidates
+        if actual_checks
+        == {
+            key: (source_sha256, True, False)
+            for key, source_sha256 in (
+                PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION.get(
+                    revision,
+                    {},
+                ).items()
+            )
+        }
+    )
+    if len(matching_revisions) != 1:
+        raise _invalid_contract()
+    selected_revision = matching_revisions[0]
+
+    actual_views = {
+        (relation_name, relation_kind, definition_sha256, tuple(relation_options))
+        for (
+            relation_name,
+            relation_kind,
+            definition_sha256,
+            relation_options,
+        ) in view_contract_rows
     }
-    if actual_checks != expected_check_contract:
+    expected_views = {
+        (
+            view.name,
+            view.relation_kind,
+            view.definition_sha256,
+            (f"check_option={view.check_option.lower()}",),
+        )
+        for view in PHASE2_VIEW_SPECS_BY_REVISION[selected_revision]
+    }
+    if actual_views != expected_views:
         raise _invalid_contract()
 
-    expected_unique = (
-        {
-            (
-                spec.relation,
-                spec.name,
-                spec.name,
-                spec.constraint_type,
-                spec.columns,
-                spec.index_options,
-                None,
-                spec.nulls_not_distinct,
-                spec.deferrable,
-                spec.initially_deferred,
-                spec.validated,
-                spec.index_valid,
-                spec.index_ready,
-                spec.access_method,
-                spec.has_no_included_columns,
-                spec.has_only_plain_columns,
-                spec.uses_default_operator_classes,
-                spec.uses_default_collations,
-            )
-            for spec in PHASE2_UNIQUE_CONSTRAINTS
-        }
-        if expected_phase2_relations
-        else set()
-    )
+    expected_unique = {
+        (
+            spec.relation,
+            spec.name,
+            spec.name,
+            spec.constraint_type,
+            spec.columns,
+            spec.index_options,
+            None,
+            spec.nulls_not_distinct,
+            spec.deferrable,
+            spec.initially_deferred,
+            spec.validated,
+            spec.index_valid,
+            spec.index_ready,
+            spec.access_method,
+            spec.has_no_included_columns,
+            spec.has_only_plain_columns,
+            spec.uses_default_operator_classes,
+            spec.uses_default_collations,
+        )
+        for spec in PHASE2_UNIQUE_CONSTRAINTS_BY_REVISION.get(
+            selected_revision,
+            (),
+        )
+    }
     actual_unique = {
         (
             relation_name,
@@ -830,27 +1082,26 @@ async def require_database_schema_contract(
     if actual_unique != expected_unique:
         raise _invalid_contract()
 
-    expected_indexes = (
-        {
-            (
-                spec.relation,
-                spec.name,
-                spec.unique,
-                True,
-                True,
-                True,
-                True,
-                True,
-                "btree",
-                spec.columns,
-                spec.options,
-                spec.predicate_sha256,
-            )
-            for spec in PHASE2_INDEX_SPECS
-        }
-        if expected_phase2_relations
-        else set()
-    )
+    expected_indexes = {
+        (
+            spec.relation,
+            spec.name,
+            spec.unique,
+            True,
+            True,
+            True,
+            True,
+            True,
+            "btree",
+            spec.columns,
+            spec.options,
+            spec.predicate_sha256,
+        )
+        for spec in PHASE2_INDEX_SPECS_BY_REVISION.get(
+            selected_revision,
+            (),
+        )
+    }
     actual_indexes = {
         (
             relation_name,

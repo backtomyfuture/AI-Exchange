@@ -12,14 +12,19 @@ from psycopg.rows import dict_row
 
 from src.db.access_contract import (
     AUDITOR_RELATION_ACCESS,
-    FOREIGN_KEY_SPECS,
+    AUDITOR_RELATION_ACCESS_BY_REVISION,
+    FOREIGN_KEY_SPECS_BY_REVISION,
     MAINTENANCE_RELATION_ACCESS,
+    MAINTENANCE_RELATION_ACCESS_BY_REVISION,
     PHASE2_RELATIONS,
+    PHASE2_RELATIONS_BY_REVISION,
+    PHASE2_VIEW_SPECS_BY_REVISION,
     RUNTIME_RELATION_ACCESS,
+    RUNTIME_RELATION_ACCESS_BY_REVISION,
     RelationAccess,
-    TRIGGER_FUNCTIONS,
-    TRIGGER_FUNCTION_SOURCE_SHA256,
-    TRIGGER_SPECS,
+    TRIGGER_FUNCTIONS_BY_REVISION,
+    TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION,
+    TRIGGER_SPECS_BY_REVISION,
 )
 
 
@@ -491,64 +496,140 @@ def _phase2_relation_count_sql(schema_oid: str) -> str:
     )"""
 
 
+def _phase2_profile_matches_sql(schema_oid: str, revision: str) -> str:
+    expected = {
+        **{
+            relation_name: "r"
+            for relation_name in PHASE2_RELATIONS_BY_REVISION[revision]
+        },
+        **{
+            view.name: view.relation_kind
+            for view in PHASE2_VIEW_SPECS_BY_REVISION[revision]
+        },
+    }
+    all_names = tuple(
+        sorted(
+            {
+                relation_name
+                for relations in PHASE2_RELATIONS_BY_REVISION.values()
+                for relation_name in relations
+            }
+            | {
+                view.name
+                for views in PHASE2_VIEW_SPECS_BY_REVISION.values()
+                for view in views
+            }
+        )
+    )
+    actual_filter = ", ".join(map(_sql_text_literal, all_names))
+    if not expected:
+        return f"""NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS managed_relation
+            WHERE managed_relation.relnamespace = {schema_oid}
+              AND managed_relation.relname IN ({actual_filter})
+        )"""
+    expected_rows = ", ".join(
+        f"({_sql_text_literal(name)}, {_sql_text_literal(kind)})"
+        for name, kind in sorted(expected.items())
+    )
+    return f"""(
+        WITH actual_managed_relations(relation_name, relation_kind) AS (
+            SELECT
+                managed_relation.relname::pg_catalog.text,
+                managed_relation.relkind::pg_catalog.text
+            FROM pg_catalog.pg_class AS managed_relation
+            WHERE managed_relation.relnamespace = {schema_oid}
+              AND managed_relation.relname IN ({actual_filter})
+        ),
+        expected_managed_relations(relation_name, relation_kind) AS (
+            VALUES {expected_rows}
+        )
+        SELECT NOT EXISTS (
+            SELECT * FROM actual_managed_relations
+            EXCEPT
+            SELECT * FROM expected_managed_relations
+        ) AND NOT EXISTS (
+            SELECT * FROM expected_managed_relations
+            EXCEPT
+            SELECT * FROM actual_managed_relations
+        )
+    )"""
+
+
 def _relation_access_contract_sql(
     schema_oid: str,
     role_oid: str,
     manifest: dict[str, RelationAccess],
     *,
     allow_missing: bool = False,
+    manifests_by_revision: dict[str, dict[str, RelationAccess]] | None = None,
 ) -> str:
-    expected_rows: list[str] = []
-    for relation_name, access in manifest.items():
-        for privilege in access.table_privileges:
-            expected_rows.append(
-                "("
-                + ", ".join(
-                    (
-                        "'table'",
-                        _sql_text_literal(relation_name),
-                        "''",
-                        _sql_text_literal(privilege),
-                        "false",
+    def expected_values(access_manifest: dict[str, RelationAccess]) -> str:
+        expected_rows: list[str] = []
+        for relation_name, access in access_manifest.items():
+            for privilege in access.table_privileges:
+                expected_rows.append(
+                    "("
+                    + ", ".join(
+                        (
+                            "'table'",
+                            _sql_text_literal(relation_name),
+                            "''",
+                            _sql_text_literal(privilege),
+                            "false",
+                        )
                     )
+                    + ")"
                 )
-                + ")"
-            )
-        if access.delete:
-            expected_rows.append(
-                "("
-                + ", ".join(
-                    (
-                        "'table'",
-                        _sql_text_literal(relation_name),
-                        "''",
-                        "'DELETE'",
-                        "false",
+            if access.delete:
+                expected_rows.append(
+                    "("
+                    + ", ".join(
+                        (
+                            "'table'",
+                            _sql_text_literal(relation_name),
+                            "''",
+                            "'DELETE'",
+                            "false",
+                        )
                     )
+                    + ")"
                 )
-                + ")"
-            )
-        for privilege, columns in (
-            ("SELECT", access.select_columns),
-            ("INSERT", access.insert_columns),
-            ("UPDATE", access.update_columns),
-        ):
-            expected_rows.extend(
-                "("
-                + ", ".join(
-                    (
-                        "'column'",
-                        _sql_text_literal(relation_name),
-                        _sql_text_literal(column),
-                        _sql_text_literal(privilege),
-                        "false",
+            for privilege, columns in (
+                ("SELECT", access.select_columns),
+                ("INSERT", access.insert_columns),
+                ("UPDATE", access.update_columns),
+            ):
+                expected_rows.extend(
+                    "("
+                    + ", ".join(
+                        (
+                            "'column'",
+                            _sql_text_literal(relation_name),
+                            _sql_text_literal(column),
+                            _sql_text_literal(privilege),
+                            "false",
+                        )
                     )
+                    + ")"
+                    for column in columns
                 )
-                + ")"
-                for column in columns
-            )
-    expected_values = ",\n".join(expected_rows)
-    phase2_relation_names = ", ".join(map(_sql_text_literal, PHASE2_RELATIONS))
+        return ",\n".join(expected_rows)
+
+    if manifests_by_revision is None:
+        base_manifest = {
+            name: access
+            for name, access in manifest.items()
+            if name not in PHASE2_RELATIONS
+        }
+        legacy_manifest = manifest
+        latest_manifest = manifest
+    else:
+        base_manifest = manifests_by_revision["20260710_0002"]
+        legacy_manifest = manifests_by_revision["20260713_0004"]
+        latest_manifest = manifests_by_revision["20260713_0005"]
+    selected_difference = "unexpected" if allow_missing else "difference"
     return f"""(
         WITH actual_access(
             access_kind,
@@ -583,58 +664,89 @@ def _relation_access_contract_sql(
             WHERE relation.relnamespace = {schema_oid}
               AND grant_acl.grantee = {role_oid}
         ),
-        expected_access(
+        expected_access_0002(
             access_kind,
             relation_name,
             column_name,
             privilege_type,
             is_grantable
         ) AS (
-            VALUES {expected_values}
+            VALUES {expected_values(base_manifest)}
         ),
-        legacy_expected_access AS (
-            SELECT *
-            FROM expected_access
-            WHERE relation_name NOT IN ({phase2_relation_names})
+        expected_access_0004(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            VALUES {expected_values(legacy_manifest)}
         ),
-        legacy_difference AS (
+        expected_access_0005(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            VALUES {expected_values(latest_manifest)}
+        ),
+        difference_0002 AS (
             SELECT * FROM (
                 SELECT * FROM actual_access
                 EXCEPT
-                SELECT * FROM legacy_expected_access
-            ) AS unexpected_legacy_access
-            UNION ALL
-            SELECT * FROM (
-                SELECT * FROM legacy_expected_access
-                EXCEPT
-                SELECT * FROM actual_access
-            ) AS missing_legacy_access
-        ),
-        unexpected_legacy_access AS (
-            SELECT * FROM actual_access
-            EXCEPT
-            SELECT * FROM legacy_expected_access
-        ),
-        difference AS (
-            SELECT * FROM (
-                SELECT * FROM actual_access
-                EXCEPT
-                SELECT * FROM expected_access
+                SELECT * FROM expected_access_0002
             ) AS unexpected_access
             UNION ALL
             SELECT * FROM (
-                SELECT * FROM expected_access
+                SELECT * FROM expected_access_0002
                 EXCEPT
                 SELECT * FROM actual_access
             ) AS missing_access
         ),
-        unexpected_access AS (
+        unexpected_0002 AS (
             SELECT * FROM actual_access
             EXCEPT
-            SELECT * FROM expected_access
+            SELECT * FROM expected_access_0002
+        ),
+        difference_0004 AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM expected_access_0004
+            ) AS unexpected_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access_0004
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_access
+        ),
+        unexpected_0004 AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access_0004
+        ),
+        difference_0005 AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM expected_access_0005
+            ) AS unexpected_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access_0005
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_access
+        ),
+        unexpected_0005 AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access_0005
         )
         SELECT CASE
-            WHEN {_phase2_relation_count_sql(schema_oid)} = 0
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
              AND NOT EXISTS (
                  SELECT 1
                  FROM pg_catalog.pg_class AS revision_relation
@@ -642,24 +754,18 @@ def _relation_access_contract_sql(
                    AND revision_relation.relname = 'alembic_version'
                    AND revision_relation.relkind = 'r'
              ) THEN NOT EXISTS (SELECT 1 FROM actual_access)
-            WHEN {_phase2_relation_count_sql(schema_oid)} = 0
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
              AND EXISTS (
                  SELECT 1
                  FROM pg_catalog.pg_class AS revision_relation
                  WHERE revision_relation.relnamespace = {schema_oid}
                    AND revision_relation.relname = 'alembic_version'
                    AND revision_relation.relkind = 'r'
-             ) THEN NOT EXISTS (
-                 SELECT 1 FROM {
-        "unexpected_legacy_access" if allow_missing else "legacy_difference"
-    }
-             )
-            WHEN {_phase2_relation_count_sql(schema_oid)} = {len(PHASE2_RELATIONS)}
-                THEN NOT EXISTS (
-                    SELECT 1 FROM {
-        "unexpected_access" if allow_missing else "difference"
-    }
-                )
+             ) THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0002)
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260713_0004")}
+                THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0004)
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260713_0005")}
+                THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0005)
             ELSE false
         END
     )"""
@@ -897,12 +1003,16 @@ def _checkpoint_auditor_access_contract_sql(
             auditor_oid,
             AUDITOR_RELATION_ACCESS,
             allow_missing=allow_missing,
+            manifests_by_revision=AUDITOR_RELATION_ACCESS_BY_REVISION,
         )
     }
     )"""
 
 
-def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
+def _target_foreign_keys_exact_for_specs_sql(
+    schema_oid: str,
+    specs: tuple,
+) -> str:
     expected_rows = ",\n".join(
         "("
         + ", ".join(
@@ -915,16 +1025,16 @@ def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
                 _sql_text_literal(spec.parent_relation),
                 _sql_text_array(spec.parent_columns),
                 _sql_text_literal(spec.match_type),
-                "'r'",
-                "'r'",
-                "false",
-                "false",
-                "true",
+                _sql_text_literal(spec.update_action),
+                _sql_text_literal(spec.delete_action),
+                "true" if spec.deferrable else "false",
+                "true" if spec.initially_deferred else "false",
+                "true" if spec.validated else "false",
                 "0::pg_catalog.oid",
             )
         )
         + ")"
-        for spec in FOREIGN_KEY_SPECS
+        for spec in specs
     )
     return f"""(
         WITH actual_foreign_keys AS (
@@ -1014,20 +1124,58 @@ def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
                 FROM actual_foreign_keys
             ) AS missing_foreign_keys
         )
-        SELECT CASE {_phase2_relation_count_sql(schema_oid)}
-            WHEN 0 THEN NOT EXISTS (SELECT 1 FROM actual_foreign_keys)
-            WHEN {len(PHASE2_RELATIONS)} THEN NOT EXISTS (
-                SELECT 1 FROM difference
-            )
-            ELSE false
-        END
+        SELECT NOT EXISTS (SELECT 1 FROM difference)
     )"""
 
 
-def _target_trigger_contract_exact_sql(
+def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
+    no_foreign_keys = f"""NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_constraint AS foreign_key
+        JOIN pg_catalog.pg_class AS child
+          ON child.oid = foreign_key.conrelid
+        JOIN pg_catalog.pg_class AS parent
+          ON parent.oid = foreign_key.confrelid
+        WHERE foreign_key.contype = 'f'
+          AND (
+              child.relnamespace = {schema_oid}
+              OR parent.relnamespace = {schema_oid}
+          )
+    )"""
+    legacy_revision = "20260713_0004"
+    latest_revision = "20260713_0005"
+    return f"""(
+        (
+            {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+            AND {no_foreign_keys}
+        ) OR (
+            {_phase2_profile_matches_sql(schema_oid, legacy_revision)}
+            AND {
+        _target_foreign_keys_exact_for_specs_sql(
+            schema_oid,
+            FOREIGN_KEY_SPECS_BY_REVISION[legacy_revision],
+        )
+    }
+        ) OR (
+            {_phase2_profile_matches_sql(schema_oid, latest_revision)}
+            AND {
+        _target_foreign_keys_exact_for_specs_sql(
+            schema_oid,
+            FOREIGN_KEY_SPECS_BY_REVISION[latest_revision],
+        )
+    }
+        )
+    )"""
+
+
+def _target_trigger_contract_exact_for_revision_sql(
     schema_oid: str,
     migration_oid: str,
+    revision: str,
 ) -> str:
+    trigger_specs = TRIGGER_SPECS_BY_REVISION[revision]
+    trigger_functions = TRIGGER_FUNCTIONS_BY_REVISION[revision]
+    trigger_function_digests = TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION[revision]
     expected_trigger_rows = ",\n".join(
         "("
         + ", ".join(
@@ -1062,18 +1210,18 @@ def _target_trigger_contract_exact_sql(
             )
         )
         + ")"
-        for spec in TRIGGER_SPECS
+        for spec in trigger_specs
     )
     expected_function_rows = ",\n".join(
         "("
         + ", ".join(
             (
                 _sql_text_literal(function_name),
-                _sql_text_literal(TRIGGER_FUNCTION_SOURCE_SHA256[function_name]),
+                _sql_text_literal(trigger_function_digests[function_name]),
             )
         )
         + ")"
-        for function_name in TRIGGER_FUNCTIONS
+        for function_name in trigger_functions
     )
     return f"""(
         WITH actual_user_triggers AS (
@@ -1218,7 +1366,7 @@ def _target_trigger_contract_exact_sql(
                   'pg_catalog.trigger'::pg_catalog.regtype
               AND (
                   routine.proname NOT IN (
-                      {", ".join(_sql_text_literal(name) for name in TRIGGER_FUNCTIONS)}
+                      {", ".join(_sql_text_literal(name) for name in trigger_functions)}
                   )
                   OR pg_catalog.pg_get_function_identity_arguments(
                       routine.oid
@@ -1238,34 +1386,75 @@ def _target_trigger_contract_exact_sql(
                 SELECT * FROM actual_trigger_functions
             ) AS missing_trigger_functions
         )
-        SELECT CASE {_phase2_relation_count_sql(schema_oid)}
-            WHEN 0 THEN
-                NOT EXISTS (SELECT 1 FROM actual_user_triggers)
-                AND NOT EXISTS (SELECT 1 FROM actual_trigger_functions)
-                AND NOT EXISTS (SELECT 1 FROM unapproved_trigger_functions)
-            WHEN {len(PHASE2_RELATIONS)} THEN
-                NOT EXISTS (SELECT 1 FROM trigger_difference)
-                AND NOT EXISTS (SELECT 1 FROM function_difference)
-                AND NOT EXISTS (SELECT 1 FROM unapproved_trigger_functions)
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_trigger AS internal_trigger
-                    JOIN pg_catalog.pg_class AS relation
-                      ON relation.oid = internal_trigger.tgrelid
-                    LEFT JOIN pg_catalog.pg_constraint AS trigger_constraint
-                      ON trigger_constraint.oid = internal_trigger.tgconstraint
-                    WHERE relation.relnamespace = {schema_oid}
-                      AND internal_trigger.tgisinternal
-                      AND (
-                          trigger_constraint.contype IS DISTINCT FROM 'f'
-                          OR trigger_constraint.conname NOT IN (
-                              {", ".join(_sql_text_literal(spec.name) for spec in FOREIGN_KEY_SPECS)}
-                          )
-                          OR internal_trigger.tgenabled <> 'O'
+        SELECT
+            NOT EXISTS (SELECT 1 FROM trigger_difference)
+            AND NOT EXISTS (SELECT 1 FROM function_difference)
+            AND NOT EXISTS (SELECT 1 FROM unapproved_trigger_functions)
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_trigger AS internal_trigger
+                JOIN pg_catalog.pg_class AS relation
+                  ON relation.oid = internal_trigger.tgrelid
+                LEFT JOIN pg_catalog.pg_constraint AS trigger_constraint
+                  ON trigger_constraint.oid = internal_trigger.tgconstraint
+                WHERE relation.relnamespace = {schema_oid}
+                  AND internal_trigger.tgisinternal
+                  AND (
+                      trigger_constraint.contype IS DISTINCT FROM 'f'
+                      OR trigger_constraint.conname NOT IN (
+                          {", ".join(_sql_text_literal(spec.name) for spec in FOREIGN_KEY_SPECS_BY_REVISION[revision])}
                       )
-                )
-            ELSE false
-        END
+                      OR internal_trigger.tgenabled <> 'O'
+                  )
+            )
+    )"""
+
+
+def _target_trigger_contract_exact_sql(
+    schema_oid: str,
+    migration_oid: str,
+) -> str:
+    no_trigger_hooks = f"""(
+        NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_trigger AS trigger
+            JOIN pg_catalog.pg_class AS relation
+              ON relation.oid = trigger.tgrelid
+            WHERE relation.relnamespace = {schema_oid}
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine.prorettype =
+                  'pg_catalog.trigger'::pg_catalog.regtype
+        )
+    )"""
+    legacy_revision = "20260713_0004"
+    latest_revision = "20260713_0005"
+    return f"""(
+        (
+            {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+            AND {no_trigger_hooks}
+        ) OR (
+            {_phase2_profile_matches_sql(schema_oid, legacy_revision)}
+            AND {
+        _target_trigger_contract_exact_for_revision_sql(
+            schema_oid,
+            migration_oid,
+            legacy_revision,
+        )
+    }
+        ) OR (
+            {_phase2_profile_matches_sql(schema_oid, latest_revision)}
+            AND {
+        _target_trigger_contract_exact_for_revision_sql(
+            schema_oid,
+            migration_oid,
+            latest_revision,
+        )
+    }
+        )
     )"""
 
 
@@ -1744,6 +1933,7 @@ def _maintenance_counterpart_privileges_sql(
             role_oid,
             MAINTENANCE_RELATION_ACCESS,
             allow_missing=allow_missing_access,
+            manifests_by_revision=MAINTENANCE_RELATION_ACCESS_BY_REVISION,
         )
     }
         AND pg_catalog.has_database_privilege(
@@ -2223,6 +2413,7 @@ SELECT
         "role.schema_oid",
         "role.runtime_oid",
         RUNTIME_RELATION_ACCESS,
+        manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
     )
 }
       AS runtime_access_contract_exact,
@@ -2233,6 +2424,7 @@ SELECT
         "role.runtime_oid",
         RUNTIME_RELATION_ACCESS,
         allow_missing=True,
+        manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
     )
 }
       AS runtime_access_contract_reconcilable,
@@ -2574,6 +2766,7 @@ SELECT
         "role.schema_oid",
         "role.current_oid",
         RUNTIME_RELATION_ACCESS,
+        manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
     )
 }
       AS runtime_access_contract_exact,
@@ -2851,6 +3044,7 @@ SELECT
         "role.schema_oid",
         "role.runtime_oid",
         RUNTIME_RELATION_ACCESS,
+        manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
     )
 }
       AS runtime_access_contract_exact,

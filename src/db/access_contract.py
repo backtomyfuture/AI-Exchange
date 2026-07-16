@@ -7,6 +7,7 @@ from typing import Final
 
 
 PHASE2_DATABASE_REVISION: Final = "20260713_0004"
+SYNC_RECONCILIATION_DATABASE_REVISION: Final = "20260713_0005"
 PHASE2_RELATIONS: Final = (
     "audit_events",
     "emails",
@@ -15,6 +16,41 @@ PHASE2_RELATIONS: Final = (
     "pipeline_shadow_comparisons",
     "sync_cursors",
 )
+PHASE2_RELATIONS_BY_REVISION: Final[dict[str, tuple[str, ...]]] = {
+    "20260710_0002": (),
+    "20260710_0003": PHASE2_RELATIONS,
+    PHASE2_DATABASE_REVISION: PHASE2_RELATIONS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        *PHASE2_RELATIONS,
+        "pipeline_command_receipts",
+        "sync_cold_start_plans",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ViewSpec:
+    name: str
+    relation_kind: str
+    check_option: str
+    definition_sha256: str
+
+
+PHASE2_VIEW_SPECS_BY_REVISION: Final[dict[str, tuple[ViewSpec, ...]]] = {
+    "20260710_0002": (),
+    "20260710_0003": (),
+    PHASE2_DATABASE_REVISION: (),
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        ViewSpec(
+            name="cold_start_command_receipts",
+            relation_kind="v",
+            check_option="CASCADED",
+            definition_sha256=(
+                "66461da92b70d58eaa079c2850896a42d920a4fbe7b78e0cb43474470f938b26"
+            ),
+        ),
+    ),
+}
 
 PHASE2_DEFAULT_EXPRESSIONS: Final[dict[tuple[str, str], str]] = {
     ("audit_events", "created_at"): "CURRENT_TIMESTAMP",
@@ -440,6 +476,223 @@ PHASE2_INDEX_SPECS: Final = (
 )
 
 
+PHASE2_DEFAULT_EXPRESSIONS_BY_REVISION: Final[dict[str, dict[tuple[str, str], str]]] = {
+    "20260710_0003": PHASE2_DEFAULT_EXPRESSIONS,
+    PHASE2_DATABASE_REVISION: PHASE2_DEFAULT_EXPRESSIONS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **PHASE2_DEFAULT_EXPRESSIONS,
+        ("pipeline_command_receipts", "created_at"): "CURRENT_TIMESTAMP",
+        ("sync_cold_start_plans", "created_at"): "CURRENT_TIMESTAMP",
+        ("sync_cold_start_plans", "item_count"): "0",
+        ("sync_cold_start_plans", "page_count"): "0",
+        ("sync_cold_start_plans", "preview_cursor_version"): "0",
+        ("sync_cold_start_plans", "redacted_samples"): "'[]'::jsonb",
+        ("sync_cold_start_plans", "updated_at"): "CURRENT_TIMESTAMP",
+        ("sync_cold_start_plans", "version"): "0",
+        ("sync_cursors", "transient_failures"): "0",
+    },
+}
+
+PHASE2_GENERATED_EXPRESSION_SHA256_BY_REVISION: Final[
+    dict[str, dict[tuple[str, str], str]]
+] = {
+    "20260710_0002": {},
+    "20260710_0003": {},
+    PHASE2_DATABASE_REVISION: {},
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        ("sync_cold_start_plans", "cursor_binding_plan_id"): (
+            "f1b485141675d63e566b2bea4995c507c6c40e5250d4a48228bcdec03825aff4"
+        ),
+    },
+}
+
+PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION: Final[
+    dict[str, dict[tuple[str, str], str]]
+] = {
+    "20260710_0003": {
+        **PHASE2_CHECK_CONSTRAINT_SHA256,
+        **PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION["20260710_0003"],
+    },
+    PHASE2_DATABASE_REVISION: PHASE2_CHECK_CONSTRAINT_SHA256,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **PHASE2_CHECK_CONSTRAINT_SHA256,
+        ("sync_cursors", "ck_sync_cursors_plan_binding"): (
+            "0170ce730371779dcd870254702aa219eb3674d4a93e48dd0324a8a7a1ae6274"
+        ),
+        ("sync_cursors", "ck_sync_cursors_retry"): (
+            "22253a06d7542d0243a0059b94220ce1e8c7ddd88e95d16227c5c5724d58735d"
+        ),
+        ("sync_cursors", "ck_sync_cursors_state_matrix"): (
+            "014b54cd0be647f224e1cd88f077648471ae1fc27f753919eb6f3701b12d9e24"
+        ),
+        ("sync_cursors", "ck_sync_cursors_status"): (
+            "8dc20405aefb36a48f6c66633c4288494de00d53fe0bca736196ed8776053742"
+        ),
+        ("sync_cursors", "ck_sync_cursors_transient_failures"): (
+            "77ef5160b8bc845bf7a092e61bb68898c1fa71c1745f7724946dbcfad0e0db22"
+        ),
+        ("pipeline_command_receipts", "ck_pipeline_command_receipts_account"): (
+            "25341c3ce11ea0a3cda1fb848bf14cc227abc891a221df7e6c0d094f11f14124"
+        ),
+        (
+            "pipeline_command_receipts",
+            "ck_pipeline_command_receipts_authority_epoch",
+        ): "d42138ae3aaf50c15e446c5c4ad962e65a6969bf643871b818855908f5f27c0c",
+        (
+            "pipeline_command_receipts",
+            "ck_pipeline_command_receipts_command_name",
+        ): "932648b521410d05bce12997387e4d301ea23f8f71d758f6e26c1b805f39bbca",
+        ("pipeline_command_receipts", "ck_pipeline_command_receipts_hashes"): (
+            "58797557ba965ff3fcb7b305317f649f9e06101043145cfd57ec887bcc60db2e"
+        ),
+        ("pipeline_command_receipts", "ck_pipeline_command_receipts_outcome"): (
+            "81e16f1ec1ab1573e19f67503718f9d03e4460c38ca80758acc437919c6d338d"
+        ),
+        ("pipeline_command_receipts", "ck_pipeline_command_receipts_result"): (
+            "4a67dd7bc60851165175c7aa41454ae6ed17e0e198530af1ec639135578306b2"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_blocked_reason"): (
+            "e1809a680586dfe440e9df1a6b79dca29df570b85a472e7bc5804ddf0abc0839"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_counts"): (
+            "29c7e8324ea5c879d0763f40ee717e3354efd1c4b63aeb38fddc144753b58355"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_cursors"): (
+            "48f9d0fe4594045b5d96e12ee51e70582a95054ab0032d9a33de75000fb4723f"
+        ),
+        (
+            "sync_cold_start_plans",
+            "ck_sync_cold_start_plans_expected_cursor",
+        ): "68deb84441caaf17ca54758f32c96e1d1e2908e0c8bd3e150a2df6be4ded94b1",
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_folder_key"): (
+            "2b226c8f6fea8ce4c93e8ebc0005964a00f4df08cdebcd11b3bc96d247d08629"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_hashes"): (
+            "50c8c34d0a563d21b22802ee011b8c84b7a5631d5c89e7a1823492044712d4dc"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_operator"): (
+            "b5b8600fa9d4622182db78be598537d41662ea6682bb0e29aa24aff92c8b0c4e"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_pipeline_name"): (
+            "6505916d0a680d292a459d1072069232644bb16413f7d4b249c2fde926109d1f"
+        ),
+        (
+            "sync_cold_start_plans",
+            "ck_sync_cold_start_plans_positive_identity",
+        ): "e5e43f686cf6aca5560d22d5bfa18bd0e5cba8341a5f26e09eff5a37b6bba9c6",
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_samples"): (
+            "47a10b8a376047a101cd29e7f926c14ba517601cd784dc3ef9843583a0aa5ad2"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_state"): (
+            "7f6bec2f50be67ffe098ce5ff49c29101d0d3b1be43826e5a305a2c9072179cd"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_state_matrix"): (
+            "a84f7de95804cfc2c7f0d2cb06145951f654c7dcbee46aedfebdc6ac08665ecb"
+        ),
+        ("sync_cold_start_plans", "ck_sync_cold_start_plans_versions"): (
+            "a846d31aba0c59e9c2984f58560fcc226b0f17c4d6140f5979ecf7d07e2448c3"
+        ),
+    },
+}
+
+PHASE2_UNIQUE_CONSTRAINTS_BY_REVISION: Final[
+    dict[str, tuple[UniqueConstraintSpec, ...]]
+] = {
+    "20260710_0003": PHASE2_UNIQUE_CONSTRAINTS,
+    PHASE2_DATABASE_REVISION: PHASE2_UNIQUE_CONSTRAINTS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        *PHASE2_UNIQUE_CONSTRAINTS,
+        UniqueConstraintSpec(
+            "pipeline_command_receipts",
+            "pk_pipeline_command_receipts",
+            "p",
+            ("id",),
+            (0,),
+        ),
+        UniqueConstraintSpec(
+            "pipeline_command_receipts",
+            "uq_pipeline_command_receipts_identity",
+            "u",
+            ("account_id", "command_name", "idempotency_key_hash"),
+            (0, 0, 0),
+        ),
+        UniqueConstraintSpec(
+            "sync_cold_start_plans",
+            "pk_sync_cold_start_plans",
+            "p",
+            ("plan_id",),
+            (0,),
+        ),
+        UniqueConstraintSpec(
+            "sync_cold_start_plans",
+            "uq_sync_cold_start_plan_identity",
+            "u",
+            ("plan_id", "account_id", "folder_key"),
+            (0, 0, 0),
+        ),
+        UniqueConstraintSpec(
+            "sync_cold_start_plans",
+            "uq_sync_cold_start_plan_apply_binding",
+            "u",
+            (
+                "plan_id",
+                "account_id",
+                "folder_key",
+                "apply_cursor",
+                "apply_cursor_version",
+                "state",
+            ),
+            (0, 0, 0, 0, 0, 0),
+        ),
+        UniqueConstraintSpec(
+            "sync_cursors",
+            "uq_sync_cursors_cold_start_binding",
+            "u",
+            (
+                "cold_start_plan_id",
+                "account_id",
+                "folder_key",
+                "cursor",
+                "version",
+                "cold_start_plan_state",
+            ),
+            (0, 0, 0, 0, 0, 0),
+        ),
+    ),
+}
+
+PHASE2_INDEX_SPECS_BY_REVISION: Final[dict[str, tuple[IndexSpec, ...]]] = {
+    "20260710_0003": PHASE2_INDEX_SPECS,
+    PHASE2_DATABASE_REVISION: PHASE2_INDEX_SPECS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        *PHASE2_INDEX_SPECS,
+        IndexSpec(
+            "sync_cold_start_plans",
+            "ix_sync_cold_start_plans_state_expiry",
+            False,
+            ("state", "expires_at", "plan_id"),
+            (0, 0, 0),
+        ),
+        IndexSpec(
+            "sync_cold_start_plans",
+            "uq_sync_cold_start_open_plan",
+            True,
+            ("account_id", "folder_key"),
+            (0, 0),
+            "4499fc6ca5e6a33cd2dab332bd299c9a30d9f65ebf92c5634832dbb34076acad",
+        ),
+        IndexSpec(
+            "sync_cursors",
+            "uq_sync_cursors_cold_start_plan",
+            True,
+            ("cold_start_plan_id",),
+            (0,),
+            "e971963bd734284263889850d56c3e4a1e3f1748509f63b8ffc0fea5c7a67d9a",
+        ),
+    ),
+}
+
+
 @dataclass(frozen=True)
 class RelationAccess:
     table_privileges: tuple[str, ...] = ()
@@ -722,6 +975,150 @@ AUDITOR_RELATION_ACCESS: Final[dict[str, RelationAccess]] = {
     ),
 }
 
+_LEGACY_RELATION_NAMES: Final = frozenset(PHASE2_RELATIONS)
+
+RUNTIME_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]] = {
+    "20260710_0002": {
+        name: access
+        for name, access in RUNTIME_RELATION_ACCESS.items()
+        if name not in _LEGACY_RELATION_NAMES
+    },
+    "20260710_0003": RUNTIME_RELATION_ACCESS,
+    PHASE2_DATABASE_REVISION: RUNTIME_RELATION_ACCESS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **RUNTIME_RELATION_ACCESS,
+        "sync_cursors": RelationAccess(
+            table_privileges=("SELECT",),
+            insert_columns=(
+                *RUNTIME_RELATION_ACCESS["sync_cursors"].insert_columns,
+                "transient_failures",
+                "retry_after_at",
+            ),
+            update_columns=(
+                *RUNTIME_RELATION_ACCESS["sync_cursors"].update_columns,
+                "transient_failures",
+                "retry_after_at",
+            ),
+        ),
+    },
+}
+
+MAINTENANCE_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]] = {
+    "20260710_0002": MAINTENANCE_RELATION_ACCESS,
+    "20260710_0003": MAINTENANCE_RELATION_ACCESS,
+    PHASE2_DATABASE_REVISION: MAINTENANCE_RELATION_ACCESS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **MAINTENANCE_RELATION_ACCESS,
+        "pipeline_ownership": RelationAccess(table_privileges=("SELECT",)),
+        "event_inbox": RelationAccess(
+            table_privileges=("SELECT",),
+            insert_columns=tuple(
+                column
+                for column in RUNTIME_RELATION_ACCESS["event_inbox"].insert_columns
+                if column != "received_at"
+            ),
+        ),
+        "sync_cursors": RelationAccess(
+            table_privileges=("SELECT",),
+            insert_columns=(
+                *RUNTIME_RELATION_ACCESS_BY_REVISION[
+                    SYNC_RECONCILIATION_DATABASE_REVISION
+                ]["sync_cursors"].insert_columns,
+                "cold_start_plan_id",
+                "cold_start_plan_state",
+            ),
+            update_columns=(
+                *RUNTIME_RELATION_ACCESS_BY_REVISION[
+                    SYNC_RECONCILIATION_DATABASE_REVISION
+                ]["sync_cursors"].update_columns,
+                "cold_start_plan_id",
+                "cold_start_plan_state",
+            ),
+        ),
+        "audit_events": RelationAccess(
+            table_privileges=("SELECT",),
+            insert_columns=RUNTIME_RELATION_ACCESS["audit_events"].insert_columns,
+        ),
+        "sync_cold_start_plans": RelationAccess(
+            table_privileges=("SELECT",),
+            insert_columns=(
+                "plan_id",
+                "account_id",
+                "folder_key",
+                "expected_cursor_status",
+                "expected_cursor",
+                "expected_cursor_version",
+                "pipeline_name",
+                "generation",
+                "fencing_token",
+                "state",
+                "version",
+                "preview_cursor",
+                "preview_cursor_version",
+                "boundary_cursor",
+                "boundary_cursor_version",
+                "apply_cursor",
+                "apply_cursor_version",
+                "rolling_hash",
+                "page_count",
+                "item_count",
+                "redacted_samples",
+                "contract_fingerprint",
+                "folder_scope_config_hash",
+                "plan_hash",
+                "actor",
+                "reason",
+                "blocked_reason_code",
+                "blocked_fingerprint",
+                "expires_at",
+                "ready_at",
+                "approved_at",
+                "completed_at",
+                "blocked_at",
+                "created_at",
+                "updated_at",
+            ),
+            update_columns=(
+                "state",
+                "version",
+                "preview_cursor",
+                "preview_cursor_version",
+                "boundary_cursor",
+                "boundary_cursor_version",
+                "apply_cursor",
+                "apply_cursor_version",
+                "rolling_hash",
+                "page_count",
+                "item_count",
+                "redacted_samples",
+                "plan_hash",
+                "blocked_reason_code",
+                "blocked_fingerprint",
+                "ready_at",
+                "approved_at",
+                "completed_at",
+                "blocked_at",
+                "updated_at",
+            ),
+        ),
+        "cold_start_command_receipts": RelationAccess(
+            table_privileges=("SELECT", "INSERT"),
+        ),
+    },
+}
+
+AUDITOR_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]] = {
+    "20260710_0002": AUDITOR_RELATION_ACCESS,
+    "20260710_0003": AUDITOR_RELATION_ACCESS,
+    PHASE2_DATABASE_REVISION: AUDITOR_RELATION_ACCESS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **AUDITOR_RELATION_ACCESS,
+        "pipeline_command_receipts": RelationAccess(
+            table_privileges=("SELECT",),
+        ),
+    },
+}
+
 
 @dataclass(frozen=True)
 class ForeignKeySpec:
@@ -731,6 +1128,11 @@ class ForeignKeySpec:
     parent_relation: str
     parent_columns: tuple[str, ...]
     match_type: str
+    update_action: str = "r"
+    delete_action: str = "r"
+    deferrable: bool = False
+    initially_deferred: bool = False
+    validated: bool = True
 
 
 FOREIGN_KEY_SPECS: Final = (
@@ -781,6 +1183,72 @@ FOREIGN_KEY_SPECS: Final = (
         "f",
     ),
 )
+
+FOREIGN_KEY_SPECS_BY_REVISION: Final[dict[str, tuple[ForeignKeySpec, ...]]] = {
+    "20260710_0003": FOREIGN_KEY_SPECS,
+    PHASE2_DATABASE_REVISION: FOREIGN_KEY_SPECS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        *FOREIGN_KEY_SPECS,
+        ForeignKeySpec(
+            "fk_sync_cold_start_plan_ownership",
+            "sync_cold_start_plans",
+            ("account_id", "generation", "fencing_token", "pipeline_name"),
+            "pipeline_ownership",
+            ("account_id", "generation", "fencing_token", "pipeline_name"),
+            "f",
+        ),
+        ForeignKeySpec(
+            "fk_sync_cold_start_plan_active_cursor",
+            "sync_cold_start_plans",
+            (
+                "cursor_binding_plan_id",
+                "account_id",
+                "folder_key",
+                "apply_cursor",
+                "apply_cursor_version",
+                "state",
+            ),
+            "sync_cursors",
+            (
+                "cold_start_plan_id",
+                "account_id",
+                "folder_key",
+                "cursor",
+                "version",
+                "cold_start_plan_state",
+            ),
+            "s",
+            update_action="a",
+            deferrable=True,
+            initially_deferred=True,
+        ),
+        ForeignKeySpec(
+            "fk_sync_cursors_cold_start_plan",
+            "sync_cursors",
+            (
+                "cold_start_plan_id",
+                "account_id",
+                "folder_key",
+                "cursor",
+                "version",
+                "cold_start_plan_state",
+            ),
+            "sync_cold_start_plans",
+            (
+                "plan_id",
+                "account_id",
+                "folder_key",
+                "apply_cursor",
+                "apply_cursor_version",
+                "state",
+            ),
+            "s",
+            update_action="a",
+            deferrable=True,
+            initially_deferred=True,
+        ),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -851,6 +1319,26 @@ TRIGGER_SPECS: Final = (
     ),
 )
 
+TRIGGER_SPECS_BY_REVISION: Final[dict[str, tuple[TriggerSpec, ...]]] = {
+    "20260710_0003": TRIGGER_SPECS,
+    PHASE2_DATABASE_REVISION: TRIGGER_SPECS,
+    SYNC_RECONCILIATION_DATABASE_REVISION: (
+        *TRIGGER_SPECS,
+        TriggerSpec(
+            "trg_pipeline_command_receipts_guard_row",
+            "pipeline_command_receipts",
+            "reject_pipeline_command_receipts_mutation",
+            27,
+        ),
+        TriggerSpec(
+            "trg_pipeline_command_receipts_guard_truncate",
+            "pipeline_command_receipts",
+            "reject_pipeline_command_receipts_mutation",
+            34,
+        ),
+    ),
+}
+
 TRIGGER_FUNCTIONS: Final = tuple(sorted({spec.function for spec in TRIGGER_SPECS}))
 
 # SHA-256 of the exact ``pg_proc.prosrc`` installed by revision 0003.  The
@@ -872,4 +1360,20 @@ TRIGGER_FUNCTION_SOURCE_SHA256: Final[dict[str, str]] = {
     "reject_audit_events_mutation": (
         "5ba2612faea4adf49b92395f87102f166df17b65aa64bf3f42ab5172bf375c5b"
     ),
+}
+
+TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION: Final[dict[str, dict[str, str]]] = {
+    "20260710_0003": TRIGGER_FUNCTION_SOURCE_SHA256,
+    PHASE2_DATABASE_REVISION: TRIGGER_FUNCTION_SOURCE_SHA256,
+    SYNC_RECONCILIATION_DATABASE_REVISION: {
+        **TRIGGER_FUNCTION_SOURCE_SHA256,
+        "reject_pipeline_command_receipts_mutation": (
+            "2a5ebd74102b1adf35afc2bf49d0a2317b867c5f57c7d0080361826f28b97f16"
+        ),
+    },
+}
+
+TRIGGER_FUNCTIONS_BY_REVISION: Final[dict[str, tuple[str, ...]]] = {
+    revision: tuple(sorted(functions))
+    for revision, functions in TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION.items()
 }

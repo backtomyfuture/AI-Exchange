@@ -10,8 +10,14 @@ from src.db.schema_contract import require_database_schema_contract
 
 EXPECTED_DATABASE_REVISION = "20260710_0002"
 PHASE_2_DATABASE_REVISION = "20260713_0004"
+SYNC_RECONCILIATION_DATABASE_REVISION = "20260713_0005"
 RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset(
-    {EXPECTED_DATABASE_REVISION, "20260710_0003", PHASE_2_DATABASE_REVISION}
+    {
+        EXPECTED_DATABASE_REVISION,
+        "20260710_0003",
+        PHASE_2_DATABASE_REVISION,
+        SYNC_RECONCILIATION_DATABASE_REVISION,
+    }
 )
 
 
@@ -66,7 +72,7 @@ async def require_runtime_database(
     if phase_2_enabled and not role_separation_required:
         raise DatabaseRoleError("database_role_preflight_failed")
     allowed = (
-        frozenset({PHASE_2_DATABASE_REVISION})
+        frozenset({SYNC_RECONCILIATION_DATABASE_REVISION})
         if phase_2_enabled
         else RUNTIME_COMPATIBLE_DATABASE_REVISIONS
     )

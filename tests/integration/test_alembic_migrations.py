@@ -158,6 +158,140 @@ def test_empty_database_upgrades_to_head(alembic_runner, empty_schema):
 
 
 @pytest.mark.integration
+def test_0005_failure_rolls_back_every_prior_ddl_to_0004(
+    alembic_runner,
+    empty_schema,
+):
+    alembic_runner.upgrade(empty_schema, "20260713_0004")
+    empty_schema.execute(
+        "CREATE TABLE pipeline_command_receipts (sentinel pg_catalog.int4)"
+    )
+
+    with pytest.raises(DBAPIError):
+        alembic_runner.upgrade(empty_schema, "20260713_0005")
+
+    assert empty_schema.scalar("SELECT version_num FROM alembic_version") == (
+        "20260713_0004"
+    )
+    assert empty_schema.table_exists("pipeline_command_receipts")
+    assert not empty_schema.table_exists("sync_cold_start_plans")
+    assert not empty_schema.table_exists("cold_start_command_receipts")
+    assert not empty_schema.column_exists("sync_cursors", "transient_failures")
+    assert not empty_schema.column_exists("sync_cursors", "cold_start_plan_id")
+    assert not empty_schema.scalar(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM pg_catalog.pg_proc AS routine "
+        "JOIN pg_catalog.pg_namespace AS namespace "
+        "ON namespace.oid = routine.pronamespace "
+        "WHERE namespace.nspname = current_schema() "
+        "AND routine.proname = "
+        "'reject_pipeline_command_receipts_mutation'"
+        ")"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exact_0004_profile_upgrades_directly_to_exact_0005_profile(
+    postgres_database_factory,
+    alembic_runner,
+):
+    from src.db.auditor import require_checkpoint_auditor_database_role
+    from src.db.bootstrap import (
+        _apply_checkpoint_migrations,
+        _apply_database_access_contract,
+    )
+    from src.db.roles import (
+        require_maintenance_database_role,
+        require_migration_database_role,
+        require_runtime_database_role,
+    )
+    from src.db.schema_contract import require_database_schema_contract
+
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260713_0004")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+    await require_database_schema_contract(
+        schema.runtime_dsn,
+        target_schema="public",
+        require_complete=True,
+        expected_revision="20260713_0004",
+    )
+
+    alembic_runner.upgrade(schema, "20260713_0005")
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0005")
+    assert schema.column_exists("sync_cursors", "cold_start_plan_state")
+    assert schema.column_exists(
+        "sync_cold_start_plans",
+        "cursor_binding_plan_id",
+    )
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
+    await require_database_schema_contract(
+        schema.runtime_dsn,
+        target_schema="public",
+        require_complete=True,
+        expected_revision="20260713_0005",
+    )
+    await require_migration_database_role(
+        schema.dsn,
+        **schema.bootstrap_identity,
+    )
+    await require_runtime_database_role(
+        schema.runtime_dsn,
+        **schema.runtime_identity,
+    )
+    await require_maintenance_database_role(
+        schema.maintenance_dsn,
+        **schema.maintenance_identity,
+    )
+    await require_checkpoint_auditor_database_role(
+        schema.auditor_dsn,
+        **schema.runtime_identity,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_mixed_0004_0005_shape_before_any_write(
+    postgres_database_factory,
+    alembic_runner,
+):
+    from src.db.bootstrap import bootstrap_database
+    from src.db.schema_contract import DatabaseSchemaContractError
+
+    schema = postgres_database_factory()
+    alembic_runner.upgrade(schema, "20260713_0004")
+    schema.execute(
+        "ALTER TABLE sync_cursors "
+        "ADD COLUMN transient_failures pg_catalog.int8 NOT NULL DEFAULT 0"
+    )
+
+    with pytest.raises(
+        DatabaseSchemaContractError,
+        match="database_schema_contract_invalid",
+    ):
+        await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
+    assert not schema.table_exists("sync_cold_start_plans")
+    assert not schema.table_exists("checkpoints")
+
+
+@pytest.mark.integration
 def test_baseline_creates_exact_legacy_schema(alembic_runner, empty_schema):
     alembic_runner.upgrade(empty_schema, "20260710_0001")
 
@@ -326,7 +460,7 @@ async def test_bootstrap_reports_the_revision_read_from_the_isolated_database(
     )
     actual_revision = schema.scalar("SELECT version_num FROM alembic_version")
 
-    assert actual_revision == "20260713_0004"
+    assert actual_revision == "20260713_0005"
     assert summary["alembic"] == actual_revision
     assert revision_reader.await_count == 2
 

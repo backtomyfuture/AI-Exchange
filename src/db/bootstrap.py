@@ -16,9 +16,9 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import sql
 
 from src.db.access_contract import (
-    AUDITOR_RELATION_ACCESS,
-    MAINTENANCE_RELATION_ACCESS,
-    RUNTIME_RELATION_ACCESS,
+    AUDITOR_RELATION_ACCESS_BY_REVISION,
+    MAINTENANCE_RELATION_ACCESS_BY_REVISION,
+    RUNTIME_RELATION_ACCESS_BY_REVISION,
     RelationAccess,
 )
 from src.db.migration_settings import load_migration_settings
@@ -312,12 +312,23 @@ async def _apply_database_access_contract(
     runtime_role: str,
     maintenance_role: str,
     auditor_role: str,
+    business_revision: str | None = None,
 ) -> None:
+    selected_revision = business_revision or await get_current_database_revision(dsn)
+    if (
+        selected_revision not in RUNTIME_RELATION_ACCESS_BY_REVISION
+        or selected_revision not in MAINTENANCE_RELATION_ACCESS_BY_REVISION
+        or selected_revision not in AUDITOR_RELATION_ACCESS_BY_REVISION
+    ):
+        raise RuntimeError("Database access contract revision is unavailable")
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
         for role, manifest in (
-            (runtime_role, RUNTIME_RELATION_ACCESS),
-            (maintenance_role, MAINTENANCE_RELATION_ACCESS),
-            (auditor_role, AUDITOR_RELATION_ACCESS),
+            (runtime_role, RUNTIME_RELATION_ACCESS_BY_REVISION[selected_revision]),
+            (
+                maintenance_role,
+                MAINTENANCE_RELATION_ACCESS_BY_REVISION[selected_revision],
+            ),
+            (auditor_role, AUDITOR_RELATION_ACCESS_BY_REVISION[selected_revision]),
         ):
             await _revoke_relation_access(
                 conn,
@@ -576,6 +587,7 @@ async def bootstrap_database(
         "20260710_0002",
         "20260710_0003",
         "20260713_0004",
+        "20260713_0005",
     }
     await require_database_schema_contract(
         dsn,
@@ -612,6 +624,7 @@ async def bootstrap_database(
         runtime_role=expected_runtime_role,
         maintenance_role=expected_maintenance_role,
         auditor_role=expected_auditor_role,
+        business_revision=business_revision,
     )
     await require_database_schema_contract(
         dsn,

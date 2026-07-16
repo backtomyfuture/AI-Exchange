@@ -86,6 +86,7 @@ def test_ingestion_enums_lock_database_vocabulary() -> None:
         "reset_required",
         "cold_start_pending",
         "blocked_contract",
+        "cold_start_applying",
     }
 
 
@@ -548,8 +549,7 @@ def test_sync_batch_preserves_wire_order_for_distinct_identities() -> None:
 
 def test_sync_batch_accepts_exact_global_maximum_of_500_changes() -> None:
     changes = tuple(
-        SyncChange(ChangeKind.CREATE, f"message-{index}", {})
-        for index in range(500)
+        SyncChange(ChangeKind.CREATE, f"message-{index}", {}) for index in range(500)
     )
 
     batch = SyncBatch(

@@ -877,7 +877,9 @@ def test_sync_contract_validator_builds_change_from_transport_mapping() -> None:
     assert validated.item["has_attachments"] is True
 
 
-@pytest.mark.parametrize("external_email_id", ["message\x1f", "message\x7f", "message\x80"])
+@pytest.mark.parametrize(
+    "external_email_id", ["message\x1f", "message\x7f", "message\x80"]
+)
 def test_sync_contract_validator_rejects_c0_c1_transport_identifiers(
     external_email_id: str,
 ) -> None:
@@ -1322,6 +1324,7 @@ def test_sync_rejects_whitespace_normalization_of_opaque_tokens(
         (0, "INBOX", "cursor-1", IngressValidationCode.ACCOUNT_INVALID),
         (2**63, "INBOX", "cursor-1", IngressValidationCode.ACCOUNT_INVALID),
         (8, " ", "cursor-1", IngressValidationCode.FOLDER_INVALID),
+        (8, "INBOX\x01", "cursor-1", IngressValidationCode.FOLDER_INVALID),
         (8, "\ud800", "cursor-1", IngressValidationCode.FOLDER_INVALID),
         (8, "INBOX", " ", IngressValidationCode.CURSOR_INVALID),
         (8, "INBOX", "\ud800", IngressValidationCode.CURSOR_INVALID),

@@ -32,6 +32,13 @@ _ROLE_BOUNDARY = {
 }
 
 
+def test_sync_reconciliation_revision_is_dormant_0005_head() -> None:
+    assert database_schema.SYNC_RECONCILIATION_DATABASE_REVISION == "20260713_0005"
+    assert database_schema.SYNC_RECONCILIATION_DATABASE_REVISION in (
+        database_schema.RUNTIME_COMPATIBLE_DATABASE_REVISIONS
+    )
+
+
 class _RevisionCursor:
     def __init__(self, row):
         self.row = row
@@ -129,7 +136,12 @@ async def test_require_current_database_rejects_missing_or_stale_revision(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "current_revision",
-    ["20260710_0002", "20260710_0003", "20260713_0004"],
+    [
+        "20260710_0002",
+        "20260710_0003",
+        "20260713_0004",
+        "20260713_0005",
+    ],
 )
 async def test_runtime_gate_accepts_compatible_revisions_when_phase2_flags_disabled(
     current_revision,
@@ -166,7 +178,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         ),
         patch(
             "src.db.schema.get_current_database_revision",
-            new=AsyncMock(return_value="20260713_0004"),
+            new=AsyncMock(return_value="20260713_0005"),
         ),
         patch.object(
             database_schema,
@@ -183,7 +195,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
-        expected_revision="20260713_0004",
+        expected_revision="20260713_0005",
     )
 
     with (

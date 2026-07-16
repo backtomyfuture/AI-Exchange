@@ -1,5 +1,21 @@
 """Durable ingestion domain boundary."""
 
+from src.ingestion.cold_start import (
+    ColdStartOriginPort,
+    ColdStartPlanNotFoundError,
+    ColdStartPlanState,
+    ColdStartPlanView,
+    ColdStartRunResult,
+    ColdStartRunStatus,
+    ColdStartSample,
+    ColdStartService,
+    ColdStartStateConflictError,
+)
+from src.ingestion.command_receipts import (
+    CommandReceipt,
+    CommandReceiptRepository,
+    IdempotencyConflict,
+)
 from src.ingestion.email_events import (
     EMAIL_STATUS_TRANSITIONS,
     EmailEventApplication,
@@ -19,6 +35,12 @@ from src.ingestion.ownership import (
     PipelineRetirementBlocked,
     RetirementBlockCode,
     RetirementGuard,
+)
+from src.ingestion.policy import (
+    FolderScope,
+    PolicySnapshot,
+    PolicySnapshotUnavailableError,
+    ProcessingPolicyResolver,
 )
 from src.ingestion.models import (
     ChangeKind,
@@ -41,6 +63,17 @@ from src.ingestion.repository import EmailEventTransaction, InboxRepository
 
 __all__ = [
     "ChangeKind",
+    "ColdStartOriginPort",
+    "ColdStartPlanNotFoundError",
+    "ColdStartPlanState",
+    "ColdStartPlanView",
+    "ColdStartRunResult",
+    "ColdStartRunStatus",
+    "ColdStartSample",
+    "ColdStartService",
+    "ColdStartStateConflictError",
+    "CommandReceipt",
+    "CommandReceiptRepository",
     "EMAIL_STATUS_TRANSITIONS",
     "EmailEventApplication",
     "EmailEventDecision",
@@ -48,6 +81,7 @@ __all__ = [
     "EmailEventReason",
     "EmailEventTransaction",
     "EmailStatus",
+    "FolderScope",
     "InboxDisposition",
     "InboxDispositionStatus",
     "InboxLease",
@@ -56,12 +90,16 @@ __all__ = [
     "InboxStatus",
     "IngressReceipt",
     "IngressSource",
+    "IdempotencyConflict",
     "NormalizedIngressEvent",
     "PipelineGeneration",
     "PipelineGenerationState",
     "PipelineOwnershipRepository",
     "PipelineRetirementBlocked",
+    "PolicySnapshot",
+    "PolicySnapshotUnavailableError",
     "ProcessingPolicy",
+    "ProcessingPolicyResolver",
     "RetirementBlockCode",
     "RetirementGuard",
     "SyncBatch",

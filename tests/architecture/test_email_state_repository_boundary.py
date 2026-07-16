@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import re
 from pathlib import Path
 
@@ -141,6 +142,70 @@ _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES = {
         # The single approved caller-supplied role snapshot query.
         "bcc1067e5aa1d30a2c57375165ce14348c9aeeacf6120797c200adb19c2a3fd8": 1,
     },
+    (
+        "src/ingestion/cold_start.py",
+        "ColdStartService._commit_apply_page",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 plan/Cursor CAS with the frozen RETURNING projection.
+        "1f92743c0a4f73774dbec05979227b97903c3327eb2ba756b2d8b3408d628f25": 1,
+    },
+    (
+        "src/ingestion/cold_start.py",
+        "ColdStartService._approve_plan",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 approval CAS with the frozen RETURNING projection.
+        "28512f06da531290c246cffcee85e457dd90b264c8083e9bc7cda429713f3b3f": 1,
+    },
+    (
+        "src/ingestion/cold_start.py",
+        "ColdStartService._accept_preview",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 first-plan INSERT with the frozen RETURNING projection.
+        "ee486804ee288158a4c33e19a550b99db8197a0b4f5cb8022c3f6ba601bc62ab": 1,
+    },
+    (
+        "src/ingestion/cold_start.py",
+        "ColdStartService._write_cold_start_block",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 blocked-plan CAS with the frozen RETURNING projection.
+        "21e44f71cae4cb7a619342410497d0b0f3a9865cdd8552f67f766f6343acca34": 1,
+    },
+    (
+        "src/ingestion/cold_start.py",
+        "ColdStartService._write_preview_page_from_context",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 preview-page CAS with the frozen RETURNING projection.
+        "31dd2b5c040f2025e7830f476fcd721461dc14e6b6e886b784b6c0ed0789d345": 1,
+    },
+    (
+        "src/ingestion/cold_start.py",
+        "_read_cold_start_plan",
+        "connection.execute",
+    ): {
+        # Reviewed Task-7 locked plan lookup with the frozen SELECT projection.
+        "f6988938abbd60747fc07f113626f6de3e83a08022f053a6a93f3812b476b6ed": 1,
+    },
+    (
+        "src/ingestion/command_receipts.py",
+        "_CommandReceiptTransaction.insert",
+        "self._connection.execute",
+    ): {
+        # Reviewed Task-7 INSERT through the fixed cold-start receipt view.
+        "b65f3762c484dc47122d9932dd8580dd124e0653a0526ef2aae1e1c91fb771b2": 1,
+    },
+    (
+        "src/ingestion/command_receipts.py",
+        "_CommandReceiptTransaction._find",
+        "self._connection.execute",
+    ): {
+        # Reviewed Task-7 lookup through the fixed cold-start receipt view.
+        "f48c0956662d2e52c4ffaf83cdf4bb010bf49a1456419778340ac5de00b60b78": 1,
+    },
 }
 _TRUSTED_DYNAMIC_NON_SQL_CALL_SHAPES = {
     ("src/server.py", "inject_test_email"): {
@@ -167,6 +232,32 @@ _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256 = {
         "de539221ec5f9829fde3f9078127c91b074d1ce4479233982de6414eebb2f2ab"
     ),
 }
+_TASK7_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/db/bootstrap.py": (
+        "f0b78331d0defb8c37921439f3d875992d6bad8baa0a0e84c9aeb3cbbbf3f135"
+    ),
+    "src/db/roles.py": (
+        "20c9c0555184a442ec7cad235d48c3fd7dca36b544b9962cec637e91dc326c23"
+    ),
+    "src/ingestion/cold_start.py": (
+        "399677f46dc6d8d55e5f5b2fdf7f29eaa3a40e1bd1828515687c593999c01e8c"
+    ),
+    "src/ingestion/command_receipts.py": (
+        "7c518629be32d2de2bb212d60733374c9c899262f370f06805681bed4ae23b67"
+    ),
+    "src/ingestion/models.py": (
+        "c11f6c40c7dec34f883a79b32ec5d2b77323e788452d3d106c8798d57d28c650"
+    ),
+    "src/ingestion/repository.py": (
+        "8afdb29b8e6f41e929971e0ebf6eedeb3e7c0fc242851a9e66186eb2adca5392"
+    ),
+}
+_TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/ingestion/models.py",
+        "src/ingestion/repository.py",
+    }
+)
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -174,12 +265,14 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "src/db/auditor.py": (
         "3db5f148a405402f21ca61fa3e465f7453cda8f99b7ed36986d2e2fb8903fde9"
     ),
-    "src/db/bootstrap.py": (
-        "b9cf227f8e83b1f399c2bd778fe2a23fd324a36b76a8d78a994dfd0c9852a139"
-    ),
-    "src/db/roles.py": (
-        "7267adc2b261905ee3fbd92ed377a546ccaec9a088f14af8b473e9411b686521"
-    ),
+    "src/db/bootstrap.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256["src/db/bootstrap.py"],
+    "src/db/roles.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256["src/db/roles.py"],
+    "src/ingestion/cold_start.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256[
+        "src/ingestion/cold_start.py"
+    ],
+    "src/ingestion/command_receipts.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256[
+        "src/ingestion/command_receipts.py"
+    ],
 }
 _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/manual_exchange_test.py": (
@@ -264,9 +357,18 @@ def _project_relative_path(filename: str) -> str | None:
         return None
 
 
+_AST_DUMP_SUPPORTS_SHOW_EMPTY = "show_empty" in inspect.signature(ast.dump).parameters
+
+
+def _normalized_ast_dump(node: ast.AST) -> str:
+    if _AST_DUMP_SUPPORTS_SHOW_EMPTY:
+        return ast.dump(node, include_attributes=False, **{"show_empty": True})
+    return ast.dump(node, include_attributes=False)
+
+
 def _normalized_file_ast_sha256(path: Path) -> str:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    normalized = ast.dump(tree, include_attributes=False)
+    normalized = _normalized_ast_dump(tree)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -282,9 +384,7 @@ def _trusted_dynamic_execution_matches(
     if normalized is None or call_path is None or query is None:
         return False
     policy_key = (normalized, owner, call_path)
-    shape = hashlib.sha256(
-        ast.dump(query, include_attributes=False).encode("utf-8")
-    ).hexdigest()
+    shape = hashlib.sha256(_normalized_ast_dump(query).encode("utf-8")).hexdigest()
     maximum = _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES.get(policy_key, {}).get(shape)
     if maximum is None:
         return False
@@ -313,9 +413,7 @@ def _trusted_dynamic_non_sql_call_matches(
     if normalized is None:
         return False
     policy_key = (normalized, owner)
-    shape = hashlib.sha256(
-        ast.dump(call, include_attributes=False).encode("utf-8")
-    ).hexdigest()
+    shape = hashlib.sha256(_normalized_ast_dump(call).encode("utf-8")).hexdigest()
     maximum = _TRUSTED_DYNAMIC_NON_SQL_CALL_SHAPES.get(policy_key, {}).get(shape)
     if maximum is None:
         return False
@@ -1766,17 +1864,55 @@ def test_email_mutations_are_owned_only_by_the_ingestion_repository() -> None:
     )
 
 
+def test_normalized_ast_dump_keeps_empty_fields_across_python_versions() -> None:
+    normalized = _normalized_ast_dump(
+        ast.parse("def reviewed():\n    return boundary()\n")
+    )
+
+    assert "type_ignores=[]" in normalized
+    assert "args=[]" in normalized
+    assert "keywords=[]" in normalized
+    assert "decorator_list=[]" in normalized
+    assert "type_params=[]" in normalized
+
+
 def test_task5_repository_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    assert _TASK7_TASK5_SUCCESSOR_PATHS == {
+        "src/ingestion/models.py",
+        "src/ingestion/repository.py",
+    }
+    assert _TASK7_TASK5_SUCCESSOR_PATHS <= set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256)
+    historical_paths = (
+        set(_TASK5_REPOSITORY_STRUCTURAL_AST_SHA256) - _TASK7_TASK5_SUCCESSOR_PATHS
+    )
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
+    }
+
+    assert actual == expected, (
+        "Task-5 repository structural review required before changing a path that "
+        "has no explicit reviewed successor: "
+        f"expected {expected}, got {actual}"
+    )
+
+
+def test_task7_reviewed_structural_ast_requires_explicit_review() -> None:
     project_root = Path(__file__).resolve().parents[2]
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256
+        for relative in _TASK7_REVIEWED_STRUCTURAL_AST_SHA256
     }
 
-    assert actual == _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256, (
-        "Task-5 repository structural review required before updating the approved "
-        f"normalized AST SHA-256: expected "
-        f"{_TASK5_REPOSITORY_STRUCTURAL_AST_SHA256}, got {actual}"
+    assert actual == _TASK7_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Task-7 structural review required before updating its normalized AST "
+        f"SHA-256 ratchet: expected {_TASK7_REVIEWED_STRUCTURAL_AST_SHA256}, "
+        f"got {actual}"
     )
 
 

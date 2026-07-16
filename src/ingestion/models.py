@@ -72,6 +72,7 @@ class SyncCursorStatus(StrEnum):
     RESET_REQUIRED = "reset_required"
     COLD_START_PENDING = "cold_start_pending"
     BLOCKED_CONTRACT = "blocked_contract"
+    COLD_START_APPLYING = "cold_start_applying"
 
 
 _EnumT = TypeVar("_EnumT", bound=StrEnum)
@@ -461,10 +462,7 @@ class SyncBatch:
             )
         if any(type(change) is not SyncChange for change in changes):
             raise ValueError("changes must contain only SyncChange values")
-        identities = [
-            (change.kind, change.external_email_id)
-            for change in changes
-        ]
+        identities = [(change.kind, change.external_email_id) for change in changes]
         if len(identities) != len(set(identities)):
             raise ValueError("changes must not contain duplicate page identities")
         object.__setattr__(self, "changes", changes)

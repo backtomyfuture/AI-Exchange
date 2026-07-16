@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from src.domain.errors import IngressValidationCode, IngressValidationError
+from src.ingestion.folder_identity import canonicalize_folder_identity
 from src.ingestion.models import (
     ChangeKind,
     IngressSource,
@@ -27,27 +28,6 @@ _EVENT_KINDS: Final = {
     "CreatedEvent": ChangeKind.CREATE,
     "ModifiedEvent": ChangeKind.UPDATE,
     "DeletedEvent": ChangeKind.DELETE,
-}
-_STANDARD_FOLDER_CANONICAL: Final = {
-    "archive": "ARCHIVE",
-    "deleted": "TRASH",
-    "deleted items": "TRASH",
-    "deleteditems": "TRASH",
-    "draft": "DRAFTS",
-    "drafts": "DRAFTS",
-    "inbox": "INBOX",
-    "junk": "JUNK",
-    "junk email": "JUNK",
-    "junkemail": "JUNK",
-    "outbox": "OUTBOX",
-    "sent": "SENT",
-    "sent items": "SENT",
-    "sentitems": "SENT",
-    "spam": "JUNK",
-    "trash": "TRASH",
-    "已发送": "SENT",
-    "已发送邮件": "SENT",
-    "草稿": "DRAFTS",
 }
 _SUPPORTED_SYNC_KINDS: Final = frozenset(
     {ChangeKind.CREATE, ChangeKind.UPDATE, ChangeKind.DELETE}
@@ -234,8 +214,10 @@ def _normalize_folder(value: object) -> str:
         code=IngressValidationCode.FOLDER_INVALID,
         max_length=512,
     )
-    lookup = folder.lower() if folder.isascii() else folder
-    return _STANDARD_FOLDER_CANONICAL.get(lookup, folder)
+    try:
+        return canonicalize_folder_identity(folder)
+    except ValueError:
+        raise IngressValidationError(IngressValidationCode.FOLDER_INVALID) from None
 
 
 def _require_exact_text(

@@ -36,10 +36,16 @@ DURABLE_TABLES = {
     "pipeline_shadow_comparisons",
     "sync_cursors",
 }
+SYNC_CONTROL_TABLES = {
+    "pipeline_command_receipts",
+    "sync_cold_start_plans",
+}
+CURRENT_DURABLE_TABLES = DURABLE_TABLES | SYNC_CONTROL_TABLES
 
-EXPECTED_RELATIONS = DURABLE_TABLES | {
+EXPECTED_RELATIONS = CURRENT_DURABLE_TABLES | {
     "alembic_version",
     "app_kv_store",
+    "cold_start_command_receipts",
     "emails_log",
     "processed_emails",
 }
@@ -50,13 +56,16 @@ EXPECTED_RELATION_KINDS = {
     "alembic_version": "r",
     "app_kv_store": "r",
     "audit_events": "r",
+    "cold_start_command_receipts": "v",
     "emails": "r",
     "emails_log": "r",
     "event_inbox": "r",
     "pipeline_ownership": "r",
+    "pipeline_command_receipts": "r",
     "pipeline_shadow_comparisons": "r",
     "processed_emails": "v",
     "sync_cursors": "r",
+    "sync_cold_start_plans": "r",
 }
 EXPECTED_RELATION_CONTRACTS = {
     name: (
@@ -116,6 +125,10 @@ EXPECTED_COLUMN_TYPES = {
     "sync_cursors.version": "int8",
     "sync_cursors.last_success_at": "timestamptz",
     "sync_cursors.last_attempt_at": "timestamptz",
+    "sync_cursors.transient_failures": "int8",
+    "sync_cursors.retry_after_at": "timestamptz",
+    "sync_cursors.cold_start_plan_id": "uuid",
+    "sync_cursors.cold_start_plan_state": "text",
     "sync_cursors.created_at": "timestamptz",
     "sync_cursors.updated_at": "timestamptz",
     "emails.id": "uuid",
@@ -170,6 +183,53 @@ EXPECTED_COLUMN_TYPES = {
     "pipeline_shadow_comparisons.safe_metadata": "jsonb",
     "pipeline_shadow_comparisons.created_at": "timestamptz",
     "pipeline_shadow_comparisons.updated_at": "timestamptz",
+    "sync_cold_start_plans.plan_id": "uuid",
+    "sync_cold_start_plans.account_id": "int8",
+    "sync_cold_start_plans.folder_key": "text",
+    "sync_cold_start_plans.expected_cursor_status": "text",
+    "sync_cold_start_plans.expected_cursor": "text",
+    "sync_cold_start_plans.expected_cursor_version": "int8",
+    "sync_cold_start_plans.pipeline_name": "text",
+    "sync_cold_start_plans.generation": "int8",
+    "sync_cold_start_plans.fencing_token": "int8",
+    "sync_cold_start_plans.state": "text",
+    "sync_cold_start_plans.version": "int8",
+    "sync_cold_start_plans.preview_cursor": "text",
+    "sync_cold_start_plans.preview_cursor_version": "int8",
+    "sync_cold_start_plans.boundary_cursor": "text",
+    "sync_cold_start_plans.boundary_cursor_version": "int8",
+    "sync_cold_start_plans.apply_cursor": "text",
+    "sync_cold_start_plans.apply_cursor_version": "int8",
+    "sync_cold_start_plans.cursor_binding_plan_id": "uuid",
+    "sync_cold_start_plans.rolling_hash": "bpchar",
+    "sync_cold_start_plans.page_count": "int8",
+    "sync_cold_start_plans.item_count": "int8",
+    "sync_cold_start_plans.redacted_samples": "jsonb",
+    "sync_cold_start_plans.contract_fingerprint": "bpchar",
+    "sync_cold_start_plans.folder_scope_config_hash": "bpchar",
+    "sync_cold_start_plans.plan_hash": "bpchar",
+    "sync_cold_start_plans.actor": "text",
+    "sync_cold_start_plans.reason": "text",
+    "sync_cold_start_plans.blocked_reason_code": "text",
+    "sync_cold_start_plans.blocked_fingerprint": "bpchar",
+    "sync_cold_start_plans.expires_at": "timestamptz",
+    "sync_cold_start_plans.ready_at": "timestamptz",
+    "sync_cold_start_plans.approved_at": "timestamptz",
+    "sync_cold_start_plans.completed_at": "timestamptz",
+    "sync_cold_start_plans.blocked_at": "timestamptz",
+    "sync_cold_start_plans.created_at": "timestamptz",
+    "sync_cold_start_plans.updated_at": "timestamptz",
+    "pipeline_command_receipts.id": "uuid",
+    "pipeline_command_receipts.account_id": "int8",
+    "pipeline_command_receipts.command_name": "text",
+    "pipeline_command_receipts.idempotency_key_hash": "bpchar",
+    "pipeline_command_receipts.canonical_payload_hash": "bpchar",
+    "pipeline_command_receipts.outcome": "text",
+    "pipeline_command_receipts.result_type": "text",
+    "pipeline_command_receipts.result_id": "text",
+    "pipeline_command_receipts.result_hash": "bpchar",
+    "pipeline_command_receipts.authority_epoch": "int8",
+    "pipeline_command_receipts.created_at": "timestamptz",
 }
 
 NULLABLE_COLUMNS = {
@@ -188,6 +248,9 @@ NULLABLE_COLUMNS = {
     "sync_cursors.blocked_at",
     "sync_cursors.last_success_at",
     "sync_cursors.last_attempt_at",
+    "sync_cursors.retry_after_at",
+    "sync_cursors.cold_start_plan_id",
+    "sync_cursors.cold_start_plan_state",
     "emails.processing_inbox_id",
     "emails.create_seen_at",
     "emails.processing_started_at",
@@ -203,6 +266,21 @@ NULLABLE_COLUMNS = {
     "pipeline_shadow_comparisons.legacy_failure_code",
     "pipeline_shadow_comparisons.shadow_decision_hash",
     "pipeline_shadow_comparisons.shadow_failure_code",
+    "sync_cold_start_plans.expected_cursor",
+    "sync_cold_start_plans.preview_cursor",
+    "sync_cold_start_plans.boundary_cursor",
+    "sync_cold_start_plans.boundary_cursor_version",
+    "sync_cold_start_plans.apply_cursor",
+    "sync_cold_start_plans.apply_cursor_version",
+    "sync_cold_start_plans.cursor_binding_plan_id",
+    "sync_cold_start_plans.rolling_hash",
+    "sync_cold_start_plans.plan_hash",
+    "sync_cold_start_plans.blocked_reason_code",
+    "sync_cold_start_plans.blocked_fingerprint",
+    "sync_cold_start_plans.ready_at",
+    "sync_cold_start_plans.approved_at",
+    "sync_cold_start_plans.completed_at",
+    "sync_cold_start_plans.blocked_at",
 }
 
 DEFAULTED_COLUMNS = {
@@ -216,6 +294,7 @@ DEFAULTED_COLUMNS = {
     "sync_cursors.version",
     "sync_cursors.created_at",
     "sync_cursors.updated_at",
+    "sync_cursors.transient_failures",
     "emails.version",
     "emails.is_read_refresh_required",
     "emails.created_at",
@@ -225,6 +304,15 @@ DEFAULTED_COLUMNS = {
     "pipeline_shadow_comparisons.safe_metadata",
     "pipeline_shadow_comparisons.created_at",
     "pipeline_shadow_comparisons.updated_at",
+    "sync_cold_start_plans.version",
+    "sync_cold_start_plans.preview_cursor_version",
+    "sync_cold_start_plans.page_count",
+    "sync_cold_start_plans.item_count",
+    "sync_cold_start_plans.redacted_samples",
+    "sync_cold_start_plans.created_at",
+    "sync_cold_start_plans.updated_at",
+    "sync_cold_start_plans.cursor_binding_plan_id",
+    "pipeline_command_receipts.created_at",
 }
 
 EXPECTED_PHASE2_DEFAULTS = {
@@ -244,7 +332,23 @@ EXPECTED_PHASE2_DEFAULTS = {
     ("pipeline_shadow_comparisons", "created_at"): "CURRENT_TIMESTAMP",
     ("pipeline_shadow_comparisons", "safe_metadata"): "'{}'::jsonb",
     ("pipeline_shadow_comparisons", "updated_at"): "CURRENT_TIMESTAMP",
+    ("pipeline_command_receipts", "created_at"): "CURRENT_TIMESTAMP",
+    ("sync_cold_start_plans", "created_at"): "CURRENT_TIMESTAMP",
+    ("sync_cold_start_plans", "cursor_binding_plan_id"): (
+        "\nCASE\n"
+        "    WHEN state = 'approved'::text AND apply_cursor IS NOT NULL "
+        "AND apply_cursor_version IS NOT NULL THEN plan_id\n"
+        "    ELSE NULL::uuid\n"
+        "END"
+    ),
+    ("sync_cold_start_plans", "item_count"): "0",
+    ("sync_cold_start_plans", "page_count"): "0",
+    ("sync_cold_start_plans", "preview_cursor_version"): "0",
+    ("sync_cold_start_plans", "redacted_samples"): "'[]'::jsonb",
+    ("sync_cold_start_plans", "updated_at"): "CURRENT_TIMESTAMP",
+    ("sync_cold_start_plans", "version"): "0",
     ("sync_cursors", "created_at"): "CURRENT_TIMESTAMP",
+    ("sync_cursors", "transient_failures"): "0",
     ("sync_cursors", "updated_at"): "CURRENT_TIMESTAMP",
     ("sync_cursors", "version"): "0",
 }
@@ -413,13 +517,82 @@ EXPECTED_PHASE2_CHECKS = {
         "e1809a680586dfe440e9df1a6b79dca29df570b85a472e7bc5804ddf0abc0839"
     ),
     ("sync_cursors", "ck_sync_cursors_state_matrix"): (
-        "d03deda2282b8a0c6dd3813340cd04416b6721192097fcc2274b396ede99b387"
+        "014b54cd0be647f224e1cd88f077648471ae1fc27f753919eb6f3701b12d9e24"
     ),
     ("sync_cursors", "ck_sync_cursors_status"): (
-        "da64e450250826bd6c8f5703ac95682b45bc5d45dbb1da89745a2b48a24278b6"
+        "8dc20405aefb36a48f6c66633c4288494de00d53fe0bca736196ed8776053742"
     ),
     ("sync_cursors", "ck_sync_cursors_version"): (
         "13b6703b3832f8093fcd588c3f98b34dab1891a6f3c8033c72f8f246941a6998"
+    ),
+    ("sync_cursors", "ck_sync_cursors_plan_binding"): (
+        "0170ce730371779dcd870254702aa219eb3674d4a93e48dd0324a8a7a1ae6274"
+    ),
+    ("sync_cursors", "ck_sync_cursors_retry"): (
+        "22253a06d7542d0243a0059b94220ce1e8c7ddd88e95d16227c5c5724d58735d"
+    ),
+    ("sync_cursors", "ck_sync_cursors_transient_failures"): (
+        "77ef5160b8bc845bf7a092e61bb68898c1fa71c1745f7724946dbcfad0e0db22"
+    ),
+    ("pipeline_command_receipts", "ck_pipeline_command_receipts_account"): (
+        "25341c3ce11ea0a3cda1fb848bf14cc227abc891a221df7e6c0d094f11f14124"
+    ),
+    (
+        "pipeline_command_receipts",
+        "ck_pipeline_command_receipts_authority_epoch",
+    ): "d42138ae3aaf50c15e446c5c4ad962e65a6969bf643871b818855908f5f27c0c",
+    (
+        "pipeline_command_receipts",
+        "ck_pipeline_command_receipts_command_name",
+    ): "932648b521410d05bce12997387e4d301ea23f8f71d758f6e26c1b805f39bbca",
+    ("pipeline_command_receipts", "ck_pipeline_command_receipts_hashes"): (
+        "58797557ba965ff3fcb7b305317f649f9e06101043145cfd57ec887bcc60db2e"
+    ),
+    ("pipeline_command_receipts", "ck_pipeline_command_receipts_outcome"): (
+        "81e16f1ec1ab1573e19f67503718f9d03e4460c38ca80758acc437919c6d338d"
+    ),
+    ("pipeline_command_receipts", "ck_pipeline_command_receipts_result"): (
+        "4a67dd7bc60851165175c7aa41454ae6ed17e0e198530af1ec639135578306b2"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_blocked_reason"): (
+        "e1809a680586dfe440e9df1a6b79dca29df570b85a472e7bc5804ddf0abc0839"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_counts"): (
+        "29c7e8324ea5c879d0763f40ee717e3354efd1c4b63aeb38fddc144753b58355"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_cursors"): (
+        "48f9d0fe4594045b5d96e12ee51e70582a95054ab0032d9a33de75000fb4723f"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_expected_cursor"): (
+        "68deb84441caaf17ca54758f32c96e1d1e2908e0c8bd3e150a2df6be4ded94b1"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_folder_key"): (
+        "2b226c8f6fea8ce4c93e8ebc0005964a00f4df08cdebcd11b3bc96d247d08629"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_hashes"): (
+        "50c8c34d0a563d21b22802ee011b8c84b7a5631d5c89e7a1823492044712d4dc"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_operator"): (
+        "b5b8600fa9d4622182db78be598537d41662ea6682bb0e29aa24aff92c8b0c4e"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_pipeline_name"): (
+        "6505916d0a680d292a459d1072069232644bb16413f7d4b249c2fde926109d1f"
+    ),
+    (
+        "sync_cold_start_plans",
+        "ck_sync_cold_start_plans_positive_identity",
+    ): "e5e43f686cf6aca5560d22d5bfa18bd0e5cba8341a5f26e09eff5a37b6bba9c6",
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_samples"): (
+        "47a10b8a376047a101cd29e7f926c14ba517601cd784dc3ef9843583a0aa5ad2"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_state"): (
+        "7f6bec2f50be67ffe098ce5ff49c29101d0d3b1be43826e5a305a2c9072179cd"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_state_matrix"): (
+        "a84f7de95804cfc2c7f0d2cb06145951f654c7dcbee46aedfebdc6ac08665ecb"
+    ),
+    ("sync_cold_start_plans", "ck_sync_cold_start_plans_versions"): (
+        "a846d31aba0c59e9c2984f58560fcc226b0f17c4d6140f5979ecf7d07e2448c3"
     ),
 }
 
@@ -554,6 +727,74 @@ EXPECTED_PHASE2_UNIQUE_INDEXES = {
         "p",
         ("account_id", "folder_key"),
     ),
+    _expected_unique_index(
+        "sync_cursors",
+        "uq_sync_cursors_cold_start_binding",
+        "u",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+    ),
+    _expected_unique_index(
+        "sync_cursors",
+        "uq_sync_cursors_cold_start_plan",
+        None,
+        ("cold_start_plan_id",),
+        predicate_sha256=(
+            "e971963bd734284263889850d56c3e4a1e3f1748509f63b8ffc0fea5c7a67d9a"
+        ),
+    ),
+    _expected_unique_index(
+        "pipeline_command_receipts",
+        "pk_pipeline_command_receipts",
+        "p",
+        ("id",),
+    ),
+    _expected_unique_index(
+        "pipeline_command_receipts",
+        "uq_pipeline_command_receipts_identity",
+        "u",
+        ("account_id", "command_name", "idempotency_key_hash"),
+    ),
+    _expected_unique_index(
+        "sync_cold_start_plans",
+        "pk_sync_cold_start_plans",
+        "p",
+        ("plan_id",),
+    ),
+    _expected_unique_index(
+        "sync_cold_start_plans",
+        "uq_sync_cold_start_plan_identity",
+        "u",
+        ("plan_id", "account_id", "folder_key"),
+    ),
+    _expected_unique_index(
+        "sync_cold_start_plans",
+        "uq_sync_cold_start_plan_apply_binding",
+        "u",
+        (
+            "plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+    ),
+    _expected_unique_index(
+        "sync_cold_start_plans",
+        "uq_sync_cold_start_open_plan",
+        None,
+        ("account_id", "folder_key"),
+        predicate_sha256=(
+            "4499fc6ca5e6a33cd2dab332bd299c9a30d9f65ebf92c5634832dbb34076acad"
+        ),
+    ),
 }
 
 
@@ -647,6 +888,29 @@ EXPECTED_PHASE2_NONCONSTRAINT_INDEXES = {
         "ix_sync_cursors_status_attempt",
         ("status", "last_attempt_at"),
     ),
+    _expected_nonconstraint_index(
+        "sync_cold_start_plans",
+        "ix_sync_cold_start_plans_state_expiry",
+        ("state", "expires_at", "plan_id"),
+    ),
+    _expected_nonconstraint_index(
+        "sync_cold_start_plans",
+        "uq_sync_cold_start_open_plan",
+        ("account_id", "folder_key"),
+        predicate_sha256=(
+            "4499fc6ca5e6a33cd2dab332bd299c9a30d9f65ebf92c5634832dbb34076acad"
+        ),
+        unique=True,
+    ),
+    _expected_nonconstraint_index(
+        "sync_cursors",
+        "uq_sync_cursors_cold_start_plan",
+        ("cold_start_plan_id",),
+        predicate_sha256=(
+            "e971963bd734284263889850d56c3e4a1e3f1748509f63b8ffc0fea5c7a67d9a"
+        ),
+        unique=True,
+    ),
 }
 
 EXPECTED_TRIGGER_FUNCTION_SHA256 = {
@@ -664,6 +928,9 @@ EXPECTED_TRIGGER_FUNCTION_SHA256 = {
     ),
     "reject_audit_events_mutation": (
         "5ba2612faea4adf49b92395f87102f166df17b65aa64bf3f42ab5172bf375c5b"
+    ),
+    "reject_pipeline_command_receipts_mutation": (
+        "2a5ebd74102b1adf35afc2bf49d0a2317b867c5f57c7d0080361826f28b97f16"
     ),
 }
 
@@ -739,6 +1006,73 @@ EXPECTED_FOREIGN_KEYS = {
         False,
         True,
     ),
+    (
+        "fk_sync_cold_start_plan_ownership",
+        "sync_cold_start_plans",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "pipeline_ownership",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "f",
+        "r",
+        "r",
+        False,
+        False,
+        True,
+    ),
+    (
+        "fk_sync_cursors_cold_start_plan",
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "sync_cold_start_plans",
+        (
+            "plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "s",
+        "a",
+        "r",
+        True,
+        True,
+        True,
+    ),
+    (
+        "fk_sync_cold_start_plan_active_cursor",
+        "sync_cold_start_plans",
+        (
+            "cursor_binding_plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "s",
+        "a",
+        "r",
+        True,
+        True,
+        True,
+    ),
 }
 
 EXPECTED_USER_TRIGGERS = {
@@ -802,6 +1136,22 @@ EXPECTED_USER_TRIGGERS = {
         "trg_pipeline_shadow_guard_truncate",
         "pipeline_shadow_comparisons",
         "guard_pipeline_shadow_comparison",
+        34,
+        False,
+        "O",
+    ),
+    (
+        "trg_pipeline_command_receipts_guard_row",
+        "pipeline_command_receipts",
+        "reject_pipeline_command_receipts_mutation",
+        27,
+        False,
+        "O",
+    ),
+    (
+        "trg_pipeline_command_receipts_guard_truncate",
+        "pipeline_command_receipts",
+        "reject_pipeline_command_receipts_mutation",
         34,
         False,
         "O",
@@ -890,7 +1240,7 @@ def _insert_inbox(
 
 @pytest.mark.integration
 def test_durable_ingestion_head_creates_exact_relation_set(db):
-    assert db.scalar("SELECT version_num FROM alembic_version") == "20260713_0004"
+    assert db.scalar("SELECT version_num FROM alembic_version") == "20260713_0005"
     relations = set(
         db.scalar(
             "SELECT COALESCE("
@@ -908,7 +1258,7 @@ def test_durable_ingestion_head_creates_exact_relation_set(db):
 
 @pytest.mark.integration
 def test_phase2_schema_matches_test_owned_exact_manifest(db):
-    phase2_relations = sorted(DURABLE_TABLES)
+    phase2_relations = sorted(CURRENT_DURABLE_TABLES)
     with psycopg.connect(db.dsn, autocommit=True) as conn:
         relation_contracts = {
             relation_name: (
@@ -1218,6 +1568,30 @@ def test_phase2_schema_matches_test_owned_exact_manifest(db):
 
 
 @pytest.mark.integration
+def test_0005_receipt_view_matches_test_owned_exact_definition(db):
+    with psycopg.connect(db.dsn, autocommit=True) as connection:
+        connection.execute("SET search_path TO pg_catalog")
+        row = connection.execute(
+            "SELECT pg_catalog.jsonb_build_array("
+            "relation.relkind::pg_catalog.text, "
+            "pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to("
+            "pg_catalog.pg_get_viewdef(relation.oid, false), 'UTF8')), 'hex'), "
+            "COALESCE(relation.reloptions, ARRAY[]::pg_catalog.text[])) "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS relation_schema "
+            "ON relation_schema.oid = relation.relnamespace "
+            "WHERE relation_schema.nspname = 'public' "
+            "AND relation.relname = 'cold_start_command_receipts'"
+        ).fetchone()[0]
+
+    assert row == [
+        "v",
+        "66461da92b70d58eaa079c2850896a42d920a4fbe7b78e0cb43474470f938b26",
+        ["check_option=cascaded"],
+    ]
+
+
+@pytest.mark.integration
 def test_0002_to_0003_is_expand_only_and_leaves_all_new_tables_empty(
     postgres_database_factory,
     alembic_runner,
@@ -1379,7 +1753,7 @@ async def test_real_0003_keeps_its_exact_schema_contract(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_current_code_bridges_exact_0003_to_0004_with_all_gates(
+async def test_current_code_bridges_exact_0003_to_0005_with_all_gates(
     postgres_database_factory,
     alembic_runner,
 ):
@@ -1410,11 +1784,19 @@ async def test_current_code_bridges_exact_0003_to_0004_with_all_gates(
 
     summary = await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert summary["alembic"] == "20260713_0004"
-    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
+    assert summary["alembic"] == "20260713_0005"
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0005")
     await require_runtime_database(
         schema.runtime_dsn,
         **flags_off,
+        role_separation_required=True,
+        **schema.runtime_identity,
+    )
+    await require_runtime_database(
+        schema.runtime_dsn,
+        durable_inbox_enabled=True,
+        ingestion_shadow_enabled=False,
+        sync_reconciliation_enabled=False,
         role_separation_required=True,
         **schema.runtime_identity,
     )
@@ -1422,7 +1804,7 @@ async def test_current_code_bridges_exact_0003_to_0004_with_all_gates(
         schema.runtime_dsn,
         target_schema="public",
         require_complete=True,
-        expected_revision="20260713_0004",
+        expected_revision="20260713_0005",
     )
     await require_migration_database_role(
         schema.dsn,
@@ -1613,7 +1995,7 @@ def test_durable_column_type_nullability_and_default_manifest_is_exact(db):
         "WHERE relation_schema.nspname = pg_catalog.current_schema() "
         "AND relation.relname = ANY(%s::pg_catalog.text[]) "
         "AND attribute.attnum > 0 AND NOT attribute.attisdropped",
-        (sorted(DURABLE_TABLES),),
+        (sorted(CURRENT_DURABLE_TABLES),),
     )
     assert set(rows) == set(EXPECTED_COLUMN_TYPES)
     for column, expected_type in EXPECTED_COLUMN_TYPES.items():
@@ -1623,7 +2005,10 @@ def test_durable_column_type_nullability_and_default_manifest_is_exact(db):
         assert metadata["nullable"] is (column in NULLABLE_COLUMNS)
         assert metadata["has_default"] is (column in DEFAULTED_COLUMNS)
         assert metadata["identity"] == ""
-        assert metadata["generated"] == ""
+        expected_generated = (
+            "s" if column == "sync_cold_start_plans.cursor_binding_plan_id" else ""
+        )
+        assert metadata["generated"] == expected_generated
         assert metadata["uses_type_collation"] is True
         assert metadata["uses_type_storage"] is True
         assert metadata["compression"] == ""
@@ -2099,14 +2484,14 @@ def test_shadow_identity_and_decisions_are_immutable(db):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_fresh_bootstrap_reaches_0004_and_passes_both_role_gates(
+async def test_fresh_bootstrap_reaches_0005_and_passes_all_role_gates(
     postgres_database_factory,
 ):
     schema = postgres_database_factory()
 
     summary = await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
 
-    assert summary["alembic"] == "20260713_0004"
+    assert summary["alembic"] == "20260713_0005"
     await require_migration_database_role(
         schema.dsn,
         **schema.bootstrap_identity,
@@ -2123,7 +2508,7 @@ async def test_fresh_bootstrap_reaches_0004_and_passes_both_role_gates(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_bootstrap_recovers_after_0004_commits_before_acl_reconciliation(
+async def test_bootstrap_recovers_after_0005_commits_before_acl_reconciliation(
     postgres_database_factory,
     monkeypatch,
 ):
@@ -2145,7 +2530,7 @@ async def test_bootstrap_recovers_after_0004_commits_before_acl_reconciliation(
             schema.dsn,
             **schema.bootstrap_identity,
         )
-    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0004")
+    assert schema.scalar("SELECT version_num FROM alembic_version") == ("20260713_0005")
     assert not schema.table_exists("checkpoints")
 
     monkeypatch.setattr(
@@ -2158,7 +2543,7 @@ async def test_bootstrap_recovers_after_0004_commits_before_acl_reconciliation(
         **schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260713_0004"
+    assert summary["alembic"] == "20260713_0005"
     await require_runtime_database_role(
         schema.runtime_dsn,
         **schema.runtime_identity,
@@ -2331,7 +2716,7 @@ async def test_schema_contract_rejects_phase2_constraint_index_or_default_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260713_0004",
+            expected_revision="20260713_0005",
         )
 
 
@@ -2366,7 +2751,7 @@ async def test_schema_contract_rejects_same_key_unique_physical_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260713_0004",
+            expected_revision="20260713_0005",
         )
 
 
@@ -2374,9 +2759,18 @@ async def test_schema_contract_rejects_same_key_unique_physical_drift(
 @pytest.mark.asyncio
 async def test_fresh_0004_passes_runtime_schema_contract(
     postgres_database_factory,
+    alembic_runner,
 ):
     schema = postgres_database_factory()
-    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
+    alembic_runner.upgrade(schema, "20260713_0004")
+    await _apply_checkpoint_migrations(schema.dsn, "public")
+    await _apply_database_access_contract(
+        schema.dsn,
+        target_schema="public",
+        runtime_role=schema.runtime_role,
+        maintenance_role=schema.maintenance_role,
+        auditor_role=schema.auditor_role,
+    )
 
     await require_database_schema_contract(
         schema.runtime_dsn,
@@ -2407,7 +2801,7 @@ async def test_schema_contract_rejects_unexpected_exclusion_constraint(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260713_0004",
+            expected_revision="20260713_0005",
         )
 
 
@@ -2438,7 +2832,7 @@ async def test_schema_contract_rejects_phase2_relation_security_or_durability_dr
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260713_0004",
+            expected_revision="20260713_0005",
         )
 
 
@@ -2479,7 +2873,7 @@ async def test_schema_contract_rejects_phase2_column_catalog_drift(
             schema.runtime_dsn,
             target_schema="public",
             require_complete=True,
-            expected_revision="20260713_0004",
+            expected_revision="20260713_0005",
         )
 
 
