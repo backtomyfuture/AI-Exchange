@@ -37,18 +37,17 @@ def test_identifier_fingerprint_is_stable_namespaced_and_single_line():
 def test_safe_log_metadata_allows_only_bounded_explicit_values():
     from src.security import redaction
 
-    allowed = {"accepted", "queue_full"}
+    allowed = {"accepted", "unavailable"}
 
+    assert redaction.safe_log_metadata("accepted", allowed_values=allowed) == "accepted"
     assert (
-        redaction.safe_log_metadata("accepted", allowed_values=allowed)
-        == "accepted"
+        redaction.safe_log_metadata("private-reason", allowed_values=allowed) == "other"
     )
-    assert redaction.safe_log_metadata("private-reason", allowed_values=allowed) == "other"
-    assert redaction.safe_log_metadata("accepted\nsecret", allowed_values=allowed) == "other"
     assert (
-        redaction.safe_log_metadata("x" * 80, allowed_values={"x" * 80})
+        redaction.safe_log_metadata("accepted\nsecret", allowed_values=allowed)
         == "other"
     )
+    assert redaction.safe_log_metadata("x" * 80, allowed_values={"x" * 80}) == "other"
 
 
 def test_security_logging_hardens_url_bearing_third_party_loggers():
@@ -137,7 +136,10 @@ def test_exception_type_never_uses_exception_message():
     assert secret not in rendered
 
 
-def test_webhook_value_error_uses_fixed_public_error_and_safe_log(caplog):
+def test_webhook_runtime_error_uses_fixed_public_error_and_safe_log(
+    caplog,
+    monkeypatch,
+):
     client = TestClient(app)
     secret = "webhook-secret-value"
     private_error = "private-email-body-from-value-error"
@@ -148,17 +150,26 @@ def test_webhook_value_error_uses_fixed_public_error_and_safe_log(caplog):
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-    with patch(
-        "src.server.get_settings",
-        return_value=SimpleNamespace(
-            EXCHANGE_WEBHOOK_SECRET=secret,
-            WEBHOOK_MAX_BYTES=1_048_576,
+    service = SimpleNamespace(
+        accept=AsyncMock(side_effect=RuntimeError(private_error)),
+    )
+    monkeypatch.setattr(
+        app.state,
+        "webhook_ingress_service",
+        service,
+        raising=False,
+    )
+
+    with (
+        patch(
+            "src.server.get_settings",
+            return_value=SimpleNamespace(
+                EXCHANGE_WEBHOOK_SECRET=secret,
+                WEBHOOK_MAX_BYTES=1_048_576,
+            ),
         ),
-    ), patch(
-        "src.server.enqueue_exchange_webhook",
-        new_callable=AsyncMock,
-        side_effect=ValueError(private_error),
-    ), caplog.at_level(logging.WARNING, logger="WebServer"):
+        caplog.at_level(logging.WARNING, logger="WebServer"),
+    ):
         response = client.post(
             "/webhooks/exchange",
             content=body,
@@ -168,8 +179,8 @@ def test_webhook_value_error_uses_fixed_public_error_and_safe_log(caplog):
             },
         )
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid webhook event"}
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Webhook ingress unavailable"}
     assert private_error not in response.text
     assert private_error not in caplog.text
     assert secret not in caplog.text
@@ -190,10 +201,13 @@ def test_lark_message_success_log_omits_email_and_message_identifiers(caplog):
     builder = MagicMock()
     builder.build_read_only_card.return_value = {"elements": []}
 
-    with patch(
-        "src.utils.lark_messaging.get_settings",
-        return_value=SimpleNamespace(LARK_CHAT_ID="private-chat-id-sentinel"),
-    ), caplog.at_level(logging.INFO, logger="src.utils.lark_messaging"):
+    with (
+        patch(
+            "src.utils.lark_messaging.get_settings",
+            return_value=SimpleNamespace(LARK_CHAT_ID="private-chat-id-sentinel"),
+        ),
+        caplog.at_level(logging.INFO, logger="src.utils.lark_messaging"),
+    ):
         result = send_read_only_card(
             raw_email_id,
             [],
@@ -220,10 +234,13 @@ def test_card_builder_logs_counts_not_recipient_subject_or_pdf(caplog):
     )
     builder = LarkCardBuilder(None, exchange_client=None)
 
-    with patch(
-        "src.utils.card_builder.get_settings",
-        return_value=SimpleNamespace(EXCHANGE_ACCOUNT_EMAIL=""),
-    ), caplog.at_level(logging.INFO, logger="src.utils.card_builder"):
+    with (
+        patch(
+            "src.utils.card_builder.get_settings",
+            return_value=SimpleNamespace(EXCHANGE_ACCOUNT_EMAIL=""),
+        ),
+        caplog.at_level(logging.INFO, logger="src.utils.card_builder"),
+    ):
         builder.build_read_only_card(
             "private-email-id-sentinel",
             [],

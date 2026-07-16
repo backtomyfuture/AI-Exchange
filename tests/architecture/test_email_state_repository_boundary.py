@@ -276,6 +276,22 @@ _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     ),
 }
 _TASK8_TASK7_SUCCESSOR_PATHS = frozenset({"src/ingestion/repository.py"})
+_TASK9G_TASK8_SUCCESSOR_PATHS = frozenset({"src/ingestion/repository.py"})
+_TASK9G_NON_SQL_SUCCESSOR_PATHS = frozenset({"src/server.py"})
+_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/ingestion/normalization.py": (
+        "cb6222ff4e5b31ea94ff02ccdd2b9efee275b8ec973dd0176016b58700cc03f6"
+    ),
+    "src/ingestion/webhook.py": (
+        "c48ab2627177b2e155b687510c6d25a9a9d12f006223f5394fe302b2785b9aef"
+    ),
+    "src/ingestion/repository.py": (
+        "16f120442ede35a86fd03674906f25cd870c6563eb51416f3dde769d68175d71"
+    ),
+    "src/server.py": (
+        "63444311ebb01488cb6c230996f80c0e95ae40c9f8ded64a105b10ff00d287a3"
+    ),
+}
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -1945,14 +1961,40 @@ def test_task7_reviewed_structural_ast_requires_explicit_review() -> None:
 
 def test_task8_reviewed_structural_ast_requires_explicit_review() -> None:
     project_root = Path(__file__).resolve().parents[2]
+    assert _TASK9G_TASK8_SUCCESSOR_PATHS == {"src/ingestion/repository.py"}
+    assert _TASK9G_TASK8_SUCCESSOR_PATHS <= set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256)
+    historical_paths = (
+        set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK9G_TASK8_SUCCESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK8_REVIEWED_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK8_REVIEWED_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _TASK8_REVIEWED_STRUCTURAL_AST_SHA256, (
+    assert actual == expected, (
         "Task-8 structural review required before updating its normalized AST "
-        f"SHA-256 ratchet: expected {_TASK8_REVIEWED_STRUCTURAL_AST_SHA256}, "
+        f"SHA-256 ratchet: expected {expected}, got {actual}"
+    )
+
+
+def test_task9g_reviewed_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    assert _TASK9G_TASK8_SUCCESSOR_PATHS <= set(_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256)
+    assert _TASK9G_NON_SQL_SUCCESSOR_PATHS <= set(
+        _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Task-9G structural review required before updating its normalized AST "
+        f"SHA-256 ratchet: expected {_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256}, "
         f"got {actual}"
     )
 
@@ -1985,15 +2027,26 @@ def test_policy_exception_paths_equal_structural_ratchet_paths() -> None:
 
 def test_non_sql_exception_files_require_explicit_structural_review() -> None:
     project_root = Path(__file__).resolve().parents[2]
+    assert _TASK9G_NON_SQL_SUCCESSOR_PATHS == {"src/server.py"}
+    assert _TASK9G_NON_SQL_SUCCESSOR_PATHS <= set(
+        _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = (
+        set(_NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256)
+        - _TASK9G_NON_SQL_SUCCESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256, (
+    assert actual == expected, (
         "Non-SQL exception structural review required before updating the "
-        f"approved normalized AST SHA-256: expected "
-        f"{_NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256}, got {actual}"
+        f"approved normalized AST SHA-256: expected {expected}, got {actual}"
     )
 
 

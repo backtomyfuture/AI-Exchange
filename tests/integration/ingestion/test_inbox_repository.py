@@ -490,7 +490,7 @@ async def test_quiesce_is_a_real_insert_and_claim_barrier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = inbox_runtime.repository
-    existing = await repo.insert(_event("before-barrier"), 1, 1)
+    await repo.insert(_event("before-barrier"), 1, 1)
     waiting_event = _event("loses-to-barrier")
     key = ownership_advisory_lock_key(8)
     lock_attempts = 0
@@ -526,9 +526,8 @@ async def test_quiesce_is_a_real_insert_and_claim_barrier(
     with pytest.raises(StaleFence):
         await asyncio.wait_for(insert_task, timeout=5)
     assert await asyncio.wait_for(claim_task, timeout=5) == []
-    assert await repo.insert(_event("before-barrier"), 1, 1) == IngressReceipt(
-        existing.inbox_id, True
-    )
+    with pytest.raises(StaleFence):
+        await repo.insert(_event("before-barrier"), 1, 1)
     assert (
         await _scalar(
             inbox_runtime.pool,

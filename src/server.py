@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,9 +15,13 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
 from src.db.schema import require_runtime_database
+from src.domain.errors import DatabaseOperationError, IngressValidationError, StaleFence
+from src.ingestion.models import IngressReceipt
+from src.ingestion.policy import PolicySnapshotUnavailableError
+from src.ingestion.webhook import TestWebhookReceipt, WebhookIngressUnavailable
 from src.safety.input_limits import input_limits_from_settings
 from src.security.auth import require_metrics_auth, validate_runtime_security
-from src.security.redaction import fingerprint_identifier, safe_log_metadata
+from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
@@ -25,6 +30,7 @@ _READINESS_SUCCESS_TTL_SECONDS = 5.0
 _READINESS_FAILURE_TTL_SECONDS = 1.0
 _READINESS_DATABASE_TIMEOUT_SECONDS = 5.0
 _READINESS_FAILURE_LOG_TTL_SECONDS = 5.0
+_WEBHOOK_SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 
 
 class ReadinessPreflightError(RuntimeError):
@@ -184,20 +190,6 @@ def get_app_context():
     return _get_app_context()
 
 
-async def enqueue_exchange_webhook(
-    payload: Dict[str, Any],
-    header_event: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Forward webhook payload into exchange worker queue.
-    """
-    from src import exchange_service
-
-    return await exchange_service.enqueue_webhook_event(
-        payload, header_event=header_event
-    )
-
-
 @app.get("/health")
 async def health_check():
     """Dependency-free liveness endpoint used by Docker and supervisors."""
@@ -254,6 +246,8 @@ async def exchange_webhook(request: Request):
     webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
     if not webhook_secret:
         raise HTTPException(status_code=503, detail="Webhook secret not configured")
+    if _WEBHOOK_SIGNATURE_PATTERN.fullmatch(signature) is None:
+        raise HTTPException(status_code=403, detail="Invalid signature")
 
     media_type = request.headers.get("Content-Type", "").partition(";")[0]
     if media_type.strip().casefold() != "application/json":
@@ -284,7 +278,7 @@ async def exchange_webhook(request: Request):
 
     try:
         payload = json.loads(body_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         logger.warning("Exchange webhook payload is not valid JSON")
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
 
@@ -292,50 +286,67 @@ async def exchange_webhook(request: Request):
         logger.warning("Exchange webhook payload root is not an object")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    payload_event = payload.get("event_type") or payload.get("event")
-    if header_event and (
-        not isinstance(payload_event, str)
-        or not hmac.compare_digest(header_event, payload_event)
-    ):
-        logger.warning("Rejected Exchange webhook event-header mismatch")
-        raise HTTPException(status_code=400, detail="Webhook event mismatch")
-
+    service = getattr(request.app.state, "webhook_ingress_service", None)
+    accept = getattr(service, "accept", None)
+    if not callable(accept):
+        logger.warning("Durable Exchange webhook ingress is unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook ingress unavailable",
+        )
     try:
-        result = await enqueue_exchange_webhook(payload, header_event=header_event)
-        if not isinstance(result, dict):
-            raise RuntimeError("invalid_webhook_enqueue_result")
-        outcome = safe_log_metadata(
-            "queue_full" if result.get("reason") == "queue_full" else "accepted",
-            allowed_values={"accepted", "queue_full"},
+        result = await accept(
+            raw_body=body_bytes,
+            payload=payload,
+            header_event=header_event,
         )
-        logger.info(
-            "Exchange webhook routed: queued=%s outcome=%s",
-            bool(result.get("queued")),
-            outcome,
-        )
-    except ValueError as exc:
+    except IngressValidationError as exc:
         logger.warning(
             "Rejected invalid Exchange webhook event: error_type=%s",
             type(exc).__name__,
         )
         raise HTTPException(status_code=400, detail="Invalid webhook event") from None
-    except Exception as exc:
-        logger.error(
-            "Failed to process Exchange webhook: error_type=%s",
+    except (
+        DatabaseOperationError,
+        PolicySnapshotUnavailableError,
+        StaleFence,
+        WebhookIngressUnavailable,
+    ) as exc:
+        logger.warning(
+            "Durable Exchange webhook ingress is unavailable: error_type=%s",
             type(exc).__name__,
         )
         raise HTTPException(
-            status_code=502,
-            detail="Failed to process webhook event",
+            status_code=503,
+            detail="Webhook ingress unavailable",
         ) from None
-
-    if result.get("reason") == "queue_full":
+    except Exception as exc:
+        logger.error(
+            "Durable Exchange webhook intake failed: error_type=%s",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=503,
-            detail={"status": "queue_full", "reason": "queue_full"},
-        )
+            detail="Webhook ingress unavailable",
+        ) from None
 
-    return {"status": "ok", "queued": bool(result.get("queued"))}
+    if type(result) is TestWebhookReceipt:
+        logger.info("Exchange webhook test event verified")
+        return {"status": "ok", "test": True}
+    if type(result) is IngressReceipt:
+        logger.info(
+            "Exchange webhook durably accepted: duplicate=%s",
+            result.duplicate,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted"},
+        )
+    logger.error("Durable Exchange webhook intake returned an invalid receipt")
+    raise HTTPException(
+        status_code=503,
+        detail="Webhook ingress unavailable",
+    )
 
 
 class MockEmailData(BaseModel):

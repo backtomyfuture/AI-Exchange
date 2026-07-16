@@ -7,8 +7,9 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, TypeAlias
 
 from src.domain.errors import IngressValidationCode, IngressValidationError
 from src.ingestion.folder_identity import canonicalize_folder_identity
@@ -29,6 +30,8 @@ _EVENT_KINDS: Final = {
     "ModifiedEvent": ChangeKind.UPDATE,
     "DeletedEvent": ChangeKind.DELETE,
 }
+_TEST_EVENT_TYPE: Final = "TestEvent"
+_TEST_EVENT_KEYS: Final = frozenset({"event", "timestamp", "account_id", "message"})
 _SUPPORTED_SYNC_KINDS: Final = frozenset(
     {ChangeKind.CREATE, ChangeKind.UPDATE, ChangeKind.DELETE}
 )
@@ -320,7 +323,7 @@ def _consistent_value(
     return present[0]
 
 
-def _body_event(payload: Mapping[str, Any]) -> tuple[str, ChangeKind]:
+def _signed_event_type(payload: Mapping[str, Any]) -> str:
     has_event = "event" in payload
     has_event_type = "event_type" in payload
     if not has_event and not has_event_type:
@@ -352,9 +355,7 @@ def _body_event(payload: Mapping[str, Any]) -> tuple[str, ChangeKind]:
             code=IngressValidationCode.EVENT_UNSUPPORTED,
             max_length=128,
         )
-    if raw_event_type not in _EVENT_KINDS:
-        _raise(IngressValidationCode.EVENT_UNSUPPORTED)
-    return raw_event_type, _EVENT_KINDS[raw_event_type]
+    return raw_event_type
 
 
 def _email_id(payload: Mapping[str, Any]) -> str:
@@ -543,6 +544,113 @@ def _source_event_at(payload: Mapping[str, Any]) -> datetime | None:
         raise IngressValidationError(IngressValidationCode.TIMESTAMP_INVALID) from None
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedMailWebhookEnvelope:
+    """Trusted mail identity parsed once from the exact signed request bytes."""
+
+    account_id: int
+    raw_event_type: str
+    change_kind: ChangeKind
+    external_email_id: str
+    exact_folder_identity: str
+    source_version: str | None
+    source_event_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedTestWebhookEnvelope:
+    """Trusted, side-effect-free Exchange extension test event."""
+
+    account_id: int
+
+
+VerifiedWebhookEnvelope: TypeAlias = (
+    VerifiedMailWebhookEnvelope | VerifiedTestWebhookEnvelope
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedWebhookRequest:
+    envelope: VerifiedWebhookEnvelope
+    signed_payload: Mapping[str, Any]
+    raw_body_sha256: str
+
+
+def verify_webhook_request(
+    *,
+    raw_body: bytes,
+    payload: Mapping[str, Any],
+    header_event: str | None,
+    expected_account_id: int | None,
+) -> _VerifiedWebhookRequest:
+    """Parse one signed representation and bind it to the configured account."""
+
+    signed_payload = _parse_signed_body(raw_body)
+    if not isinstance(payload, Mapping):
+        _raise(IngressValidationCode.BODY_PAYLOAD_MISMATCH)
+    signed_canonical = _canonical_json_bytes(
+        signed_payload,
+        error_code=IngressValidationCode.INVALID_BODY,
+    )
+    supplied_canonical = _canonical_json_bytes(
+        payload,
+        error_code=IngressValidationCode.BODY_PAYLOAD_MISMATCH,
+    )
+    if signed_canonical != supplied_canonical:
+        _raise(IngressValidationCode.BODY_PAYLOAD_MISMATCH)
+
+    raw_event_type = _signed_event_type(signed_payload)
+    if header_event is not None:
+        normalized_header = _require_exact_text(
+            header_event,
+            code=IngressValidationCode.HEADER_EVENT_MISMATCH,
+            max_length=128,
+        )
+        if normalized_header != raw_event_type:
+            _raise(IngressValidationCode.HEADER_EVENT_MISMATCH)
+
+    account_id = _require_account_id(signed_payload.get("account_id"))
+    if expected_account_id is not None:
+        configured_account_id = _require_account_id(expected_account_id)
+        if account_id != configured_account_id:
+            _raise(IngressValidationCode.ACCOUNT_INVALID)
+
+    raw_body_sha256 = hashlib.sha256(raw_body).hexdigest()
+    if raw_event_type == _TEST_EVENT_TYPE:
+        if frozenset(signed_payload) != _TEST_EVENT_KEYS:
+            _raise(IngressValidationCode.EVENT_UNSUPPORTED)
+        timestamp = signed_payload.get("timestamp")
+        if type(timestamp) is not int or timestamp < 0 or timestamp > 253_402_300_799:
+            _raise(IngressValidationCode.TIMESTAMP_INVALID)
+        _require_exact_text(
+            signed_payload.get("message"),
+            code=IngressValidationCode.EVENT_UNSUPPORTED,
+            max_length=2048,
+        )
+        return _VerifiedWebhookRequest(
+            envelope=VerifiedTestWebhookEnvelope(account_id=account_id),
+            signed_payload=signed_payload,
+            raw_body_sha256=raw_body_sha256,
+        )
+
+    if raw_event_type not in _EVENT_KINDS:
+        _raise(IngressValidationCode.EVENT_UNSUPPORTED)
+    source_event_at = _source_event_at(signed_payload)
+    return _VerifiedWebhookRequest(
+        envelope=VerifiedMailWebhookEnvelope(
+            account_id=account_id,
+            raw_event_type=raw_event_type,
+            change_kind=_EVENT_KINDS[raw_event_type],
+            external_email_id=_email_id(signed_payload),
+            exact_folder_identity=_folder(signed_payload),
+            source_version=_source_version(signed_payload),
+            source_event_at=source_event_at,
+        ),
+        signed_payload=signed_payload,
+        raw_body_sha256=raw_body_sha256,
+    )
+
+
 def _dedupe_key(
     *,
     account_id: int,
@@ -589,6 +697,56 @@ def _build_event(**values: Any) -> NormalizedIngressEvent:
         ) from None
 
 
+def normalize_verified_webhook_request(
+    verified: _VerifiedWebhookRequest,
+    *,
+    processing_policy: ProcessingPolicy,
+) -> NormalizedIngressEvent:
+    """Bind one already-verified mail envelope to one immutable policy fact."""
+
+    if type(verified) is not _VerifiedWebhookRequest:
+        _raise(IngressValidationCode.NORMALIZED_EVENT_INVALID)
+    envelope = verified.envelope
+    if type(envelope) is not VerifiedMailWebhookEnvelope:
+        _raise(IngressValidationCode.EVENT_UNSUPPORTED)
+    policy = _require_policy(processing_policy)
+
+    if envelope.source_version is not None:
+        identity_time = None
+        identity_raw_hash = None
+    elif envelope.source_event_at is not None:
+        identity_time = envelope.source_event_at
+        identity_raw_hash = None
+    else:
+        identity_time = None
+        identity_raw_hash = verified.raw_body_sha256
+    dedupe_key = _dedupe_key(
+        account_id=envelope.account_id,
+        source=IngressSource.WEBHOOK,
+        raw_event_type=envelope.raw_event_type,
+        kind=envelope.change_kind,
+        external_email_id=envelope.external_email_id,
+        folder=envelope.exact_folder_identity,
+        source_version=envelope.source_version,
+        cursor=None,
+        source_event_at=identity_time,
+        raw_body_sha256=identity_raw_hash,
+    )
+    return _build_event(
+        account_id=envelope.account_id,
+        source=IngressSource.WEBHOOK,
+        raw_event_type=envelope.raw_event_type,
+        kind=envelope.change_kind,
+        external_email_id=envelope.external_email_id,
+        folder=envelope.exact_folder_identity,
+        source_version=envelope.source_version,
+        dedupe_key=dedupe_key,
+        payload=verified.signed_payload,
+        processing_policy=policy,
+        source_event_at=envelope.source_event_at,
+    )
+
+
 def normalize_webhook_event(
     *,
     raw_body: bytes,
@@ -598,70 +756,15 @@ def normalize_webhook_event(
 ) -> NormalizedIngressEvent:
     """Normalize a verified Webhook body without trusting unsigned headers."""
 
-    policy = _require_policy(processing_policy)
-    signed_payload = _parse_signed_body(raw_body)
-    if not isinstance(payload, Mapping):
-        _raise(IngressValidationCode.BODY_PAYLOAD_MISMATCH)
-    signed_canonical = _canonical_json_bytes(
-        signed_payload,
-        error_code=IngressValidationCode.INVALID_BODY,
+    verified = verify_webhook_request(
+        raw_body=raw_body,
+        payload=payload,
+        header_event=header_event,
+        expected_account_id=None,
     )
-    supplied_canonical = _canonical_json_bytes(
-        payload,
-        error_code=IngressValidationCode.BODY_PAYLOAD_MISMATCH,
-    )
-    if signed_canonical != supplied_canonical:
-        _raise(IngressValidationCode.BODY_PAYLOAD_MISMATCH)
-
-    raw_event_type, kind = _body_event(signed_payload)
-    if header_event is not None:
-        normalized_header = _require_exact_text(
-            header_event,
-            code=IngressValidationCode.HEADER_EVENT_MISMATCH,
-            max_length=128,
-        )
-        if normalized_header != raw_event_type:
-            _raise(IngressValidationCode.HEADER_EVENT_MISMATCH)
-
-    account_id = _require_account_id(signed_payload.get("account_id"))
-    external_email_id = _email_id(signed_payload)
-    folder = _folder(signed_payload)
-    source_version = _source_version(signed_payload)
-    source_event_at = _source_event_at(signed_payload)
-
-    if source_version is not None:
-        identity_time = None
-        identity_raw_hash = None
-    elif source_event_at is not None:
-        identity_time = source_event_at
-        identity_raw_hash = None
-    else:
-        identity_time = None
-        identity_raw_hash = hashlib.sha256(raw_body).hexdigest()
-    dedupe_key = _dedupe_key(
-        account_id=account_id,
-        source=IngressSource.WEBHOOK,
-        raw_event_type=raw_event_type,
-        kind=kind,
-        external_email_id=external_email_id,
-        folder=folder,
-        source_version=source_version,
-        cursor=None,
-        source_event_at=identity_time,
-        raw_body_sha256=identity_raw_hash,
-    )
-    return _build_event(
-        account_id=account_id,
-        source=IngressSource.WEBHOOK,
-        raw_event_type=raw_event_type,
-        kind=kind,
-        external_email_id=external_email_id,
-        folder=folder,
-        source_version=source_version,
-        dedupe_key=dedupe_key,
-        payload=signed_payload,
-        processing_policy=policy,
-        source_event_at=source_event_at,
+    return normalize_verified_webhook_request(
+        verified,
+        processing_policy=processing_policy,
     )
 
 

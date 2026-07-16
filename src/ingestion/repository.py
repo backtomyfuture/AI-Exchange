@@ -2883,13 +2883,6 @@ class EmailEventTransaction:
                 self._connection,
                 event.account_id,
             )
-            duplicate = await self._repository._duplicate_receipt(
-                self._connection,
-                event,
-            )
-            if duplicate is not None:
-                return duplicate
-
             ownership_query = sql.SQL(
                 "SELECT pipeline_name FROM {} "
                 "WHERE account_id = %s AND generation = %s "
@@ -2911,6 +2904,13 @@ class EmailEventTransaction:
             )[0]
             if not isinstance(pipeline_name, str):
                 raise _invariant_error("event inbox ownership row is invalid")
+
+            duplicate = await self._repository._duplicate_receipt(
+                self._connection,
+                event,
+            )
+            if duplicate is not None:
+                return duplicate
 
             suppressed = event.processing_policy in _SUPPRESSED_POLICIES
             status = "completed" if suppressed else "pending"
