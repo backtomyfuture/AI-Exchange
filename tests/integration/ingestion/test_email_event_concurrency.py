@@ -1005,7 +1005,7 @@ async def test_reaper_incremented_attempt_resumes_once(
     resumed = next(result for result in (first, second) if result.should_process)
     duplicate = next(result for result in (first, second) if not result.should_process)
     assert resumed.disposition is EmailEventDisposition.PROCESSING_RESUMED
-    assert resumed.version == 2
+    assert resumed.version == 3
     for result in (duplicate, *repeated):
         assert result.disposition is EmailEventDisposition.PROCESSING_ALREADY_ELECTED
         assert result.may_complete_without_processing is False
@@ -1026,20 +1026,17 @@ async def test_retry_wait_reclaimed_attempt_returns_to_processing_and_clears_err
 ) -> None:
     lease = await _insert_and_claim(email_runtime, _event("retry-wait-resume"))
     created = await email_runtime.repository.apply_email_event(lease)
-    await _execute(
-        email_runtime.pool,
-        "UPDATE emails SET status = 'retry_wait', version = version + 1, "
-        "safe_error_code = 'email.synthetic_retry', "
-        "safe_error_summary = 'Synthetic retry wait' WHERE id = %s",
-        (created.email_id,),
+    failed = await email_runtime.repository.finish_email_processing_failure(
+        lease,
+        created.email_id,
+        created.version,
+        DatabaseOperationError(
+            operation="synthetic.retry_wait",
+            retryable=True,
+            message="Synthetic retry wait",
+        ),
     )
-    await _execute(
-        email_runtime.pool,
-        "UPDATE event_inbox SET lease_until = received_at + INTERVAL '1 microsecond' "
-        "WHERE id = %s",
-        (lease.id,),
-    )
-    assert await email_runtime.repository.recover_expired_leases(10) == 1
+    assert failed.email_status is EmailStatus.RETRY_WAIT
     await _execute(
         email_runtime.pool,
         "UPDATE event_inbox SET available_at = pg_catalog.clock_timestamp() "
@@ -2250,11 +2247,18 @@ async def test_processing_receipt_rejects_json_boolean_number_type_confusion(
         "WHERE id = %s",
         (create_lease.id,),
     )
-    assert await email_runtime.repository.recover_expired_leases(10) == 1
+    # A committed neutral email relation makes the unlinked reaper skip rather
+    # than reverse the global email -> ownership -> inbox lock order. This test
+    # is about JSON receipt type exactness, so project the reclaimed attempt
+    # explicitly after proving the safe skip.
+    assert await email_runtime.repository.recover_expired_leases(10) == 0
     await _execute(
         email_runtime.pool,
-        "UPDATE event_inbox SET available_at = pg_catalog.clock_timestamp() "
-        "WHERE id = %s",
+        "UPDATE event_inbox SET status = 'retry_wait', lease_owner = NULL, "
+        "lease_until = NULL, attempts = attempts + 1, "
+        "available_at = pg_catalog.clock_timestamp(), "
+        "safe_error_code = 'inbox.lease_expired', "
+        "safe_error_summary = 'Inbox worker lease expired' WHERE id = %s",
         (create_lease.id,),
     )
     reclaimed = next(

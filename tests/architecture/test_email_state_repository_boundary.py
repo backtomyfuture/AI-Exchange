@@ -258,6 +258,24 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
         "src/ingestion/repository.py",
     }
 )
+_TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/exchange_service.py": (
+        "f74f8ad30a08d10006a9dc7d8212451eaccaf9a3f2e36215256ae3164ea88e20"
+    ),
+    "src/ingestion/processing.py": (
+        "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
+    ),
+    "src/ingestion/legacy_adapter.py": (
+        "4bc7bf8f98dc212f2712b3b861cf777369bba1d71d81bcb7d070304deb796be5"
+    ),
+    "src/ingestion/worker.py": (
+        "625dbcb0a7fed84c81b7ec980716aa7d47144dec4fafd5bbcee763e479842be3"
+    ),
+    "src/ingestion/repository.py": (
+        "a289982ac850c3066896da788b2fccd3f8ceccf8621eb59a6815cd81754f71bb"
+    ),
+}
+_TASK8_TASK7_SUCCESSOR_PATHS = frozenset({"src/ingestion/repository.py"})
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -1904,14 +1922,37 @@ def test_task5_repository_structural_ast_requires_explicit_review() -> None:
 
 def test_task7_reviewed_structural_ast_requires_explicit_review() -> None:
     project_root = Path(__file__).resolve().parents[2]
+    assert _TASK8_TASK7_SUCCESSOR_PATHS == {"src/ingestion/repository.py"}
+    assert _TASK8_TASK7_SUCCESSOR_PATHS <= set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256)
+    assert _TASK8_TASK7_SUCCESSOR_PATHS <= set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256)
+    historical_paths = (
+        set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK8_TASK7_SUCCESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK7_REVIEWED_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK7_REVIEWED_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _TASK7_REVIEWED_STRUCTURAL_AST_SHA256, (
-        "Task-7 structural review required before updating its normalized AST "
-        f"SHA-256 ratchet: expected {_TASK7_REVIEWED_STRUCTURAL_AST_SHA256}, "
+    assert actual == expected, (
+        "Task-7 structural review required before changing a path that has no "
+        f"explicit Task-8 reviewed successor: expected {expected}, got {actual}"
+    )
+
+
+def test_task8_reviewed_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TASK8_REVIEWED_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TASK8_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Task-8 structural review required before updating its normalized AST "
+        f"SHA-256 ratchet: expected {_TASK8_REVIEWED_STRUCTURAL_AST_SHA256}, "
         f"got {actual}"
     )
 

@@ -1271,7 +1271,10 @@ async def test_effect_first_and_expiry_reaper_linearize_on_the_database_row(
     reaper_repo = InboxRepository(
         _ProbedPool(
             inbox_runtime.pool,
-            match=lambda statement: "FOR UPDATE OF e SKIP LOCKED LIMIT" in statement,
+            match=lambda statement: (
+                "e.status AS inbox_status" in statement
+                and "FOR UPDATE SKIP LOCKED" in statement
+            ),
             after=reaper_select_completed,
         )
     )
@@ -1340,7 +1343,8 @@ async def test_reaper_first_invalidates_concurrent_begin_effect_token(
             inbox_runtime.pool,
             match=lambda statement: (
                 statement.lstrip().startswith("UPDATE")
-                and "effect_started_at IS NOT DISTINCT FROM" in statement
+                and "attempts = %s, available_at" in statement
+                and "lease_until <= pg_catalog.clock_timestamp()" in statement
             ),
             after=reaper_updated,
             release=release_reaper,

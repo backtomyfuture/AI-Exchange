@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import re
 from copy import deepcopy
@@ -10,7 +11,7 @@ from src.domain.email_state import (
     InitialEmailWriteResult,
     ProcessingOutcome,
 )
-from src.domain.errors import DatabaseOperationError
+from src.domain.errors import DatabaseOperationError, StaleFence
 from src.graph.state_factory import (
     MAX_ID_BYTES,
     MAX_TOKENS,
@@ -32,6 +33,15 @@ from src.utils import lark_app
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.utils.notification_policy import decide_notification_kind
 from src.storage import ContentRef
+from src.ingestion.processing import (
+    BeforeExternalEffect,
+    ExternalEffectAuthorizationError,
+    ExternalEffectBoundary,
+    ExternalEffectKind,
+    GuardedExternalEffectFailed,
+    LegacyEffectScope,
+    ProcessingPolicyRejected,
+)
 
 logger = logging.getLogger("ExchangeService")
 WORKER_CONCURRENCY = 3
@@ -81,11 +91,43 @@ class NotificationSideEffectCommittedError(RuntimeError):
         self.cause = cause
 
 
+async def _authorize_external_effect(
+    boundary: ExternalEffectBoundary | None,
+    kind: ExternalEffectKind,
+    ordinal: int,
+    target: object,
+) -> None:
+    """Authorize one external call on the guarded path; legacy calls stay unchanged."""
+    if boundary is not None:
+        await boundary.before(kind, ordinal, target)
+
+
+def _content_ref_effect_target(operation: str, ref: ContentRef) -> dict[str, object]:
+    return {
+        "operation": operation,
+        "account_id": ref.account_id,
+        "object_id": ref.object_id,
+        "key_version": ref.key_version,
+        "sha256": ref.sha256,
+    }
+
+
+def _identifier_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _effect_boundary_kwargs(
+    boundary: ExternalEffectBoundary | None,
+) -> dict[str, ExternalEffectBoundary]:
+    return {} if boundary is None else {"_effect_boundary": boundary}
+
+
 async def _upload_attachments_to_lark(
     email_data: dict,
     *,
     max_uploads: int = MAX_TOKENS,
     acknowledge_token: Callable[[str], Awaitable[None]] | None = None,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> AttachmentUploadProjection:
     """Upload attachments, durably ACKing each token before the next upload."""
     if (
@@ -102,20 +144,44 @@ async def _upload_attachments_to_lark(
     links: list[dict[str, str]] = []
     import base64
 
-    for att in attachments[:max_uploads]:
+    for ordinal, att in enumerate(attachments[:max_uploads]):
         if att.get("content"):
             try:
                 content_bytes = base64.b64decode(att["content"], validate=True)
-                res = lark_app.upload_file_to_drive(
-                    att.get("name", "unknown"), content_bytes, len(content_bytes)
-                )
             except Exception as exc:
                 logger.error(
                     "Attachment upload failed: error_type=%s",
                     type(exc).__name__,
                 )
                 break
+            await _authorize_external_effect(
+                _effect_boundary,
+                ExternalEffectKind.FEISHU,
+                ordinal,
+                {
+                    "operation": "upload_attachment",
+                    "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+                    "size": len(content_bytes),
+                },
+            )
+            try:
+                res = await asyncio.to_thread(
+                    lark_app.upload_file_to_drive,
+                    att.get("name", "unknown"),
+                    content_bytes,
+                    len(content_bytes),
+                )
+            except Exception as exc:
+                if _effect_boundary is not None:
+                    raise GuardedExternalEffectFailed() from None
+                logger.error(
+                    "Attachment upload failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                break
             token = res.get("file_token") if res else None
+            if _effect_boundary is not None and not (isinstance(token, str) and token):
+                raise GuardedExternalEffectFailed()
             if isinstance(token, str) and token:
                 tokens.append(token)
                 if acknowledge_token is not None:
@@ -132,10 +198,26 @@ async def _upload_attachments_to_lark(
     return AttachmentUploadProjection(tokens=tuple(tokens), links=tuple(links))
 
 
-async def _ingest_to_qdrant(email_id: str, email_data: dict, ctx) -> None:
+async def _ingest_to_qdrant(
+    email_id: str,
+    email_data: dict,
+    ctx,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> None:
     """Ingest email into Qdrant vector store (sync call wrapped in thread)."""
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.QDRANT,
+        0,
+        {"operation": "ingest_email", "email_id": email_id},
+    )
     try:
-        await asyncio.to_thread(ctx.email_processor.process_email, email_data)
+        processed = await asyncio.to_thread(
+            ctx.email_processor.process_email, email_data
+        )
+        if _effect_boundary is not None and processed is not True:
+            raise GuardedExternalEffectFailed()
         logger.info(
             "Email ingested to Qdrant: email=%s",
             fingerprint_identifier(email_id, namespace="email"),
@@ -144,6 +226,8 @@ async def _ingest_to_qdrant(email_id: str, email_data: dict, ctx) -> None:
     except DatabaseOperationError:
         raise
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error("Qdrant ingest failed: error_type=%s", type(exc).__name__)
 
 
@@ -164,6 +248,7 @@ async def _run_ai_pipeline(
     preserved_pdf_token: str | None = None,
     attachment_links: list[dict[str, str]] | None = None,
     _state_lock_held: bool = False,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ):
     """Rebuild slim State from durable refs and return a transient edge projection."""
     if not _state_lock_held:
@@ -177,7 +262,14 @@ async def _run_ai_pipeline(
                 preserved_pdf_token=preserved_pdf_token,
                 attachment_links=attachment_links,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.CONTENT,
+        1,
+        {"operation": "load_email_content", "email_id": email_id},
+    )
     try:
         ref = _require_owned_ref(await ctx.db_manager.get_content_ref(email_id))
         email_data = await ctx.content_store.load_email(ref)
@@ -201,7 +293,21 @@ async def _run_ai_pipeline(
                 )
             )
 
+        graph_ordinal = 0
+
         async def consume(graph_input) -> None:
+            nonlocal graph_ordinal
+            await _authorize_external_effect(
+                _effect_boundary,
+                ExternalEffectKind.MODEL,
+                graph_ordinal,
+                {
+                    "operation": "graph_astream",
+                    "email_id": email_id,
+                    "resume": graph_input is None,
+                },
+            )
+            graph_ordinal += 1
             async for event in ctx.graph.astream(graph_input, config=config):
                 if "categorizer" in event:
                     classification = event["categorizer"].get("classification", {})
@@ -269,9 +375,17 @@ async def _run_ai_pipeline(
             "next_step": state_values.get("next_step", ""),
             "safe_error_summary": state_values.get("safe_error_summary"),
         }
+    except (
+        ExternalEffectAuthorizationError,
+        StaleFence,
+        GuardedExternalEffectFailed,
+    ):
+        raise
     except DatabaseOperationError:
         raise
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error(
             "Graph pipeline failed: error_type=%s",
             type(exc).__name__,
@@ -285,6 +399,7 @@ async def _stage_notification_pdf(
     pdf_result: object,
     *,
     _state_lock_held: bool = False,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> NotificationPdfStage:
     """Persist a PDF token, reconciling ambiguous writes before any card send."""
     if not _state_lock_held:
@@ -294,6 +409,7 @@ async def _stage_notification_pdf(
                 ctx,
                 pdf_result,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
     if pdf_result is None:
         return NotificationPdfStage(ready=True)
@@ -346,15 +462,9 @@ async def _stage_notification_pdf(
     token = pdf_result.get("file_token")
     url = pdf_result.get("url")
     valid_token = (
-        isinstance(token, str)
-        and bool(token)
-        and len(token.encode("utf-8")) <= 512
+        isinstance(token, str) and bool(token) and len(token.encode("utf-8")) <= 512
     )
-    valid_url = (
-        isinstance(url, str)
-        and bool(url)
-        and len(url.encode("utf-8")) <= 2_048
-    )
+    valid_url = isinstance(url, str) and bool(url) and len(url.encode("utf-8")) <= 2_048
     if not valid_token or not valid_url:
         if isinstance(token, str) and token:
             safely_reconciled = await _delete_drive_token_or_retain(
@@ -362,6 +472,7 @@ async def _stage_notification_pdf(
                 ctx,
                 token,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
             if not safely_reconciled:
                 return NotificationPdfStage(
@@ -389,13 +500,12 @@ async def _stage_notification_pdf(
                 ctx,
                 token,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
             return NotificationPdfStage(
                 ready=safely_reconciled,
                 error_code=(
-                    None
-                    if safely_reconciled
-                    else "pdf_replacement_capacity_exhausted"
+                    None if safely_reconciled else "pdf_replacement_capacity_exhausted"
                 ),
             )
         delta: dict[str, object] = {"pdf_token": token}
@@ -403,7 +513,15 @@ async def _stage_notification_pdf(
             delta["attachment_tokens"] = [*cleanup_tokens, old_token]
         update = sanitize_graph_delta(values, delta)
         await ctx.graph.aupdate_state(config, update)
+    except (
+        ExternalEffectAuthorizationError,
+        StaleFence,
+        GuardedExternalEffectFailed,
+    ):
+        raise
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error(
             "Notification PDF token persistence failed: error_type=%s",
             type(exc).__name__,
@@ -450,6 +568,7 @@ async def _stage_notification_pdf(
                 ctx,
                 token,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
             return NotificationPdfStage(
                 ready=safely_reconciled,
@@ -464,6 +583,7 @@ async def _stage_notification_pdf(
             ctx,
             token,
             _state_lock_held=True,
+            _effect_boundary=_effect_boundary,
         )
         return NotificationPdfStage(
             ready=safely_reconciled,
@@ -529,11 +649,25 @@ async def _delete_drive_token_or_retain(
     token: str,
     *,
     _state_lock_held: bool = False,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> bool:
     """Return true only when a Drive token is deleted or durably tracked."""
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.FEISHU,
+        40,
+        {
+            "operation": "delete_drive_file",
+            "token_sha256": _identifier_digest(token),
+        },
+    )
     try:
         deleted = await asyncio.to_thread(lark_app.delete_file_from_drive, token)
+        if _effect_boundary is not None and deleted is not True:
+            raise GuardedExternalEffectFailed()
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error(
             "Drive token cleanup failed: error_type=%s",
             type(exc).__name__,
@@ -555,6 +689,7 @@ async def _remove_cleanup_token(
     token: str,
     *,
     _state_lock_held: bool = False,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> None:
     """Best-effort removal of a stale handle after confirmed remote deletion."""
     if not _state_lock_held:
@@ -564,6 +699,7 @@ async def _remove_cleanup_token(
                 ctx,
                 token,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
         return
     config = {"configurable": {"thread_id": email_id}}
@@ -571,15 +707,15 @@ async def _remove_cleanup_token(
         state = await ctx.graph.aget_state(config)
         values = state.values
         tokens = [
-            item
-            for item in (values.get("attachment_tokens") or [])
-            if item != token
+            item for item in (values.get("attachment_tokens") or []) if item != token
         ]
         if tokens == list(values.get("attachment_tokens") or []):
             return
         update = sanitize_graph_delta(values, {"attachment_tokens": tokens})
         await ctx.graph.aupdate_state(config, update)
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.warning(
             "Cleanup handle removal failed: error_type=%s",
             type(exc).__name__,
@@ -591,32 +727,61 @@ async def _delete_replaced_pdf(
     ctx,
     old_token: str | None,
     new_token: str | None,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> bool:
     if not old_token:
         return True
     if old_token == new_token:
         return True
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.FEISHU,
+        34,
+        {
+            "operation": "delete_replaced_pdf",
+            "token_sha256": _identifier_digest(old_token),
+        },
+    )
     try:
         deleted = await asyncio.to_thread(
             lark_app.delete_file_from_drive,
             old_token,
         )
+        if _effect_boundary is not None and deleted is not True:
+            raise GuardedExternalEffectFailed()
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error(
             "Replaced PDF cleanup failed: error_type=%s",
             type(exc).__name__,
         )
         deleted = False
     if deleted:
-        await _remove_cleanup_token(email_id, ctx, old_token)
+        await _remove_cleanup_token(
+            email_id,
+            ctx,
+            old_token,
+            _effect_boundary=_effect_boundary,
+        )
         return True
+    if _effect_boundary is not None:
+        raise GuardedExternalEffectFailed()
     reconciled = await _retain_cleanup_token(email_id, ctx, old_token)
     if not reconciled:
         logger.error("Replaced PDF cleanup handle is untracked")
     return reconciled
 
 
-async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, config: dict) -> dict:
+async def _dispatch_notification(
+    email_id: str,
+    pipeline_result: dict,
+    ctx,
+    config: dict,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> dict:
     """
     Send Lark card based on classification result.
 
@@ -641,7 +806,8 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
     kind = decide_notification_kind(classification, email_data)
 
     await ctx.db_manager.update_status(
-        email_id, None,
+        email_id,
+        None,
         routing_log=routing_log,
         active_skills=active_skills,
         original_draft=pipeline_result.get("draft", ""),
@@ -649,8 +815,14 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
 
     # Tier 2 substrate: write classification/skill labels back into Qdrant
     # so future similar emails can vote on these skills via semantic retrieval.
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.QDRANT,
+        1,
+        {"operation": "update_email_labels", "email_id": email_id},
+    )
     try:
-        await asyncio.to_thread(
+        labels_updated = await asyncio.to_thread(
             ctx.email_processor.update_email_labels,
             email_id,
             active_skills,
@@ -658,7 +830,11 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             intent,
             classification.get("need_reply"),
         )
+        if _effect_boundary is not None and labels_updated is not True:
+            raise GuardedExternalEffectFailed()
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         # Best-effort enrichment; never block notification on label writes.
         logger.warning(
             "update_email_labels failed: error_type=%s",
@@ -670,12 +846,28 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             "Sending Lark approval request: email=%s",
             fingerprint_identifier(email_id, namespace="email"),
         )
-        pdf_result = await lark_app.generate_and_upload_pdf(email_id)
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            32,
+            {"operation": "generate_notification_pdf", "email_id": email_id},
+        )
+        try:
+            pdf_result = await lark_app.generate_and_upload_pdf(email_id)
+        except Exception:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            raise
         pdf_stage = await _stage_notification_pdf(
             email_id,
             ctx,
             pdf_result,
+            _effect_boundary=_effect_boundary,
         )
+        if _effect_boundary is not None and (
+            not pdf_stage.ready or pdf_stage.new_token is None or pdf_stage.url is None
+        ):
+            raise GuardedExternalEffectFailed()
         if not pdf_stage.ready:
             logger.error(
                 "Approval notification PDF staging failed: code=%s",
@@ -688,16 +880,31 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             )
             return {"delivered": False, "kind": "approval"}
 
-        delivered = bool(lark_app.send_approval_card(
-            email_id=email_id,
-            draft=pipeline_result.get("draft", ""),
-            context=pipeline_result.get("context", []),
-            email_data=pipeline_result.get("email", {}),
-            classification=classification,
-            pdf_url=pdf_stage.url,
-            routing_log=routing_log,
-            active_skills=active_skills,
-        ))
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            33,
+            {"operation": "send_approval_card", "email_id": email_id},
+        )
+        try:
+            delivery_result = await asyncio.to_thread(
+                lark_app.send_approval_card,
+                email_id=email_id,
+                draft=pipeline_result.get("draft", ""),
+                context=pipeline_result.get("context", []),
+                email_data=pipeline_result.get("email", {}),
+                classification=classification,
+                pdf_url=pdf_stage.url,
+                routing_log=routing_log,
+                active_skills=active_skills,
+            )
+        except Exception:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            raise
+        if _effect_boundary is not None and delivery_result is not True:
+            raise GuardedExternalEffectFailed()
+        delivered = bool(delivery_result)
         if delivered:
             try:
                 await _delete_replaced_pdf(
@@ -705,6 +912,7 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                     ctx,
                     pdf_stage.old_token,
                     pdf_stage.new_token,
+                    _effect_boundary=_effect_boundary,
                 )
                 await ctx.db_manager.update_status(email_id, "waiting_approval")
             except asyncio.CancelledError as exc:
@@ -723,11 +931,13 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                 fingerprint_identifier(email_id, namespace="email"),
             )
             await ctx.db_manager.update_status(
-                email_id, "delivery_failed",
+                email_id,
+                "delivery_failed",
                 error_message="Approval card send returned failure",
             )
         try:
             from src.observability.metrics import record_card_dispatch
+
             record_card_dispatch("approval", delivered)
         except Exception:
             pass
@@ -740,12 +950,28 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             priority,
             intent,
         )
-        pdf_result = await lark_app.generate_and_upload_pdf(email_id)
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            32,
+            {"operation": "generate_notification_pdf", "email_id": email_id},
+        )
+        try:
+            pdf_result = await lark_app.generate_and_upload_pdf(email_id)
+        except Exception:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            raise
         pdf_stage = await _stage_notification_pdf(
             email_id,
             ctx,
             pdf_result,
+            _effect_boundary=_effect_boundary,
         )
+        if _effect_boundary is not None and (
+            not pdf_stage.ready or pdf_stage.new_token is None or pdf_stage.url is None
+        ):
+            raise GuardedExternalEffectFailed()
         if not pdf_stage.ready:
             logger.error(
                 "Read-only notification PDF staging failed: code=%s",
@@ -758,15 +984,30 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
             )
             return {"delivered": False, "kind": "read_only"}
 
-        delivered = bool(lark_app.send_read_only_card(
-            email_id=email_id,
-            context=pipeline_result.get("context", []),
-            email_data=pipeline_result.get("email", {}),
-            classification=classification,
-            pdf_url=pdf_stage.url,
-            routing_log=routing_log,
-            active_skills=active_skills,
-        ))
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            33,
+            {"operation": "send_read_only_card", "email_id": email_id},
+        )
+        try:
+            delivery_result = await asyncio.to_thread(
+                lark_app.send_read_only_card,
+                email_id=email_id,
+                context=pipeline_result.get("context", []),
+                email_data=pipeline_result.get("email", {}),
+                classification=classification,
+                pdf_url=pdf_stage.url,
+                routing_log=routing_log,
+                active_skills=active_skills,
+            )
+        except Exception:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            raise
+        if _effect_boundary is not None and delivery_result is not True:
+            raise GuardedExternalEffectFailed()
+        delivered = bool(delivery_result)
         if delivered:
             try:
                 await _delete_replaced_pdf(
@@ -774,6 +1015,7 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                     ctx,
                     pdf_stage.old_token,
                     pdf_stage.new_token,
+                    _effect_boundary=_effect_boundary,
                 )
                 await ctx.db_manager.update_status(email_id, "notified_readonly")
             except asyncio.CancelledError as exc:
@@ -792,11 +1034,13 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
                 fingerprint_identifier(email_id, namespace="email"),
             )
             await ctx.db_manager.update_status(
-                email_id, "delivery_failed",
+                email_id,
+                "delivery_failed",
                 error_message="Read-only card send returned failure",
             )
         try:
             from src.observability.metrics import record_card_dispatch
+
             record_card_dispatch("read_only", delivered)
         except Exception:
             pass
@@ -809,6 +1053,7 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
     await ctx.db_manager.update_status(email_id, "skipped")
     try:
         from src.observability.metrics import record_card_dispatch
+
         record_card_dispatch("skipped", True)
     except Exception:
         pass
@@ -816,10 +1061,23 @@ async def _dispatch_notification(email_id: str, pipeline_result: dict, ctx, conf
     return {"delivered": True, "kind": "skipped"}
 
 
-async def _mark_email_read(email_id: str, ctx) -> None:
+async def _mark_email_read(
+    email_id: str,
+    ctx,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> None:
     """Mark email as read on Exchange server."""
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.EXCHANGE_MUTATION,
+        0,
+        {"operation": "mark_as_read", "email_id": email_id, "is_read": True},
+    )
     try:
         success = await ctx.exchange_client.mark_as_read(email_id, is_read=True)
+        if _effect_boundary is not None and success is not True:
+            raise GuardedExternalEffectFailed()
         if success:
             logger.info(
                 "Email marked read on Exchange: email=%s",
@@ -831,6 +1089,10 @@ async def _mark_email_read(email_id: str, ctx) -> None:
                 fingerprint_identifier(email_id, namespace="email"),
             )
     except Exception as exc:
+        if _effect_boundary is not None:
+            if isinstance(exc, GuardedExternalEffectFailed):
+                raise
+            raise GuardedExternalEffectFailed() from None
         logger.error("Mark-as-read failed: error_type=%s", type(exc).__name__)
 
 
@@ -847,6 +1109,53 @@ async def process_and_archive_email(
     - skip_analysis=True: ingest only -> mark archived (no upload/AI/notify/mark_read)
     - force_reprocess=True: proceed even if email already exists in DB
     """
+    return await _process_email_entry(
+        email_data,
+        ctx,
+        skip_analysis,
+        force_reprocess,
+        effect_boundary=None,
+    )
+
+
+async def process_and_archive_email_guarded(
+    email_data,
+    ctx,
+    skip_analysis: bool = False,
+    force_reprocess: bool = False,
+    *,
+    before_external_effect: BeforeExternalEffect,
+    effect_scope: LegacyEffectScope,
+) -> ProcessingOutcome:
+    """Run the legacy processor with a mandatory fenced external-effect port."""
+    settings = get_settings()
+    if (
+        type(effect_scope) is not LegacyEffectScope
+        or type(settings.EXCHANGE_ACCOUNT_ID) is not int
+        or settings.EXCHANGE_ACCOUNT_ID <= 0
+        or effect_scope.account_id != settings.EXCHANGE_ACCOUNT_ID
+        or type(email_data) is not dict
+        or email_data.get("id") != effect_scope.external_email_id
+    ):
+        raise ProcessingPolicyRejected()
+    boundary = ExternalEffectBoundary(effect_scope, before_external_effect)
+    return await _process_email_entry(
+        email_data,
+        ctx,
+        skip_analysis,
+        force_reprocess,
+        effect_boundary=boundary,
+    )
+
+
+async def _process_email_entry(
+    email_data,
+    ctx,
+    skip_analysis: bool,
+    force_reprocess: bool,
+    *,
+    effect_boundary: ExternalEffectBoundary | None,
+) -> ProcessingOutcome:
     validate_email_input(
         email_data,
         input_limits_from_settings(get_settings()),
@@ -856,14 +1165,28 @@ async def process_and_archive_email(
     config = {"configurable": {"thread_id": thread_id}}
 
     from src.utils.logging_setup import log_email_context
+
     with log_email_context(thread_id):
         return await _process_and_archive_email_inner(
-            email_data, ctx, skip_analysis, force_reprocess, thread_id, config
+            email_data,
+            ctx,
+            skip_analysis,
+            force_reprocess,
+            thread_id,
+            config,
+            **_effect_boundary_kwargs(effect_boundary),
         )
 
 
 async def _process_and_archive_email_inner(
-    email_data, ctx, skip_analysis, force_reprocess, thread_id, config
+    email_data,
+    ctx,
+    skip_analysis,
+    force_reprocess,
+    thread_id,
+    config,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> ProcessingOutcome:
     event_type = email_data.get("_event_type", "unknown")
     logger.info(
@@ -876,8 +1199,10 @@ async def _process_and_archive_email_inner(
 
     # Initialize Draft Recipients (Reply Logic)
     if "draft_to" not in email_data:
-        email_data["draft_to"] = [email_data.get("sender")] if email_data.get("sender") else []
-    
+        email_data["draft_to"] = (
+            [email_data.get("sender")] if email_data.get("sender") else []
+        )
+
     if "draft_cc" not in email_data:
         email_data["draft_cc"] = email_data.get("cc", [])
 
@@ -887,7 +1212,7 @@ async def _process_and_archive_email_inner(
             "Email already exists in database: email=%s",
             fingerprint_identifier(thread_id, namespace="email"),
         )
-        if not skip_analysis:
+        if not skip_analysis and _effect_boundary is None:
             status = await ctx.db_manager.get_email_status(thread_id)
             if status in SAFE_DUPLICATE_READ_STATUSES:
                 await _mark_email_read(thread_id, ctx)
@@ -900,6 +1225,7 @@ async def _process_and_archive_email_inner(
         reuse_existing=(
             force_reprocess and initial_write is InitialEmailWriteResult.DUPLICATE
         ),
+        **_effect_boundary_kwargs(_effect_boundary),
     )
 
     logger.info(
@@ -908,18 +1234,46 @@ async def _process_and_archive_email_inner(
     )
 
     if skip_analysis:
-        await _archive_only(thread_id, email_data, ctx, event_type)
+        await _archive_only(
+            thread_id,
+            email_data,
+            ctx,
+            event_type,
+            **_effect_boundary_kwargs(_effect_boundary),
+        )
         return ProcessingOutcome.ARCHIVED
 
-    return await _run_ai_path(thread_id, email_data, ctx, config)
+    return await _run_ai_path(
+        thread_id,
+        email_data,
+        ctx,
+        config,
+        **_effect_boundary_kwargs(_effect_boundary),
+    )
 
 
-async def _delete_unclaimed_content_candidate(ref: ContentRef, ctx, *, reason: str) -> None:
+async def _delete_unclaimed_content_candidate(
+    ref: ContentRef,
+    ctx,
+    *,
+    reason: str,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> None:
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.CONTENT,
+        2,
+        _content_ref_effect_target("delete_unclaimed_content", ref),
+    )
     try:
         await ctx.content_store.delete(ref)
     except asyncio.CancelledError:
+        if _effect_boundary is not None:
+            raise
         logger.error("Unclaimed content cleanup was cancelled: reason=%s", reason)
     except Exception as cleanup_exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.error(
             "Unclaimed content cleanup failed: reason=%s error_type=%s",
             reason,
@@ -933,6 +1287,7 @@ async def _ensure_durable_content_ref(
     ctx,
     *,
     reuse_existing: bool,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> ContentRef:
     """Persist content and its typed DB ref before any downstream operation."""
     if reuse_existing:
@@ -941,15 +1296,34 @@ async def _ensure_durable_content_ref(
             return _require_owned_ref(existing)
 
     settings = get_settings()
-    ref = await ctx.content_store.put_email(
-        settings.EXCHANGE_ACCOUNT_ID,
-        email_id,
-        email_data,
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.CONTENT,
+        0,
+        {
+            "operation": "put_email_content",
+            "account_id": settings.EXCHANGE_ACCOUNT_ID,
+            "email_id": email_id,
+        },
     )
+    try:
+        ref = await ctx.content_store.put_email(
+            settings.EXCHANGE_ACCOUNT_ID,
+            email_id,
+            email_data,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
+        raise
     ref = _require_owned_ref(ref)
     try:
         claimed = await ctx.db_manager.set_content_ref_if_absent(email_id, ref)
     except asyncio.CancelledError as cancel_exc:
+        if _effect_boundary is not None:
+            raise
         # The CAS may have committed before cancellation was observed.  Read
         # back before deciding whether this attempt's object is unclaimed.
         try:
@@ -959,8 +1333,7 @@ async def _ensure_durable_content_ref(
             raise cancel_exc from None
         except Exception as read_exc:
             logger.error(
-                "Content reference cancellation outcome unknown: "
-                "read_error_type=%s",
+                "Content reference cancellation outcome unknown: read_error_type=%s",
                 type(read_exc).__name__,
             )
             raise cancel_exc from None
@@ -974,6 +1347,7 @@ async def _ensure_durable_content_ref(
                         ref,
                         ctx,
                         reason="cancelled_foreign_winner",
+                        _effect_boundary=_effect_boundary,
                     )
                 logger.error(
                     "Content reference cancellation winner invalid: error_type=%s",
@@ -982,17 +1356,16 @@ async def _ensure_durable_content_ref(
                 raise cancel_exc from None
 
         if persisted_ref is None or persisted_ref != ref:
-            try:
-                await ctx.content_store.delete(ref)
-            except asyncio.CancelledError:
-                logger.error("Cancelled content cleanup was interrupted")
-            except Exception as cleanup_exc:
-                logger.error(
-                    "Cancelled content cleanup failed: error_type=%s",
-                    type(cleanup_exc).__name__,
-                )
+            await _delete_unclaimed_content_candidate(
+                ref,
+                ctx,
+                reason="cancelled_unclaimed_candidate",
+                _effect_boundary=_effect_boundary,
+            )
         raise cancel_exc from None
     except Exception as write_exc:
+        if _effect_boundary is not None:
+            raise
         try:
             persisted_ref = await ctx.db_manager.get_content_ref(email_id)
         except Exception as read_exc:
@@ -1012,27 +1385,26 @@ async def _ensure_durable_content_ref(
                     ref,
                     ctx,
                     reason="ambiguous_foreign_winner",
+                    _effect_boundary=_effect_boundary,
                 )
                 raise
             if persisted_ref == ref:
                 logger.warning("Content reference commit confirmed by read-back")
                 return ref
-            try:
-                await ctx.content_store.delete(ref)
-            except Exception as cleanup_exc:
-                logger.error(
-                    "Unclaimed content cleanup failed: error_type=%s",
-                    type(cleanup_exc).__name__,
-                )
+            await _delete_unclaimed_content_candidate(
+                ref,
+                ctx,
+                reason="ambiguous_concurrent_winner",
+                _effect_boundary=_effect_boundary,
+            )
             return persisted_ref
 
-        try:
-            await ctx.content_store.delete(ref)
-        except Exception as cleanup_exc:
-            logger.error(
-                "Content cleanup failed: error_type=%s",
-                type(cleanup_exc).__name__,
-            )
+        await _delete_unclaimed_content_candidate(
+            ref,
+            ctx,
+            reason="ambiguous_unclaimed_candidate",
+            _effect_boundary=_effect_boundary,
+        )
         raise write_exc from None
 
     if claimed:
@@ -1041,39 +1413,36 @@ async def _ensure_durable_content_ref(
     try:
         persisted_ref = await ctx.db_manager.get_content_ref(email_id)
     except asyncio.CancelledError as cancel_exc:
+        if _effect_boundary is not None:
+            raise
         # CAS=False proves this candidate was never claimed, so it is safe to
         # delete even though reading the concurrent winner was cancelled.
-        try:
-            await ctx.content_store.delete(ref)
-        except asyncio.CancelledError:
-            logger.error("Unclaimed content cleanup was cancelled")
-        except Exception as cleanup_exc:
-            logger.error(
-                "Unclaimed content cleanup after cancellation failed: "
-                "error_type=%s",
-                type(cleanup_exc).__name__,
-            )
+        await _delete_unclaimed_content_candidate(
+            ref,
+            ctx,
+            reason="false_claim_cancelled_readback",
+            _effect_boundary=_effect_boundary,
+        )
         raise cancel_exc from None
     except Exception as read_exc:
+        if _effect_boundary is not None:
+            raise
         # A False CAS result proves this candidate was not claimed.  It is safe
         # to remove even though reading the concurrent winner failed.
-        try:
-            await ctx.content_store.delete(ref)
-        except Exception as cleanup_exc:
-            logger.error(
-                "Unclaimed content cleanup after read-back failure failed: "
-                "error_type=%s",
-                type(cleanup_exc).__name__,
-            )
+        await _delete_unclaimed_content_candidate(
+            ref,
+            ctx,
+            reason="false_claim_failed_readback",
+            _effect_boundary=_effect_boundary,
+        )
         raise read_exc from None
     if persisted_ref is None:
-        try:
-            await ctx.content_store.delete(ref)
-        except Exception as cleanup_exc:
-            logger.error(
-                "Unresolved content cleanup failed: error_type=%s",
-                type(cleanup_exc).__name__,
-            )
+        await _delete_unclaimed_content_candidate(
+            ref,
+            ctx,
+            reason="false_claim_unresolved",
+            _effect_boundary=_effect_boundary,
+        )
         raise DatabaseOperationError(
             operation="set_content_ref_if_absent",
             retryable=True,
@@ -1086,23 +1455,35 @@ async def _ensure_durable_content_ref(
             ref,
             ctx,
             reason="false_claim_foreign_winner",
+            _effect_boundary=_effect_boundary,
         )
         raise
     if persisted_ref == ref:
         return ref
-    try:
-        await ctx.content_store.delete(ref)
-    except Exception as cleanup_exc:
-        logger.error(
-            "Concurrent content cleanup failed: error_type=%s",
-            type(cleanup_exc).__name__,
-        )
+    await _delete_unclaimed_content_candidate(
+        ref,
+        ctx,
+        reason="false_claim_concurrent_winner",
+        _effect_boundary=_effect_boundary,
+    )
     return persisted_ref
 
 
-async def _archive_only(thread_id: str, email_data: dict, ctx, event_type: str) -> None:
+async def _archive_only(
+    thread_id: str,
+    email_data: dict,
+    ctx,
+    event_type: str,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> None:
     """Archive-folder route: ingest into Qdrant only; never touch mark_as_read."""
-    await _ingest_to_qdrant(thread_id, email_data, ctx)
+    await _ingest_to_qdrant(
+        thread_id,
+        email_data,
+        ctx,
+        _effect_boundary=_effect_boundary,
+    )
     await ctx.db_manager.update_status(thread_id, "archived")
     logger.info(
         "Email archived to Qdrant: email=%s event=%s",
@@ -1175,9 +1556,7 @@ async def _checkpoint_ai_path_resources(
         max_item_bytes=MAX_ID_BYTES,
         reject_excess=True,
     )
-    merged_tokens = list(
-        dict.fromkeys([*current.attachment_tokens, *requested_tokens])
-    )
+    merged_tokens = list(dict.fromkeys([*current.attachment_tokens, *requested_tokens]))
     merged_tokens = cap_identifier_list(
         merged_tokens,
         field="attachment_token",
@@ -1232,16 +1611,13 @@ async def _checkpoint_ai_path_resources(
     )
     tokens_confirmed = set(merged_tokens).issubset(confirmed_tokens)
     pdf_confirmed = (
-        retained_pdf_token is None
-        or confirmed_pdf_token == retained_pdf_token
+        retained_pdf_token is None or confirmed_pdf_token == retained_pdf_token
     )
     if checkpoint_confirmed and tokens_confirmed and pdf_confirmed:
         return CleanupHandleSnapshot(
             attachment_tokens=tuple(confirmed_tokens),
             pdf_token=(
-                confirmed_pdf_token
-                if isinstance(confirmed_pdf_token, str)
-                else None
+                confirmed_pdf_token if isinstance(confirmed_pdf_token, str) else None
             ),
         )
     if write_error is not None:
@@ -1261,6 +1637,7 @@ async def _cleanup_graph_drive_files(
     preserve_attachment_tokens: list[str] | None = None,
     preserve_pdf_token: str | None = None,
     _state_lock_held: bool = False,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> None:
     """Best-effort remote cleanup while retaining failed handles in slim State."""
     if not _state_lock_held:
@@ -1272,6 +1649,7 @@ async def _cleanup_graph_drive_files(
                 preserve_attachment_tokens=preserve_attachment_tokens,
                 preserve_pdf_token=preserve_pdf_token,
                 _state_lock_held=True,
+                _effect_boundary=_effect_boundary,
             )
         return
     config = {"configurable": {"thread_id": email_id}}
@@ -1282,10 +1660,14 @@ async def _cleanup_graph_drive_files(
         if state is not None and isinstance(getattr(state, "values", None), Mapping):
             values = state.values
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.warning(
             "Cleanup state lookup failed: error_type=%s",
             type(exc).__name__,
         )
+    if _effect_boundary is not None and (state is None or not values):
+        raise GuardedExternalEffectFailed()
 
     state_attachment_tokens = [
         token
@@ -1295,45 +1677,69 @@ async def _cleanup_graph_drive_files(
     all_attachment_tokens = list(
         dict.fromkeys([*state_attachment_tokens, *fallback_attachment_tokens])
     )
-    preserved_attachment_tokens = list(
-        dict.fromkeys(preserve_attachment_tokens or [])
-    )
+    preserved_attachment_tokens = list(dict.fromkeys(preserve_attachment_tokens or []))
     preserved_attachment_set = set(preserved_attachment_tokens)
     pdf_token = values.get("pdf_token")
 
     failed_attachment_tokens: list[str] = []
-    for token in all_attachment_tokens:
+    for ordinal, token in enumerate(all_attachment_tokens):
         if token in preserved_attachment_set or token == preserve_pdf_token:
             continue
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            64 + ordinal,
+            {
+                "operation": "cleanup_attachment",
+                "token_sha256": _identifier_digest(token),
+            },
+        )
         try:
             deleted = await asyncio.to_thread(lark_app.delete_file_from_drive, token)
+            if _effect_boundary is not None and deleted is not True:
+                raise GuardedExternalEffectFailed()
         except Exception as exc:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
             logger.error(
                 "Drive cleanup failed: error_type=%s",
                 type(exc).__name__,
             )
             deleted = False
         if not deleted:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed()
             failed_attachment_tokens.append(token)
 
     retained_pdf_token = preserve_pdf_token
-    if (
-        isinstance(pdf_token, str)
-        and pdf_token
-        and pdf_token != preserve_pdf_token
-    ):
+    if isinstance(pdf_token, str) and pdf_token and pdf_token != preserve_pdf_token:
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            96,
+            {
+                "operation": "cleanup_pdf",
+                "token_sha256": _identifier_digest(pdf_token),
+            },
+        )
         try:
             deleted = await asyncio.to_thread(
                 lark_app.delete_file_from_drive,
                 pdf_token,
             )
+            if _effect_boundary is not None and deleted is not True:
+                raise GuardedExternalEffectFailed()
         except Exception as exc:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
             logger.error(
                 "PDF cleanup failed: error_type=%s",
                 type(exc).__name__,
             )
             deleted = False
         if not deleted:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed()
             if preserve_pdf_token is None:
                 retained_pdf_token = pdf_token
             else:
@@ -1357,6 +1763,8 @@ async def _cleanup_graph_drive_files(
             update_kwargs["as_node"] = "__start__"
         await ctx.graph.aupdate_state(config, update, **update_kwargs)
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.warning(
             "Cleanup state update failed: error_type=%s",
             type(exc).__name__,
@@ -1366,19 +1774,20 @@ async def _cleanup_graph_drive_files(
     try:
         confirmed = await _snapshot_cleanup_handles(email_id, ctx)
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         logger.warning(
             "Cleanup state read-back failed: error_type=%s",
             type(exc).__name__,
         )
         return
-    tokens_confirmed = set(retained_state_tokens).issubset(
-        confirmed.attachment_tokens
-    )
+    tokens_confirmed = set(retained_state_tokens).issubset(confirmed.attachment_tokens)
     pdf_confirmed = (
-        retained_pdf_token is None
-        or confirmed.pdf_token == retained_pdf_token
+        retained_pdf_token is None or confirmed.pdf_token == retained_pdf_token
     )
     if not tokens_confirmed or not pdf_confirmed:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed()
         logger.warning("Cleanup state update was not confirmed")
 
 
@@ -1387,6 +1796,8 @@ async def _run_ai_path(
     email_data: dict,
     ctx,
     config: dict,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> ProcessingOutcome:
     """
     Inbox route: upload -> ingest -> AI -> notify, with two-phase mark_as_read.
@@ -1431,11 +1842,17 @@ async def _run_ai_path(
             email_data,
             max_uploads=MAX_TOKENS - len(baseline.attachment_tokens),
             acknowledge_token=acknowledge_attachment_token,
+            **_effect_boundary_kwargs(_effect_boundary),
         )
         for token in attachment_uploads.tokens:
             if token not in attachment_tokens:
                 await acknowledge_attachment_token(token)
-        await _ingest_to_qdrant(thread_id, email_data, ctx)
+        await _ingest_to_qdrant(
+            thread_id,
+            email_data,
+            ctx,
+            **_effect_boundary_kwargs(_effect_boundary),
+        )
         pipeline_result = await _run_ai_pipeline(
             thread_id,
             ctx,
@@ -1444,14 +1861,18 @@ async def _run_ai_path(
             preserved_attachment_tokens=list(baseline.attachment_tokens),
             preserved_pdf_token=baseline.pdf_token,
             attachment_links=[dict(link) for link in attachment_uploads.links],
+            **_effect_boundary_kwargs(_effect_boundary),
         )
         if pipeline_result is None:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed()
             await _cleanup_graph_drive_files(
                 thread_id,
                 ctx,
                 fallback_attachment_tokens=attachment_tokens,
                 preserve_attachment_tokens=list(baseline.attachment_tokens),
                 preserve_pdf_token=baseline.pdf_token,
+                **_effect_boundary_kwargs(_effect_boundary),
             )
             await ctx.db_manager.update_status(thread_id, "error")
             return ProcessingOutcome.FAILED
@@ -1497,17 +1918,26 @@ async def _run_ai_path(
                     fallback_attachment_tokens=attachment_tokens,
                     preserve_attachment_tokens=list(baseline.attachment_tokens),
                     preserve_pdf_token=baseline.pdf_token,
+                    **_effect_boundary_kwargs(_effect_boundary),
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if _effect_boundary is not None:
+                    raise
                 logger.error(
                     "Manual-review cleanup failed: error_type=%s",
                     type(exc).__name__,
                 )
             return ProcessingOutcome.MANUAL_REVIEW
 
-        dispatch_result = await _dispatch_notification(thread_id, pipeline_result, ctx, config)
+        dispatch_result = await _dispatch_notification(
+            thread_id,
+            pipeline_result,
+            ctx,
+            config,
+            **_effect_boundary_kwargs(_effect_boundary),
+        )
         notification_committed = bool(
             dispatch_result.get("delivered")
             and dispatch_result.get("kind") in {"approval", "read_only"}
@@ -1519,15 +1949,21 @@ async def _run_ai_path(
                 fallback_attachment_tokens=attachment_tokens,
                 preserve_attachment_tokens=list(baseline.attachment_tokens),
                 preserve_pdf_token=baseline.pdf_token,
+                **_effect_boundary_kwargs(_effect_boundary),
             )
         elif dispatch_result.get("kind") == "skipped":
             await _cleanup_graph_drive_files(
                 thread_id,
                 ctx,
                 fallback_attachment_tokens=attachment_tokens,
+                **_effect_boundary_kwargs(_effect_boundary),
             )
         if dispatch_result.get("delivered"):
-            await _mark_email_read(thread_id, ctx)
+            await _mark_email_read(
+                thread_id,
+                ctx,
+                **_effect_boundary_kwargs(_effect_boundary),
+            )
         else:
             logger.warning(
                 "Skipping mark-read after delivery failure: email=%s kind=%s",
@@ -1547,7 +1983,7 @@ async def _run_ai_path(
         )
         raise committed.cause from None
     except asyncio.CancelledError:
-        if not notification_committed:
+        if _effect_boundary is None and not notification_committed:
             await _cleanup_graph_drive_files(
                 thread_id,
                 ctx,
@@ -1557,15 +1993,20 @@ async def _run_ai_path(
             )
         raise
     except DatabaseOperationError:
-        await _cleanup_graph_drive_files(
-            thread_id,
-            ctx,
-            fallback_attachment_tokens=attachment_tokens,
-            preserve_attachment_tokens=list(baseline.attachment_tokens),
-            preserve_pdf_token=baseline.pdf_token,
-        )
+        if _effect_boundary is None:
+            await _cleanup_graph_drive_files(
+                thread_id,
+                ctx,
+                fallback_attachment_tokens=attachment_tokens,
+                preserve_attachment_tokens=list(baseline.attachment_tokens),
+                preserve_pdf_token=baseline.pdf_token,
+            )
+        raise
+    except (ExternalEffectAuthorizationError, StaleFence, GuardedExternalEffectFailed):
         raise
     except Exception as exc:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
         await _cleanup_graph_drive_files(
             thread_id,
             ctx,
@@ -1600,14 +2041,21 @@ def _extract_id(raw) -> str | None:
 # Shared enqueue implementation (used by both WebhookWorker and legacy API)
 # ---------------------------------------------------------------------------
 
-async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_event: str | None = None) -> dict:
+
+async def _enqueue_event_impl(
+    queue: asyncio.Queue, ctx, payload: dict, header_event: str | None = None
+) -> dict:
     """Core routing + enqueue logic, parameterised on *queue* and *ctx*."""
     if queue is None:
         raise RuntimeError("Exchange worker is not running")
 
     event_type = header_event or payload.get("event_type") or payload.get("event")
     if event_type not in {"NewMailEvent", "CreatedEvent"}:
-        return {"queued": False, "reason": "unsupported_event", "event_type": event_type}
+        return {
+            "queued": False,
+            "reason": "unsupported_event",
+            "event_type": event_type,
+        }
 
     email_id = _extract_id(payload.get("item_id")) or _extract_id(payload.get("id"))
     parent_folder_id = _extract_id(payload.get("parent_folder_id"))
@@ -1616,13 +2064,19 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
         return {"queued": False, "reason": "no_item_id", "event_type": event_type}
 
     exchange_client = ctx.exchange_client if ctx else None
-    folder_name = exchange_client.get_folder_name(parent_folder_id) if exchange_client else None
+    folder_name = (
+        exchange_client.get_folder_name(parent_folder_id) if exchange_client else None
+    )
 
     route = None
     skip_analysis = False
 
     if event_type == "NewMailEvent":
-        folder_policies = getattr(exchange_client, "_folder_policies", None) if exchange_client else None
+        folder_policies = (
+            getattr(exchange_client, "_folder_policies", None)
+            if exchange_client
+            else None
+        )
         if folder_policies:
             policy = exchange_client.get_folder_policy(parent_folder_id)
         else:
@@ -1670,6 +2124,7 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
         queue.put_nowait((email_data, skip_analysis))
         try:
             from src.observability.metrics import webhook_queue_depth
+
             webhook_queue_depth.set(queue.qsize())
         except Exception:
             pass
@@ -1705,6 +2160,7 @@ async def _enqueue_event_impl(queue: asyncio.Queue, ctx, payload: dict, header_e
 # ---------------------------------------------------------------------------
 # WebhookWorker class
 # ---------------------------------------------------------------------------
+
 
 class WebhookWorker:
     """Process webhook events with a fixed set of queue consumers."""
@@ -1755,7 +2211,9 @@ class WebhookWorker:
             )
             for index in range(self.concurrency)
         ]
-        logger.info("Exchange webhook worker started (concurrency=%d).", self.concurrency)
+        logger.info(
+            "Exchange webhook worker started (concurrency=%d).", self.concurrency
+        )
 
     async def stop(self, drain_timeout: float = 30.0):
         """Close intake, drain queued work, then collect all consumers."""
@@ -1822,7 +2280,9 @@ class WebhookWorker:
                 pass
         logger.info("Exchange webhook worker stopped.")
 
-    async def enqueue_event(self, payload: dict, header_event: str | None = None) -> dict:
+    async def enqueue_event(
+        self, payload: dict, header_event: str | None = None
+    ) -> dict:
         """Route and enqueue a webhook event."""
         if not self._accepting:
             raise RuntimeError("Exchange webhook worker is not accepting events")
