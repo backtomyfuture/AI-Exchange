@@ -141,7 +141,8 @@ def load_migration_settings(
 
         parsed = conninfo_to_dict(database_url)
         if (
-            parsed.get("user") != migration_role
+            not database_url.startswith("postgresql://")
+            or parsed.get("user") != migration_role
             or not parsed.get("password")
             or not parsed.get("host")
             or not parsed.get("dbname")

@@ -378,6 +378,25 @@ def test_migration_settings_requires_exact_migration_search_path(
         module.load_migration_settings(_environment(secret_path))
 
 
+def test_migration_settings_rejects_libpq_keyword_dsn_before_alembic(
+    tmp_path: Path,
+):
+    module = _module()
+    secret_path = _private_secret(
+        tmp_path / "migration-dsn",
+        "host=postgres dbname=email_agent user=migration_owner "
+        "password=Migration9Q2w7V4m options=-csearch_path=public",
+    )
+
+    with pytest.raises(
+        module.MigrationSettingsError, match="migration_settings_invalid"
+    ) as caught:
+        module.load_migration_settings(_environment(secret_path))
+
+    assert "Migration9Q2w7V4m" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
 def test_runtime_database_url_fixes_catalog_first_search_path():
     from psycopg.conninfo import conninfo_to_dict
 
