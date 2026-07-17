@@ -15,10 +15,12 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
 from src.db.schema import require_runtime_database
+from src.db.runtime_boundary import require_runtime_database_boundary
 from src.domain.errors import DatabaseOperationError, IngressValidationError, StaleFence
 from src.ingestion.models import IngressReceipt
 from src.ingestion.policy import PolicySnapshotUnavailableError
 from src.ingestion.webhook import TestWebhookReceipt, WebhookIngressUnavailable
+from src.init_app import get_runtime_app_context
 from src.safety.input_limits import input_limits_from_settings
 from src.security.auth import require_metrics_auth, validate_runtime_security
 from src.security.redaction import fingerprint_identifier
@@ -145,21 +147,38 @@ _docs_enabled = _initial_app_env != "production"
 
 
 @asynccontextmanager
-async def secure_service_lifespan(application: FastAPI):
-    """Make the exported server app use the same guarded unified runtime."""
+async def application_lifespan(application: FastAPI):
+    """Own the one Phase-2 durable-ingestion runtime."""
 
-    validate_runtime_security(get_settings())
-    from src.main import lifespan as unified_lifespan
-
-    async with unified_lifespan(application):
+    settings = get_settings()
+    validate_runtime_security(settings)
+    await require_runtime_database_boundary(settings)
+    context = get_runtime_app_context()
+    runtime = context.create_ingestion_runtime(settings)
+    application.state.ingestion_runtime = None
+    application.state.webhook_ingress_service = None
+    try:
+        await runtime.start()
+        service = runtime.webhook_ingress_service
+        if service is None:
+            raise RuntimeError("webhook_ingress_service_unavailable")
+        application.state.ingestion_runtime = runtime
+        application.state.webhook_ingress_service = service
         yield
+    finally:
+        application.state.webhook_ingress_service = None
+        try:
+            await runtime.stop()
+        finally:
+            application.state.ingestion_runtime = None
+            context.release_ingestion_runtime(runtime)
 
 
 app = FastAPI(
     docs_url="/docs" if _docs_enabled else None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
-    lifespan=secure_service_lifespan,
+    lifespan=application_lifespan,
 )
 
 
@@ -201,13 +220,17 @@ async def health_check():
 
 
 @app.get("/ready")
-async def readiness_check():
-    """Read-only database/schema readiness without leaking failure details."""
+async def readiness_check(request: Request):
+    """Read-only schema, policy, authority and Web-session readiness."""
     try:
         settings = get_settings()
         validate_runtime_security(settings)
         await _require_cached_runtime_database(settings)
-        return {"status": "ready"}
+        runtime = getattr(request.app.state, "ingestion_runtime", None)
+        check_ready = getattr(runtime, "check_ready", None)
+        if not callable(check_ready) or not await check_ready():
+            raise ReadinessPreflightError("ingestion_runtime_not_ready")
+        return {"status": "ready", "processing": "standby"}
     except Exception as exc:
         _log_readiness_failure_once(exc)
         return JSONResponse(
@@ -220,10 +243,66 @@ async def readiness_check():
 async def metrics_endpoint(request: Request) -> Response:
     """Prometheus scrape endpoint."""
     require_metrics_auth(request, get_settings())
-    from src.observability.metrics import render_metrics
+    from src.observability.metrics import record_durable_ingestion, render_metrics
+
+    runtime = getattr(request.app.state, "ingestion_runtime", None)
+    stats = None
+    ready = False
+    try:
+        check_ready = getattr(runtime, "check_ready", None)
+        queue_stats = getattr(runtime, "queue_stats", None)
+        if callable(check_ready):
+            ready = bool(await check_ready())
+        if callable(queue_stats):
+            stats = await queue_stats()
+    except Exception as exc:
+        logger.warning(
+            "Durable ingestion metrics snapshot failed: error_type=%s",
+            type(exc).__name__,
+        )
+        ready = False
+        stats = None
+    record_durable_ingestion(stats, ready=ready)
 
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
+
+
+@app.get("/queue")
+async def queue_status(request: Request):
+    """Return the bounded durable Inbox aggregate without identifiers."""
+
+    require_metrics_auth(request, get_settings())
+    runtime = getattr(request.app.state, "ingestion_runtime", None)
+    check_ready = getattr(runtime, "check_ready", None)
+    queue_stats = getattr(runtime, "queue_stats", None)
+    try:
+        if (
+            not callable(check_ready)
+            or not callable(queue_stats)
+            or not await check_ready()
+        ):
+            raise ReadinessPreflightError("ingestion_runtime_not_ready")
+        stats = await queue_stats()
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready"},
+        )
+    return {
+        "status": "ready",
+        "ingress": "active",
+        "session": "active",
+        "processing": "standby",
+        "queue": {
+            "pending": stats.pending,
+            "retry_wait": stats.retry_wait,
+            "leased": stats.leased,
+            "manual_review": stats.manual_review,
+            "dead_letter": stats.dead_letter,
+            "oldest_pending_seconds": stats.oldest_pending_seconds,
+        },
+    }
 
 
 @app.post("/webhooks/exchange")

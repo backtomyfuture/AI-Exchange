@@ -163,6 +163,10 @@ services:
       DURABLE_INBOX_ENABLED: ${DURABLE_INBOX_ENABLED:-false}
       INGESTION_SHADOW_ENABLED: ${INGESTION_SHADOW_ENABLED:-false}
       SYNC_RECONCILIATION_ENABLED: ${SYNC_RECONCILIATION_ENABLED:-false}
+      INGESTION_INSTANCE_ID: ${INGESTION_INSTANCE_ID:-ai-exchange-web}
+      INGESTION_LEASE_SECONDS: ${INGESTION_LEASE_SECONDS:-30}
+      INGESTION_HEARTBEAT_SECONDS: ${INGESTION_HEARTBEAT_SECONDS:-10}
+      INGESTION_SHUTDOWN_SECONDS: ${INGESTION_SHUTDOWN_SECONDS:-30}
       EXCHANGE_API_URL: ${EXCHANGE_API_URL:-}
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
       EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:-8}
@@ -228,7 +232,7 @@ services:
     volumes:
       - content_data:/app/data/content
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
       interval: 30s
       timeout: 10s
       retries: 3

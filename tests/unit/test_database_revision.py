@@ -14,6 +14,7 @@ from src.db.schema import (
     require_current_database,
 )
 from src.db.roles import DatabaseRoleError
+from src.db.runtime_boundary import require_runtime_database_boundary
 
 
 _PHASE_2_FLAGS_DISABLED = {
@@ -303,7 +304,6 @@ async def test_runtime_gate_rejects_sync_before_capability_verifier_without_db_a
 
 @pytest.mark.asyncio
 async def test_startup_and_readiness_boundaries_fail_closed_for_unverified_sync():
-    from src import main as main_module
     from src import server as server_module
 
     settings = SimpleNamespace(
@@ -332,7 +332,7 @@ async def test_startup_and_readiness_boundaries_fail_closed_for_unverified_sync(
                 DatabaseRevisionError,
                 match="sync_reconciliation_capability_unavailable",
             ):
-                await main_module._require_runtime_database_boundary(settings)
+                await require_runtime_database_boundary(settings)
             with pytest.raises(
                 DatabaseRevisionError,
                 match="sync_reconciliation_capability_unavailable",
@@ -525,7 +525,7 @@ def test_database_manager_has_no_runtime_schema_initializer():
 
 @pytest.mark.asyncio
 async def test_lifespan_checks_revision_before_context_setup():
-    from src import main as main_module
+    from src import server as server_module
 
     settings = SimpleNamespace(
         LOG_LEVEL="INFO",
@@ -541,44 +541,26 @@ async def test_lifespan_checks_revision_before_context_setup():
         POSTGRES_SCHEMA="public",
     )
     context = MagicMock()
-    context.setup_async = AsyncMock()
     revision_error = DatabaseRevisionError("database schema is stale")
     runtime_revision_check = AsyncMock(side_effect=revision_error)
-    legacy_revision_check = AsyncMock(
-        side_effect=AssertionError("legacy_revision_gate_was_called")
-    )
 
     with (
-        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(server_module, "get_settings", return_value=settings),
+        patch.object(server_module, "validate_runtime_security"),
         patch.object(
-            main_module,
-            "require_runtime_database",
+            server_module,
+            "require_runtime_database_boundary",
             new=runtime_revision_check,
-            create=True,
         ) as revision_check,
         patch.object(
-            main_module,
-            "require_current_database",
-            new=legacy_revision_check,
-            create=True,
+            server_module,
+            "get_runtime_app_context",
+            return_value=context,
         ),
-        patch.object(main_module, "get_app_context", return_value=context),
     ):
         with pytest.raises(DatabaseRevisionError, match="stale"):
-            async with main_module.lifespan(main_module.app):
+            async with server_module.application_lifespan(server_module.app):
                 pass
 
-    revision_check.assert_awaited_once_with(
-        settings.database_url,
-        durable_inbox_enabled=True,
-        ingestion_shadow_enabled=False,
-        sync_reconciliation_enabled=True,
-        role_separation_required=True,
-        expected_runtime_role="runtime_user",
-        expected_migration_role="migration_owner",
-        expected_maintenance_role="maintenance_user",
-        expected_auditor_role="checkpoint_auditor",
-        target_schema="public",
-    )
-    legacy_revision_check.assert_not_awaited()
-    context.setup_async.assert_not_awaited()
+    revision_check.assert_awaited_once_with(settings)
+    context.create_ingestion_runtime.assert_not_called()

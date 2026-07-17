@@ -345,6 +345,20 @@ _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "20e87718472f4a39e6f5277f17321b3ef5cad83f5b25c9a4ca92c5652827a32a"
     ),
 }
+_TASK11G_PREDECESSOR_PATHS = frozenset(
+    {
+        "src/ingestion/repository.py",
+        "src/server.py",
+    }
+)
+_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/ingestion/repository.py": (
+        "4f1e138bce5fceb6782dc94d4d66444754386b6883d2ce78eaf213a35044822a"
+    ),
+    "src/server.py": (
+        "34af871f76b9827675d38fc909027425078f01153820e32c6e01e0f1b18adf26"
+    ),
+}
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -370,9 +384,7 @@ _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
     "src/router/engine.py": (
         "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
     ),
-    "src/server.py": (
-        "e6c13889b3dedfb0f88f49d3434c800fc15ee2f3dcad70e577129459193c9786"
-    ),
+    "src/server.py": _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
     "src/utils/email_processor.py": (
         "ba933f7ec3b7c6be28039bcf050b580c45e6fdf0d4e555916525a7d96e3c2332"
     ),
@@ -2073,7 +2085,9 @@ def test_task9g_reviewed_structural_ast_requires_explicit_review() -> None:
         _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
     )
     historical_paths = (
-        set(_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK10G_TASK9G_SUCCESSOR_PATHS
+        set(_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256)
+        - _TASK10G_TASK9G_SUCCESSOR_PATHS
+        - _TASK11G_PREDECESSOR_PATHS
     )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
@@ -2098,14 +2112,39 @@ def test_task10g_reviewed_structural_ast_requires_explicit_review() -> None:
         | _TASK10G_TASK9G_SUCCESSOR_PATHS
     )
     assert predecessor_paths == set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256)
+    historical_paths = (
+        set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK11G_PREDECESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256, (
+    assert actual == expected, (
         "Task-10G structural review required before updating its normalized AST "
-        f"SHA-256 ratchet: expected {_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256}, "
+        f"SHA-256 ratchet: expected {expected}, got {actual}"
+    )
+
+
+def test_task11g_reviewed_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    predecessor_paths = set(_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256) | set(
+        _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    assert _TASK11G_PREDECESSOR_PATHS <= predecessor_paths
+    assert _TASK11G_PREDECESSOR_PATHS == set(_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256)
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Task-11G structural review required before updating its normalized AST "
+        f"SHA-256 ratchet: expected {_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256}, "
         f"got {actual}"
     )
 

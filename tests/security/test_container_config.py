@@ -219,10 +219,20 @@ def test_production_application_publishes_one_webhook_port():
     assert ports == ("${APP_PORT:-8000}:8000",)
 
 
-def test_production_shutdown_budget_covers_worker_and_lark_drains():
+def test_production_shutdown_budget_covers_bounded_ingestion_drain():
     compose = _load_yaml(PRODUCTION_COMPOSE)
 
     assert compose["services"]["ai-assistant-service"]["stop_grace_period"] == "90s"
+
+
+def test_production_healthchecks_use_session_aware_readiness():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service_check = compose["services"]["ai-assistant-service"]["healthcheck"]["test"]
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert service_check == ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+    assert "CMD curl -f http://localhost:8000/ready || exit 1" in dockerfile
+    assert "CMD curl -f http://localhost:8000/health || exit 1" not in dockerfile
 
 
 def test_production_does_not_expose_host_gateway_to_application():

@@ -419,60 +419,30 @@ def test_security_credentials_are_secretstr_fields():
 
 @pytest.mark.asyncio
 async def test_lifespan_validates_runtime_before_database_or_context():
-    from src import main as main_module
+    from src import server as server_module
 
     settings = _secure_production_settings(EXCHANGE_SSL_VERIFY=False)
     runtime_database_check = AsyncMock(
         side_effect=AssertionError("database_reached_before_security_validation")
     )
-    legacy_database_check = AsyncMock(
-        side_effect=AssertionError("legacy_database_gate_reached")
-    )
     with (
-        patch.object(main_module, "get_settings", return_value=settings),
+        patch.object(server_module, "get_settings", return_value=settings),
         patch.object(
-            main_module,
-            "require_runtime_database",
+            server_module,
+            "require_runtime_database_boundary",
             new=runtime_database_check,
-            create=True,
         ) as database_check,
         patch.object(
-            main_module,
-            "require_current_database",
-            new=legacy_database_check,
-            create=True,
-        ),
-        patch.object(
-            main_module,
-            "get_app_context",
+            server_module,
+            "get_runtime_app_context",
             side_effect=AssertionError("context_reached_before_security_validation"),
         ),
     ):
         with pytest.raises(RuntimeError, match="EXCHANGE_SSL_VERIFY"):
-            async with main_module.lifespan(main_module.app):
+            async with server_module.application_lifespan(server_module.app):
                 pass
 
     database_check.assert_not_awaited()
-    legacy_database_check.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_direct_main_validates_runtime_before_context():
-    from src import main as main_module
-
-    settings = _secure_production_settings(LARK_ALLOWED_OPEN_IDS="")
-    with (
-        patch.object(main_module, "get_settings", return_value=settings),
-        patch.object(
-            main_module,
-            "get_app_context",
-            side_effect=AssertionError("context_reached_before_security_validation"),
-        ) as get_context,
-    ):
-        with pytest.raises(RuntimeError, match="LARK_ALLOWED_OPEN_IDS"):
-            await main_module.main()
-
-    get_context.assert_not_called()
 
 
 def test_run_server_validates_runtime_before_uvicorn_bind():

@@ -3,12 +3,13 @@
 import hmac
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from src.observability import metrics as m
+from src.ingestion.models import InboxStats
 from src.server import app
 
 
@@ -50,6 +51,56 @@ def test_record_circuit_breaker_state_maps_text_to_int():
     assert "circuit_breaker_state 1.0" in body
 
 
+def test_record_durable_ingestion_uses_only_bounded_queue_labels():
+    stats = InboxStats(
+        pending=3,
+        retry_wait=2,
+        leased=1,
+        dead_letter=4,
+        manual_review=5,
+        oldest_pending_seconds=12.5,
+    )
+
+    m.record_durable_ingestion(stats, ready=True)
+
+    body = _scrape()
+    for status, value in {
+        "pending": 3,
+        "retry_wait": 2,
+        "leased": 1,
+        "dead_letter": 4,
+        "manual_review": 5,
+    }.items():
+        assert f'durable_inbox_items{{status="{status}"}} {value}.0' in body
+    assert "durable_inbox_oldest_pending_seconds 12.5" in body
+    assert "durable_ingress_ready 1.0" in body
+    assert "durable_ingestion_snapshot_ok 1.0" in body
+    assert "durable_processing_active 0.0" in body
+    assert "webhook_queue_depth 5.0" in body
+
+
+def test_failed_queue_snapshot_preserves_backlog_and_marks_snapshot_unknown():
+    stats = InboxStats(
+        pending=7,
+        retry_wait=3,
+        leased=2,
+        dead_letter=5,
+        manual_review=4,
+        oldest_pending_seconds=18.0,
+    )
+    m.record_durable_ingestion(stats, ready=True)
+
+    m.record_durable_ingestion(None, ready=False)
+
+    body = _scrape()
+    assert 'durable_inbox_items{status="pending"} 7.0' in body
+    assert 'durable_inbox_items{status="dead_letter"} 5.0' in body
+    assert "durable_inbox_oldest_pending_seconds 18.0" in body
+    assert "webhook_queue_depth 10.0" in body
+    assert "durable_ingress_ready 0.0" in body
+    assert "durable_ingestion_snapshot_ok 0.0" in body
+
+
 def test_metrics_endpoint_returns_prometheus_payload():
     client = TestClient(app)
     with patch(
@@ -75,6 +126,72 @@ def test_metrics_endpoint_returns_prometheus_payload():
     )
 
 
+def test_queue_endpoint_returns_one_identifier_free_runtime_snapshot():
+    client = TestClient(app)
+    settings = SimpleNamespace(METRICS_TOKEN=SecretStr("metrics-secret"))
+    stats = InboxStats(
+        pending=3,
+        retry_wait=2,
+        leased=1,
+        dead_letter=4,
+        manual_review=5,
+        oldest_pending_seconds=12.5,
+    )
+    runtime = SimpleNamespace(
+        check_ready=AsyncMock(return_value=True),
+        queue_stats=AsyncMock(return_value=stats),
+    )
+
+    with (
+        patch("src.server.get_settings", return_value=settings),
+        patch.object(app.state, "ingestion_runtime", runtime, create=True),
+    ):
+        response = client.get(
+            "/queue",
+            headers={"Authorization": "Bearer metrics-secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "ingress": "active",
+        "session": "active",
+        "processing": "standby",
+        "queue": {
+            "pending": 3,
+            "retry_wait": 2,
+            "leased": 1,
+            "manual_review": 5,
+            "dead_letter": 4,
+            "oldest_pending_seconds": 12.5,
+        },
+    }
+    runtime.check_ready.assert_awaited_once_with()
+    runtime.queue_stats.assert_awaited_once_with()
+
+
+def test_queue_endpoint_rejects_unready_runtime_before_stats_query():
+    client = TestClient(app)
+    settings = SimpleNamespace(METRICS_TOKEN=SecretStr("metrics-secret"))
+    runtime = SimpleNamespace(
+        check_ready=AsyncMock(return_value=False),
+        queue_stats=AsyncMock(),
+    )
+
+    with (
+        patch("src.server.get_settings", return_value=settings),
+        patch.object(app.state, "ingestion_runtime", runtime, create=True),
+    ):
+        response = client.get(
+            "/queue",
+            headers={"Authorization": "Bearer metrics-secret"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+    runtime.queue_stats.assert_not_awaited()
+
+
 def test_metrics_endpoint_requires_exactly_one_authorization_header():
     client = TestClient(app)
     settings = SimpleNamespace(METRICS_TOKEN=SecretStr("metrics-secret"))
@@ -96,10 +213,13 @@ def test_metrics_token_is_compared_with_constant_time_primitive():
     settings = SimpleNamespace(METRICS_TOKEN=SecretStr("metrics-secret"))
     real_compare = hmac.compare_digest
 
-    with patch("src.server.get_settings", return_value=settings), patch(
-        "src.security.auth.hmac.compare_digest",
-        wraps=real_compare,
-    ) as compare:
+    with (
+        patch("src.server.get_settings", return_value=settings),
+        patch(
+            "src.security.auth.hmac.compare_digest",
+            wraps=real_compare,
+        ) as compare,
+    ):
         response = client.get(
             "/metrics",
             headers={"Authorization": "Bearer metrics-secret"},
@@ -126,8 +246,7 @@ def test_metrics_endpoint_rejects_missing_malformed_and_wrong_credentials():
 
     assert all(response.status_code == 401 for response in responses)
     assert all(
-        response.headers.get("www-authenticate") == "Bearer"
-        for response in responses
+        response.headers.get("www-authenticate") == "Bearer" for response in responses
     )
 
 
@@ -151,10 +270,13 @@ def test_metrics_token_never_enters_logs(caplog):
     client = TestClient(app)
     token = "metrics-log-secret-sentinel"
 
-    with patch(
-        "src.server.get_settings",
-        return_value=SimpleNamespace(METRICS_TOKEN=SecretStr(token)),
-    ), caplog.at_level(logging.INFO):
+    with (
+        patch(
+            "src.server.get_settings",
+            return_value=SimpleNamespace(METRICS_TOKEN=SecretStr(token)),
+        ),
+        caplog.at_level(logging.INFO),
+    ):
         response = client.get(
             "/metrics",
             headers={"Authorization": f"Bearer {token}"},

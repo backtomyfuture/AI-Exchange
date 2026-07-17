@@ -39,6 +39,7 @@ def test_health_returns_only_liveness_metadata_without_app_context():
 
 def test_ready_checks_database_revision_and_returns_minimal_success():
     client = TestClient(app)
+    runtime = SimpleNamespace(check_ready=AsyncMock(return_value=True))
     settings = SimpleNamespace(
         database_url="postgresql://private-dsn-sentinel",
         DURABLE_INBOX_ENABLED=False,
@@ -76,14 +77,36 @@ def test_ready_checks_database_revision_and_returns_minimal_success():
             new=legacy_gate,
             create=True,
         ),
+        patch.object(app.state, "ingestion_runtime", runtime, create=True),
     ):
         response = client.get("/ready")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ready"}
+    assert response.json() == {"status": "ready", "processing": "standby"}
     cached_gate.assert_awaited_once_with(settings)
+    runtime.check_ready.assert_awaited_once_with()
     require_database.assert_not_awaited()
     legacy_gate.assert_not_awaited()
+
+
+def test_ready_rejects_missing_or_unready_runtime_without_mutating_session():
+    client = TestClient(app)
+    settings = SimpleNamespace(database_url="postgresql://private-dsn-sentinel")
+    cached_gate = AsyncMock()
+    runtime = SimpleNamespace(check_ready=AsyncMock(return_value=False))
+
+    with (
+        patch.object(server_module, "get_settings", return_value=settings),
+        patch.object(server_module, "validate_runtime_security"),
+        patch.object(server_module, "_require_cached_runtime_database", cached_gate),
+        patch.object(app.state, "ingestion_runtime", runtime, create=True),
+    ):
+        response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+    runtime.check_ready.assert_awaited_once_with()
+    assert not hasattr(runtime, "heartbeat")
 
 
 def test_ready_failure_is_generic_and_never_logs_or_returns_exception_text(caplog):

@@ -3094,11 +3094,12 @@ def test_real_runtime_import_closure_includes_required_dependencies() -> None:
     }
     required_runtime_dependencies = {
         "src/init_app.py",
-        "src/utils/self_healing.py",
+        "src/ingestion/runtime.py",
     }
     dormant_provider_exemptions = {
         "src/ingestion/cold_start.py",
         "src/ingestion/sync.py",
+        "src/utils/self_healing.py",
     }
 
     assert required_runtime_dependencies <= relative_candidates

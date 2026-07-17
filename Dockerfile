@@ -57,9 +57,9 @@ RUN mkdir -p /app/data/content && \
 # 切换到非 root 用户
 USER appuser
 
-# 健康检查 - 使用 curl 检查 /health endpoint
+# 只有精确数据库、策略与 Web 会话全部就绪后才接收流量。
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/ready || exit 1
 
-# 启动统一服务 (Web + Worker)
+# 启动唯一 FastAPI 应用；Phase 2 的处理端保持 standby。
 CMD ["python", "-m", "src.main"]
