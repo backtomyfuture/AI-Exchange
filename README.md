@@ -80,7 +80,9 @@ Exchange 地址必须通过证书校验。若服务实际通过私网 IP 访问�
 名称，不要把 `EXCHANGE_SSL_VERIFY` 设为 `false`。把 `EXCHANGE_API_URL` 改为证书
 SAN 覆盖的主机名，并在 `.env` 设置 `EXCHANGE_TLS_HOSTNAME`、
 `EXCHANGE_TLS_IP`、`EXCHANGE_CA_FILE_HOST`；最后一个变量指向只含证书/信任链、
-不含私钥的可读 PEM 文件。此时所有 Compose 命令都追加 TLS 覆盖文件，例如：
+不含私钥的可读 PEM 文件。如果服务端只发送叶子证书，单独挂载叶子证书不足以完成
+链校验；应从证书 AIA 指向的官方 CA 来源取得并核验中间证书与根证书，组成私有临时
+trust bundle，而不是关闭验证。此时所有 Compose 命令都追加 TLS 覆盖文件，例如：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.exchange-tls.yml \
@@ -104,14 +106,14 @@ host 完全一致且被证书覆盖。若 Exchange 地址本身已使用可解�
 
 真实 Inbox opaque ID 从 Exchange 的 `emails/folders/all` 接口读取，并写入本次 policy
 manifest；不能用显示名 `INBOX` 代替。私网 TLS 场景可在镜像构建后，使用同一个
-Compose project、TLS overlay 和应用镜像执行一个 `--no-deps --no-build` one-shot；它从
+Compose project、TLS overlay 和应用镜像执行一个不传 `--build` 的 `--no-deps` one-shot；它从
 容器环境读取 API key，不把密钥放入命令行，并利用 overlay 的 SNI/DNS/CA 配置：
 
 ```bash
 umask 077
 docker compose -p "$PROJECT_NAME" \
   -f docker-compose.yml -f docker-compose.exchange-tls.yml \
-  run --rm --no-deps --no-build --entrypoint python ai-assistant-service -c '
+  run --rm --no-deps --entrypoint python ai-assistant-service -c '
 import asyncio
 from src.config import get_settings
 from src.utils.exchange_api import ExchangeClient
@@ -120,9 +122,11 @@ async def main():
     client = ExchangeClient(settings)
     try:
         folders = await client.get_all_folders(force_refresh=True)
-        expected = settings.EXCHANGE_FOLDERS_FULL.strip().casefold()
+        expected = {name.strip().casefold()
+                    for name in settings.EXCHANGE_FOLDERS_FULL.split(",")
+                    if name.strip()}
         matches = [folder_id for folder_id, name in folders.items()
-                   if name.strip().casefold() == expected]
+                   if name.strip().casefold() in expected]
         if len(matches) != 1:
             raise SystemExit("inbox_folder_not_unique")
         print(matches[0])
