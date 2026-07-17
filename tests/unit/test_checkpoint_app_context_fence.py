@@ -194,3 +194,62 @@ async def test_setup_async_fails_closed_when_send_recovery_fails() -> None:
 
     context.pool.open.assert_not_awaited()
     context.exchange_client.get_all_folders.assert_not_awaited()
+
+
+async def test_context_close_is_best_effort_in_checkpoint_database_exchange_order() -> (
+    None
+):
+    from src.init_app import AppContext, AppContextCloseError
+
+    events: list[str] = []
+    context = AppContext()
+
+    async def fail_database_close() -> None:
+        events.append("database.close")
+        raise RuntimeError("database_close_failed")
+
+    context.pool = SimpleNamespace(
+        close=AsyncMock(side_effect=lambda: events.append("checkpoint.close"))
+    )
+    context.db_manager = SimpleNamespace(
+        close=AsyncMock(side_effect=fail_database_close)
+    )
+    context.exchange_client = SimpleNamespace(
+        close=AsyncMock(side_effect=lambda: events.append("exchange.close"))
+    )
+
+    with pytest.raises(AppContextCloseError, match="^app_context_close_failed$"):
+        await context.close()
+
+    assert context.pool.close.await_count == 1
+    assert context.db_manager.close.await_count == 1
+    assert context.exchange_client.close.await_count == 1
+    assert events == ["checkpoint.close", "database.close", "exchange.close"]
+
+
+async def test_context_close_preserves_cancellation_after_attempting_all_resources() -> (
+    None
+):
+    import asyncio
+
+    from src.init_app import AppContext
+
+    events: list[str] = []
+    context = AppContext()
+
+    async def cancel_checkpoint() -> None:
+        events.append("checkpoint.close")
+        raise asyncio.CancelledError
+
+    context.pool = SimpleNamespace(close=AsyncMock(side_effect=cancel_checkpoint))
+    context.db_manager = SimpleNamespace(
+        close=AsyncMock(side_effect=lambda: events.append("database.close"))
+    )
+    context.exchange_client = SimpleNamespace(
+        close=AsyncMock(side_effect=lambda: events.append("exchange.close"))
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await context.close()
+
+    assert events == ["checkpoint.close", "database.close", "exchange.close"]

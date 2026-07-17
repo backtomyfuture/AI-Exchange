@@ -1746,7 +1746,7 @@ def _runtime_relation_capability_sql(role_oid: str, relation_oid: str) -> str:
 
 
 def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
-    """Keep legacy audit writes while proving 0006 is SELECT-only."""
+    """Allow only append-only, column-bounded runtime audit writes."""
 
     grant_option_denied = f"""(
         NOT pg_catalog.has_table_privilege(
@@ -1768,7 +1768,7 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
             {role_oid}, audit_relation.oid, 'UPDATE WITH GRANT OPTION'
         )
     )"""
-    greenfield_select_only = f"""NOT EXISTS (
+    greenfield_append_only = f"""NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_class AS audit_relation
         WHERE audit_relation.relnamespace = {schema_oid}
@@ -1779,7 +1779,7 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
                   {role_oid}, audit_relation.oid, 'SELECT'
               )
               OR NOT {grant_option_denied}
-              OR pg_catalog.has_table_privilege(
+              OR NOT pg_catalog.has_any_column_privilege(
                   {role_oid}, audit_relation.oid, 'INSERT'
               )
               OR pg_catalog.has_table_privilege(
@@ -1796,9 +1796,6 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
               )
               OR pg_catalog.has_table_privilege(
                   {role_oid}, audit_relation.oid, 'TRIGGER'
-              )
-              OR pg_catalog.has_any_column_privilege(
-                  {role_oid}, audit_relation.oid, 'INSERT'
               )
               OR pg_catalog.has_any_column_privilege(
                   {role_oid}, audit_relation.oid, 'UPDATE'
@@ -1842,7 +1839,7 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
     return f"""(
         CASE
             WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
-                THEN {greenfield_select_only}
+                THEN {greenfield_append_only}
             ELSE {legacy_insert}
         END
     )"""

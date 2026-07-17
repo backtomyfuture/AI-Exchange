@@ -61,5 +61,5 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/ready || exit 1
 
-# 启动唯一 FastAPI 应用；Phase 2 的处理端保持 standby。
+# 启动唯一 FastAPI 应用；DURABLE_INBOX_ENABLED=true 时同进程启动单消费者处理端。
 CMD ["python", "-m", "src.main"]

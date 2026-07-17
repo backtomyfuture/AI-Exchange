@@ -12,6 +12,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from copy import deepcopy
+from collections.abc import Callable
 from typing import Dict, Any, List, Optional
 import lark_oapi
 from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
@@ -108,6 +109,7 @@ ALLOWED_CARD_ACTIONS = frozenset(
 # Global instances
 lark_ws_client: Optional[WsClient] = None
 _lark_ws_thread: threading.Thread | None = None
+_lark_ws_stop_requested = threading.Event()
 lark_api_client: Optional[lark_oapi.Client] = None
 card_builder: Optional[LarkCardBuilder] = None
 db_manager = None
@@ -2424,7 +2426,61 @@ async def process_pdf_generation_and_reply(
     )
 
 
-def start_lark_ws():
+def _lark_ws_connection_ready(client: object | None) -> bool:
+    """Fail closed unless the pinned SDK exposes one open WebSocket."""
+
+    if client is None:
+        return False
+    try:
+        connection = getattr(client, "_conn", None)
+        if connection is None:
+            return False
+
+        # websockets has represented connection state through an enum, ``open``
+        # and ``closed`` across supported releases. Prefer the enum when present
+        # because it distinguishes OPEN from CONNECTING/CLOSING precisely.
+        state = getattr(connection, "state", None)
+        state_name = getattr(state, "name", None)
+        if isinstance(state_name, str):
+            return state_name.casefold() == "open"
+
+        open_state = getattr(connection, "open", None)
+        if type(open_state) is bool:
+            return open_state
+
+        closed_state = getattr(connection, "closed", None)
+        if type(closed_state) is bool:
+            return not closed_state
+    except Exception:
+        return False
+
+    return False
+
+
+def lark_ws_ready() -> bool:
+    """Return whether the callback thread owns a currently open connection."""
+
+    client = lark_ws_client
+    thread = _lark_ws_thread
+    return bool(
+        client is not None
+        and thread is not None
+        and thread.is_alive()
+        and not _lark_ws_stop_requested.is_set()
+        and _lark_ws_connection_ready(client)
+    )
+
+
+def begin_lark_ws_shutdown() -> None:
+    """Disarm unexpected-exit handling before intentional process shutdown."""
+
+    _lark_ws_stop_requested.set()
+
+
+def start_lark_ws(
+    *,
+    fail_stop: Callable[[str], None] | None = None,
+):
     """
     Start WebSocket Client in a background thread
     """
@@ -2457,7 +2513,28 @@ def start_lark_ws():
         log_level=lark_oapi.LogLevel.CRITICAL
     )
 
-    _lark_ws_thread = threading.Thread(target=lark_ws_client.start, daemon=True)
+    _lark_ws_stop_requested.clear()
+    client = lark_ws_client
+
+    def run_client() -> None:
+        try:
+            client.start()
+        except BaseException as exc:
+            logger.critical(
+                "Lark WebSocket Client exited with error: error_type=%s",
+                type(exc).__name__,
+            )
+        finally:
+            if not _lark_ws_stop_requested.is_set():
+                logger.critical("Lark WebSocket Client exited unexpectedly")
+                if fail_stop is not None:
+                    fail_stop("lark_ws_lost")
+
+    _lark_ws_thread = threading.Thread(
+        target=run_client,
+        name="lark-websocket-client",
+        daemon=True,
+    )
     _lark_ws_thread.start()
     logger.info("Lark WebSocket Client started in background thread.")
 
@@ -2467,6 +2544,7 @@ def stop_lark_ws(*, timeout_seconds: float = 5.0) -> None:
 
     global lark_ws_client, _lark_ws_thread
     disable_lark_intake()
+    begin_lark_ws_shutdown()
     client = lark_ws_client
     thread = _lark_ws_thread
     if client is None or thread is None:

@@ -35,3 +35,7 @@ processed_emails.json
 
 # Generated local verification artifacts
 artifacts/
+
+# Real deployment manifests and operator release metadata are local-only.
+deploy/*/
+deploy/*.json

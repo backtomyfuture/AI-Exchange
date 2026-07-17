@@ -51,6 +51,10 @@ def _secure_production_settings(**overrides: Any) -> Settings:
         "POSTGRES_SCHEMA": "public",
         "POSTGRES_MIGRATION_OWNER_ROLE": "ai_exchange_migration_owner",
         "DATABASE_ROLE_SEPARATION_REQUIRED": True,
+        "DURABLE_INBOX_ENABLED": True,
+        "INGESTION_SHADOW_ENABLED": False,
+        "SYNC_RECONCILIATION_ENABLED": False,
+        "INGESTION_INSTANCE_ID": "ai-exchange-web",
         "EXCHANGE_API_URL": "https://exchange.internal.company/api/v1/exchange/emails",
         "EXCHANGE_API_KEY": SecretStr(_SAFE_SECRET_VALUES["EXCHANGE_API_KEY"]),
         "EXCHANGE_ACCOUNT_ID": 8,
@@ -107,6 +111,42 @@ def test_secure_production_baseline_is_accepted():
     result = validate_runtime_security(settings)
 
     assert result is settings
+
+
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_value"),
+    [
+        ("DURABLE_INBOX_ENABLED", False),
+        ("INGESTION_SHADOW_ENABLED", True),
+        ("SYNC_RECONCILIATION_ENABLED", True),
+    ],
+)
+def test_production_accepts_only_the_phase4_lite_runtime_mode(
+    field_name: str,
+    unsafe_value: bool,
+) -> None:
+    validate_runtime_security = _load_runtime_validator()
+    settings = _secure_production_settings(**{field_name: unsafe_value})
+
+    with pytest.raises(RuntimeError) as caught:
+        validate_runtime_security(settings)
+
+    assert field_name in str(caught.value)
+
+
+@pytest.mark.parametrize("instance_id", ["", "ai-exchange-blue", "worker-2"])
+def test_production_rejects_non_singleton_ingestion_identity(
+    instance_id: str,
+) -> None:
+    validate_runtime_security = _load_runtime_validator()
+    settings = _secure_production_settings(INGESTION_INSTANCE_ID=instance_id)
+
+    with pytest.raises(RuntimeError) as caught:
+        validate_runtime_security(settings)
+
+    assert "INGESTION_INSTANCE_ID" in str(caught.value)
+    if instance_id:
+        assert instance_id not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -325,6 +365,7 @@ def test_development_mode_does_not_apply_production_only_rejections():
     [
         "MIGRATION_DATABASE_URL",
         "MIGRATION_DATABASE_URL_FILE",
+        "INGESTION_MAINTENANCE_DATABASE_URL_FILE",
         "CHECKPOINT_MAINTENANCE_DATABASE_URL",
         "CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE",
         "CHECKPOINT_AUDITOR_DATABASE_URL",

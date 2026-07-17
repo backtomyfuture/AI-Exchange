@@ -38,9 +38,10 @@ from src.ingestion.processing import (
     ProcessingPolicyRejected,
     ProcessingReceiptConflict,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
 
-def _lease(*, pipeline_name: str = "legacy_compat") -> InboxLease:
+def _lease(*, pipeline_name: str = GREENFIELD_PIPELINE_NAME) -> InboxLease:
     now = datetime.now(UTC)
     event = NormalizedIngressEvent(
         account_id=8,
@@ -311,20 +312,24 @@ async def test_external_effect_boundary_rejects_non_none_authorization_receipt()
 
 
 class _Adapter:
-    pipeline_name = "legacy_compat"
+    pipeline_name = GREENFIELD_PIPELINE_NAME
 
     async def process(self, *_args, **_kwargs):
         return ProcessingCompletion.no_action()
 
 
-def test_processing_adapter_router_freezes_exact_phase2_registry() -> None:
+class _RetiredLegacyAdapter(_Adapter):
+    pipeline_name = "legacy_compat"
+
+
+def test_processing_adapter_router_freezes_exact_production_registry() -> None:
     adapter = _Adapter()
-    source = {"legacy_compat": adapter}
+    source = {GREENFIELD_PIPELINE_NAME: adapter}
     router = ProcessingAdapterRouter(source)
     lease = _lease()
     source.clear()
 
-    assert router.registry == MappingProxyType({"legacy_compat": adapter})
+    assert router.registry == MappingProxyType({GREENFIELD_PIPELINE_NAME: adapter})
     assert router.select(lease, _authority(lease)) is adapter
 
 
@@ -338,7 +343,7 @@ def test_processing_adapter_router_freezes_exact_phase2_registry() -> None:
 )
 def test_processing_adapter_router_selects_only_exact_executable_stamp(state) -> None:
     adapter = _Adapter()
-    router = ProcessingAdapterRouter({"legacy_compat": adapter})
+    router = ProcessingAdapterRouter({GREENFIELD_PIPELINE_NAME: adapter})
     lease = _lease()
 
     assert router.select(lease, _authority(lease, state=state)) is adapter
@@ -379,15 +384,15 @@ def test_processing_adapter_router_selects_only_exact_executable_stamp(state) ->
 )
 def test_processing_adapter_router_fails_closed_on_nonexact_authority(mutate) -> None:
     lease = _lease()
-    router = ProcessingAdapterRouter({"legacy_compat": _Adapter()})
+    router = ProcessingAdapterRouter({GREENFIELD_PIPELINE_NAME: _Adapter()})
 
     with pytest.raises(ProcessingAdapterUnavailable):
         router.select(lease, mutate(_authority(lease)))
 
 
-def test_durable_stamp_never_falls_back_to_legacy_adapter() -> None:
-    lease = _lease(pipeline_name="durable_candidate")
-    router = ProcessingAdapterRouter({"legacy_compat": _Adapter()})
+def test_retired_legacy_stamp_never_routes_to_production_adapter() -> None:
+    lease = _lease(pipeline_name="legacy_compat")
+    router = ProcessingAdapterRouter({GREENFIELD_PIPELINE_NAME: _Adapter()})
 
     with pytest.raises(ProcessingAdapterUnavailable):
         router.select(lease, _authority(lease))
@@ -397,11 +402,12 @@ def test_durable_stamp_never_falls_back_to_legacy_adapter() -> None:
     "registry",
     [
         {},
-        {"durable_candidate": _Adapter()},
-        {"legacy_compat": object()},
+        {"legacy_compat": _Adapter()},
+        {GREENFIELD_PIPELINE_NAME: _RetiredLegacyAdapter()},
+        {GREENFIELD_PIPELINE_NAME: object()},
     ],
 )
-def test_phase2_router_rejects_permissive_or_invalid_registries(registry) -> None:
+def test_router_rejects_nonproduction_or_invalid_registries(registry) -> None:
     with pytest.raises(ValueError):
         ProcessingAdapterRouter(registry)
 
@@ -521,9 +527,11 @@ def test_external_effect_boundary_rejects_scope_like_objects() -> None:
         ExternalEffectBoundary(object(), AsyncMock(return_value=None))  # type: ignore[arg-type]
 
 
-def test_phase2_router_rejects_non_mapping_registry_before_copying() -> None:
+def test_router_rejects_non_mapping_registry_before_copying() -> None:
     with pytest.raises(ValueError, match="mapping"):
-        ProcessingAdapterRouter([("legacy_compat", _Adapter())])  # type: ignore[arg-type]
+        ProcessingAdapterRouter(  # type: ignore[arg-type]
+            [(GREENFIELD_PIPELINE_NAME, _Adapter())]
+        )
 
 
 @pytest.mark.parametrize(
@@ -537,7 +545,7 @@ def test_processing_adapter_router_rejects_stamp_like_objects(
     lease: object,
     authority: object,
 ) -> None:
-    router = ProcessingAdapterRouter({"legacy_compat": _Adapter()})
+    router = ProcessingAdapterRouter({GREENFIELD_PIPELINE_NAME: _Adapter()})
 
     with pytest.raises(ProcessingAdapterUnavailable):
         router.select(lease, authority)  # type: ignore[arg-type]

@@ -1,0 +1,14 @@
+# Optional production overlay for an Exchange endpoint reached by private IP
+# while its certificate is issued to a DNS name.  Keep TLS verification on and
+# make EXCHANGE_API_URL use the exact EXCHANGE_TLS_HOSTNAME value.
+services:
+  ai-assistant-service:
+    environment:
+      EXCHANGE_CA_FILE: /run/ai-exchange/exchange-ca.pem
+    extra_hosts:
+      - "${EXCHANGE_TLS_HOSTNAME:?EXCHANGE_TLS_HOSTNAME is required}:${EXCHANGE_TLS_IP:?EXCHANGE_TLS_IP is required}"
+    volumes:
+      - type: bind
+        source: ${EXCHANGE_CA_FILE_HOST:?EXCHANGE_CA_FILE_HOST is required}
+        target: /run/ai-exchange/exchange-ca.pem
+        read_only: true

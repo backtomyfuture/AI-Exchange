@@ -26,6 +26,7 @@ from src.ingestion.processing import (
     ProcessingCompletion,
     ProcessingPolicyRejected,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -108,9 +109,9 @@ GuardedProcessor = Callable[..., Awaitable[ProcessingOutcome]]
 
 
 class LegacyProcessingAdapter:
-    """Exact Task-8 compatibility adapter; never selected implicitly."""
+    """Existing processor bridge selected only by the production pipeline stamp."""
 
-    pipeline_name = "legacy_compat"
+    pipeline_name = GREENFIELD_PIPELINE_NAME
 
     __slots__ = ("_ctx", "_guarded_processor", "_legacy_account_id")
 

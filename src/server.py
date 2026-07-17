@@ -3,7 +3,10 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import re
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,12 +17,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings, resolve_secret
+from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
 from src.db.schema import require_runtime_database
 from src.db.runtime_boundary import require_runtime_database_boundary
 from src.domain.errors import DatabaseOperationError, IngressValidationError, StaleFence
 from src.ingestion.models import IngressReceipt
 from src.ingestion.policy import PolicySnapshotUnavailableError
 from src.ingestion.webhook import TestWebhookReceipt, WebhookIngressUnavailable
+from src.init_app import get_app_context as initialize_app_context
 from src.init_app import get_runtime_app_context
 from src.safety.input_limits import input_limits_from_settings
 from src.security.auth import require_metrics_auth, validate_runtime_security
@@ -33,10 +38,38 @@ _READINESS_FAILURE_TTL_SECONDS = 1.0
 _READINESS_DATABASE_TIMEOUT_SECONDS = 5.0
 _READINESS_FAILURE_LOG_TTL_SECONDS = 5.0
 _WEBHOOK_SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_LARK_INTAKE_DRAIN_SECONDS = 30.0
+_LARK_INTAKE_STOP_SECONDS = 32.0
+_LARK_WS_JOIN_SECONDS = 5.0
+_LARK_WS_STOP_SECONDS = 11.0
+_LARK_WS_START_SECONDS = 30.0
+_LARK_WS_START_POLL_SECONDS = 0.1
+_LARK_WS_DISCONNECT_GRACE_SECONDS = 30.0
+_LARK_WS_MONITOR_INTERVAL_SECONDS = 1.0
+_CONTEXT_CLOSE_SECONDS = 10.0
+_FENCE_CLOSE_SECONDS = 10.0
+_RUNTIME_STOP_MARGIN_SECONDS = 2.0
+_MAX_RUNTIME_SHUTDOWN_SECONDS = 30
+_RUNTIME_STOP_SECONDS = 2.0 * _MAX_RUNTIME_SHUTDOWN_SECONDS + (
+    _RUNTIME_STOP_MARGIN_SECONDS
+)
 
 
 class ReadinessPreflightError(RuntimeError):
     """Safe cached failure for a recently failed database preflight."""
+
+
+class ApplicationShutdownError(RuntimeError):
+    """Fixed failure for an incomplete application-lifecycle shutdown."""
+
+
+def _runtime_stop_timeout_seconds(settings: Any) -> float:
+    """Cover both runtime drain phases plus a small bounded cleanup margin."""
+
+    value = getattr(settings, "INGESTION_SHUTDOWN_SECONDS", 30)
+    if type(value) is not int or not 1 <= value <= _MAX_RUNTIME_SHUTDOWN_SECONDS:
+        raise RuntimeError("ingestion_shutdown_budget_invalid")
+    return 2.0 * float(value) + _RUNTIME_STOP_MARGIN_SECONDS
 
 
 _ReadinessContract = tuple[bytes, bool, bool, bool, bool, str, str, str, str, str]
@@ -146,32 +179,361 @@ _initial_app_env = str(getattr(get_settings(), "APP_ENV", "development")).casefo
 _docs_enabled = _initial_app_env != "production"
 
 
+def _fail_stop_after_checkpoint_fence_loss(_reason: str) -> None:
+    """Disable human intake before the fence forces process termination."""
+
+    logger.critical("Checkpoint maintenance lifecycle fence was lost")
+    lark_app.disable_lark_intake()
+
+
+def _fail_stop_after_processing_control_loss(reason: str) -> None:
+    """Terminate so the process supervisor restarts a lost control plane."""
+
+    logger.critical("Processing control plane was lost: reason=%s", reason)
+    lark_app.disable_lark_intake()
+    os._exit(1)
+
+
+def _bounded_lark_seconds(name: str, value: object, *, maximum: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0 < float(value) <= maximum
+    ):
+        raise RuntimeError(f"{name}_invalid")
+    return float(value)
+
+
+async def _wait_for_lark_ws_connection(
+    *,
+    timeout_seconds: float = _LARK_WS_START_SECONDS,
+    poll_seconds: float = _LARK_WS_START_POLL_SECONDS,
+) -> None:
+    """Wait a bounded time for an actual SDK WebSocket connection."""
+
+    timeout = _bounded_lark_seconds(
+        "lark_ws_startup_budget",
+        timeout_seconds,
+        maximum=120.0,
+    )
+    poll = _bounded_lark_seconds(
+        "lark_ws_startup_poll",
+        poll_seconds,
+        maximum=5.0,
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not lark_app.lark_ws_ready():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise RuntimeError("lark_ws_startup_timeout")
+        await asyncio.sleep(min(poll, remaining))
+
+
+async def _monitor_lark_ws_connection(
+    *,
+    fail_stop: Callable[[str], None],
+    grace_seconds: float = _LARK_WS_DISCONNECT_GRACE_SECONDS,
+    poll_seconds: float = _LARK_WS_MONITOR_INTERVAL_SECONDS,
+) -> None:
+    """Fail-stop once when a live callback connection stays unavailable."""
+
+    if not callable(fail_stop):
+        raise ValueError("lark_ws_fail_stop_invalid")
+    grace = _bounded_lark_seconds(
+        "lark_ws_disconnect_grace",
+        grace_seconds,
+        maximum=300.0,
+    )
+    poll = _bounded_lark_seconds(
+        "lark_ws_monitor_interval",
+        poll_seconds,
+        maximum=5.0,
+    )
+    loop = asyncio.get_running_loop()
+    disconnected_since: float | None = None
+    while True:
+        if lark_app.lark_ws_ready():
+            disconnected_since = None
+        else:
+            now = loop.time()
+            if disconnected_since is None:
+                disconnected_since = now
+            elif now - disconnected_since >= grace:
+                logger.critical(
+                    "Lark WebSocket connection remained unavailable past grace"
+                )
+                fail_stop("lark_ws_disconnected")
+                return
+        await asyncio.sleep(poll)
+
+
+async def _cancel_lark_ws_monitor(
+    monitor: asyncio.Task[None] | None,
+) -> None:
+    if monitor is None:
+        return
+    monitor.cancel()
+    try:
+        await monitor
+    except asyncio.CancelledError as exc:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise exc
+
+
+async def _shutdown_application_components(
+    application: FastAPI,
+    *,
+    context: Any,
+    runtime: Any,
+    fence: RuntimeCheckpointMaintenanceFence | None,
+    context_initialize_attempted: bool,
+    lark_initialize_attempted: bool,
+    lark_ws_start_attempted: bool,
+    lark_ws_monitor_task: asyncio.Task[None] | None = None,
+    runtime_stop_seconds: float = _RUNTIME_STOP_SECONDS,
+) -> None:
+    """Attempt every owned shutdown stage before releasing the fence."""
+
+    failures: list[tuple[str, BaseException]] = []
+    application.state.webhook_ingress_service = None
+    application.state.ingestion_runtime = None
+
+    def attempt_sync(stage: str, operation) -> bool:
+        try:
+            operation()
+        except BaseException as exc:
+            failures.append((stage, exc))
+            return False
+        return True
+
+    async def attempt_async(stage: str, operation) -> bool:
+        try:
+            await operation()
+        except BaseException as exc:
+            failures.append((stage, exc))
+            return False
+        return True
+
+    processing_cleanup_required = bool(
+        fence is not None
+        or context_initialize_attempted
+        or lark_initialize_attempted
+        or lark_ws_start_attempted
+    )
+    lark_ws_shutdown_started = True
+    if lark_ws_start_attempted:
+        lark_ws_shutdown_started = attempt_sync(
+            "lark_ws_shutdown_begin",
+            lark_app.begin_lark_ws_shutdown,
+        )
+    lark_disable_succeeded = True
+    if processing_cleanup_required:
+        lark_disable_succeeded = attempt_sync(
+            "lark_intake_disable",
+            lark_app.disable_lark_intake,
+        )
+    lark_ws_monitor_stopped = await attempt_async(
+        "lark_ws_monitor_stop",
+        lambda: _cancel_lark_ws_monitor(lark_ws_monitor_task),
+    )
+    runtime_stop_succeeded = await attempt_async(
+        "runtime_stop",
+        lambda: asyncio.wait_for(
+            runtime.stop(),
+            timeout=runtime_stop_seconds,
+        ),
+    )
+    lark_intake_stop_succeeded = True
+    if lark_initialize_attempted:
+        lark_intake_stop_succeeded = await attempt_async(
+            "lark_intake_stop",
+            lambda: asyncio.wait_for(
+                lark_app.stop_lark_intake(
+                    timeout_seconds=_LARK_INTAKE_DRAIN_SECONDS,
+                ),
+                timeout=_LARK_INTAKE_STOP_SECONDS,
+            ),
+        )
+    lark_ws_stop_succeeded = True
+    if lark_ws_start_attempted:
+        lark_ws_stop_succeeded = await attempt_async(
+            "lark_ws_stop",
+            lambda: asyncio.wait_for(
+                asyncio.to_thread(
+                    lark_app.stop_lark_ws,
+                    timeout_seconds=_LARK_WS_JOIN_SECONDS,
+                ),
+                timeout=_LARK_WS_STOP_SECONDS,
+            ),
+        )
+    processing_stopped = (
+        runtime_stop_succeeded
+        and lark_ws_shutdown_started
+        and lark_ws_monitor_stopped
+        and lark_disable_succeeded
+        and lark_intake_stop_succeeded
+        and lark_ws_stop_succeeded
+    )
+    context_close_succeeded = not context_initialize_attempted
+    if context_initialize_attempted:
+        if processing_stopped:
+            context_close_succeeded = await attempt_async(
+                "context_close",
+                lambda: asyncio.wait_for(
+                    context.close(),
+                    timeout=_CONTEXT_CLOSE_SECONDS,
+                ),
+            )
+        else:
+            failures.append(
+                (
+                    "context_close_blocked",
+                    RuntimeError("processing_shutdown_unproved"),
+                )
+            )
+    owned_resources_closed = processing_stopped and context_close_succeeded
+    if owned_resources_closed:
+        attempt_sync(
+            "runtime_release",
+            lambda: context.release_ingestion_runtime(runtime),
+        )
+    else:
+        failures.append(
+            (
+                "runtime_release_blocked",
+                RuntimeError("runtime_release_blocked"),
+            )
+        )
+    if fence is not None:
+        if owned_resources_closed:
+            await attempt_async(
+                "fence_close",
+                lambda: asyncio.wait_for(
+                    fence.close(),
+                    timeout=_FENCE_CLOSE_SECONDS,
+                ),
+            )
+        else:
+            failures.append(
+                (
+                    "fence_close_blocked",
+                    RuntimeError("checkpoint_fence_release_blocked"),
+                )
+            )
+    if failures:
+        logger.critical(
+            "Application shutdown failed closed: stages=%s",
+            ",".join(stage for stage, _exc in failures),
+        )
+        for _stage, exc in failures:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise exc
+        raise ApplicationShutdownError("application_shutdown_incomplete")
+
+
 @asynccontextmanager
 async def application_lifespan(application: FastAPI):
-    """Own the one Phase-2 durable-ingestion runtime."""
+    """Own the one ingress runtime and optional Phase4-Lite processing stack."""
 
     settings = get_settings()
+    runtime_stop_seconds = _runtime_stop_timeout_seconds(settings)
     validate_runtime_security(settings)
     await require_runtime_database_boundary(settings)
     context = get_runtime_app_context()
-    runtime = context.create_ingestion_runtime(settings)
+    runtime = context.create_ingestion_runtime(
+        settings,
+        fail_stop=_fail_stop_after_processing_control_loss,
+    )
     application.state.ingestion_runtime = None
     application.state.webhook_ingress_service = None
+    fence: RuntimeCheckpointMaintenanceFence | None = None
+    context_initialize_attempted = False
+    lark_initialize_attempted = False
+    lark_ws_start_attempted = False
+    lark_ws_monitor_task: asyncio.Task[None] | None = None
     try:
+        if bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)):
+            fence = RuntimeCheckpointMaintenanceFence(
+                settings.database_url,
+                fail_stop=_fail_stop_after_checkpoint_fence_loss,
+            )
+            await fence.start()
+            context_initialize_attempted = True
+            initialized_context = initialize_app_context()
+            if initialized_context is not context:
+                raise RuntimeError("app_context_ownership_mismatch")
+            context.bind_checkpoint_write_guard(fence.assert_held)
+            await context.setup_async()
+            lark_initialize_attempted = True
+            lark_app.init_lark_app(
+                context.db_manager,
+                context.graph,
+                context.exchange_client,
+                worker_loop_arg=asyncio.get_running_loop(),
+                dependencies=context.graph_dependencies,
+            )
+            # init_lark_app retains its legacy default of enabling intake. No
+            # callback may be accepted until the runtime registration, recovery,
+            # and Worker startup below have all succeeded.
+            lark_app.disable_lark_intake()
+            lark_ws_start_attempted = True
+            lark_app.start_lark_ws(
+                fail_stop=_fail_stop_after_processing_control_loss,
+            )
+            await _wait_for_lark_ws_connection()
         await runtime.start()
+        if bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)):
+            if not lark_app.lark_ws_ready():
+                raise RuntimeError("lark_ws_unavailable_after_runtime_start")
+            lark_ws_monitor_task = asyncio.create_task(
+                _monitor_lark_ws_connection(
+                    fail_stop=_fail_stop_after_processing_control_loss,
+                ),
+                name="lark-websocket-connection-monitor",
+            )
+            lark_app.enable_lark_intake()
         service = runtime.webhook_ingress_service
         if service is None:
             raise RuntimeError("webhook_ingress_service_unavailable")
         application.state.ingestion_runtime = runtime
         application.state.webhook_ingress_service = service
         yield
-    finally:
-        application.state.webhook_ingress_service = None
+    except BaseException as primary_exc:
         try:
-            await runtime.stop()
-        finally:
-            application.state.ingestion_runtime = None
-            context.release_ingestion_runtime(runtime)
+            await _shutdown_application_components(
+                application,
+                context=context,
+                runtime=runtime,
+                fence=fence,
+                context_initialize_attempted=context_initialize_attempted,
+                lark_initialize_attempted=lark_initialize_attempted,
+                lark_ws_start_attempted=lark_ws_start_attempted,
+                lark_ws_monitor_task=lark_ws_monitor_task,
+                runtime_stop_seconds=runtime_stop_seconds,
+            )
+        except BaseException as cleanup_exc:
+            logger.critical(
+                "Application cleanup failed while preserving primary failure: "
+                "primary_error_type=%s cleanup_error_type=%s",
+                type(primary_exc).__name__,
+                type(cleanup_exc).__name__,
+            )
+        raise
+    else:
+        await _shutdown_application_components(
+            application,
+            context=context,
+            runtime=runtime,
+            fence=fence,
+            context_initialize_attempted=context_initialize_attempted,
+            lark_initialize_attempted=lark_initialize_attempted,
+            lark_ws_start_attempted=lark_ws_start_attempted,
+            lark_ws_monitor_task=lark_ws_monitor_task,
+            runtime_stop_seconds=runtime_stop_seconds,
+        )
 
 
 app = FastAPI(
@@ -230,7 +592,14 @@ async def readiness_check(request: Request):
         check_ready = getattr(runtime, "check_ready", None)
         if not callable(check_ready) or not await check_ready():
             raise ReadinessPreflightError("ingestion_runtime_not_ready")
-        return {"status": "ready", "processing": "standby"}
+        if bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)) and not (
+            lark_app.lark_ws_ready()
+        ):
+            raise ReadinessPreflightError("lark_ws_not_ready")
+        processing = (
+            "active" if bool(getattr(runtime, "processing_ready", False)) else "standby"
+        )
+        return {"status": "ready", "processing": processing}
     except Exception as exc:
         _log_readiness_failure_once(exc)
         return JSONResponse(
@@ -293,7 +662,9 @@ async def queue_status(request: Request):
         "status": "ready",
         "ingress": "active",
         "session": "active",
-        "processing": "standby",
+        "processing": (
+            "active" if bool(getattr(runtime, "processing_ready", False)) else "standby"
+        ),
         "queue": {
             "pending": stats.pending,
             "retry_wait": stats.retry_wait,

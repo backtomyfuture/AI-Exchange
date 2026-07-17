@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
 from typing import Any, Final
-from uuid import UUID, uuid4
+from uuid import RFC_4122, UUID, uuid4
 
 import psycopg
 from psycopg import sql
@@ -870,6 +870,18 @@ def _require_email_id(value: object) -> str:
     return normalized
 
 
+def _require_lease_session_id(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("lease_session_id must be a canonical UUID4")
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("lease_session_id must be a canonical UUID4") from None
+    if parsed.version != 4 or parsed.variant != RFC_4122 or str(parsed) != value:
+        raise ValueError("lease_session_id must be a canonical UUID4")
+    return value
+
+
 def _require_email_version(value: object) -> int:
     if (
         isinstance(value, bool)
@@ -1168,7 +1180,10 @@ class InboxRepository:
             "SELECT account_id, generation, pipeline_name, state, fencing_token "
             "FROM {} WHERE account_id = %s "
             "AND generation = ANY(%s::pg_catalog.int8[]) "
-            "ORDER BY generation FOR SHARE"
+            # The caller already holds the account-scoped shared advisory lock.
+            # Ownership transitions take its exclusive counterpart, so a row lock
+            # would be redundant and would incorrectly require UPDATE privilege.
+            "ORDER BY generation"
         ).format(self._table("pipeline_ownership"))
         cursor = await connection.execute(query, (lease.account_id, generations))
         rows = await cursor.fetchall()
@@ -1728,11 +1743,13 @@ class InboxRepository:
     async def claim_batch(
         self,
         worker_id: str,
+        lease_session_id: str,
         pipeline_names: Iterable[str],
         limit: int,
         lease_seconds: int,
     ) -> list[InboxLease]:
         worker_id = _require_exact_text("worker_id", worker_id, max_length=128)
+        lease_session_id = _require_lease_session_id(lease_session_id)
         pipelines = _require_pipeline_names(pipeline_names)
         limit = _require_bounded_int("limit", limit, maximum=_MAX_BATCH)
         lease_seconds = _require_bounded_int(
@@ -1786,11 +1803,22 @@ class InboxRepository:
 
                     claim = sql.SQL(
                         "WITH claimable AS ("
-                        "SELECT e.id FROM {} AS e JOIN {} AS p "
+                        "SELECT e.id, runtime.session_id FROM {} AS e JOIN {} AS p "
                         "ON p.account_id = e.account_id "
                         "AND p.generation = e.generation "
                         "AND p.fencing_token = e.fencing_token "
                         "AND p.pipeline_name = e.pipeline_name "
+                        "JOIN {} AS runtime ON runtime.account_id = e.account_id "
+                        "AND runtime.generation = e.generation "
+                        "AND runtime.fencing_token = e.fencing_token "
+                        "AND runtime.authority_epoch = e.authority_epoch "
+                        "AND runtime.capability_hash = e.capability_hash "
+                        "AND runtime.session_id = %s "
+                        "AND runtime.instance_id = %s "
+                        "AND runtime.workload = 'web' "
+                        "AND runtime.lifecycle = 'active' "
+                        "AND runtime.lease_until > "
+                        "pg_catalog.statement_timestamp() "
                         "WHERE e.status IN ('pending', 'retry_wait') "
                         "AND e.available_at <= pg_catalog.statement_timestamp() "
                         "AND e.processing_policy = ANY(%s::pg_catalog.text[]) "
@@ -1801,6 +1829,7 @@ class InboxRepository:
                         "FOR UPDATE OF e SKIP LOCKED LIMIT %s"
                         ") UPDATE {} AS e SET "
                         "status = 'leased', lease_owner = %s, "
+                        "lease_session_id = c.session_id, "
                         "lease_until = pg_catalog.statement_timestamp() "
                         "+ pg_catalog.make_interval(secs => %s), "
                         "processing_started_at = COALESCE("
@@ -1811,12 +1840,15 @@ class InboxRepository:
                     ).format(
                         self._table("event_inbox"),
                         self._table("pipeline_ownership"),
+                        self._table("pipeline_runtime_instances"),
                         self._table("event_inbox"),
                         _LEASE_RETURNING,
                     )
                     claimed_cursor = await connection.execute(
                         claim,
                         (
+                            lease_session_id,
+                            worker_id,
                             list(_CLAIMABLE_POLICIES),
                             list(pipelines),
                             sorted(set(account_ids)),
@@ -1858,9 +1890,11 @@ class InboxRepository:
                         "pg_catalog.clock_timestamp() "
                         "+ pg_catalog.make_interval(secs => %s)), "
                         "updated_at = pg_catalog.clock_timestamp() "
-                        "FROM {} AS p WHERE e.id = %s AND e.account_id = %s "
+                        "FROM {} AS p, {} AS runtime "
+                        "WHERE e.id = %s AND e.account_id = %s "
                         "AND e.pipeline_name = %s AND e.generation = %s "
-                        "AND e.fencing_token = %s AND e.lease_owner = %s "
+                        "AND e.fencing_token = %s AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s "
                         "AND e.attempts = %s AND e.lease_until = %s "
                         "AND e.status = 'leased' "
                         "AND e.lease_until > pg_catalog.clock_timestamp() "
@@ -1868,24 +1902,29 @@ class InboxRepository:
                         "AND p.generation = e.generation "
                         "AND p.fencing_token = e.fencing_token "
                         "AND p.pipeline_name = e.pipeline_name "
-                        "AND p.state = ANY(%s::pg_catalog.text[]) RETURNING {}"
+                        "AND p.state = ANY(%s::pg_catalog.text[]) "
+                        "AND runtime.session_id = e.lease_session_id "
+                        "AND runtime.account_id = e.account_id "
+                        "AND runtime.generation = e.generation "
+                        "AND runtime.fencing_token = e.fencing_token "
+                        "AND runtime.authority_epoch = e.authority_epoch "
+                        "AND runtime.capability_hash = e.capability_hash "
+                        "AND runtime.instance_id = e.lease_owner "
+                        "AND runtime.workload = 'web' "
+                        "AND runtime.lifecycle = 'active' "
+                        "AND runtime.lease_until > "
+                        "pg_catalog.statement_timestamp() RETURNING {}"
                     ).format(
                         self._table("event_inbox"),
                         self._table("pipeline_ownership"),
+                        self._table("pipeline_runtime_instances"),
                         _LEASE_RETURNING,
                     )
                     cursor = await connection.execute(
                         query,
                         (
                             lease_seconds,
-                            lease.id,
-                            lease.account_id,
-                            lease.pipeline_name,
-                            lease.generation,
-                            lease.fencing_token,
-                            lease.lease_owner,
-                            lease.attempts,
-                            lease.lease_until,
+                            *self._lease_params(lease),
                             list(_LEASE_OWNERSHIP_STATES),
                         ),
                     )
@@ -1909,7 +1948,8 @@ class InboxRepository:
                         "updated_at = pg_catalog.clock_timestamp() "
                         "FROM {} AS p WHERE e.id = %s AND e.account_id = %s "
                         "AND e.pipeline_name = %s AND e.generation = %s "
-                        "AND e.fencing_token = %s AND e.lease_owner = %s "
+                        "AND e.fencing_token = %s AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s "
                         "AND e.attempts = %s AND e.lease_until = %s "
                         "AND e.status = 'leased' "
                         "AND e.lease_until > pg_catalog.clock_timestamp() "
@@ -1971,6 +2011,34 @@ class InboxRepository:
                         ownership_state=ownership_state,
                         require_unexpired=True,
                     )
+                    runtime_query = sql.SQL(
+                        "SELECT runtime.session_id FROM {} AS runtime "
+                        "WHERE runtime.session_id = %s "
+                        "AND runtime.account_id = %s "
+                        "AND runtime.generation = %s "
+                        "AND runtime.fencing_token = %s "
+                        "AND runtime.authority_epoch = %s "
+                        "AND runtime.capability_hash = %s "
+                        "AND runtime.instance_id = %s "
+                        "AND runtime.workload = 'web' "
+                        "AND runtime.lifecycle = 'active' "
+                        "AND runtime.lease_until > "
+                        "pg_catalog.statement_timestamp()"
+                    ).format(self._table("pipeline_runtime_instances"))
+                    runtime_cursor = await connection.execute(
+                        runtime_query,
+                        (
+                            lease.lease_session_id,
+                            lease.account_id,
+                            lease.generation,
+                            lease.fencing_token,
+                            lease.authority_epoch,
+                            lease.capability_hash,
+                            lease.lease_owner,
+                        ),
+                    )
+                    if await runtime_cursor.fetchone() is None:
+                        raise ProcessingCompletionRejected()
                     email_marked = email.external_effects_started_at is not None
                     inbox_marked = inbox.effect_started_at is not None
                     if email_marked is not inbox_marked:
@@ -2011,14 +2079,31 @@ class InboxRepository:
                     if await email_cursor.fetchone() is None:
                         raise ProcessingCompletionRejected()
                     inbox_update = sql.SQL(
-                        "UPDATE {} SET effect_started_at = COALESCE("
-                        "effect_started_at, %s), updated_at = %s "
-                        "WHERE id = %s AND account_id = %s AND pipeline_name = %s "
-                        "AND generation = %s AND fencing_token = %s "
-                        "AND lease_owner = %s AND attempts = %s "
-                        "AND lease_until = %s AND status = 'leased' "
-                        "AND lease_until > pg_catalog.clock_timestamp() RETURNING id"
-                    ).format(self._table("event_inbox"))
+                        "UPDATE {} AS e SET effect_started_at = COALESCE("
+                        "e.effect_started_at, %s), updated_at = %s "
+                        "FROM {} AS runtime "
+                        "WHERE e.id = %s AND e.account_id = %s "
+                        "AND e.pipeline_name = %s "
+                        "AND e.generation = %s AND e.fencing_token = %s "
+                        "AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s AND e.attempts = %s "
+                        "AND e.lease_until = %s AND e.status = 'leased' "
+                        "AND e.lease_until > pg_catalog.clock_timestamp() "
+                        "AND runtime.session_id = e.lease_session_id "
+                        "AND runtime.account_id = e.account_id "
+                        "AND runtime.generation = e.generation "
+                        "AND runtime.fencing_token = e.fencing_token "
+                        "AND runtime.authority_epoch = e.authority_epoch "
+                        "AND runtime.capability_hash = e.capability_hash "
+                        "AND runtime.instance_id = e.lease_owner "
+                        "AND runtime.workload = 'web' "
+                        "AND runtime.lifecycle = 'active' "
+                        "AND runtime.lease_until > "
+                        "pg_catalog.statement_timestamp() RETURNING e.id"
+                    ).format(
+                        self._table("event_inbox"),
+                        self._table("pipeline_runtime_instances"),
+                    )
                     inbox_cursor = await connection.execute(
                         inbox_update,
                         (
@@ -2173,12 +2258,14 @@ class InboxRepository:
                         raise ProcessingCompletionRejected()
                     inbox_update = sql.SQL(
                         "UPDATE {} SET status = %s, lease_owner = NULL, "
-                        "lease_until = NULL, safe_error_code = %s, "
+                        "lease_until = NULL, lease_session_id = NULL, "
+                        "safe_error_code = %s, "
                         "safe_error_summary = %s, updated_at = "
                         "pg_catalog.clock_timestamp() WHERE id = %s "
                         "AND account_id = %s AND pipeline_name = %s "
                         "AND generation = %s AND fencing_token = %s "
-                        "AND lease_owner = %s AND attempts = %s "
+                        "AND lease_session_id = %s AND lease_owner = %s "
+                        "AND attempts = %s "
                         "AND lease_until = %s AND status = 'leased' RETURNING id"
                     ).format(self._table("event_inbox"))
                     inbox_cursor = await connection.execute(
@@ -2319,14 +2406,16 @@ class InboxRepository:
                         raise ProcessingCompletionRejected()
                     inbox_update = sql.SQL(
                         "UPDATE {} SET status = %s, lease_owner = NULL, "
-                        "lease_until = NULL, attempts = %s, available_at = CASE "
+                        "lease_until = NULL, lease_session_id = NULL, "
+                        "attempts = %s, available_at = CASE "
                         "WHEN %s = 'retry_wait' THEN pg_catalog.clock_timestamp() "
                         "+ pg_catalog.make_interval(secs => %s) ELSE available_at END, "
                         "safe_error_code = %s, safe_error_summary = %s, "
                         "updated_at = pg_catalog.clock_timestamp() WHERE id = %s "
                         "AND account_id = %s AND pipeline_name = %s "
                         "AND generation = %s AND fencing_token = %s "
-                        "AND lease_owner = %s AND attempts = %s "
+                        "AND lease_session_id = %s AND lease_owner = %s "
+                        "AND attempts = %s "
                         "AND lease_until = %s AND status = 'leased' RETURNING id"
                     ).format(self._table("event_inbox"))
                     inbox_cursor = await connection.execute(
@@ -2380,11 +2469,13 @@ class InboxRepository:
                     query = sql.SQL(
                         "UPDATE {} AS e SET status = 'completed', "
                         "lease_owner = NULL, lease_until = NULL, "
+                        "lease_session_id = NULL, "
                         "safe_error_code = NULL, safe_error_summary = NULL, "
                         "updated_at = pg_catalog.clock_timestamp() "
                         "FROM {} AS p WHERE e.id = %s AND e.account_id = %s "
                         "AND e.pipeline_name = %s AND e.generation = %s "
-                        "AND e.fencing_token = %s AND e.lease_owner = %s "
+                        "AND e.fencing_token = %s AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s "
                         "AND e.attempts = %s AND e.lease_until = %s "
                         "AND e.status = 'leased' "
                         "AND e.lease_until > pg_catalog.clock_timestamp() "
@@ -2454,7 +2545,8 @@ class InboxRepository:
                         "AND p.pipeline_name = e.pipeline_name "
                         "WHERE e.id = %s AND e.account_id = %s "
                         "AND e.pipeline_name = %s AND e.generation = %s "
-                        "AND e.fencing_token = %s AND e.lease_owner = %s "
+                        "AND e.fencing_token = %s AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s "
                         "AND e.attempts = %s AND e.lease_until = %s "
                         "AND e.status = 'leased' "
                         "AND e.lease_until > pg_catalog.clock_timestamp() "
@@ -2499,7 +2591,8 @@ class InboxRepository:
                     )
                     update = sql.SQL(
                         "UPDATE {} AS e SET status = %s, lease_owner = NULL, "
-                        "lease_until = NULL, attempts = %s, "
+                        "lease_until = NULL, lease_session_id = NULL, "
+                        "attempts = %s, "
                         "available_at = CASE WHEN %s = 'retry_wait' "
                         "THEN pg_catalog.clock_timestamp() "
                         "+ pg_catalog.make_interval(secs => %s) "
@@ -2508,7 +2601,8 @@ class InboxRepository:
                         "updated_at = pg_catalog.clock_timestamp() "
                         "FROM {} AS p WHERE e.id = %s AND e.account_id = %s "
                         "AND e.pipeline_name = %s AND e.generation = %s "
-                        "AND e.fencing_token = %s AND e.lease_owner = %s "
+                        "AND e.fencing_token = %s AND e.lease_session_id = %s "
+                        "AND e.lease_owner = %s "
                         "AND e.attempts = %s AND e.lease_until = %s "
                         "AND e.effect_started_at IS NOT DISTINCT FROM %s "
                         "AND e.status = 'leased' "
@@ -2579,11 +2673,18 @@ class InboxRepository:
         self,
         connection: psycopg.AsyncConnection[Any],
         lease: _LeaseToken,
+        *,
+        for_update: bool = False,
     ) -> tuple[str, str | None] | None:
+        if type(for_update) is not bool:
+            raise ValueError("for_update must be an exact boolean")
         query = sql.SQL(
             "SELECT id, processing_inbox_id FROM {} WHERE account_id = %s "
-            "AND external_email_id = %s"
-        ).format(self._table("emails"))
+            "AND external_email_id = %s{}"
+        ).format(
+            self._table("emails"),
+            sql.SQL(" FOR UPDATE") if for_update else sql.SQL(""),
+        )
         cursor = await connection.execute(
             query,
             (lease.account_id, lease.event.external_email_id),
@@ -2712,13 +2813,15 @@ class InboxRepository:
             raise ProcessingCompletionRejected()
         inbox_update = sql.SQL(
             "UPDATE {} SET status = %s, lease_owner = NULL, lease_until = NULL, "
+            "lease_session_id = NULL, "
             "attempts = %s, available_at = CASE WHEN %s = 'retry_wait' "
             "THEN pg_catalog.clock_timestamp() + "
             "pg_catalog.make_interval(secs => %s) ELSE available_at END, "
             "safe_error_code = %s, safe_error_summary = %s, "
             "updated_at = pg_catalog.clock_timestamp() WHERE id = %s "
             "AND account_id = %s AND pipeline_name = %s AND generation = %s "
-            "AND fencing_token = %s AND lease_owner = %s AND attempts = %s "
+            "AND fencing_token = %s AND lease_session_id = %s "
+            "AND lease_owner = %s AND attempts = %s "
             "AND lease_until = %s AND status = 'leased' AND lease_until <= "
             "pg_catalog.clock_timestamp() RETURNING id"
         ).format(self._table("event_inbox"))
@@ -2771,8 +2874,12 @@ class InboxRepository:
             or inbox.lease_active
         ):
             return False
-        relation = await self._find_email_relation(connection, lease)
-        if relation is not None:
+        relation = await self._find_email_relation(
+            connection,
+            lease,
+            for_update=True,
+        )
+        if relation is not None and relation[1] == lease.id:
             return False
         new_attempts = _next_attempts(lease.attempts)
         if ownership_state.value not in _LEASE_OWNERSHIP_STATES:
@@ -2794,13 +2901,15 @@ class InboxRepository:
         )
         update = sql.SQL(
             "UPDATE {} SET status = %s, lease_owner = NULL, lease_until = NULL, "
+            "lease_session_id = NULL, "
             "attempts = %s, available_at = CASE WHEN %s = 'retry_wait' "
             "THEN pg_catalog.clock_timestamp() + "
             "pg_catalog.make_interval(secs => %s) ELSE available_at END, "
             "safe_error_code = %s, safe_error_summary = %s, "
             "updated_at = pg_catalog.clock_timestamp() WHERE id = %s "
             "AND account_id = %s AND pipeline_name = %s AND generation = %s "
-            "AND fencing_token = %s AND lease_owner = %s AND attempts = %s "
+            "AND fencing_token = %s AND lease_session_id = %s "
+            "AND lease_owner = %s AND attempts = %s "
             "AND lease_until = %s AND status = 'leased' AND lease_until <= "
             "pg_catalog.clock_timestamp() RETURNING id"
         ).format(self._table("event_inbox"))
@@ -2979,6 +3088,7 @@ class InboxRepository:
             lease.pipeline_name,
             lease.generation,
             lease.fencing_token,
+            lease.lease_session_id,
             lease.lease_owner,
             lease.attempts,
             lease.lease_until,
@@ -3227,7 +3337,9 @@ class EmailEventTransaction:
             "SELECT account_id, generation, pipeline_name, state, fencing_token "
             "FROM {} WHERE account_id = %s "
             "AND generation = ANY(%s::pg_catalog.int8[]) "
-            "ORDER BY generation FOR SHARE"
+            # apply_email_event already holds the account-scoped shared advisory
+            # lock; ownership transitions take the exclusive counterpart.
+            "ORDER BY generation"
         ).format(self._repository._table("pipeline_ownership"))
         cursor = await self._connection.execute(query, (lease.account_id, generations))
         rows = await cursor.fetchall()

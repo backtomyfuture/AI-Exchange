@@ -162,6 +162,49 @@ _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES = {
         "bcc1067e5aa1d30a2c57375165ce14348c9aeeacf6120797c200adb19c2a3fd8": 1,
     },
     (
+        "src/db/provision.py",
+        "_require_true_row",
+        "cursor.execute",
+    ): {"5091c5de978dfb9719b901b76a4ee97a380cbb9a177df621aba2748824992100": 1},
+    (
+        "src/db/provision.py",
+        "_ensure_roles",
+        "cursor.execute",
+    ): {
+        "8e237dcc90b345d7861be6faf3add5e67fdfe3156e86b9c6e132ed02edf80897": 1,
+        "94a926f165f5517e7aa3739224dcf95eacf56bb4f5326906f1bb1ac97a199b86": 1,
+    },
+    (
+        "src/db/provision.py",
+        "_revoke_role_database_access",
+        "cursor.execute",
+    ): {
+        "3d1bdff0d0ab46689b63e3b18a2a17e3ae2f90e18deac453e39559a0204753e9": 1,
+        "170dfec3150b12f1396bc3b4884383d25fa88f67073f45abfa190445181714b2": 1,
+    },
+    (
+        "src/db/provision.py",
+        "_apply_database_boundary",
+        "cursor.execute",
+    ): {
+        "526c4ee1a2557a2747242b12cf74cc7d553f9e2f26c470ac0baf6fcdd5548e31": 1,
+        "3de6b940ab3bb2c205618dbbab726937678f21fcc75e812b8afc474cedff6a64": 1,
+        "b928f40fb391879e46f84e39a33e84687d3edaeab3f63d64bbc73de819896bee": 1,
+        "14e8a831c09a4d44cca72231e34e3a8e0da3cd5e9dd91dbc177bde3e450173ce": 1,
+        "21a5488c705981733fa5bd22126c8850b3e98fe2fef4c21be500c8df1e962e94": 1,
+        "ea94b1985d061b578955a5c83f450c752ccad23bde6fb8b360bd983874a936a1": 1,
+        "aa4c5507f772dfb151f596d403c3b03dddcf98c7f5b88ff516a138039a578331": 1,
+    },
+    (
+        "src/db/provision.py",
+        "_apply_default_and_large_object_boundary",
+        "cursor.execute",
+    ): {
+        "28c7f1e1810c405f05452964c9ebe4613b8e657f2033501a86a8a23e91eea302": 1,
+        "434c9a979e4e11968769b3d504d798b39b6fad38d8fcffb5306b35cbec413ef1": 1,
+        "27290b547b12aa239ed200f1674ac417bf11bdaf768e68a0d85ffd42971a7e42": 1,
+    },
+    (
         "src/ingestion/cold_start.py",
         "ColdStartService._commit_apply_page",
         "connection.execute",
@@ -359,6 +402,53 @@ _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "34af871f76b9827675d38fc909027425078f01153820e32c6e01e0f1b18adf26"
     ),
 }
+_PHASE4_LITE_TASK8_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/ingestion/legacy_adapter.py",
+        "src/ingestion/processing.py",
+    }
+)
+_PHASE4_LITE_TASK10G_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/db/roles.py",
+        "src/ingestion/worker.py",
+    }
+)
+_PHASE4_LITE_TASK11G_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/ingestion/repository.py",
+        "src/server.py",
+    }
+)
+_PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/db/access_contract.py": (
+        "ae750156e6e0ab5156066fd15e36c06efad66d105f3d3292713744ca7e7cf4a3"
+    ),
+    "src/db/roles.py": (
+        "40da8178c318277c1d20a94c5496c93c86e3d2029f6e798c201af37ee6aa6311"
+    ),
+    "src/ingestion/legacy_adapter.py": (
+        "44b21f0853d8699e749ddf6524c552c86dc2dbadd4b018a092816d78d1e83514"
+    ),
+    "src/ingestion/processing.py": (
+        "eac0bf67b02c6d5519bba6863e5bede9e901110cc902c1c10a5e3efe173b99ee"
+    ),
+    "src/ingestion/repository.py": (
+        "eaa83ce98dfb808b6551d6cf71b22753f57aa2c1818851dcf8ae2213bba734b0"
+    ),
+    "src/ingestion/runtime.py": (
+        "082bbcc655b60d7a2b9429bff0acdf1e0fade059943292cc22fa5b204a3c758d"
+    ),
+    "src/ingestion/worker.py": (
+        "b84ffc0a600252db9925045843e51ef0b19e076b986e345677590654780f31c9"
+    ),
+    "src/init_app.py": (
+        "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
+    ),
+    "src/server.py": (
+        "b65e45b233930fbb083f06854c76ce8fefce89221aca618a281151de33d7173c"
+    ),
+}
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -369,7 +459,12 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "src/db/bootstrap.py": _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256[
         "src/db/bootstrap.py"
     ],
-    "src/db/roles.py": _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256["src/db/roles.py"],
+    "src/db/roles.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256[
+        "src/db/roles.py"
+    ],
+    "src/db/provision.py": (
+        "04f72590b1098d1b60356b34e52221ba94cb39113e490821134cdc8bd3ac8483"
+    ),
     "src/ingestion/cold_start.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256[
         "src/ingestion/cold_start.py"
     ],
@@ -384,7 +479,7 @@ _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
     "src/router/engine.py": (
         "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
     ),
-    "src/server.py": _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
+    "src/server.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
     "src/utils/email_processor.py": (
         "ba933f7ec3b7c6be28039bcf050b580c45e6fdf0d4e555916525a7d96e3c2332"
     ),
@@ -2054,8 +2149,16 @@ def test_task8_reviewed_structural_ast_requires_explicit_review() -> None:
     assert _TASK10G_TASK8_SUCCESSOR_PATHS <= set(
         _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
     )
+    assert _PHASE4_LITE_TASK8_SUCCESSOR_PATHS <= set(
+        _TASK8_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    assert _PHASE4_LITE_TASK8_SUCCESSOR_PATHS <= set(
+        _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256
+    )
     historical_paths = set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256) - (
-        _TASK9G_TASK8_SUCCESSOR_PATHS | _TASK10G_TASK8_SUCCESSOR_PATHS
+        _TASK9G_TASK8_SUCCESSOR_PATHS
+        | _TASK10G_TASK8_SUCCESSOR_PATHS
+        | _PHASE4_LITE_TASK8_SUCCESSOR_PATHS
     )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
@@ -2112,8 +2215,14 @@ def test_task10g_reviewed_structural_ast_requires_explicit_review() -> None:
         | _TASK10G_TASK9G_SUCCESSOR_PATHS
     )
     assert predecessor_paths == set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256)
-    historical_paths = (
-        set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK11G_PREDECESSOR_PATHS
+    assert _PHASE4_LITE_TASK10G_SUCCESSOR_PATHS <= set(
+        _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    assert _PHASE4_LITE_TASK10G_SUCCESSOR_PATHS <= set(
+        _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256) - (
+        _TASK11G_PREDECESSOR_PATHS | _PHASE4_LITE_TASK10G_SUCCESSOR_PATHS
     )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
@@ -2137,15 +2246,50 @@ def test_task11g_reviewed_structural_ast_requires_explicit_review() -> None:
     )
     assert _TASK11G_PREDECESSOR_PATHS <= predecessor_paths
     assert _TASK11G_PREDECESSOR_PATHS == set(_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256)
+    assert _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS <= set(
+        _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    assert _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS <= set(
+        _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = (
+        set(_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256)
+        - _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _TASK11G_REVIEWED_STRUCTURAL_AST_SHA256, (
+    assert actual == expected, (
         "Task-11G structural review required before updating its normalized AST "
-        f"SHA-256 ratchet: expected {_TASK11G_REVIEWED_STRUCTURAL_AST_SHA256}, "
-        f"got {actual}"
+        f"SHA-256 ratchet: expected {expected}, got {actual}"
+    )
+
+
+def test_phase4_lite_reviewed_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    predecessor_successors = (
+        _PHASE4_LITE_TASK8_SUCCESSOR_PATHS
+        | _PHASE4_LITE_TASK10G_SUCCESSOR_PATHS
+        | _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS
+    )
+    assert predecessor_successors <= set(
+        _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Phase-4-Lite structural review required before updating its normalized "
+        f"AST SHA-256 ratchet: expected "
+        f"{_PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256}, got {actual}"
     )
 
 

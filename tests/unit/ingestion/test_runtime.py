@@ -24,6 +24,7 @@ from src.ingestion.runtime import (
     GreenfieldWebhookWriter,
     IngestionRuntime,
     RuntimeManifestRepository,
+    RuntimeShutdownError,
     RuntimeUnavailableError,
     build_ingestion_runtime,
 )
@@ -42,6 +43,7 @@ from src.ingestion.runtime_capability import (
     RuntimeCapabilityStage,
 )
 from src.ingestion.webhook import WebhookIngressService, WebhookIngressUnavailable
+from src.ingestion.worker import DurableInboxWorker
 
 
 _HASH_A = "a" * 64
@@ -182,14 +184,26 @@ def _event() -> NormalizedIngressEvent:
 
 
 class _Pool:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        open_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.events = events
+        self.open_error = open_error
+        self.close_error = close_error
 
     async def open(self) -> None:
         self.events.append("pool.open")
+        if self.open_error is not None:
+            raise self.open_error
 
     async def close(self) -> None:
         self.events.append("pool.close")
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _AuthorityRepository:
@@ -228,9 +242,16 @@ class _ManifestRepository:
 
 
 class _InstanceRepository:
-    def __init__(self, events: list[str], *, heartbeat_error: Exception | None = None):
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        heartbeat_error: Exception | None = None,
+        drain_error: Exception | None = None,
+    ):
         self.events = events
         self.heartbeat_error = heartbeat_error
+        self.drain_error = drain_error
         self.heartbeat_calls: list[tuple[int, int, int]] = []
 
     async def register(
@@ -266,6 +287,8 @@ class _InstanceRepository:
 
     async def drain(self, lease: RuntimeInstanceLease) -> RuntimeInstanceLease:
         self.events.append("instance.drain")
+        if self.drain_error is not None:
+            raise self.drain_error
         return _lease(
             session_id=lease.session_id,
             lease_version=lease.lease_version + 1,
@@ -294,6 +317,68 @@ class _Writer:
         if self.block:
             await self.release.wait()
         return IngressReceipt(inbox_id=_INBOX_ID, duplicate=False)
+
+
+class _RecoveryRepository:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        error: BaseException | None = None,
+        block_first: bool = False,
+    ) -> None:
+        self.events = events
+        self.error = error
+        self.block_first = block_first
+        self.calls: list[int] = []
+        self.recovered_twice = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def recover_expired_leases(self, limit: int) -> int:
+        self.events.append(f"recovery.recover:{limit}")
+        self.calls.append(limit)
+        self.entered.set()
+        if self.block_first and len(self.calls) == 1:
+            await self.release.wait()
+        if len(self.calls) >= 2:
+            self.recovered_twice.set()
+        if self.error is not None:
+            raise self.error
+        return 0
+
+
+class _ProcessingWorker:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        start_error: BaseException | None = None,
+        stop_error: BaseException | None = None,
+        block_stop: bool = False,
+    ) -> None:
+        self.events = events
+        self.start_error = start_error
+        self.stop_error = stop_error
+        self.block_stop = block_stop
+        self.stop_entered = asyncio.Event()
+        self.stop_release = asyncio.Event()
+        self.ready = False
+
+    async def start(self) -> None:
+        self.events.append("worker.start")
+        if self.start_error is not None:
+            raise self.start_error
+        self.ready = True
+
+    async def stop(self, grace_seconds: float = 30.0) -> None:
+        self.events.append(f"worker.stop:{grace_seconds}")
+        self.ready = False
+        self.stop_entered.set()
+        if self.block_stop:
+            await self.stop_release.wait()
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 class _AsyncContext:
@@ -347,12 +432,16 @@ def _runtime(
     manifest_repository: _ManifestRepository | None = None,
     instance_repository: _InstanceRepository | None = None,
     writer: _Writer | None = None,
+    pool: _Pool | None = None,
+    processing_worker: _ProcessingWorker | None = None,
+    recovery_repository: _RecoveryRepository | None = None,
+    fail_stop=None,
 ) -> tuple[IngestionRuntime, _InstanceRepository, _Writer]:
     instances = instance_repository or _InstanceRepository(events)
     sink = writer or _Writer(events)
     runtime = IngestionRuntime(
         account_id=8,
-        pool=_Pool(events),
+        pool=pool or _Pool(events),
         authority_repository=authority_repository or _AuthorityRepository(events),
         manifest_repository=manifest_repository or _ManifestRepository(events),
         instance_repository=instances,
@@ -362,6 +451,9 @@ def _runtime(
         lease_seconds=30,
         heartbeat_seconds=10,
         shutdown_seconds=1,
+        processing_worker=processing_worker,
+        inbox_recovery_repository=recovery_repository,
+        fail_stop=fail_stop,
     )
     return runtime, instances, sink
 
@@ -384,6 +476,344 @@ async def test_start_publishes_only_the_session_bound_webhook_runtime() -> None:
 
     await runtime.stop()
     assert events[-2:] == ["instance.drain", "pool.close"]
+
+
+@pytest.mark.asyncio
+async def test_start_recovers_then_starts_one_processing_runtime_before_ready() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+
+    await runtime.start()
+
+    assert runtime.processing_ready is True
+    assert runtime.ready is True
+    assert recovery.calls == [runtime_module._RECOVERY_BATCH_LIMIT]
+    assert events[:6] == [
+        "pool.open",
+        "authority.get:8",
+        "manifest.load",
+        "instance.register",
+        f"recovery.recover:{runtime_module._RECOVERY_BATCH_LIMIT}",
+        "worker.start",
+    ]
+    recovery_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "durable-inbox-expired-lease-recovery" and not task.done()
+    ]
+    assert len(recovery_tasks) == 1
+
+    cancel_recovery = runtime._cancel_recovery
+
+    async def tracked_cancel_recovery() -> None:
+        events.append("recovery.stop")
+        await cancel_recovery()
+
+    runtime._cancel_recovery = tracked_cancel_recovery  # type: ignore[method-assign]
+    await runtime.stop()
+
+    assert runtime.processing_ready is False
+    assert events.index("recovery.stop") < events.index("worker.stop:1.0")
+    assert events.index("worker.start") < events.index("worker.stop:1.0")
+    assert events.index("worker.stop:1.0") < events.index("instance.drain")
+    assert events.index("instance.drain") < events.index("pool.close")
+
+
+@pytest.mark.asyncio
+async def test_web_session_heartbeat_exists_while_startup_recovery_is_blocked() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events, block_first=True)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+
+    start_task = asyncio.create_task(runtime.start())
+    await recovery.entered.wait()
+
+    assert runtime._heartbeat_task is not None
+    assert runtime._heartbeat_task.done() is False
+    assert runtime.ready is False
+    assert runtime.processing_ready is False
+    assert runtime._state.accepting is False
+
+    recovery.release.set()
+    await start_task
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_fails_closed_if_heartbeat_dies_during_recovery() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events, block_first=True)
+    worker = _ProcessingWorker(events)
+    instances = _InstanceRepository(
+        events,
+        heartbeat_error=RuntimeError("stale_session"),
+    )
+    runtime, _instances, _writer = _runtime(
+        events,
+        instance_repository=instances,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+    runtime._heartbeat_seconds = 0.001
+
+    start_task = asyncio.create_task(runtime.start())
+    await recovery.entered.wait()
+    heartbeat = runtime._heartbeat_task
+    assert heartbeat is not None
+    await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
+    recovery.release.set()
+
+    with pytest.raises(RuntimeUnavailableError, match="startup_failed"):
+        await start_task
+
+    assert runtime.ready is False
+    assert runtime.processing_ready is False
+    assert events.index("worker.start") < events.index("worker.stop:1.0")
+    assert events.index("worker.stop:1.0") < events.index("instance.drain")
+    assert events.index("instance.drain") < events.index("pool.close")
+
+
+@pytest.mark.asyncio
+async def test_background_heartbeat_loss_invokes_process_fail_stop() -> None:
+    events: list[str] = []
+    reasons: list[str] = []
+    instances = _InstanceRepository(
+        events,
+        heartbeat_error=RuntimeError("stale_session"),
+    )
+    runtime, _instances, _writer = _runtime(
+        events,
+        instance_repository=instances,
+        fail_stop=reasons.append,
+    )
+    runtime._heartbeat_seconds = 0.001
+    await runtime.start()
+
+    heartbeat = runtime._heartbeat_task
+    assert heartbeat is not None
+    await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
+
+    assert reasons == ["ingestion_runtime_heartbeat_lost"]
+    assert runtime.ready is False
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_loss_is_escalated_by_web_session_heartbeat() -> None:
+    events: list[str] = []
+    reasons: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+        fail_stop=reasons.append,
+    )
+    runtime._heartbeat_seconds = 0.001
+    await runtime.start()
+
+    worker.ready = False
+    heartbeat = runtime._heartbeat_task
+    assert heartbeat is not None
+    await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
+
+    assert reasons == ["ingestion_runtime_processing_lost"]
+    assert runtime.processing_ready is False
+    assert runtime.ready is False
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_is_escalated_by_web_session_heartbeat() -> None:
+    events: list[str] = []
+    reasons: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+        fail_stop=reasons.append,
+    )
+    runtime._recovery_interval_seconds = 0.001
+    runtime._heartbeat_seconds = 0.001
+    await runtime.start()
+
+    recovery.error = RuntimeError("database_unavailable")
+    recovery_task = runtime._recovery_task
+    assert recovery_task is not None
+    with pytest.raises(RuntimeError, match="database_unavailable"):
+        await asyncio.wait_for(asyncio.shield(recovery_task), timeout=1)
+    assert runtime.processing_ready is False
+    assert runtime.ready is False
+
+    heartbeat = runtime._heartbeat_task
+    assert heartbeat is not None
+    await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
+    assert reasons == ["ingestion_runtime_processing_lost"]
+
+    recovery.error = None
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_normal_shutdown_does_not_report_processing_loss() -> None:
+    events: list[str] = []
+    reasons: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+        fail_stop=reasons.append,
+    )
+    runtime._heartbeat_seconds = 0.001
+    await runtime.start()
+
+    await runtime.stop()
+
+    assert reasons == []
+    assert runtime.ready is False
+
+
+@pytest.mark.asyncio
+async def test_start_rollback_preserves_owners_when_worker_stop_is_unproved() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events, block_first=True)
+    worker = _ProcessingWorker(
+        events,
+        stop_error=RuntimeError("worker_shutdown_unproved"),
+    )
+    instances = _InstanceRepository(
+        events,
+        heartbeat_error=RuntimeError("stale_session"),
+    )
+    runtime, _instances, _writer = _runtime(
+        events,
+        instance_repository=instances,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+    runtime._heartbeat_seconds = 0.001
+
+    start_task = asyncio.create_task(runtime.start())
+    await recovery.entered.wait()
+    heartbeat = runtime._heartbeat_task
+    assert heartbeat is not None
+    await asyncio.wait_for(asyncio.shield(heartbeat), timeout=1)
+    recovery.release.set()
+
+    with pytest.raises(RuntimeShutdownError, match="startup_cleanup_incomplete"):
+        await start_task
+
+    assert runtime.ready is False
+    assert runtime._stopped is False
+    assert runtime._pool_open is True
+    assert runtime._processing_started is True
+    assert "instance.drain" not in events
+    assert "pool.close" not in events
+
+    worker.stop_error = None
+    await runtime.stop()
+    assert events.count("worker.stop:1.0") == 2
+    assert events.index("instance.drain") < events.index("pool.close")
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_is_low_frequency_single_and_bounded() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+
+    runtime._recovery_interval_seconds = 0.001
+    await runtime.start()
+    await asyncio.wait_for(recovery.recovered_twice.wait(), timeout=1)
+
+    assert runtime.processing_ready is True
+    assert len(recovery.calls) >= 2
+    assert set(recovery.calls) == {runtime_module._RECOVERY_BATCH_LIMIT}
+    assert (
+        len(
+            [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == "durable-inbox-expired-lease-recovery"
+                and not task.done()
+            ]
+        )
+        == 1
+    )
+
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_processing_readiness_fails_closed_when_worker_is_not_live() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+
+    await runtime.start()
+    assert runtime.ready is True
+    worker.ready = False
+
+    assert runtime.processing_ready is False
+    assert runtime.ready is False
+
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_processing_start_failure_strictly_unwinds_every_started_owner() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events, start_error=RuntimeError("worker_failed"))
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="startup_failed"):
+        await runtime.start()
+
+    assert runtime.ready is False
+    assert runtime.processing_ready is False
+    assert runtime.webhook_ingress_service is None
+    assert events == [
+        "pool.open",
+        "authority.get:8",
+        "manifest.load",
+        "instance.register",
+        f"recovery.recover:{runtime_module._RECOVERY_BATCH_LIMIT}",
+        "worker.start",
+        "worker.stop:1.0",
+        "instance.drain",
+        "pool.close",
+    ]
 
 
 @pytest.mark.asyncio
@@ -456,6 +886,95 @@ async def test_start_failure_unwinds_the_owned_business_pool() -> None:
         "manifest.load",
         "pool.close",
     ]
+    with pytest.raises(RuntimeUnavailableError, match="runtime_not_startable"):
+        await runtime.start()
+
+
+@pytest.mark.asyncio
+async def test_pool_open_failure_still_attempts_strict_pool_rollback() -> None:
+    events: list[str] = []
+    runtime, _instances, _writer = _runtime(
+        events,
+        pool=_Pool(events, open_error=RuntimeError("open_failed")),
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="startup_failed"):
+        await runtime.start()
+
+    assert events == ["pool.open", "pool.close"]
+    assert runtime.ready is False
+
+
+@pytest.mark.asyncio
+async def test_partial_pool_open_cleanup_failure_remains_retryable() -> None:
+    events: list[str] = []
+    pool = _Pool(
+        events,
+        open_error=RuntimeError("open_failed"),
+        close_error=RuntimeError("close_unproved"),
+    )
+    runtime, _instances, _writer = _runtime(events, pool=pool)
+
+    with pytest.raises(RuntimeShutdownError, match="startup_cleanup_incomplete"):
+        await runtime.start()
+
+    assert runtime._pool_open_attempted is True
+    assert runtime._stopped is False
+    assert events == ["pool.open", "pool.close"]
+
+    pool.close_error = None
+    await runtime.stop()
+
+    assert events == ["pool.open", "pool.close", "pool.close"]
+    assert runtime._pool_open_attempted is False
+    assert runtime._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_registered_lease_cleanup_failure_retains_retry_authority() -> (
+    None
+):
+    events: list[str] = []
+
+    class InvalidRegistrationRepository(_InstanceRepository):
+        async def register(
+            self,
+            authority: RuntimeAuthority,
+            runtime_contract: RuntimeContract,
+            instance_id: str,
+            session_id: str,
+            lease_seconds: int,
+        ) -> RuntimeInstanceLease:
+            del authority, runtime_contract, instance_id, lease_seconds
+            self.events.append("instance.register")
+            return replace(_lease(session_id=session_id), account_id=9)
+
+    instances = InvalidRegistrationRepository(
+        events,
+        drain_error=RuntimeError("drain_unproved"),
+    )
+    runtime, _instances, _writer = _runtime(
+        events,
+        instance_repository=instances,
+    )
+
+    with pytest.raises(RuntimeShutdownError, match="startup_cleanup_incomplete"):
+        await runtime.start()
+
+    assert runtime._state.lease is None
+    assert runtime._registered_lease is not None
+    assert runtime._registered_lease.account_id == 9
+    assert runtime._pool_open_attempted is True
+    assert runtime._stopped is False
+    assert "pool.close" not in events
+
+    instances.drain_error = None
+    await runtime.stop()
+
+    assert events[-2:] == ["instance.drain", "pool.close"]
+    assert runtime._registered_lease is None
+    assert runtime._pool_open_attempted is False
+    assert runtime._stopped is True
 
 
 @pytest.mark.asyncio
@@ -490,7 +1009,7 @@ async def test_stop_rejects_new_intake_before_waiting_for_entered_commit() -> No
 
 
 @pytest.mark.asyncio
-async def test_stop_timeout_closes_pool_without_cancelling_entered_commit() -> None:
+async def test_stop_timeout_preserves_pool_until_entered_commit_finishes() -> None:
     events: list[str] = []
     writer = _Writer(events)
     writer.block = True
@@ -505,9 +1024,11 @@ async def test_stop_timeout_closes_pool_without_cancelling_entered_commit() -> N
     ):
         await runtime.stop()
 
-    assert "pool.close" in events
+    assert "pool.close" not in events
     assert "instance.drain" not in events
-    assert runtime.webhook_ingress_service is None
+    assert runtime.webhook_ingress_service is not None
+    assert runtime._pool_open is True
+    assert runtime._stopped is False
     assert not any(
         task.get_name() == "greenfield-webhook-intake-drain" and not task.done()
         for task in asyncio.all_tasks()
@@ -515,6 +1036,174 @@ async def test_stop_timeout_closes_pool_without_cancelling_entered_commit() -> N
 
     writer.release.set()
     assert await insert_task == IngressReceipt(inbox_id=_INBOX_ID, duplicate=False)
+    await runtime.stop()
+
+    assert events.index("instance.drain") < events.index("pool.close")
+    assert runtime.webhook_ingress_service is None
+
+
+@pytest.mark.asyncio
+async def test_stop_retries_each_unproved_owner_before_releasing_resources() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events, stop_error=RuntimeError("worker_stop"))
+    instances = _InstanceRepository(
+        events,
+        heartbeat_error=RuntimeError("heartbeat"),
+        drain_error=RuntimeError("drain"),
+    )
+    pool = _Pool(events, close_error=RuntimeError("pool_close"))
+    runtime, _instances, _writer = _runtime(
+        events,
+        instance_repository=instances,
+        pool=pool,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+    await runtime.start()
+    runtime._state.accepted_count = 1
+
+    with pytest.raises(RuntimeShutdownError, match="shutdown_incomplete"):
+        await runtime.stop()
+
+    assert runtime.ready is False
+    assert runtime.processing_ready is False
+    assert runtime.webhook_ingress_service is not None
+    assert runtime._processing_started is True
+    assert "instance.heartbeat" not in events
+    assert "instance.drain" not in events
+    assert "pool.close" not in events
+
+    worker.stop_error = None
+    with pytest.raises(RuntimeShutdownError, match="shutdown_incomplete"):
+        await runtime.stop()
+
+    assert runtime._processing_started is False
+    assert "instance.heartbeat" in events
+    assert "instance.drain" in events
+    assert "pool.close" not in events
+    assert runtime._pool_open is True
+
+    instances.heartbeat_error = None
+    instances.drain_error = None
+    pool.close_error = None
+    await runtime.stop()
+
+    assert events.count("worker.stop:1.0") == 2
+    assert events.index("instance.drain") < events.index("pool.close")
+    assert runtime.webhook_ingress_service is None
+    assert runtime._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_real_worker_failed_stop_retains_tasks_and_runtime_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = DurableInboxWorker(
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        worker_id="ai-exchange-web",
+        lease_session_id=str(uuid4()),
+        concurrency=1,
+        lease_seconds=30,
+        heartbeat_interval_seconds=10,
+    )
+    release = asyncio.Event()
+
+    async def stubborn_consumer() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    consumer = asyncio.create_task(stubborn_consumer())
+    worker._tasks = [consumer]
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,  # type: ignore[arg-type]
+        recovery_repository=recovery,
+    )
+    monkeypatch.setattr(
+        "src.ingestion.worker._WORKER_CANCELLATION_SECONDS",
+        0.01,
+    )
+    runtime._shutdown_seconds = 0.01
+    await runtime.start()
+
+    with pytest.raises(RuntimeShutdownError, match="shutdown_incomplete"):
+        await runtime.stop()
+
+    assert worker.tasks == (consumer,)
+    assert runtime._processing_started is True
+    assert runtime._pool_open is True
+    assert runtime._stopped is False
+    assert "instance.drain" not in events
+    assert "pool.close" not in events
+
+    release.set()
+    await asyncio.wait_for(consumer, timeout=0.1)
+    await runtime.stop()
+
+    assert worker.tasks == ()
+    assert runtime._processing_started is False
+    assert events.index("instance.drain") < events.index("pool.close")
+
+
+@pytest.mark.asyncio
+async def test_stop_cancellation_returns_without_releasing_owned_resources() -> None:
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events, block_stop=True)
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+    await runtime.start()
+
+    stop_task = asyncio.create_task(runtime.stop())
+    await worker.stop_entered.wait()
+    stop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop_task, timeout=0.1)
+
+    assert "instance.drain" not in events
+    assert "pool.close" not in events
+    assert runtime.ready is False
+    worker.stop_release.set()
+
+
+@pytest.mark.asyncio
+async def test_stop_preserves_dependency_cancellation_without_releasing_owners() -> (
+    None
+):
+    events: list[str] = []
+    recovery = _RecoveryRepository(events)
+    worker = _ProcessingWorker(events, stop_error=asyncio.CancelledError())
+    runtime, _instances, _writer = _runtime(
+        events,
+        processing_worker=worker,
+        recovery_repository=recovery,
+    )
+    await runtime.start()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.stop()
+
+    assert "instance.drain" not in events
+    assert "pool.close" not in events
+    assert runtime._processing_started is True
+    assert runtime._pool_open is True
+    assert runtime.webhook_ingress_service is not None
+
+    worker.stop_error = None
+    await runtime.stop()
+    assert events.index("instance.drain") < events.index("pool.close")
+    assert runtime.webhook_ingress_service is None
 
 
 @pytest.mark.asyncio
@@ -794,7 +1483,9 @@ async def test_session_bound_inbox_counts_rejected_writes_and_invalid_receipts()
         ({"heartbeat_seconds": 30}, "runtime timing"),
         ({"session_id": "not-a-uuid"}, "session_id"),
         ({"session_id": "00000000-0000-0000-0000-000000000000"}, "session_id"),
+        ({"session_id": "00000000-0000-4000-8000-00000000000A"}, "session_id"),
         ({"pool": object()}, "dependency"),
+        ({"fail_stop": object()}, "fail_stop"),
     ],
 )
 def test_runtime_constructor_rejects_invalid_configuration(
@@ -865,6 +1556,7 @@ def test_runtime_factory_wires_one_dedicated_business_pool() -> None:
 
     assert isinstance(runtime, IngestionRuntime)
     assert runtime.ready is False
+    assert runtime.processing_ready is False
     create.assert_called_once_with(
         conninfo=settings.database_url,
         min_size=1,
@@ -872,3 +1564,104 @@ def test_runtime_factory_wires_one_dedicated_business_pool() -> None:
         open=False,
         kwargs={"autocommit": True, "row_factory": runtime_module.dict_row},
     )
+
+
+def test_runtime_factory_requires_context_before_allocating_processing_pool() -> None:
+    settings = SimpleNamespace(
+        database_url="postgresql://runtime@example.invalid/database",
+        EXCHANGE_ACCOUNT_ID=8,
+        DURABLE_INBOX_ENABLED=True,
+    )
+
+    with patch.object(runtime_module, "AsyncConnectionPool") as create:
+        with pytest.raises(ValueError, match="processing_context is required"):
+            build_ingestion_runtime(settings)
+
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("INGESTION_SHADOW_ENABLED", "does not permit ingestion Shadow"),
+        ("SYNC_RECONCILIATION_ENABLED", "does not permit Sync reconciliation"),
+    ],
+)
+def test_runtime_factory_rejects_features_outside_phase4_lite_before_pool_creation(
+    field: str,
+    message: str,
+) -> None:
+    settings = SimpleNamespace(
+        database_url="postgresql://runtime@example.invalid/database",
+        EXCHANGE_ACCOUNT_ID=8,
+        **{field: True},
+    )
+
+    with patch.object(runtime_module, "AsyncConnectionPool") as create:
+        with pytest.raises(ValueError, match=message):
+            build_ingestion_runtime(settings)
+
+    create.assert_not_called()
+
+
+def test_runtime_factory_wires_one_worker_on_the_same_business_pool() -> None:
+    settings = SimpleNamespace(
+        database_url="postgresql://runtime@example.invalid/database",
+        EXCHANGE_ACCOUNT_ID=8,
+        DURABLE_INBOX_ENABLED=True,
+        INGESTION_INSTANCE_ID="runtime-web",
+        INGESTION_LEASE_SECONDS=40,
+        INGESTION_HEARTBEAT_SECONDS=10,
+        INGESTION_SHUTDOWN_SECONDS=20,
+    )
+    processing_context = object()
+    pool = MagicMock()
+    authority_repository = MagicMock()
+    instance_repository = MagicMock()
+    generated_session_id = uuid4()
+
+    with (
+        patch.object(
+            runtime_module,
+            "uuid4",
+            return_value=generated_session_id,
+        ) as create_session_id,
+        patch.object(
+            runtime_module, "AsyncConnectionPool", return_value=pool
+        ) as create,
+        patch.object(
+            runtime_module,
+            "RuntimeAuthorityRepository",
+            return_value=authority_repository,
+        ),
+        patch.object(
+            runtime_module,
+            "RuntimeInstanceRepository",
+            return_value=instance_repository,
+        ),
+    ):
+        runtime = build_ingestion_runtime(
+            settings,
+            processing_context=processing_context,
+        )
+
+    worker = runtime._processing_worker
+    recovery = runtime._inbox_recovery_repository
+    assert worker is not None
+    assert recovery is not None
+    assert worker.concurrency == 1
+    assert worker._pipeline_names == ("durable_v1",)
+    assert worker._worker_id == "runtime-web"
+    assert worker._lease_session_id == runtime._session_id == str(generated_session_id)
+    assert worker._lease_seconds == 40
+    assert worker._heartbeat_interval_seconds == 10.0
+    assert worker._inbox is recovery
+    assert recovery._pool is pool
+    assert worker._ownership._pool is pool
+    adapter = worker._router.registry["durable_v1"]
+    assert adapter.pipeline_name == "durable_v1"
+    assert adapter.legacy_account_id == 8
+    assert adapter._ctx is processing_context
+    assert runtime._recovery_interval_seconds == 80.0
+    create_session_id.assert_called_once_with()
+    create.assert_called_once()

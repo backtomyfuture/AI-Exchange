@@ -9,6 +9,7 @@ from src.ingestion import command_receipts
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "src" / "ingestion" / "worker.py"
+RUNTIME = ROOT / "src" / "ingestion" / "runtime.py"
 LIVE_ROOTS = (
     ROOT / "src" / "main.py",
     ROOT / "src" / "server.py",
@@ -103,15 +104,24 @@ def _method_node(tree: ast.Module, class_name: str, method_name: str):
     raise AssertionError(f"missing {class_name}.{method_name}")
 
 
-def test_durable_worker_has_no_live_runtime_import_or_startup_wiring() -> None:
+def test_durable_worker_has_exactly_one_runtime_factory_wiring() -> None:
     violations = [
         str(path.relative_to(ROOT))
-        for root in LIVE_ROOTS
+        for root in (*LIVE_ROOTS, RUNTIME)
         for path in _python_files(root)
         if _imports_worker(path)
     ]
 
-    assert violations == []
+    assert violations == ["src/ingestion/runtime.py"]
+    tree = ast.parse(RUNTIME.read_text(encoding="utf-8"), filename=str(RUNTIME))
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "DurableInboxWorker"
+    ]
+    assert len(constructors) == 1
 
 
 def test_worker_has_no_module_level_task_creation_or_configuration_gate() -> None:

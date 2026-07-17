@@ -4,7 +4,7 @@
 
 ## 核心功能
 
-1.  **自动化同步**: 自动轮询 Exchange 邮箱，抓取新邮件。
+1.  **可靠收件**: 以 Exchange Webhook 为主通道，先写入 PostgreSQL Durable Inbox，再异步处理；当前不启用轮询。
 2.  **智能分类**: 使用 LLM 识别邮件意图，判断是否需要回复及其紧急程度。
 3.  **多模态 RAG**: 支持提取邮件文本和图片描述，并存储在 Qdrant 中作为历史背景。
 4.  **人机协作 (Human-in-the-Loop)**:
@@ -21,11 +21,13 @@
     -   `Exchange API`: 自定义适配器，处理邮件收发和状态更新。
     -   `Lark (飞书)`: 采用 WebSocket (长连接) 监听回调，HTTP API 发送交互卡片。
 
-## 分离式服务
+## 单进程服务
 
-项目在部署时分为两个核心容器服务：
--   **`exchange-service`**: 负责邮件同步循环、初步分类、RAG 检索和生成初始草稿并推送卡片。
--   **`lark-service`**: 运行 WebSocket 监听器，接收用户在飞书卡片上的操作，并根据反馈恢复/更新 LangGraph 状态机。
+当前精简上线形态只有一个 **`ai-assistant-service`**：FastAPI 接收 Exchange
+Webhook，同一进程内的单消费者 Durable Inbox Worker 复用现有 LangGraph、
+ContentStore 和飞书 WebSocket 完成处理与审批。Webhook 请求只负责可靠落库，业务
+处理失败不会丢失已接收事件。该形态面向单 Exchange 账户、单飞书账户和全新初始化；
+不包含 Shadow、Sync 轮询、历史数据迁移、多账户或多实例滚动切换。
 
 ## 快速开始
 
@@ -46,7 +48,13 @@ uv sync --frozen
 checkpoint execute 的完整 DSN 必须分别写入 `MIGRATION_DATABASE_URL_FILE`、
 `CHECKPOINT_AUDITOR_DATABASE_URL_FILE` 和
 `CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE` 指向的 0400/0600 文件，不能写回
-`.env`。
+`.env`。首次部署还要准备 `DATABASE_PROVISION_ADMIN_URL_FILE` 与四个
+`POSTGRES_*_PASSWORD_FILE` 指向的 0400/0600 文件；这些文件只挂载到手动
+provisioning 容器，不进入应用或 migration 容器。四个密码文件分别是对应角色的
+唯一密码来源：runtime 文件必须与 `.env` 的 `POSTGRES_RUNTIME_PASSWORD` 一致，
+migration、maintenance、auditor DSN 必须使用各自密码文件中的同一密码；admin URL
+的密码必须与 `POSTGRES_ADMIN_PASSWORD` 一致。完整构建与初始化证据流程见
+[`deploy/README.md`](deploy/README.md)。
 
 migration DSN 的
 `options` 必须精确设置为 `-csearch_path=<目标 schema>`。不要显式把
@@ -55,24 +63,148 @@ migration DSN 的
 DDL。auditor 与 maintenance DSN 必须分别以各自角色登录，且 `options` 精确设置为
 `-csearch_path=pg_catalog,<目标 schema>`；它们只能用于各自独立维护容器。四个
 数据库身份必须互不相同。不要把 admin、migration、auditor 或 maintenance 凭据
-放入运行时配置。随后填入：
--   Exchange API 认证信息
--   飞书 App ID & Secret
--   Gemini API Key & Base URL
--   Postgres & Qdrant 连接信息
+放入运行时配置。随后完成生产 preflight：
+
+- Exchange HTTPS URL、API key、账户 ID，以及与服务端完全一致且至少 16 字节的
+  Webhook secret；
+- 飞书 `LARK_APP_ID`、至少 16 字节的 `LARK_APP_SECRET`/`LARK_ENCRYPT_KEY`、
+  `LARK_CHAT_ID`，以及至少一个真实且非 `*` 的 `LARK_ALLOWED_OPEN_IDS`；
+- 至少 16 字节的 `METRICS_TOKEN`，和解码后严格 32 字节的 Base64
+  `CONTENT_STORE_KEY`；
+- 真实模型/Embedding 凭据与地址、四角色 PostgreSQL 配置，以及 Qdrant 配置；
+- 非占位、无用户信息的真实 HTTPS `EXTERNAL_URL`。本机冒烟可以用 HTTP curl 访问
+  `127.0.0.1`，但 Compose 内这个生产配置仍必须是未来受控的 HTTPS 回调 origin；尚未
+  配置反向代理时，不能宣称外部 Webhook 已经上线。
+
+Exchange 地址必须通过证书校验。若服务实际通过私网 IP 访问、证书却只覆盖 DNS
+名称，不要把 `EXCHANGE_SSL_VERIFY` 设为 `false`。把 `EXCHANGE_API_URL` 改为证书
+SAN 覆盖的主机名，并在 `.env` 设置 `EXCHANGE_TLS_HOSTNAME`、
+`EXCHANGE_TLS_IP`、`EXCHANGE_CA_FILE_HOST`；最后一个变量指向只含证书/信任链、
+不含私钥的可读 PEM 文件。此时所有 Compose 命令都追加 TLS 覆盖文件，例如：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.exchange-tls.yml \
+  config --quiet
+```
+
+覆盖层只给应用容器增加精确 DNS 到 IP 映射，并把 PEM 只读挂载到固定容器路径；
+应用仍强制保持 TLS 验证。`EXCHANGE_TLS_HOSTNAME` 必须与 `EXCHANGE_API_URL` 的
+host 完全一致且被证书覆盖。若 Exchange 地址本身已使用可解析且证书链完整的域名，
+则不使用该覆盖层，并保持 `EXCHANGE_CA_FILE` 为空。
+
+反方向的 Exchange Webhook 入口同样有外部前置：本 Compose 只提供容器内 HTTP，
+不包含公网 TLS 终止。正式环境必须由现有反向代理/入口提供真实可达的 HTTPS
+`EXTERNAL_URL`，并把 `/webhooks/exchange` 路由到应用端口；本机直接访问 HTTP 只用于
+隔离冒烟。当前项目验证完成后，再在 Exchange 扩展中以 `is_active=false` 创建/更新
+单账户、仅 `NewMailEvent` 的订阅。两端必须使用完全相同、至少 16 字节的高熵
+`EXCHANGE_WEBHOOK_SECRET`；先触发扩展的 TestEvent，不能只看扩展接口外层 HTTP 200，
+还必须确认返回的目标 `data.status_code=200`，且 `data.response_body` 可解析为精确的
+`{"status":"ok","test":true}`。这些条件全部满足后才把订阅设为 active，再用一封
+真实测试邮件验证“Webhook 202 → Durable Inbox → 飞书卡片 → 用户点击 → 数据库状态变化”。
+
+真实 Inbox opaque ID 从 Exchange 的 `emails/folders/all` 接口读取，并写入本次 policy
+manifest；不能用显示名 `INBOX` 代替。私网 TLS 场景可在镜像构建后，使用同一个
+Compose project、TLS overlay 和应用镜像执行一个 `--no-deps --no-build` one-shot；它从
+容器环境读取 API key，不把密钥放入命令行，并利用 overlay 的 SNI/DNS/CA 配置：
+
+```bash
+umask 077
+docker compose -p "$PROJECT_NAME" \
+  -f docker-compose.yml -f docker-compose.exchange-tls.yml \
+  run --rm --no-deps --no-build --entrypoint python ai-assistant-service -c '
+import asyncio
+from src.config import get_settings
+from src.utils.exchange_api import ExchangeClient
+async def main():
+    settings = get_settings()
+    client = ExchangeClient(settings)
+    try:
+        folders = await client.get_all_folders(force_refresh=True)
+        expected = settings.EXCHANGE_FOLDERS_FULL.strip().casefold()
+        matches = [folder_id for folder_id, name in folders.items()
+                   if name.strip().casefold() == expected]
+        if len(matches) != 1:
+            raise SystemExit("inbox_folder_not_unique")
+        print(matches[0])
+    finally:
+        await client.close()
+asyncio.run(main())
+' > "/tmp/ai-exchange-inbox-$PROJECT_NAME"
+test -s "/tmp/ai-exchange-inbox-$PROJECT_NAME"
+```
+
+输出文件只用于随后生成本次 manifest，不能提交。若 Exchange 域名本身正常解析且证书链
+完整，则去掉 TLS overlay 参数。TestEvent 只证明签名和可达性，不会写 Durable Inbox，
+因此不能替代后两项验收。
 
 ### 3. 运行系统
 
-使用 Docker Compose 启动完整环境：
+只从已经提交且干净的当前 HEAD 部署。先严格执行
+[`deploy/README.md`](deploy/README.md) 第 1 节：完整测试、显式构建当前镜像并记录
+image ID，不能复用旧镜像。为本次部署选择一个从未使用过的 Compose project name；
+以下每条 Compose 命令必须使用同一个 project，避免意外复用默认项目的 PostgreSQL、
+Qdrant 或 ContentStore volume。随后执行：
+
 ```bash
-# 仅在独立 DBA checkpoint 已完成备份、角色创建、ownership 转移和权限复核，
-# 且 disposable PostgreSQL 验证通过后执行；当前 live 数据库尚不满足该条件。
-docker compose --profile migration run --rm database-bootstrap
-docker compose up -d
+PROJECT_NAME="ai-exchange-phase4-20260717-1"
+
+# 两条都必须为空；非空就换一个全新 project name，不删除或接管现有资源。
+test -z "$(docker ps -aq --filter label=com.docker.compose.project="$PROJECT_NAME")"
+test -z "$(docker volume ls -q --filter label=com.docker.compose.project="$PROJECT_NAME")"
+
+# 只支持本 Compose 创建的全新、专用 PostgreSQL volume；禁止共享/外部集群。
+# 集群除 POSTGRES_DB、postgres、template0、template1 外存在任何数据库都会拒绝。
+docker compose -p "$PROJECT_NAME" up -d postgres qdrant
+
+docker compose -p "$PROJECT_NAME" --profile database-provision run --rm database-provision
+docker compose -p "$PROJECT_NAME" --profile migration run --rm database-bootstrap
 ```
 
-常规 `docker compose up -d` 不会启动带 profile 的 bootstrap 或维护容器，也不会
-挂载它们的私有文件。`database-bootstrap` 只接收 migration DSN，以及四个角色名
+从 Exchange 读取本账户真实 Inbox opaque folder ID 后，按
+[`deploy/README.md`](deploy/README.md) 第 2–3 节生成
+`deploy/generated-<BUILD_ID>/POLICY.json` 与 `CONTRACT.json`，先 dry-run，再把该
+精确子目录只读挂载给 `ingestion-maintenance initialize`。不要挂载整个 `deploy/`，
+不要手写 hash，也不要引用仓库中不存在的根级 `deploy/POLICY.json`。
+
+初始化成功并配置真实 Exchange、飞书、模型与 ContentStore 凭据后，在 `.env` 中只把
+`DURABLE_INBOX_ENABLED` 设为 `true`；Shadow 与 Sync 保持 `false`。
+`INGESTION_INSTANCE_ID` 必须保持固定值 `ai-exchange-web`，且不得对应用服务执行
+`--scale`。启动并验证：
+
+```bash
+docker compose -p "$PROJECT_NAME" up -d --no-build ai-assistant-service
+.venv/bin/python - <<'PY'
+import json
+import os
+import time
+import urllib.request
+
+url = f"http://127.0.0.1:{os.getenv('APP_PORT', '8000')}/ready"
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            payload = json.load(response)
+        if payload.get("status") == "ready" and payload.get("processing") == "active":
+            break
+    except Exception:
+        pass
+    time.sleep(2)
+else:
+    raise SystemExit("phase4_lite_readiness_timeout")
+PY
+```
+
+响应必须同时包含 `"status":"ready"` 与 `"processing":"active"`；仅 HTTP 200 或
+`processing=standby` 都不算成功。若上一节要求 Exchange TLS 覆盖层，上述每条 Compose
+命令都使用 `-f docker-compose.yml -f docker-compose.exchange-tls.yml`。
+若旧测试实例仍在并行运行，还必须先在新项目的 `.env` 选择未占用的 `APP_PORT`（隔离
+冒烟建议 `18081`）；不要停止、删除或接管旧项目来释放端口。
+
+常规 `docker compose -p "$PROJECT_NAME" up -d` 不会启动带 profile 的 bootstrap 或维护容器，也不会
+挂载它们的私有文件。`database-provision` 是唯一接收 admin DSN 和四个角色密码
+文件的容器，并且只接受空数据库；成功后可安全重试，但不能用于历史库改造。
+`database-bootstrap` 只接收 migration DSN，以及四个角色名
 用于迁移和授权；它不接收 maintenance DSN/receipt key。`ai-assistant-service` 只接收
 runtime 凭据和其余三个非秘密角色名，用于启动门禁；它不接收任何 migration 或
 maintenance secret。
@@ -99,10 +231,10 @@ migration role 的默认权限必须显式撤销 `PUBLIC` 对新函数的 `EXECU
 `lo_from_bytea` 的 `EXECUTE`，使 runtime 不能在两次门禁之间创建 large object。
 同一 PostgreSQL cluster 内所有其他可连接 database 也必须撤销 `PUBLIC` 的
 `CONNECT/TEMPORARY`，确保 migration/runtime/maintenance/auditor 四个受管角色对其他
-`datallowconn` database 均无有效 `CONNECT`，再只向四个受管角色显式授权；新
-Compose volume 会通过
-init SQL 处理 `postgres/template1`，已有 volume 必须由 DBA 在 cutover checkpoint
-中执行等价操作。
+`datallowconn` database 均无有效 `CONNECT`，再只向四个受管角色显式授权。新 Compose
+volume 会通过 init SQL 处理 `postgres/template1`。provisioner 会拒绝额外 database、
+业务对象和不完整的受管角色集合，但无法证明宿主 volume 从未被使用；全新 project/volume
+仍由上述部署前检查保证。一次成功 provision 后可以在同一专用新集群中安全重试。
 bootstrap 在 DDL 前后都会验证已知业务/Checkpointer 列确实绑定
 `pg_catalog` 类型，并校验锁定的 `langgraph-checkpoint-postgres==3.0.4` migration
 manifest；依赖内容漂移会在第一条 DDL 前失败。所有校验失败只会返回通用错误，
@@ -111,9 +243,8 @@ manifest；依赖内容漂移会在第一条 DDL 前失败。所有校验失败�
 0003 之后只允许版本化访问清单中逐项声明的 foreign key、constraint/user trigger
 及其函数；任何额外 trigger、rewrite rule、`SECURITY DEFINER` routine、启用的
 event trigger 或继承/分区关系都会使门禁失败。runtime 可访问的 ordinary view
-必须设置 `security_invoker=true`；历史 owner-rights view 只有在 runtime 完全
-没有表级/列级权限时才作为只读迁移桥保留，避免隐式执行路径获得
-migration-owner 权限。
+必须设置 `security_invoker=true`，避免隐式执行路径获得 migration-owner 权限；本次
+greenfield 部署不创建或保留任何历史迁移桥。
 
 ### 4. 手工 checkpoint maintenance
 
@@ -131,7 +262,7 @@ auditor DSN、maintenance DSN，以及单行 base64 编码的 Ed25519 原始公�
 named volume 中，供后续精确确认使用：
 
 ```bash
-docker compose --profile checkpoint-maintenance run --rm checkpoint-maintenance \
+docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance run --rm checkpoint-maintenance \
   plan --older-than-hours 24 --limit 100
 ```
 
@@ -167,7 +298,7 @@ fence。context 关闭有固定 10 秒墙钟上限；超时或异常会直接硬
 外部客户端或非 checkpoint 写入，因此人工停写核验始终是必需条件。
 
 ```bash
-docker compose --profile checkpoint-maintenance-execute run --rm \
+docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance-execute run --rm \
   --volume /absolute/path/backup-receipt.json:/run/backup-receipt.json:ro \
   checkpoint-maintenance-execute execute \
   --plan-id <PLAN_ID> --confirm-plan-id <PLAN_ID> \
@@ -176,12 +307,12 @@ docker compose --profile checkpoint-maintenance-execute run --rm \
   --operator-attests-service-quiesced --limit 100
 ```
 
-这些命令仅描述手工维护入口，不构成当前生产激活许可；Phase 2 的 durable Inbox、
-Shadow 和 Sync 开关仍保持 `false`，直到对应验收门禁和人工切换记录齐备。
+这些命令仅描述手工 checkpoint 维护入口。精简上线只允许显式打开
+`DURABLE_INBOX_ENABLED=true`；`INGESTION_SHADOW_ENABLED` 与
+`SYNC_RECONCILIATION_ENABLED` 必须保持 `false`。这不是原六阶段方案中的完整
+cutover/production-ready 声明，而是面向可清空测试数据、单账户、单进程的新系统启动。
 
-或者本地分进程启动：
--   运行主同步服务: `python -m src.exchange_service`
--   运行飞书监听服务: `python -m src.lark_service`
+本地启动同一个应用：`python -m src.main`。旧的轮询/分进程入口不是当前部署拓扑。
 
 ## 目录结构说明
 
@@ -197,4 +328,4 @@ Shadow 和 Sync 开关仍保持 `false`，直到对应验收门禁和人工切�
 -   **模型切换**: 推荐使用 Gemini 3 Flash 以获得最佳的性价比平衡。
 
 ---
-**Last Updated**: 2026-01-30
+**Last Updated**: 2026-07-17

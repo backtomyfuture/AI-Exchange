@@ -1,7 +1,7 @@
 from typing import Literal
 
 from psycopg.conninfo import make_conninfo
-from pydantic import PositiveInt, SecretStr
+from pydantic import Field, PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -32,15 +32,15 @@ class Settings(BaseSettings):
     POSTGRES_CHECKPOINT_AUDITOR_ROLE: str = "ai_exchange_checkpoint_auditor"
     DATABASE_ROLE_SEPARATION_REQUIRED: bool = False
 
-    # Durable ingestion rollout. The compatibility bridge accepts the current
-    # and expand revisions only while every Phase 2 feature remains disabled.
+    # Phase4-Lite keeps safe defaults off. A fresh single-account deployment may
+    # enable only Durable Inbox processing; Shadow and Sync remain out of scope.
     DURABLE_INBOX_ENABLED: bool = False
     INGESTION_SHADOW_ENABLED: bool = False
     SYNC_RECONCILIATION_ENABLED: bool = False
     INGESTION_INSTANCE_ID: str = "ai-exchange-web"
     INGESTION_LEASE_SECONDS: PositiveInt = 30
     INGESTION_HEARTBEAT_SECONDS: PositiveInt = 10
-    INGESTION_SHUTDOWN_SECONDS: PositiveInt = 30
+    INGESTION_SHUTDOWN_SECONDS: int = Field(default=30, ge=1, le=30)
 
     # Exchange
     EXCHANGE_API_URL: str = ""

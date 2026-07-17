@@ -177,7 +177,7 @@ def _assert_select_only(access: access_contract.RelationAccess) -> None:
     assert access.delete is False
 
 
-def test_greenfield_relation_acl_removes_raw_governed_mutation() -> None:
+def test_greenfield_relation_acl_limits_runtime_worker_to_exact_columns() -> None:
     runtime = access_contract.RUNTIME_RELATION_ACCESS_BY_REVISION[REVISION]
     maintenance = access_contract.MAINTENANCE_RELATION_ACCESS_BY_REVISION[REVISION]
 
@@ -185,12 +185,134 @@ def test_greenfield_relation_acl_removes_raw_governed_mutation() -> None:
     assert GOVERNED_RELATIONS <= set(maintenance)
     assert "pipeline_shadow_comparisons" not in runtime
     assert "pipeline_shadow_comparisons" not in maintenance
-    for relation in GOVERNED_RELATIONS:
+    for relation in GOVERNED_RELATIONS - {"audit_events", "emails", "event_inbox"}:
         _assert_select_only(runtime[relation])
+    for relation in GOVERNED_RELATIONS:
         _assert_select_only(maintenance[relation])
 
+    assert runtime["event_inbox"] == access_contract.RelationAccess(
+        table_privileges=("SELECT",),
+        insert_columns=(
+            "id",
+            "account_id",
+            "external_email_id",
+            "folder_key",
+            "source",
+            "raw_event_type",
+            "change_kind",
+            "dedupe_key",
+            "source_version",
+            "source_event_at",
+            "payload",
+            "processing_policy",
+            "pipeline_name",
+            "generation",
+            "fencing_token",
+            "status",
+            "available_at",
+        ),
+        update_columns=(
+            "status",
+            "lease_owner",
+            "lease_session_id",
+            "lease_until",
+            "attempts",
+            "available_at",
+            "processing_started_at",
+            "effect_started_at",
+            "safe_error_code",
+            "safe_error_summary",
+            "updated_at",
+        ),
+    )
+    assert runtime["emails"] == access_contract.RelationAccess(
+        table_privileges=("SELECT",),
+        insert_columns=(
+            "id",
+            "account_id",
+            "external_email_id",
+            "source_folder_key",
+            "status",
+            "owner_generation",
+            "owner_fencing_token",
+            "owner_authority_epoch",
+            "owner_capability_hash",
+            "processing_inbox_id",
+            "processing_execution_epoch",
+            "create_seen_at",
+            "processing_started_at",
+            "source_deleted_at",
+            "external_effects_started_at",
+            "safe_error_code",
+            "safe_error_summary",
+            "content_ref",
+            "is_read",
+            "is_read_refresh_required",
+        ),
+        update_columns=(
+            "source_folder_key",
+            "status",
+            "version",
+            "processing_inbox_id",
+            "processing_execution_epoch",
+            "create_seen_at",
+            "processing_started_at",
+            "source_deleted_at",
+            "external_effects_started_at",
+            "safe_error_code",
+            "safe_error_summary",
+            "content_ref",
+            "is_read",
+            "is_read_refresh_required",
+            "updated_at",
+        ),
+    )
+    assert runtime["audit_events"] == access_contract.RelationAccess(
+        table_privileges=("SELECT",),
+        insert_columns=(
+            "id",
+            "event_key",
+            "account_id",
+            "email_id",
+            "object_type",
+            "object_fingerprint",
+            "action",
+            "result",
+            "actor",
+            "reason",
+            "safe_metadata",
+        ),
+    )
+    for relation in ("audit_events", "emails", "event_inbox"):
+        assert set(runtime[relation].table_privileges) == {"SELECT"}
+        assert runtime[relation].delete is False
+
     assert runtime["emails_log"] == access_contract.RelationAccess(
-        table_privileges=("SELECT",)
+        table_privileges=("SELECT",),
+        insert_columns=(
+            "id",
+            "subject",
+            "sender",
+            "received_at",
+            "status",
+        ),
+        update_columns=(
+            "status",
+            "classification",
+            "draft_content",
+            "updated_at",
+            "routing_log",
+            "active_skills",
+            "original_draft",
+            "final_draft",
+            "approver_user_id",
+            "rejection_reason",
+            "error_message",
+            "content_ref",
+        ),
+    )
+    assert {"draft_diff", "version"}.isdisjoint(
+        runtime["emails_log"].update_columns
     )
     assert runtime["checkpoints"].insert_columns
     assert runtime["checkpoints"].update_columns

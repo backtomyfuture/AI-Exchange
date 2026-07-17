@@ -1,8 +1,9 @@
 """Single-process greenfield durable-ingestion runtime.
 
-Phase 2 owns only a Web process session and the verified Webhook-to-Inbox
-commit path.  Worker, Sync, Graph, Lark and model effects remain deliberately
-absent until their later capability stages are installed.
+The Web session always owns the verified Webhook-to-Inbox commit path.  When
+durable processing is explicitly enabled, the same runtime and business pool
+also own one fixed-count Inbox worker and one bounded expired-lease recovery
+loop.  Sync remains a separate, inactive capability.
 """
 
 from __future__ import annotations
@@ -10,11 +11,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from uuid import UUID, uuid4
+from uuid import RFC_4122, UUID, uuid4
 
 import psycopg
 from psycopg.rows import dict_row
@@ -32,6 +33,7 @@ from src.ingestion.models import (
 )
 from src.ingestion.policy import FolderScope, PolicySnapshot, ProcessingPolicyResolver
 from src.ingestion.runtime_authority import (
+    GREENFIELD_PIPELINE_NAME,
     RuntimeAuthority,
     RuntimeAuthorityRepository,
     RuntimeAuthorityState,
@@ -53,6 +55,10 @@ from src.ingestion.webhook import WebhookIngressService, WebhookIngressUnavailab
 logger = logging.getLogger(__name__)
 
 _INSTANCE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z", re.ASCII)
+_RECOVERY_BATCH_LIMIT = 500
+_MIN_RECOVERY_INTERVAL_SECONDS = 30.0
+_RECOVERY_LEASE_MULTIPLIER = 2.0
+_PROCESS_CONTROL_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 _CAPABILITY_SQL = (
     "SELECT stage, schema_revision, schema_digest::text AS schema_digest, "
     "protocol_version, minimum_build_id, config_hash::text AS config_hash, "
@@ -71,6 +77,14 @@ _SCOPES_SQL = (
     "WHERE account_id = %s AND initialization_id = %s "
     "ORDER BY canonical_key"
 )
+
+
+def _raise_if_current_task_cancelled(error: BaseException) -> None:
+    if not isinstance(error, asyncio.CancelledError):
+        return
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        raise error
 
 
 class RuntimeUnavailableError(RuntimeError):
@@ -127,6 +141,19 @@ class _WebhookWriterPort(Protocol):
     ) -> IngressReceipt: ...
 
 
+class _InboxRecoveryPort(Protocol):
+    async def recover_expired_leases(self, limit: int) -> int: ...
+
+
+class _ProcessingWorkerPort(Protocol):
+    @property
+    def ready(self) -> bool: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self, grace_seconds: float = 30.0) -> None: ...
+
+
 class _LeaseRenewerPort(Protocol):
     async def __call__(
         self,
@@ -137,13 +164,15 @@ class _LeaseRenewerPort(Protocol):
 
 
 def _require_uuid4(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("session_id must be a canonical UUID4")
     try:
-        parsed = UUID(str(value))
+        parsed = UUID(value)
     except (AttributeError, TypeError, ValueError):
-        raise ValueError("session_id must be a UUID4") from None
-    if parsed.version != 4 or parsed.variant != UUID(str(uuid4())).variant:
-        raise ValueError("session_id must be a UUID4")
-    return str(parsed)
+        raise ValueError("session_id must be a canonical UUID4") from None
+    if parsed.version != 4 or parsed.variant != RFC_4122 or str(parsed) != value:
+        raise ValueError("session_id must be a canonical UUID4")
+    return value
 
 
 def _row_mapping(
@@ -417,7 +446,7 @@ class _SessionBoundWebhookInbox:
 
 
 class IngestionRuntime:
-    """Own exactly one Web session and one durable Webhook intake service."""
+    """Own one Web session and, optionally, its durable processing worker."""
 
     def __init__(
         self,
@@ -433,6 +462,9 @@ class IngestionRuntime:
         lease_seconds: int,
         heartbeat_seconds: int,
         shutdown_seconds: int,
+        processing_worker: _ProcessingWorkerPort | None = None,
+        inbox_recovery_repository: _InboxRecoveryPort | None = None,
+        fail_stop: Callable[[str], None] | None = None,
     ) -> None:
         if type(account_id) is not int or not 1 <= account_id < 2**63:
             raise ValueError("account_id must be a positive BIGINT")
@@ -447,7 +479,7 @@ class IngestionRuntime:
             or type(heartbeat_seconds) is not int
             or not 1 <= heartbeat_seconds < lease_seconds
             or type(shutdown_seconds) is not int
-            or not 1 <= shutdown_seconds <= 3600
+            or not 1 <= shutdown_seconds <= 30
         ):
             raise ValueError("runtime timing is invalid")
         for dependency, method in (
@@ -462,6 +494,18 @@ class IngestionRuntime:
         ):
             if not callable(getattr(dependency, method, None)):
                 raise ValueError("runtime dependency is invalid")
+        if (processing_worker is None) != (inbox_recovery_repository is None):
+            raise ValueError("processing dependencies must be configured together")
+        if processing_worker is not None:
+            for dependency, method in (
+                (processing_worker, "start"),
+                (processing_worker, "stop"),
+                (inbox_recovery_repository, "recover_expired_leases"),
+            ):
+                if not callable(getattr(dependency, method, None)):
+                    raise ValueError("processing dependency is invalid")
+        if fail_stop is not None and not callable(fail_stop):
+            raise ValueError("fail_stop must be callable")
         self._account_id = account_id
         self._pool = pool
         self._authority_repository = authority_repository
@@ -472,6 +516,13 @@ class IngestionRuntime:
         self._lease_seconds = lease_seconds
         self._heartbeat_seconds = heartbeat_seconds
         self._shutdown_seconds = shutdown_seconds
+        self._recovery_interval_seconds = max(
+            _MIN_RECOVERY_INTERVAL_SECONDS,
+            float(lease_seconds) * _RECOVERY_LEASE_MULTIPLIER,
+        )
+        self._processing_worker = processing_worker
+        self._inbox_recovery_repository = inbox_recovery_repository
+        self._fail_stop = fail_stop
         self._state = _SessionState()
         self._webhook_inbox = _SessionBoundWebhookInbox(
             self._state,
@@ -480,20 +531,44 @@ class IngestionRuntime:
         )
         self._service: WebhookIngressService | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
         self._pool_open = False
+        self._pool_open_attempted = False
+        self._registered_lease: RuntimeInstanceLease | None = None
         self._started = False
         self._stopped = False
         self._ready = False
+        self._processing_started = False
+        self._processing_ready = False
 
     @property
     def ready(self) -> bool:
         lease = self._state.lease
+        heartbeat = self._heartbeat_task
+        processing_ready = self._processing_worker is None or self.processing_ready
         return bool(
             self._ready
+            and processing_ready
             and self._state.accepting
+            and heartbeat is not None
+            and not heartbeat.done()
             and type(lease) is RuntimeInstanceLease
             and lease.lifecycle is RuntimeInstanceLifecycle.ACTIVE
             and lease.lease_until > datetime.now(UTC)
+        )
+
+    @property
+    def processing_ready(self) -> bool:
+        """Whether the configured worker and its sole recovery loop are live."""
+
+        recovery = self._recovery_task
+        worker = self._processing_worker
+        return bool(
+            worker is not None
+            and self._processing_ready
+            and worker.ready is True
+            and recovery is not None
+            and not recovery.done()
         )
 
     @property
@@ -511,8 +586,8 @@ class IngestionRuntime:
     async def start(self) -> None:
         if self._started or self._stopped:
             raise RuntimeUnavailableError("runtime_not_startable")
-        registered = False
         try:
+            self._pool_open_attempted = True
             await self._pool.open()
             self._pool_open = True
             authority = require_phase2_ingress_authority(
@@ -526,7 +601,8 @@ class IngestionRuntime:
                 self._session_id,
                 self._lease_seconds,
             )
-            registered = True
+            if type(lease) is RuntimeInstanceLease:
+                self._registered_lease = lease
             if (
                 type(lease) is not RuntimeInstanceLease
                 or lease.account_id != self._account_id
@@ -537,7 +613,10 @@ class IngestionRuntime:
             self._state.lease = lease
             self._state.accepted_count = lease.accepted_count
             self._state.rejected_count = lease.rejected_count
-            self._state.accepting = True
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(),
+                name="greenfield-web-session-heartbeat",
+            )
             self._service = WebhookIngressService(
                 expected_account_id=self._account_id,
                 snapshot_provider=_FrozenSnapshotProvider(self._account_id, snapshot),
@@ -548,28 +627,151 @@ class IngestionRuntime:
                 ),
                 inbox_repository=self._webhook_inbox,
             )
+            await self._start_processing()
+            if self._heartbeat_task is None or self._heartbeat_task.done():
+                raise RuntimeUnavailableError("startup_failed")
             self._started = True
+            self._state.accepting = True
             self._ready = True
-            self._heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(),
-                name="greenfield-web-session-heartbeat",
-            )
         except BaseException as exc:
             self._ready = False
             self._state.accepting = False
-            if registered and self._state.lease is not None:
-                try:
-                    await self._instance_repository.drain(self._state.lease)
-                except BaseException:
-                    pass
-            if self._pool_open:
-                try:
-                    await self._pool.close()
-                finally:
-                    self._pool_open = False
+            cleanup = asyncio.create_task(
+                self._rollback_start(),
+                name="greenfield-runtime-startup-rollback",
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as cancellation:
+                cleanup_result = await asyncio.gather(
+                    cleanup,
+                    return_exceptions=True,
+                )
+                if cleanup_result and isinstance(cleanup_result[0], BaseException):
+                    raise cleanup_result[0]
+                self._stopped = True
+                raise cancellation
+            self._stopped = True
             if isinstance(exc, asyncio.CancelledError):
-                raise
+                raise exc
             raise RuntimeUnavailableError("startup_failed") from None
+
+    async def _start_processing(self) -> None:
+        worker = self._processing_worker
+        repository = self._inbox_recovery_repository
+        if worker is None or repository is None:
+            return
+        recovered = await repository.recover_expired_leases(_RECOVERY_BATCH_LIMIT)
+        if (
+            type(recovered) is not int
+            or recovered < 0
+            or recovered > _RECOVERY_BATCH_LIMIT
+        ):
+            raise RuntimeError("expired lease recovery returned an invalid result")
+        self._processing_started = True
+        await worker.start()
+        self._recovery_task = asyncio.create_task(
+            self._recovery_loop(),
+            name="durable-inbox-expired-lease-recovery",
+        )
+        self._processing_ready = True
+
+    async def _recovery_loop(self) -> None:
+        repository = self._inbox_recovery_repository
+        if repository is None:
+            return
+        try:
+            while True:
+                await asyncio.sleep(self._recovery_interval_seconds)
+                recovered = await repository.recover_expired_leases(
+                    _RECOVERY_BATCH_LIMIT
+                )
+                if (
+                    type(recovered) is not int
+                    or recovered < 0
+                    or recovered > _RECOVERY_BATCH_LIMIT
+                ):
+                    raise RuntimeError(
+                        "expired lease recovery returned an invalid result"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.critical("Durable Inbox expired-lease recovery stopped")
+            raise
+
+    async def _cancel_recovery(self) -> None:
+        self._processing_ready = False
+        recovery = self._recovery_task
+        self._recovery_task = None
+        if recovery is None:
+            return
+        recovery.cancel()
+        try:
+            await recovery
+        except asyncio.CancelledError as error:
+            _raise_if_current_task_cancelled(error)
+            pass
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # A completed failed task is still a proven-stopped owner.  Its
+            # failure already removed processing readiness and is escalated by
+            # the Web-session heartbeat.
+            pass
+
+    async def _rollback_start(
+        self,
+    ) -> None:
+        cleanup_failures: list[BaseException] = []
+        try:
+            await self._cancel_heartbeat()
+        except BaseException as error:
+            cleanup_failures.append(error)
+        try:
+            await self._cancel_recovery()
+        except BaseException as error:
+            cleanup_failures.append(error)
+        worker = self._processing_worker
+        if worker is not None and self._processing_started:
+            try:
+                await worker.stop(grace_seconds=float(self._shutdown_seconds))
+            except BaseException as error:
+                cleanup_failures.append(error)
+            else:
+                self._processing_started = False
+        if cleanup_failures:
+            for error in cleanup_failures:
+                if isinstance(error, _PROCESS_CONTROL_EXCEPTIONS):
+                    raise error
+            raise RuntimeShutdownError("startup_cleanup_incomplete")
+        lease = self._state.lease or self._registered_lease
+        if type(lease) is RuntimeInstanceLease:
+            if lease.lifecycle is RuntimeInstanceLifecycle.ACTIVE:
+                try:
+                    drained = await self._instance_repository.drain(lease)
+                except BaseException as error:
+                    if isinstance(error, _PROCESS_CONTROL_EXCEPTIONS):
+                        raise
+                    raise RuntimeShutdownError("startup_cleanup_incomplete") from None
+                self._state.lease = drained
+                self._registered_lease = drained
+            elif lease.lifecycle is not RuntimeInstanceLifecycle.DRAINING:
+                raise RuntimeShutdownError("startup_cleanup_incomplete")
+        if self._pool_open_attempted:
+            try:
+                await self._pool.close()
+            except BaseException as error:
+                if isinstance(error, _PROCESS_CONTROL_EXCEPTIONS):
+                    raise
+                raise RuntimeShutdownError("startup_cleanup_incomplete") from None
+            else:
+                self._pool_open = False
+                self._pool_open_attempted = False
+                self._registered_lease = None
+        self._service = None
 
     async def _heartbeat_loop(self) -> None:
         try:
@@ -578,8 +780,15 @@ class IngestionRuntime:
                 await self.heartbeat_once()
         except asyncio.CancelledError:
             raise
-        except RuntimeUnavailableError:
+        except RuntimeUnavailableError as error:
             logger.critical("Greenfield Web session heartbeat failed closed")
+            if self._fail_stop is not None:
+                reason = (
+                    "ingestion_runtime_processing_lost"
+                    if str(error) == "processing_lost"
+                    else "ingestion_runtime_heartbeat_lost"
+                )
+                self._fail_stop(reason)
 
     async def _renew_webhook_lease(
         self,
@@ -603,6 +812,14 @@ class IngestionRuntime:
 
     async def heartbeat_once(self) -> None:
         try:
+            if (
+                self._started
+                and self._ready
+                and self._state.accepting
+                and self._processing_worker is not None
+                and not self.processing_ready
+            ):
+                raise RuntimeUnavailableError("processing_lost")
             async with self._state.lock:
                 lease = self._state.lease
                 if (
@@ -620,6 +837,10 @@ class IngestionRuntime:
                     raise RuntimeError("lease_invalid")
                 self._state.lease = current
         except asyncio.CancelledError:
+            raise
+        except RuntimeUnavailableError:
+            self._ready = False
+            self._state.accepting = False
             raise
         except BaseException:
             self._ready = False
@@ -660,17 +881,59 @@ class IngestionRuntime:
         heartbeat.cancel()
         try:
             await heartbeat
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            _raise_if_current_task_cancelled(error)
             pass
 
     async def stop(self) -> None:
-        if self._stopped or not self._pool_open:
+        if self._stopped:
             self._ready = False
             self._state.accepting = False
+            return
+        if not self._started:
+            self._ready = False
+            self._state.accepting = False
+            if not self._pool_open_attempted:
+                self._stopped = True
+                return
+            await self._rollback_start()
             self._stopped = True
             return
+        if not self._pool_open:
+            raise RuntimeShutdownError("shutdown_incomplete")
         self._ready = False
         self._webhook_inbox.disable()
+        cleanup = asyncio.create_task(
+            self._finish_stop(),
+            name="greenfield-runtime-stop",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cleanup.cancel()
+            cleanup.add_done_callback(self._consume_stop_result)
+            raise
+
+    @staticmethod
+    def _consume_stop_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
+
+    async def _finish_stop(self) -> None:
+        failures: list[str] = []
+        process_control: BaseException | None = None
+
+        def record_failure(code: str, error: BaseException) -> None:
+            nonlocal process_control
+            failures.append(code)
+            if process_control is None and isinstance(
+                error, _PROCESS_CONTROL_EXCEPTIONS
+            ):
+                process_control = error
 
         idle_waiter = asyncio.create_task(
             self._webhook_inbox.wait_idle(),
@@ -682,28 +945,48 @@ class IngestionRuntime:
                 timeout=self._shutdown_seconds,
             )
         except TimeoutError:
+            failures.append("intake_drain_timeout")
             idle_waiter.cancel()
-            try:
-                await idle_waiter
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(idle_waiter, return_exceptions=True)
+        except BaseException as exc:
+            _raise_if_current_task_cancelled(exc)
+            record_failure("intake_drain", exc)
+
+        try:
             await self._cancel_heartbeat()
+        except BaseException as exc:
+            _raise_if_current_task_cancelled(exc)
+            record_failure("heartbeat_stop", exc)
+        try:
+            await self._cancel_recovery()
+        except BaseException as exc:
+            _raise_if_current_task_cancelled(exc)
+            record_failure("recovery_stop", exc)
+
+        worker = self._processing_worker
+        if worker is not None and self._processing_started:
             try:
-                await self._pool.close()
-            except BaseException:
-                logger.critical("Business pool close failed after intake drain timeout")
-            finally:
-                self._pool_open = False
-                self._stopped = True
-                self._service = None
-            raise RuntimeShutdownError("intake_drain_timeout") from None
+                await worker.stop(grace_seconds=float(self._shutdown_seconds))
+            except BaseException as exc:
+                _raise_if_current_task_cancelled(exc)
+                record_failure("worker_stop", exc)
+            else:
+                self._processing_started = False
 
-        await self._cancel_heartbeat()
+        self._processing_ready = False
+        if failures:
+            if process_control is not None:
+                raise process_control
+            code = (
+                "intake_drain_timeout"
+                if failures == ["intake_drain_timeout"]
+                else "shutdown_incomplete"
+            )
+            raise RuntimeShutdownError(code)
 
-        failures: list[str] = []
-        async with self._state.lock:
-            lease = self._state.lease
-            if type(lease) is RuntimeInstanceLease:
+        lease = self._state.lease
+        if type(lease) is RuntimeInstanceLease:
+            if lease.lifecycle is RuntimeInstanceLifecycle.ACTIVE:
                 if (
                     lease.accepted_count != self._state.accepted_count
                     or lease.rejected_count != self._state.rejected_count
@@ -716,28 +999,63 @@ class IngestionRuntime:
                             self._lease_seconds,
                         )
                         self._state.lease = lease
-                    except BaseException:
-                        failures.append("final_heartbeat")
+                    except BaseException as exc:
+                        _raise_if_current_task_cancelled(exc)
+                        record_failure("final_heartbeat", exc)
                 try:
                     drained = await self._instance_repository.drain(lease)
                     self._state.lease = drained
-                except BaseException:
-                    failures.append("session_drain")
+                    lease = drained
+                except BaseException as exc:
+                    _raise_if_current_task_cancelled(exc)
+                    record_failure("session_drain", exc)
+            elif lease.lifecycle is not RuntimeInstanceLifecycle.DRAINING:
+                failures.append("session_state")
+        else:
+            failures.append("session_missing")
+
+        if (
+            type(lease) is not RuntimeInstanceLease
+            or lease.lifecycle is not RuntimeInstanceLifecycle.DRAINING
+        ):
+            if process_control is not None:
+                raise process_control
+            raise RuntimeShutdownError("shutdown_incomplete")
+
         try:
             await self._pool.close()
-        except BaseException:
-            failures.append("pool_close")
-        finally:
+        except BaseException as exc:
+            _raise_if_current_task_cancelled(exc)
+            record_failure("pool_close", exc)
+        else:
             self._pool_open = False
+            self._pool_open_attempted = False
+            self._registered_lease = None
             self._stopped = True
             self._service = None
+        if process_control is not None:
+            raise process_control
         if failures:
             raise RuntimeShutdownError("shutdown_incomplete")
 
 
-def build_ingestion_runtime(settings: Any) -> IngestionRuntime:
+def build_ingestion_runtime(
+    settings: Any,
+    *,
+    processing_context: Any | None = None,
+    fail_stop: Callable[[str], None] | None = None,
+) -> IngestionRuntime:
     """Create the one production runtime around one dedicated business pool."""
 
+    if bool(getattr(settings, "INGESTION_SHADOW_ENABLED", False)):
+        raise ValueError("Phase4-Lite does not permit ingestion Shadow")
+    if bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)):
+        raise ValueError("Phase4-Lite does not permit Sync reconciliation")
+    processing_enabled = bool(getattr(settings, "DURABLE_INBOX_ENABLED", False))
+    if processing_enabled and processing_context is None:
+        raise ValueError(
+            "processing_context is required when durable Inbox processing is enabled"
+        )
     pool = AsyncConnectionPool(
         conninfo=settings.database_url,
         min_size=1,
@@ -746,6 +1064,39 @@ def build_ingestion_runtime(settings: Any) -> IngestionRuntime:
         kwargs={"autocommit": True, "row_factory": dict_row},
     )
     authority_repository = RuntimeAuthorityRepository(pool)
+    session_id = str(uuid4())
+    processing_worker: _ProcessingWorkerPort | None = None
+    inbox_recovery_repository: _InboxRecoveryPort | None = None
+    if processing_enabled:
+        # Local imports are required: ``init_app`` imports this runtime while
+        # the compatibility adapter reaches ``exchange_service`` and then
+        # ``init_app`` again.
+        from src.ingestion.legacy_adapter import LegacyProcessingAdapter
+        from src.ingestion.ownership import PipelineOwnershipRepository
+        from src.ingestion.processing import ProcessingAdapterRouter
+        from src.ingestion.worker import DurableInboxWorker
+
+        inbox_repository = InboxRepository(pool)
+        adapter = LegacyProcessingAdapter(
+            processing_context,
+            legacy_account_id=settings.EXCHANGE_ACCOUNT_ID,
+        )
+        processing_worker = DurableInboxWorker(
+            inbox_repository,
+            PipelineOwnershipRepository(pool),
+            ProcessingAdapterRouter({GREENFIELD_PIPELINE_NAME: adapter}),
+            worker_id=str(
+                getattr(settings, "INGESTION_INSTANCE_ID", "ai-exchange-web")
+            ),
+            lease_session_id=session_id,
+            pipeline_names=(GREENFIELD_PIPELINE_NAME,),
+            concurrency=1,
+            lease_seconds=int(getattr(settings, "INGESTION_LEASE_SECONDS", 30)),
+            heartbeat_interval_seconds=float(
+                getattr(settings, "INGESTION_HEARTBEAT_SECONDS", 10)
+            ),
+        )
+        inbox_recovery_repository = inbox_repository
     return IngestionRuntime(
         account_id=settings.EXCHANGE_ACCOUNT_ID,
         pool=pool,
@@ -754,10 +1105,13 @@ def build_ingestion_runtime(settings: Any) -> IngestionRuntime:
         instance_repository=RuntimeInstanceRepository(pool),
         webhook_writer=GreenfieldWebhookWriter(pool),
         instance_id=str(getattr(settings, "INGESTION_INSTANCE_ID", "ai-exchange-web")),
-        session_id=str(uuid4()),
+        session_id=session_id,
         lease_seconds=int(getattr(settings, "INGESTION_LEASE_SECONDS", 30)),
         heartbeat_seconds=int(getattr(settings, "INGESTION_HEARTBEAT_SECONDS", 10)),
         shutdown_seconds=int(getattr(settings, "INGESTION_SHUTDOWN_SECONDS", 30)),
+        processing_worker=processing_worker,
+        inbox_recovery_repository=inbox_recovery_repository,
+        fail_stop=fail_stop,
     )
 
 

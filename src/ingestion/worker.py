@@ -1,7 +1,7 @@
-"""Dormant fixed-count durable Inbox worker and invocation lease authority.
+"""Fixed-count durable Inbox worker and invocation lease authority.
 
-This module deliberately owns no startup wiring or concrete processing adapter.
-Calling :meth:`DurableInboxWorker.start` is the only way to create consumers.
+The runtime owns startup wiring and the concrete processing adapter. Calling
+:meth:`DurableInboxWorker.start` is the only way to create consumers.
 """
 
 from __future__ import annotations
@@ -13,13 +13,16 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from enum import StrEnum
 from typing import Protocol, TypeVar
+from uuid import RFC_4122, UUID
 
+from src.domain.errors import ManualReviewRequired
 from src.ingestion.email_events import (
     EmailEventApplication,
     EmailEventDisposition,
     EmailStatus,
 )
 from src.ingestion.models import (
+    InboxDisposition,
     InboxLease,
     POSTGRES_BIGINT_MAX,
     PipelineGeneration,
@@ -34,12 +37,14 @@ from src.ingestion.processing import (
     ProcessingFinishResult,
     ProcessingPolicyRejected,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
 
 logger = logging.getLogger(__name__)
 
 _TARGET_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _PROCESS_CONTROL_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+_WORKER_CANCELLATION_SECONDS = 1.0
 _LOCAL_COMPLETION_POLICIES = frozenset(
     {
         ProcessingPolicy.METADATA_ONLY,
@@ -178,12 +183,19 @@ class _InboxRepository(Protocol):
     async def claim_batch(
         self,
         worker_id: str,
+        lease_session_id: str,
         pipeline_names: Iterable[str],
         limit: int,
         lease_seconds: int,
     ) -> list[InboxLease]: ...
 
     async def apply_email_event(self, lease: InboxLease) -> EmailEventApplication: ...
+
+    async def fail(
+        self,
+        lease: InboxLease,
+        error: BaseException,
+    ) -> InboxDisposition: ...
 
     async def renew(
         self,
@@ -254,8 +266,8 @@ def _pipeline_names(value: Sequence[str]) -> tuple[str, ...]:
         or len(names) != len(set(names))
     ):
         raise ValueError("pipeline_names must contain unique exact bounded names")
-    if names != ("legacy_compat",):
-        raise ValueError("Phase-2 Worker may claim only legacy_compat")
+    if names != (GREENFIELD_PIPELINE_NAME,):
+        raise ValueError(f"Worker may claim only {GREENFIELD_PIPELINE_NAME}")
     return names
 
 
@@ -267,6 +279,18 @@ def _worker_id(value: object) -> str:
         or len(value) > 128
     ):
         raise ValueError("worker_id must be exact bounded text")
+    return value
+
+
+def _lease_session_id(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("lease_session_id must be a canonical UUID4")
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("lease_session_id must be a canonical UUID4") from None
+    if parsed.version != 4 or parsed.variant != RFC_4122 or str(parsed) != value:
+        raise ValueError("lease_session_id must be a canonical UUID4")
     return value
 
 
@@ -294,7 +318,7 @@ def _validate_effect_request(
 
 
 class DurableInboxWorker:
-    """Dormant fixed-consumer Worker for fenced durable Inbox processing."""
+    """Fixed-consumer Worker for fenced durable Inbox processing."""
 
     def __init__(
         self,
@@ -303,7 +327,8 @@ class DurableInboxWorker:
         router: ProcessingAdapterRouter,
         *,
         worker_id: str,
-        pipeline_names: Sequence[str] = ("legacy_compat",),
+        lease_session_id: str,
+        pipeline_names: Sequence[str] = (GREENFIELD_PIPELINE_NAME,),
         concurrency: int = 4,
         lease_seconds: int = 60,
         heartbeat_interval_seconds: float = 20.0,
@@ -313,6 +338,7 @@ class DurableInboxWorker:
         self._ownership = ownership_repository
         self._router = router
         self._worker_id = _worker_id(worker_id)
+        self._lease_session_id = _lease_session_id(lease_session_id)
         self._pipeline_names = _pipeline_names(pipeline_names)
         self.concurrency = _positive_int("concurrency", concurrency)
         self._lease_seconds = _positive_int("lease_seconds", lease_seconds)
@@ -330,6 +356,16 @@ class DurableInboxWorker:
     @property
     def tasks(self) -> tuple[asyncio.Task[None], ...]:
         return tuple(self._tasks)
+
+    @property
+    def ready(self) -> bool:
+        """Whether every fixed consumer is still live and accepting work."""
+
+        return bool(
+            not self._closed
+            and len(self._tasks) == self.concurrency
+            and all(not task.done() for task in self._tasks)
+        )
 
     async def start(self) -> None:
         """Create exactly ``concurrency`` consumers once; no runtime wiring."""
@@ -354,6 +390,7 @@ class DurableInboxWorker:
         )
         leases = await self._inbox.claim_batch(
             resolved_worker_id,
+            self._lease_session_id,
             self._pipeline_names,
             1,
             self._lease_seconds,
@@ -378,12 +415,18 @@ class DurableInboxWorker:
     async def process_lease(
         self,
         lease: InboxLease,
-    ) -> ProcessingFinishResult | bool | None:
+    ) -> ProcessingFinishResult | InboxDisposition | bool | None:
         """Apply one event and execute only the policy-authorized fixed branch."""
 
         if type(lease) is not InboxLease:
             raise ValueError("lease must be an exact InboxLease")
-        application = await self._inbox.apply_email_event(lease)
+        try:
+            application = await self._inbox.apply_email_event(lease)
+        except ManualReviewRequired as error:
+            disposition = await self._inbox.fail(lease, error)
+            if type(disposition) is not InboxDisposition:
+                raise RuntimeError("apply failure returned an invalid disposition")
+            return disposition
         if type(application) is not EmailEventApplication:
             raise RuntimeError("apply_email_event returned an invalid application")
 
@@ -628,25 +671,25 @@ class DurableInboxWorker:
             return
 
     async def _consume(self) -> None:
-        while not self._stop_requested.is_set():
-            try:
+        try:
+            while not self._stop_requested.is_set():
                 processed = await self.run_once()
-            except asyncio.CancelledError:
-                raise
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                logger.warning("Durable Inbox consumer iteration failed")
-                processed = 0
-            if processed:
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._stop_requested.wait(),
-                    timeout=self._idle_seconds,
-                )
-            except TimeoutError:
-                pass
+                if processed:
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._stop_requested.wait(),
+                        timeout=self._idle_seconds,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.critical("Durable Inbox consumer stopped after control failure")
+            raise
 
     async def stop(self, grace_seconds: float = 30.0) -> None:
         """Stop claiming, drain inline invocations, then cancel after the grace."""
@@ -664,20 +707,52 @@ class DurableInboxWorker:
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
-            await cleanup
+            cleanup.cancel()
+            cleanup.add_done_callback(self._consume_task_result)
             raise
-        finally:
+        else:
+            if any(not task.done() for task in tasks):
+                raise RuntimeError("durable Inbox worker shutdown incomplete")
             self._tasks.clear()
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[object]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            return
 
     @staticmethod
     async def _finish_stop(
         tasks: tuple[asyncio.Task[None], ...],
         grace_seconds: float,
     ) -> None:
-        _done, pending = await asyncio.wait(tasks, timeout=grace_seconds)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=grace_seconds)
+            for task in pending:
+                task.cancel()
+            if pending:
+                cancelled, still_running = await asyncio.wait(
+                    pending,
+                    timeout=_WORKER_CANCELLATION_SECONDS,
+                )
+                done |= cancelled
+            else:
+                still_running = set()
+            for task in done:
+                DurableInboxWorker._consume_task_result(task)
+            if still_running:
+                for task in still_running:
+                    task.add_done_callback(DurableInboxWorker._consume_task_result)
+                raise RuntimeError("durable Inbox worker shutdown incomplete")
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+                    task.add_done_callback(DurableInboxWorker._consume_task_result)
+            raise
 
 
 __all__ = ["DurableInboxWorker", "LeaseAuthority", "LeaseAuthorityLost"]

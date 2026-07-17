@@ -36,6 +36,7 @@ from src.ingestion.processing import (
     ExternalEffectKind,
     ProcessingPolicyRejected,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
 
 def _lease(
@@ -59,7 +60,7 @@ def _lease(
     return InboxLease(
         id=str(uuid4()),
         account_id=8,
-        pipeline_name="legacy_compat",
+        pipeline_name=GREENFIELD_PIPELINE_NAME,
         generation=3,
         fencing_token=7,
         execution_epoch=0,
@@ -484,6 +485,7 @@ def test_adapter_is_immutable_and_exposes_only_frozen_account_scope() -> None:
     )
 
     assert adapter.legacy_account_id == 8
+    assert adapter.pipeline_name == GREENFIELD_PIPELINE_NAME
     with pytest.raises(AttributeError, match="immutable"):
         adapter.legacy_account_id = 9  # type: ignore[misc]
     with pytest.raises(AttributeError, match="immutable"):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import psycopg
@@ -30,6 +31,7 @@ from src.db.roles import (
     require_runtime_database_role,
 )
 from src.db.schema import DatabaseRevisionError, require_runtime_database
+from src.domain.email_state import InitialEmailWriteResult
 from src.maintenance.checkpoint_cleanup import CheckpointCleaner
 from src.maintenance.checkpoint_repository import PostgresCheckpointRepository
 from src.maintenance.cleanup_artifacts import PlanArtifactStore
@@ -37,6 +39,7 @@ from src.maintenance.cleanup_backup import (
     Ed25519BackupReceiptVerifier,
     create_ed25519_signed_backup_receipt,
 )
+from src.utils.db_async import AsyncDatabaseManager
 
 
 RECEIPT_PRIVATE_SEED = b"\x22" * 32
@@ -388,10 +391,24 @@ _MAINTENANCE_0005_TABLE_PRIVILEGES = {
     "cold_start_command_receipts": ("SELECT", "INSERT"),
 }
 _MAINTENANCE_0005_INSERT_COLUMNS = {
-    "event_inbox": tuple(
-        column
-        for column in _RUNTIME_INSERT_COLUMNS["event_inbox"]
-        if column != "received_at"
+    "event_inbox": (
+        "id",
+        "account_id",
+        "external_email_id",
+        "folder_key",
+        "source",
+        "raw_event_type",
+        "change_kind",
+        "dedupe_key",
+        "source_version",
+        "source_event_at",
+        "payload",
+        "processing_policy",
+        "pipeline_name",
+        "generation",
+        "fencing_token",
+        "status",
+        "available_at",
     ),
     "sync_cursors": (
         *_RUNTIME_0005_INSERT_COLUMNS["sync_cursors"],
@@ -553,25 +570,97 @@ _EXPECTED_RUNTIME_ACL_0006 = {
         *_GREENFIELD_SELECT_ONLY_RELATIONS,
     )
 }
+_RUNTIME_0006_INSERT_COLUMNS = {
+    "emails_log": (
+        "id",
+        "subject",
+        "sender",
+        "received_at",
+        "status",
+    ),
+    "checkpoints": _RUNTIME_INSERT_COLUMNS["checkpoints"],
+    "checkpoint_blobs": _RUNTIME_INSERT_COLUMNS["checkpoint_blobs"],
+    "checkpoint_writes": _RUNTIME_INSERT_COLUMNS["checkpoint_writes"],
+    "event_inbox": tuple(
+        column
+        for column in _RUNTIME_INSERT_COLUMNS["event_inbox"]
+        if column != "received_at"
+    ),
+    "emails": (
+        "id",
+        "account_id",
+        "external_email_id",
+        "source_folder_key",
+        "status",
+        "owner_generation",
+        "owner_fencing_token",
+        "owner_authority_epoch",
+        "owner_capability_hash",
+        "processing_inbox_id",
+        "processing_execution_epoch",
+        "create_seen_at",
+        "processing_started_at",
+        "source_deleted_at",
+        "external_effects_started_at",
+        "safe_error_code",
+        "safe_error_summary",
+        "content_ref",
+        "is_read",
+        "is_read_refresh_required",
+    ),
+    "audit_events": _RUNTIME_INSERT_COLUMNS["audit_events"],
+}
+_RUNTIME_0006_UPDATE_COLUMNS = {
+    "emails_log": (
+        "status",
+        "classification",
+        "draft_content",
+        "updated_at",
+        "routing_log",
+        "active_skills",
+        "original_draft",
+        "final_draft",
+        "approver_user_id",
+        "rejection_reason",
+        "error_message",
+        "content_ref",
+    ),
+    "checkpoints": _RUNTIME_UPDATE_COLUMNS["checkpoints"],
+    "checkpoint_writes": _RUNTIME_UPDATE_COLUMNS["checkpoint_writes"],
+    "event_inbox": (
+        "status",
+        "lease_owner",
+        "lease_session_id",
+        "lease_until",
+        "attempts",
+        "available_at",
+        "processing_started_at",
+        "effect_started_at",
+        "safe_error_code",
+        "safe_error_summary",
+        "updated_at",
+    ),
+    "emails": (
+        "source_folder_key",
+        "status",
+        "version",
+        "processing_inbox_id",
+        "processing_execution_epoch",
+        "create_seen_at",
+        "processing_started_at",
+        "source_deleted_at",
+        "external_effects_started_at",
+        "safe_error_code",
+        "safe_error_summary",
+        "content_ref",
+        "is_read",
+        "is_read_refresh_required",
+        "updated_at",
+    ),
+}
 for _privilege, _columns_by_relation in (
-    (
-        "INSERT",
-        {
-            relation: _RUNTIME_INSERT_COLUMNS[relation]
-            for relation in (
-                "checkpoints",
-                "checkpoint_blobs",
-                "checkpoint_writes",
-            )
-        },
-    ),
-    (
-        "UPDATE",
-        {
-            relation: _RUNTIME_UPDATE_COLUMNS[relation]
-            for relation in ("checkpoints", "checkpoint_writes")
-        },
-    ),
+    ("INSERT", _RUNTIME_0006_INSERT_COLUMNS),
+    ("UPDATE", _RUNTIME_0006_UPDATE_COLUMNS),
 ):
     _EXPECTED_RUNTIME_ACL_0006.update(
         (
@@ -1033,7 +1122,79 @@ async def test_0006_all_role_gates_accept_exact_relation_and_routine_acls(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_0006_governed_relations_have_no_raw_write_path_for_managed_roles(
+async def test_0006_runtime_role_executes_bounded_legacy_email_writes(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
+    manager = AsyncDatabaseManager(SimpleNamespace(database_url=schema.runtime_dsn))
+    email_id = "phase4-runtime-legacy-write"
+
+    try:
+        assert await manager.recover_incomplete_approval_states() == 0
+        assert (
+            await manager.log_initial_email(
+                {
+                    "id": email_id,
+                    "subject": "Phase 4 runtime grant",
+                    "sender": "sender@example.test",
+                    "received_at": "2026-07-17T08:00:00+00:00",
+                }
+            )
+            is InitialEmailWriteResult.CREATED
+        )
+        assert await manager.save_draft(email_id, "bounded draft") == email_id
+        await manager.update_status(
+            email_id,
+            "waiting_approval",
+            classification={"category": "integration"},
+            routing_log={"route": "runtime"},
+            active_skills=["draft"],
+            original_draft="original draft",
+            final_draft="final draft",
+            approver_user_id="approver",
+            rejection_reason="not rejected",
+            error_message="no error",
+        )
+    finally:
+        await manager.close()
+
+    with psycopg.connect(schema.dsn, autocommit=True) as connection:
+        row = connection.execute(
+            "SELECT status, draft_content, classification, routing_log, "
+            "active_skills, original_draft, final_draft, approver_user_id, "
+            "rejection_reason, error_message FROM emails_log WHERE id = %s",
+            (email_id,),
+        ).fetchone()
+    assert row == (
+        "waiting_approval",
+        "bounded draft",
+        {"category": "integration"},
+        {"route": "runtime"},
+        ["draft"],
+        "original draft",
+        "final draft",
+        "approver",
+        "not rejected",
+        "no error",
+    )
+
+    for statement in (
+        "INSERT INTO emails_log (processed_at) "
+        "VALUES (pg_catalog.clock_timestamp())",
+        "UPDATE emails_log SET draft_diff = 'forbidden' WHERE false",
+        "UPDATE emails_log SET version = version WHERE false",
+        "DELETE FROM emails_log",
+        "TRUNCATE emails_log",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            schema.runtime_execute(statement)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0006_governed_relations_expose_only_bounded_runtime_worker_columns(
     postgres_database_factory,
     alembic_runner,
 ):
@@ -1063,20 +1224,46 @@ async def test_0006_governed_relations_have_no_raw_write_path_for_managed_roles(
             ),
         ).fetchall()
     assert len(rows) == 2 * len(_GREENFIELD_SELECT_ONLY_RELATIONS)
-    assert all(not any(row[2:]) for row in rows)
+    expected_runtime_column_insert = {"audit_events", "emails", "event_inbox"}
+    expected_runtime_column_update = {"emails", "event_inbox"}
+    for row in rows:
+        role_name, relation_name = row[:2]
+        assert not any(row[2:7])
+        if role_name == schema.runtime_role:
+            assert row[7] is (relation_name in expected_runtime_column_insert)
+            assert row[8] is (relation_name in expected_runtime_column_update)
+        else:
+            assert row[7:] == (False, False)
+
+    schema.runtime_execute(
+        "UPDATE event_inbox SET status = status, "
+        "lease_session_id = lease_session_id WHERE false"
+    )
 
     for execute, statement in (
-        (schema.runtime_execute, "INSERT INTO audit_events DEFAULT VALUES"),
+        (
+            schema.runtime_execute,
+            "INSERT INTO audit_events (created_at) "
+            "VALUES (pg_catalog.clock_timestamp())",
+        ),
+        (
+            schema.runtime_execute,
+            "INSERT INTO event_inbox (received_at) "
+            "VALUES (pg_catalog.clock_timestamp())",
+        ),
         (
             schema.maintenance_execute,
             "UPDATE event_inbox SET status = status",
         ),
         (
             schema.runtime_execute,
-            "MERGE INTO emails AS target "
-            "USING (SELECT NULL::pg_catalog.uuid AS id) AS source "
-            "ON target.id = source.id "
-            "WHEN MATCHED THEN UPDATE SET status = target.status",
+            "UPDATE event_inbox SET execution_epoch = execution_epoch "
+            "WHERE false",
+        ),
+        (
+            schema.runtime_execute,
+            "UPDATE emails SET owner_authority_epoch = owner_authority_epoch "
+            "WHERE false",
         ),
         (schema.runtime_execute, "DELETE FROM emails"),
         (schema.maintenance_execute, "TRUNCATE pipeline_ownership"),

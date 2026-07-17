@@ -15,6 +15,7 @@ from src.ingestion.processing import ExternalEffectKind
 ROOT = Path(__file__).resolve().parents[2]
 EXCHANGE_SERVICE = ROOT / "src" / "exchange_service.py"
 LEGACY_ADAPTER = ROOT / "src" / "ingestion" / "legacy_adapter.py"
+RUNTIME = ROOT / "src" / "ingestion" / "runtime.py"
 LIVE_ROOTS = (
     ROOT / "src" / "main.py",
     ROOT / "src" / "server.py",
@@ -95,9 +96,9 @@ def test_adapter_default_is_only_the_guarded_legacy_entry() -> None:
     assert not any(isinstance(node, ast.Lambda) for node in ast.walk(tree))
 
 
-def test_live_runtime_does_not_import_or_construct_legacy_adapter() -> None:
+def test_legacy_adapter_has_exactly_one_runtime_factory_wiring() -> None:
     violations: list[str] = []
-    for root in LIVE_ROOTS:
+    for root in (*LIVE_ROOTS, RUNTIME):
         for path in _python_files(root):
             source = path.read_text(encoding="utf-8")
             if (
@@ -106,7 +107,16 @@ def test_live_runtime_does_not_import_or_construct_legacy_adapter() -> None:
             ):
                 violations.append(str(path.relative_to(ROOT)))
 
-    assert violations == []
+    assert violations == ["src/ingestion/runtime.py"]
+    tree = _tree(RUNTIME)
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "LegacyProcessingAdapter"
+    ]
+    assert len(constructors) == 1
 
 
 def test_webhook_worker_remains_on_unchanged_unguarded_live_entry() -> None:

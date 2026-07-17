@@ -12,7 +12,11 @@ from src.utils import lark_app
 def reset_lark_intake(monkeypatch: pytest.MonkeyPatch):
     lark_app.enable_lark_intake()
     monkeypatch.setattr(lark_app, "worker_loop", None)
+    monkeypatch.setattr(lark_app, "lark_ws_client", None)
+    monkeypatch.setattr(lark_app, "_lark_ws_thread", None)
+    lark_app._lark_ws_stop_requested.clear()
     yield
+    lark_app._lark_ws_stop_requested.set()
     lark_app.enable_lark_intake()
 
 
@@ -280,6 +284,158 @@ def test_stop_lark_ws_disconnects_and_joins_sdk_thread(
     submitted.result.assert_called_once_with(timeout=0.25)
     sdk_loop.call_soon_threadsafe.assert_called_once_with(sdk_loop.stop)
     thread.join.assert_called_once_with(timeout=0.25)
+    assert lark_app.lark_ws_client is None
+    assert lark_app._lark_ws_thread is None
+
+
+def test_lark_ws_readiness_rejects_disconnected_alive_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    thread = Mock()
+    thread.is_alive.return_value = True
+    monkeypatch.setattr(
+        lark_app,
+        "lark_ws_client",
+        SimpleNamespace(_conn=None),
+    )
+    monkeypatch.setattr(lark_app, "_lark_ws_thread", thread)
+    lark_app._lark_ws_stop_requested.clear()
+
+    assert lark_app.lark_ws_ready() is False
+
+
+@pytest.mark.parametrize(
+    ("connection", "expected"),
+    (
+        (SimpleNamespace(state=SimpleNamespace(name="OPEN")), True),
+        (SimpleNamespace(state=SimpleNamespace(name="CLOSING")), False),
+        (SimpleNamespace(open=True), True),
+        (SimpleNamespace(open=False), False),
+        (SimpleNamespace(closed=False), True),
+        (SimpleNamespace(closed=True), False),
+    ),
+)
+def test_lark_ws_readiness_supports_bounded_websockets_state_variants(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: object,
+    expected: bool,
+) -> None:
+    thread = Mock()
+    thread.is_alive.return_value = True
+    monkeypatch.setattr(
+        lark_app,
+        "lark_ws_client",
+        SimpleNamespace(_conn=connection),
+    )
+    monkeypatch.setattr(lark_app, "_lark_ws_thread", thread)
+    lark_app._lark_ws_stop_requested.clear()
+
+    assert lark_app.lark_ws_ready() is expected
+
+    lark_app._lark_ws_stop_requested.set()
+    assert lark_app.lark_ws_ready() is False
+
+
+def test_unexpected_lark_ws_exit_invokes_fail_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        LARK_APP_ID="cli_runtime",
+        LARK_APP_SECRET="runtime-secret",
+    )
+    event_builder = Mock()
+    event_builder.register_p2_card_action_trigger.return_value = event_builder
+    event_builder.register_p2_im_message_receive_v1.return_value = event_builder
+    event_builder.build.return_value = object()
+    client = Mock()
+    reasons: list[str] = []
+
+    class InlineThread:
+        def __init__(self, *, target, name, daemon) -> None:
+            assert name == "lark-websocket-client"
+            assert daemon is True
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(lark_app, "lark_ws_client", None)
+    monkeypatch.setattr(lark_app, "_lark_ws_thread", None)
+    monkeypatch.setattr(lark_app, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        lark_app.lark_oapi.EventDispatcherHandler,
+        "builder",
+        lambda *_args: event_builder,
+    )
+    monkeypatch.setattr(lark_app.lark_oapi.ws, "Client", Mock(return_value=client))
+    monkeypatch.setattr(lark_app.threading, "Thread", InlineThread)
+
+    lark_app.start_lark_ws(fail_stop=reasons.append)
+
+    assert reasons == ["lark_ws_lost"]
+    lark_app._lark_ws_stop_requested.set()
+
+
+def test_normal_lark_ws_stop_never_invokes_fail_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        LARK_APP_ID="cli_runtime",
+        LARK_APP_SECRET="runtime-secret",
+    )
+    event_builder = Mock()
+    event_builder.register_p2_card_action_trigger.return_value = event_builder
+    event_builder.register_p2_im_message_receive_v1.return_value = event_builder
+    event_builder.build.return_value = object()
+    reasons: list[str] = []
+
+    class Client:
+        _auto_reconnect = True
+        _conn = SimpleNamespace(open=True)
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon) -> None:
+            assert name == "lark-websocket-client"
+            assert daemon is True
+            self._target = target
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.25
+            self._target()
+            self._alive = False
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    monkeypatch.setattr(lark_app, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        lark_app.lark_oapi.EventDispatcherHandler,
+        "builder",
+        lambda *_args: event_builder,
+    )
+    monkeypatch.setattr(lark_app.lark_oapi.ws, "Client", Mock(return_value=Client()))
+    monkeypatch.setattr(lark_app.threading, "Thread", DeferredThread)
+
+    lark_app.start_lark_ws(fail_stop=reasons.append)
+    assert lark_app.lark_ws_ready() is True
+
+    lark_app.stop_lark_ws(timeout_seconds=0.25)
+
+    assert reasons == []
+    assert lark_app._lark_ws_stop_requested.is_set()
     assert lark_app.lark_ws_client is None
     assert lark_app._lark_ws_thread is None
 

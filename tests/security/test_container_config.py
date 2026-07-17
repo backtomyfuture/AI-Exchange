@@ -11,6 +11,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
+EXCHANGE_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.exchange-tls.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
 BOOTSTRAP_REQUIREMENTS = PROJECT_ROOT / "requirements.bootstrap.txt"
@@ -101,6 +102,23 @@ def test_production_container_inputs_do_not_use_latest_tags():
 
     assert ":latest" not in dockerfile
     assert ":latest" not in compose
+
+
+def test_all_application_one_shots_share_one_explicit_release_image():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    expected = "${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}"
+
+    for service_name in (
+        "database-provision",
+        "database-bootstrap",
+        "ingestion-maintenance",
+        "checkpoint-maintenance",
+        "checkpoint-maintenance-execute",
+        "ai-assistant-service",
+    ):
+        service = compose["services"][service_name]
+        assert service["build"] == "."
+        assert service["image"] == expected
 
 
 def test_docker_bootstrap_does_not_upgrade_unlocked_build_tools():
@@ -222,7 +240,7 @@ def test_production_application_publishes_one_webhook_port():
 def test_production_shutdown_budget_covers_bounded_ingestion_drain():
     compose = _load_yaml(PRODUCTION_COMPOSE)
 
-    assert compose["services"]["ai-assistant-service"]["stop_grace_period"] == "90s"
+    assert compose["services"]["ai-assistant-service"]["stop_grace_period"] == "150s"
 
 
 def test_production_healthchecks_use_session_aware_readiness():
@@ -240,6 +258,28 @@ def test_production_does_not_expose_host_gateway_to_application():
     service = compose["services"]["ai-assistant-service"]
 
     assert "extra_hosts" not in service
+
+
+def test_optional_exchange_tls_overlay_pins_dns_alias_and_read_only_ca():
+    compose = _load_yaml(EXCHANGE_TLS_COMPOSE)
+    service = compose["services"]["ai-assistant-service"]
+
+    assert service["environment"] == {
+        "EXCHANGE_CA_FILE": "/run/ai-exchange/exchange-ca.pem"
+    }
+    assert service["extra_hosts"] == [
+        "${EXCHANGE_TLS_HOSTNAME:?EXCHANGE_TLS_HOSTNAME is required}:"
+        "${EXCHANGE_TLS_IP:?EXCHANGE_TLS_IP is required}"
+    ]
+    assert service["volumes"] == [
+        {
+            "type": "bind",
+            "source": "${EXCHANGE_CA_FILE_HOST:?EXCHANGE_CA_FILE_HOST is required}",
+            "target": "/run/ai-exchange/exchange-ca.pem",
+            "read_only": True,
+        }
+    ]
+    assert "host-gateway" not in EXCHANGE_TLS_COMPOSE.read_text(encoding="utf-8")
 
 
 def test_production_application_has_no_source_or_test_bind_mounts():
@@ -327,11 +367,105 @@ def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
         "POSTGRES_PASSWORD",
     }.intersection(service["environment"])
     assert set(compose["secrets"]) == {
+        "database_provision_admin_url",
+        "postgres_migration_password",
+        "postgres_runtime_password",
+        "postgres_maintenance_password",
+        "postgres_checkpoint_auditor_password",
         "migration_database_url",
+        "ingestion_maintenance_database_url",
         "checkpoint_auditor_database_url",
         "checkpoint_maintenance_database_url",
         "checkpoint_maintenance_receipt_ed25519_public_key",
     }
+
+
+def test_database_provision_is_isolated_greenfield_admin_one_shot():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["database-provision"]
+
+    assert service["profiles"] == ["database-provision"]
+    assert service["restart"] == "no"
+    assert service["command"] == ["python", "-m", "src.db.provision"]
+    assert "ports" not in service
+    assert _network_names(service) == {"backend"}
+    assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["cap_add"] == ["DAC_READ_SEARCH"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["secrets"] == [
+        {
+            "source": "database_provision_admin_url",
+            "target": "database_provision_admin_url",
+        },
+        {
+            "source": "postgres_migration_password",
+            "target": "postgres_migration_password",
+        },
+        {
+            "source": "postgres_runtime_password",
+            "target": "postgres_runtime_password",
+        },
+        {
+            "source": "postgres_maintenance_password",
+            "target": "postgres_maintenance_password",
+        },
+        {
+            "source": "postgres_checkpoint_auditor_password",
+            "target": "postgres_checkpoint_auditor_password",
+        },
+    ]
+    assert service["environment"]["DATABASE_PROVISION_ADMIN_URL_FILE"] == (
+        "/run/secrets/database_provision_admin_url"
+    )
+    assert service["environment"]["POSTGRES_MIGRATION_PASSWORD_FILE"] == (
+        "/run/secrets/postgres_migration_password"
+    )
+    assert service["environment"]["POSTGRES_RUNTIME_PASSWORD_FILE"] == (
+        "/run/secrets/postgres_runtime_password"
+    )
+    assert service["environment"]["POSTGRES_MAINTENANCE_PASSWORD_FILE"] == (
+        "/run/secrets/postgres_maintenance_password"
+    )
+    assert service["environment"][
+        "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE"
+    ] == "/run/secrets/postgres_checkpoint_auditor_password"
+    assert "env_file" not in service
+    assert not {
+        "POSTGRES_ADMIN_USER",
+        "POSTGRES_ADMIN_PASSWORD",
+        "POSTGRES_RUNTIME_PASSWORD",
+        "MIGRATION_DATABASE_URL_FILE",
+    }.intersection(service["environment"])
+
+
+def test_ingestion_maintenance_is_manual_restricted_one_shot():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["ingestion-maintenance"]
+
+    assert service["profiles"] == ["ingestion-maintenance"]
+    assert service["restart"] == "no"
+    assert service["entrypoint"] == ["python", "scripts/manage_ingestion.py"]
+    assert service["command"] == ["--help"]
+    assert "ports" not in service
+    assert _network_names(service) == {"backend"}
+    assert service["user"] == "0:0"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["cap_add"] == ["DAC_READ_SEARCH"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["secrets"] == [
+        {
+            "source": "ingestion_maintenance_database_url",
+            "target": "ingestion_maintenance_database_url",
+        }
+    ]
+    assert service["environment"]["INGESTION_MAINTENANCE_DATABASE_URL_FILE"] == (
+        "/run/secrets/ingestion_maintenance_database_url"
+    )
+    assert "MIGRATION_DATABASE_URL_FILE" not in service["environment"]
+    assert "POSTGRES_PASSWORD" not in service["environment"]
 
 
 def test_checkpoint_maintenance_plan_is_manual_and_cannot_sign_receipts():
@@ -507,14 +641,40 @@ def test_env_example_declares_all_minimum_security_controls():
     values = _read_env_example()
     required = {
         "APP_ENV",
+        "AI_EXCHANGE_IMAGE",
         "POSTGRES_PASSWORD",
         "EXCHANGE_CA_FILE",
+        "EXCHANGE_TLS_HOSTNAME",
+        "EXCHANGE_TLS_IP",
+        "EXCHANGE_CA_FILE_HOST",
         "METRICS_TOKEN",
         "LARK_ALLOWED_OPEN_IDS",
     }
 
     assert required <= values.keys()
     assert values["APP_ENV"] == "development"
+
+
+def test_env_example_declares_file_backed_greenfield_provisioning_secrets():
+    values = _read_env_example()
+
+    assert {
+        "DATABASE_PROVISION_ADMIN_URL_FILE",
+        "POSTGRES_MIGRATION_PASSWORD_FILE",
+        "POSTGRES_RUNTIME_PASSWORD_FILE",
+        "POSTGRES_MAINTENANCE_PASSWORD_FILE",
+        "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE",
+    } <= values.keys()
+    assert all(
+        values[name].startswith("./secrets/")
+        for name in (
+            "DATABASE_PROVISION_ADMIN_URL_FILE",
+            "POSTGRES_MIGRATION_PASSWORD_FILE",
+            "POSTGRES_RUNTIME_PASSWORD_FILE",
+            "POSTGRES_MAINTENANCE_PASSWORD_FILE",
+            "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE",
+        )
+    )
 
 
 def test_env_example_enables_exchange_tls_verification_by_default():

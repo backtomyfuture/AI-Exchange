@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from src.domain.email_state import PipelineGenerationState
+from src.domain.errors import ManualReviewRequired
 from src.ingestion.email_events import (
     EmailEventApplication,
     EmailEventDecision,
@@ -17,6 +18,8 @@ from src.ingestion.email_events import (
 )
 from src.ingestion.models import (
     ChangeKind,
+    InboxDisposition,
+    InboxDispositionStatus,
     InboxLease,
     InboxStatus,
     IngressSource,
@@ -30,6 +33,7 @@ from src.ingestion.processing import (
     ProcessingCompletion,
     ProcessingFinishResult,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 from src.ingestion.worker import (
     DurableInboxWorker,
     LeaseAuthority,
@@ -40,7 +44,7 @@ from src.ingestion.worker import (
 def _lease(
     *,
     policy: ProcessingPolicy = ProcessingPolicy.FULL,
-    pipeline_name: str = "legacy_compat",
+    pipeline_name: str = GREENFIELD_PIPELINE_NAME,
     lease_until: datetime | None = None,
 ) -> InboxLease:
     now = datetime.now(UTC)
@@ -126,8 +130,10 @@ class _InboxRepository:
         self.application_result: object = application
         self.claimed: list[InboxLease] = []
         self.claim_result: object | None = None
+        self.claim_calls: list[tuple[str, str, tuple[str, ...], int, int]] = []
         self.renew_results: list[InboxLease | None | BaseException] = []
         self.apply_calls: list[InboxLease] = []
+        self.fail_calls: list[tuple[InboxLease, BaseException]] = []
         self.renew_calls: list[InboxLease] = []
         self.complete_calls: list[InboxLease] = []
         self.effect_calls: list[tuple[InboxLease, str, int]] = []
@@ -141,10 +147,33 @@ class _InboxRepository:
         self.complete_result: object = True
         self.finish_result: object | None = None
         self.failure_result: object | None = None
+        self.fail_result: object = InboxDisposition(
+            status=InboxDispositionStatus.MANUAL_REVIEW,
+            attempts=2,
+            available_at=None,
+            safe_error_code="inbox.manual_review",
+        )
 
-    async def claim_batch(self, worker_id, pipeline_names, limit, lease_seconds):
+    async def claim_batch(
+        self,
+        worker_id,
+        lease_session_id,
+        pipeline_names,
+        limit,
+        lease_seconds,
+    ):
+        self.claim_calls.append(
+            (
+                worker_id,
+                lease_session_id,
+                tuple(pipeline_names),
+                limit,
+                lease_seconds,
+            )
+        )
         assert worker_id
-        assert tuple(pipeline_names)
+        assert lease_session_id == "00000000-0000-4000-8000-000000000002"
+        assert tuple(pipeline_names) == (GREENFIELD_PIPELINE_NAME,)
         assert limit == 1
         assert lease_seconds > 0
         if self.claim_result is not None:
@@ -155,7 +184,13 @@ class _InboxRepository:
 
     async def apply_email_event(self, lease: InboxLease) -> EmailEventApplication:
         self.apply_calls.append(lease)
+        if isinstance(self.application_result, BaseException):
+            raise self.application_result
         return self.application_result  # type: ignore[return-value]
+
+    async def fail(self, lease: InboxLease, error: BaseException):
+        self.fail_calls.append((lease, error))
+        return self.fail_result
 
     async def renew(self, lease: InboxLease, lease_seconds: int):
         self.renew_calls.append(lease)
@@ -231,7 +266,7 @@ class _OwnershipRepository:
 
 
 class _Adapter:
-    pipeline_name = "legacy_compat"
+    pipeline_name = GREENFIELD_PIPELINE_NAME
 
     def __init__(self) -> None:
         self.calls = []
@@ -300,7 +335,7 @@ def _worker(
         ownership,
         router,
         worker_id="worker-1",
-        pipeline_names=("legacy_compat",),
+        lease_session_id=lease.lease_session_id,
         concurrency=concurrency,
         lease_seconds=30,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
@@ -498,6 +533,42 @@ async def test_processing_already_elected_exits_without_any_lease_lifecycle_call
     assert not ownership.calls
     assert not router.calls
     assert not adapter.calls
+
+
+async def test_manual_review_during_apply_is_classified_with_the_exact_lease() -> None:
+    lease = _lease()
+    worker, inbox, ownership, router, adapter = _worker(lease, _application())
+    error = ManualReviewRequired(
+        reason="email.sticky_owner_mismatch",
+        safe_summary="Email ownership requires review",
+    )
+    inbox.application_result = error
+
+    result = await worker.process_lease(lease)
+
+    assert result is inbox.fail_result
+    assert inbox.apply_calls == [lease]
+    assert inbox.fail_calls == [(lease, error)]
+    assert not inbox.complete_calls
+    assert not inbox.effect_calls
+    assert not inbox.finish_calls
+    assert not inbox.failure_calls
+    assert not ownership.calls
+    assert not router.calls
+    assert not adapter.calls
+
+
+async def test_manual_review_apply_failure_rejects_forged_disposition() -> None:
+    lease = _lease()
+    worker, inbox, _ownership, _router, _adapter = _worker(lease, _application())
+    inbox.application_result = ManualReviewRequired(
+        reason="email.sticky_owner_mismatch",
+        safe_summary="Email ownership requires review",
+    )
+    inbox.fail_result = object()
+
+    with pytest.raises(RuntimeError, match="invalid disposition"):
+        await worker.process_lease(lease)
 
 
 async def test_may_complete_without_processing_uses_initial_token_without_heartbeat() -> (
@@ -930,7 +1001,7 @@ async def test_invalid_adapter_or_repository_finish_result_fails_closed() -> Non
 
 
 async def test_unavailable_router_never_falls_back_and_uses_aggregate_failure() -> None:
-    lease = _lease(pipeline_name="durable_candidate")
+    lease = _lease(pipeline_name="legacy_compat")
     application = _application()
     worker, inbox, ownership, router, adapter = _worker(lease, application)
     ownership.generation = _generation(lease)
@@ -997,8 +1068,10 @@ async def test_worker_starts_only_fixed_consumers_and_stops_idempotently() -> No
         concurrency=3,
     )
 
+    assert worker.ready is False
     await worker.start()
     assert len(worker.tasks) == worker.concurrency == 3
+    assert worker.ready is True
     original_tasks = worker.tasks
     await worker.start()
     assert worker.tasks == original_tasks
@@ -1007,7 +1080,53 @@ async def test_worker_starts_only_fixed_consumers_and_stops_idempotently() -> No
     await worker.stop(grace_seconds=1)
 
     assert worker.tasks == ()
+    assert worker.ready is False
     assert await worker.run_once() == 0
+
+
+async def test_worker_readiness_requires_every_consumer_to_be_live() -> None:
+    lease = _lease()
+    worker, _inbox, _ownership, _router, _adapter = _worker(
+        lease,
+        _application(),
+        concurrency=2,
+    )
+
+    await worker.start()
+    assert worker.ready is True
+
+    failed_consumer = worker.tasks[0]
+    failed_consumer.cancel()
+    await asyncio.gather(failed_consumer, return_exceptions=True)
+
+    assert worker.ready is False
+    await worker.stop(grace_seconds=1)
+
+
+@pytest.mark.parametrize("failure_lane", ["claim", "process"])
+async def test_consumer_control_failure_exits_and_removes_readiness(
+    failure_lane: str,
+) -> None:
+    lease = _lease()
+    worker, inbox, _ownership, _router, _adapter = _worker(
+        lease,
+        _application(),
+        concurrency=1,
+    )
+    if failure_lane == "claim":
+        inbox.claim_result = object()
+    else:
+        inbox.claimed.append(lease)
+        inbox.application_result = object()
+
+    await worker.start()
+    consumer = worker.tasks[0]
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(asyncio.shield(consumer), timeout=1)
+
+    assert worker.ready is False
+    assert consumer.done() is True
+    await worker.stop(grace_seconds=1)
 
 
 async def test_zero_grace_stop_cancels_inline_processing_without_receipt() -> None:
@@ -1031,14 +1150,64 @@ async def test_zero_grace_stop_cancels_inline_processing_without_receipt() -> No
     assert not inbox.failure_calls
 
 
+async def test_worker_stop_has_a_hard_bound_when_consumer_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.ingestion.worker as worker_module
+
+    lease = _lease()
+    worker, _inbox, _ownership, _router, _adapter = _worker(
+        lease,
+        _application(),
+    )
+    release = asyncio.Event()
+
+    async def stubborn_consumer() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(stubborn_consumer())
+    worker._tasks = [task]
+    monkeypatch.setattr(worker_module, "_WORKER_CANCELLATION_SECONDS", 0.01)
+
+    with pytest.raises(RuntimeError, match="shutdown incomplete"):
+        await asyncio.wait_for(worker.stop(grace_seconds=0), timeout=0.1)
+
+    assert worker.tasks == (task,)
+    release.set()
+    await asyncio.wait_for(task, timeout=0.1)
+    await worker.stop(grace_seconds=0)
+    assert worker.tasks == ()
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"worker_id": ""}, "worker_id"),
-        ({"pipeline_names": "legacy_compat"}, "pipeline_names"),
+        ({"lease_session_id": ""}, "lease_session_id"),
+        (
+            {"lease_session_id": "00000000-0000-0000-8000-000000000002"},
+            "lease_session_id",
+        ),
+        (
+            {"lease_session_id": "00000000-0000-4000-8000-00000000000A"},
+            "lease_session_id",
+        ),
+        ({"pipeline_names": GREENFIELD_PIPELINE_NAME}, "pipeline_names"),
         ({"pipeline_names": ()}, "pipeline_names"),
-        ({"pipeline_names": ("legacy_compat", "legacy_compat")}, "pipeline_names"),
-        ({"pipeline_names": ("durable_candidate",)}, "legacy_compat"),
+        (
+            {
+                "pipeline_names": (
+                    GREENFIELD_PIPELINE_NAME,
+                    GREENFIELD_PIPELINE_NAME,
+                )
+            },
+            "pipeline_names",
+        ),
+        ({"pipeline_names": ("legacy_compat",)}, GREENFIELD_PIPELINE_NAME),
         ({"concurrency": 0}, "concurrency"),
         ({"lease_seconds": True}, "lease_seconds"),
         ({"heartbeat_interval_seconds": True}, "heartbeat_interval_seconds"),
@@ -1059,7 +1228,8 @@ def test_worker_rejects_invalid_bounded_runtime_inputs(
     router = _Router(_Adapter())
     values: dict[str, object] = {
         "worker_id": "worker-1",
-        "pipeline_names": ("legacy_compat",),
+        "lease_session_id": lease.lease_session_id,
+        "pipeline_names": (GREENFIELD_PIPELINE_NAME,),
         "concurrency": 1,
         "lease_seconds": 30,
         "heartbeat_interval_seconds": 10,
@@ -1082,6 +1252,10 @@ async def test_run_once_claims_one_lease_and_processes_inline() -> None:
     inbox.claimed.append(lease)
 
     assert await worker.run_once() == 1
+    assert inbox.claim_calls[0][0:2] == (
+        "worker-1",
+        lease.lease_session_id,
+    )
     assert inbox.complete_calls == [lease]
     assert await worker.run_once() == 0
 

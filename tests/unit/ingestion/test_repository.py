@@ -30,6 +30,9 @@ from src.ingestion.repository import (
 )
 
 
+_LEASE_SESSION_ID = "00000000-0000-4000-8000-000000000002"
+
+
 class _NeverPool:
     def connection(self):
         raise AssertionError("database access must not occur")
@@ -634,24 +637,142 @@ async def test_pool_owned_insert_only_delegates_after_configuring_transaction(
 async def test_claim_inputs_are_bounded_before_database_access() -> None:
     repository = InboxRepository(_NeverPool())
     invalid_calls = (
-        lambda: repository.claim_batch("", {"durable_v1"}, 1, 60),
-        lambda: repository.claim_batch(" worker", {"durable_v1"}, 1, 60),
-        lambda: repository.claim_batch("x" * 129, {"durable_v1"}, 1, 60),
-        lambda: repository.claim_batch("worker", set(), 1, 60),
-        lambda: repository.claim_batch("worker", {""}, 1, 60),
-        lambda: repository.claim_batch("worker", {"x" * 65}, 1, 60),
+        lambda: repository.claim_batch("", _LEASE_SESSION_ID, {"durable_v1"}, 1, 60),
         lambda: repository.claim_batch(
-            "worker", {f"pipeline-{index}" for index in range(65)}, 1, 60
+            " worker", _LEASE_SESSION_ID, {"durable_v1"}, 1, 60
         ),
-        lambda: repository.claim_batch("worker", {"durable_v1"}, 0, 60),
-        lambda: repository.claim_batch("worker", {"durable_v1"}, 501, 60),
-        lambda: repository.claim_batch("worker", {"durable_v1"}, 1, 0),
-        lambda: repository.claim_batch("worker", {"durable_v1"}, 1, 3601),
+        lambda: repository.claim_batch(
+            "x" * 129, _LEASE_SESSION_ID, {"durable_v1"}, 1, 60
+        ),
+        lambda: repository.claim_batch("worker", "", {"durable_v1"}, 1, 60),
+        lambda: repository.claim_batch(
+            "worker",
+            "00000000-0000-0000-8000-000000000002",
+            {"durable_v1"},
+            1,
+            60,
+        ),
+        lambda: repository.claim_batch(
+            "worker",
+            "00000000-0000-4000-8000-00000000000A",
+            {"durable_v1"},
+            1,
+            60,
+        ),
+        lambda: repository.claim_batch("worker", _LEASE_SESSION_ID, set(), 1, 60),
+        lambda: repository.claim_batch("worker", _LEASE_SESSION_ID, {""}, 1, 60),
+        lambda: repository.claim_batch(
+            "worker", _LEASE_SESSION_ID, {"x" * 65}, 1, 60
+        ),
+        lambda: repository.claim_batch(
+            "worker",
+            _LEASE_SESSION_ID,
+            {f"pipeline-{index}" for index in range(65)},
+            1,
+            60,
+        ),
+        lambda: repository.claim_batch(
+            "worker", _LEASE_SESSION_ID, {"durable_v1"}, 0, 60
+        ),
+        lambda: repository.claim_batch(
+            "worker", _LEASE_SESSION_ID, {"durable_v1"}, 501, 60
+        ),
+        lambda: repository.claim_batch(
+            "worker", _LEASE_SESSION_ID, {"durable_v1"}, 1, 0
+        ),
+        lambda: repository.claim_batch(
+            "worker", _LEASE_SESSION_ID, {"durable_v1"}, 1, 3601
+        ),
     )
 
     for call in invalid_calls:
         with pytest.raises(ValueError):
             await call()
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "finish_email_processing",
+        "finish_email_processing_failure",
+        "complete",
+        "fail",
+        "_recover_linked_expired_lease",
+        "_recover_unlinked_expired_lease",
+    ),
+)
+def test_every_terminal_lease_mutation_clears_its_runtime_session(
+    method_name: str,
+) -> None:
+    source = inspect.getsource(getattr(InboxRepository, method_name))
+
+    assert "lease_session_id = NULL" in source
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "renew",
+        "begin_effect",
+        "begin_processing_effect",
+        "finish_email_processing",
+        "finish_email_processing_failure",
+        "complete",
+        "fail",
+        "_recover_linked_expired_lease",
+        "_recover_unlinked_expired_lease",
+    ),
+)
+def test_every_lease_cas_matches_the_exact_runtime_session(method_name: str) -> None:
+    source = inspect.getsource(getattr(InboxRepository, method_name))
+
+    assert "lease_session_id = %s" in source
+
+
+@pytest.mark.parametrize("method_name", ("renew", "begin_processing_effect"))
+def test_session_sensitive_authorization_requires_exact_live_web_runtime_authority(
+    method_name: str,
+) -> None:
+    source = inspect.getsource(getattr(InboxRepository, method_name))
+
+    for predicate in (
+        "runtime.session_id = e.lease_session_id",
+        "runtime.account_id = e.account_id",
+        "runtime.generation = e.generation",
+        "runtime.fencing_token = e.fencing_token",
+        "runtime.authority_epoch = e.authority_epoch",
+        "runtime.capability_hash = e.capability_hash",
+        "runtime.instance_id = e.lease_owner",
+        "runtime.workload = 'web'",
+        "runtime.lifecycle = 'active'",
+        "runtime.lease_until > ",
+    ):
+        assert predicate in source
+    if method_name == "begin_processing_effect":
+        assert source.index("runtime.session_id = %s") < source.index(
+            "if email_marked:"
+        )
+        assert source.index("runtime.session_id = e.lease_session_id") > source.index(
+            "inbox_update ="
+        )
+
+
+@pytest.mark.parametrize(
+    ("owner", "method_name"),
+    (
+        (InboxRepository, "_lock_processing_ownership"),
+        (EmailEventTransaction, "_lock_ownership"),
+    ),
+)
+def test_runtime_ownership_reads_rely_on_account_advisory_lock_without_row_lock(
+    owner: type[object],
+    method_name: str,
+) -> None:
+    source = inspect.getsource(getattr(owner, method_name))
+
+    assert "pipeline_ownership" in source
+    assert "FOR SHARE" not in source
+    assert "FOR KEY SHARE" not in source
 
 
 @pytest.mark.parametrize("pipeline_names", ("durable_v1", object()))
@@ -722,7 +843,13 @@ async def test_fail_propagates_baseexception_control_flow_before_lease_or_pool()
         ("insert", (None, 1, 1), "insert_event_inbox"),
         (
             "claim_batch",
-            ("worker", frozenset({"durable_v1"}), 1, 60),
+            (
+                "worker",
+                _LEASE_SESSION_ID,
+                frozenset({"durable_v1"}),
+                1,
+                60,
+            ),
             "claim_event_inbox",
         ),
         ("recover_expired_leases", (1,), "recover_event_inbox_leases"),

@@ -29,9 +29,57 @@ services:
     networks:
       - backend
 
+  database-provision:
+    profiles: ["database-provision"]
+    build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    restart: "no"
+    command: ["python", "-m", "src.db.provision"]
+    # Administrator access exists only in this explicit greenfield one-shot.
+    # Compose file secrets retain host ownership, so only read-DAC is restored.
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      DATABASE_PROVISION_ADMIN_URL_FILE: /run/secrets/database_provision_admin_url
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_MIGRATION_PASSWORD_FILE: /run/secrets/postgres_migration_password
+      POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      POSTGRES_MAINTENANCE_PASSWORD_FILE: /run/secrets/postgres_maintenance_password
+      POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE: /run/secrets/postgres_checkpoint_auditor_password
+      TZ: Asia/Shanghai
+    secrets:
+      - source: database_provision_admin_url
+        target: database_provision_admin_url
+      - source: postgres_migration_password
+        target: postgres_migration_password
+      - source: postgres_runtime_password
+        target: postgres_runtime_password
+      - source: postgres_maintenance_password
+        target: postgres_maintenance_password
+      - source: postgres_checkpoint_auditor_password
+        target: postgres_checkpoint_auditor_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
   database-bootstrap:
     profiles: ["migration"]
     build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
     restart: "no"
     command: ["python", "-m", "src.db.bootstrap"]
     # Compose file-backed secrets cannot remap uid/gid/mode. The host source
@@ -63,9 +111,45 @@ services:
     networks:
       - backend
 
+  ingestion-maintenance:
+    profiles: ["ingestion-maintenance"]
+    build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    restart: "no"
+    entrypoint: ["python", "scripts/manage_ingestion.py"]
+    command: ["--help"]
+    # This explicit one-shot receives only the restricted ingestion-maintenance
+    # DSN. Policy/contract inputs are mounted per invocation, never baked in.
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      INGESTION_MAINTENANCE_DATABASE_URL_FILE: /run/secrets/ingestion_maintenance_database_url
+      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
+      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
+      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      TZ: Asia/Shanghai
+    secrets:
+      - source: ingestion_maintenance_database_url
+        target: ingestion_maintenance_database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
   checkpoint-maintenance:
     profiles: ["checkpoint-maintenance"]
     build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
     command: ["--help"]
@@ -103,6 +187,7 @@ services:
   checkpoint-maintenance-execute:
     profiles: ["checkpoint-maintenance-execute"]
     build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
     command: ["execute", "--help"]
@@ -140,6 +225,7 @@ services:
 
   ai-assistant-service:
     build: .
+    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
     restart: always
     command: python -m src.main
     environment:
@@ -237,7 +323,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-    stop_grace_period: 90s
+    stop_grace_period: 150s
     deploy:
       resources:
         limits:
@@ -259,6 +345,16 @@ volumes:
   qdrant_data:
 
 secrets:
+  database_provision_admin_url:
+    file: ${DATABASE_PROVISION_ADMIN_URL_FILE:-./secrets/database_provision_admin_url}
+  postgres_migration_password:
+    file: ${POSTGRES_MIGRATION_PASSWORD_FILE:-./secrets/postgres_migration_password}
+  postgres_runtime_password:
+    file: ${POSTGRES_RUNTIME_PASSWORD_FILE:-./secrets/postgres_runtime_password}
+  postgres_maintenance_password:
+    file: ${POSTGRES_MAINTENANCE_PASSWORD_FILE:-./secrets/postgres_maintenance_password}
+  postgres_checkpoint_auditor_password:
+    file: ${POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE:-./secrets/postgres_checkpoint_auditor_password}
   checkpoint_auditor_database_url:
     file: ${CHECKPOINT_AUDITOR_DATABASE_URL_FILE:-./secrets/checkpoint_auditor_database_url}
   checkpoint_maintenance_database_url:
@@ -267,3 +363,5 @@ secrets:
     file: ${CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE:-./secrets/checkpoint_maintenance_receipt_ed25519_public_key}
   migration_database_url:
     file: ${MIGRATION_DATABASE_URL_FILE:-./secrets/migration_database_url}
+  ingestion_maintenance_database_url:
+    file: ${INGESTION_MAINTENANCE_DATABASE_URL_FILE:-./secrets/ingestion_maintenance_database_url}

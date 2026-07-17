@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from collections.abc import Callable
 from psycopg_pool import AsyncConnectionPool
 
 from src.db.checkpoint_saver import (
@@ -19,6 +21,10 @@ from src.ingestion.runtime import IngestionRuntime, build_ingestion_runtime
 logger = logging.getLogger(__name__)
 
 
+class AppContextCloseError(RuntimeError):
+    """Fixed failure for an incomplete best-effort application-context close."""
+
+
 class AppContext:
     def __init__(self):
         self.exchange_client = None
@@ -32,12 +38,21 @@ class AppContext:
         self._checkpoint_write_guard: CheckpointWriteGuard | None = None
         self._checkpoint_setup_started = False
 
-    def create_ingestion_runtime(self, settings=None) -> IngestionRuntime:
-        """Create the one Phase-2 runtime without initializing legacy services."""
+    def create_ingestion_runtime(
+        self,
+        settings=None,
+        *,
+        fail_stop: Callable[[str], None] | None = None,
+    ) -> IngestionRuntime:
+        """Create the sole ingress runtime before optional processing services."""
 
         if self.ingestion_runtime is not None:
             raise RuntimeError("ingestion_runtime_already_created")
-        self.ingestion_runtime = build_ingestion_runtime(settings or get_settings())
+        self.ingestion_runtime = build_ingestion_runtime(
+            settings or get_settings(),
+            processing_context=self,
+            fail_stop=fail_stop,
+        )
         return self.ingestion_runtime
 
     def release_ingestion_runtime(self, runtime: IngestionRuntime) -> None:
@@ -166,12 +181,28 @@ class AppContext:
             logger.info("Graph initialized with FencedAsyncPostgresSaver.")
 
     async def close(self):
-        if self.exchange_client:
-            await self.exchange_client.close()
-        if self.db_manager:
-            await self.db_manager.close()
-        if self.pool:
-            await self.pool.close()
+        failures: list[tuple[str, BaseException]] = []
+        for resource_name, resource in (
+            ("checkpoint_pool", self.pool),
+            ("database", self.db_manager),
+            ("exchange", self.exchange_client),
+        ):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except BaseException as exc:
+                failures.append((resource_name, exc))
+                logger.error(
+                    "Application context close failed: resource=%s error_type=%s",
+                    resource_name,
+                    type(exc).__name__,
+                )
+        for _resource_name, exc in failures:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise exc
+        if failures:
+            raise AppContextCloseError("app_context_close_failed") from None
 
 
 # Singleton instance

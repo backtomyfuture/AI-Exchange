@@ -651,6 +651,68 @@ async def test_expired_inbox_lock_rejects_invalid_scalar_projection(
 
 
 @pytest.mark.asyncio
+async def test_unlinked_expired_lease_with_existing_email_is_requeued(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(normalized_event)
+    candidate = _expired_candidate(lease)
+    repository, connection = _repository_with_connection(
+        _Cursor(one=(str(uuid4()), None)),
+        _Cursor(one=(candidate.id,)),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_expired_inbox",
+        AsyncMock(return_value=_inbox(candidate, lease_active=False)),
+    )
+    append_audit = AsyncMock()
+    monkeypatch.setattr(repository, "_append_audit", append_audit)
+
+    recovered = await repository._recover_unlinked_expired_lease(
+        connection,  # type: ignore[arg-type]
+        candidate,
+    )
+
+    assert recovered is True
+    append_audit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unlinked_recovery_defers_if_email_becomes_linked_to_same_inbox(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(normalized_event)
+    candidate = _expired_candidate(lease)
+    repository, connection = _repository_with_connection(
+        _Cursor(one=(str(uuid4()), candidate.id)),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_expired_inbox",
+        AsyncMock(return_value=_inbox(candidate, lease_active=False)),
+    )
+
+    recovered = await repository._recover_unlinked_expired_lease(
+        connection,  # type: ignore[arg-type]
+        candidate,
+    )
+
+    assert recovered is False
+
+
+@pytest.mark.asyncio
 async def test_processing_receipt_append_rejects_unreadable_insert_result(
     normalized_event: NormalizedIngressEvent,
     monkeypatch: pytest.MonkeyPatch,
@@ -759,6 +821,46 @@ async def test_effect_start_fails_closed_when_locked_relation_disappears(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_active", [False, True])
+async def test_effect_start_idempotency_still_requires_live_runtime_session(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_active: bool,
+) -> None:
+    lease = _lease(normalized_event)
+    now = datetime.now(UTC)
+    runtime_row = {"session_id": lease.lease_session_id} if runtime_active else None
+    repository, _connection = _repository_with_connection(_Cursor(one=runtime_row))
+    _patch_transaction_setup(repository, monkeypatch)
+    email = _email(lease, external_effects_started_at=now)
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_email",
+        AsyncMock(return_value=email),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_inbox",
+        AsyncMock(return_value=_inbox(lease, effect_started_at=now)),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_require_authorized_processing_attempt",
+        AsyncMock(),
+    )
+
+    assert (
+        await repository.begin_processing_effect(lease, email.id, 4)
+        is runtime_active
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("write_failure", ["timestamp", "email", "inbox"])
 async def test_effect_start_rejects_when_atomic_marker_write_is_lost(
     normalized_event: NormalizedIngressEvent,
@@ -767,11 +869,17 @@ async def test_effect_start_rejects_when_atomic_marker_write_is_lost(
 ) -> None:
     lease = _lease(normalized_event)
     now = datetime.now(UTC)
-    cursors = [_Cursor(one=None)]
+    runtime_cursor = _Cursor(one={"session_id": lease.lease_session_id})
+    cursors = [runtime_cursor, _Cursor(one=None)]
     if write_failure == "email":
-        cursors = [_Cursor(one={"effect_started_at": now}), _Cursor(one=None)]
+        cursors = [
+            runtime_cursor,
+            _Cursor(one={"effect_started_at": now}),
+            _Cursor(one=None),
+        ]
     elif write_failure == "inbox":
         cursors = [
+            runtime_cursor,
             _Cursor(one={"effect_started_at": now}),
             _Cursor(one=(str(uuid4()),)),
             _Cursor(one=None),

@@ -22,6 +22,7 @@ from src.ingestion.models import (
     POSTGRES_BIGINT_MAX,
     PipelineGeneration,
 )
+from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -392,7 +393,7 @@ class ProcessingAdapter(Protocol):
 
 
 class ProcessingAdapterRouter:
-    """Pure exact-stamp selector over the one Phase-2 compatibility adapter."""
+    """Pure exact-stamp selector over the sole production pipeline adapter."""
 
     __slots__ = ("_registry",)
 
@@ -400,15 +401,17 @@ class ProcessingAdapterRouter:
         if not isinstance(registry, Mapping):
             raise ValueError("registry must be a mapping")
         copied = dict(registry)
-        if frozenset(copied) != frozenset({"legacy_compat"}):
-            raise ValueError("Phase-2 registry must contain only legacy_compat")
-        adapter = copied["legacy_compat"]
+        if frozenset(copied) != frozenset({GREENFIELD_PIPELINE_NAME}):
+            raise ValueError(
+                f"registry must contain only {GREENFIELD_PIPELINE_NAME}"
+            )
+        adapter = copied[GREENFIELD_PIPELINE_NAME]
         if getattr(
             adapter, "pipeline_name", None
-        ) != "legacy_compat" or not _is_async_callable(
+        ) != GREENFIELD_PIPELINE_NAME or not _is_async_callable(
             getattr(adapter, "process", None)
         ):
-            raise ValueError("legacy_compat adapter is invalid")
+            raise ValueError(f"{GREENFIELD_PIPELINE_NAME} adapter is invalid")
         self._registry = MappingProxyType(copied)
 
     @property
@@ -432,7 +435,7 @@ class ProcessingAdapterRouter:
             and authority.fencing_token == stamped_lease.fencing_token
             and authority.state in _EXECUTABLE_STATES
         )
-        if not exact or stamped_lease.pipeline_name != "legacy_compat":
+        if not exact or stamped_lease.pipeline_name != GREENFIELD_PIPELINE_NAME:
             raise ProcessingAdapterUnavailable()
         try:
             return self._registry[stamped_lease.pipeline_name]
