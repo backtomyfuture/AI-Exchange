@@ -16,20 +16,90 @@ from src.maintenance.checkpoint_repository import (
 )
 
 
-def test_cleanup_revision_allowlist_is_fixed_and_independent_from_runtime_bridge():
+def test_cleanup_revision_allowlist_accepts_only_greenfield_head():
     from src.maintenance import checkpoint_repository
 
     assert CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS == frozenset(
-        {
-            "20260710_0002",
-            "20260710_0003",
-            "20260713_0004",
-            "20260713_0005",
-        }
+        {"20260716_0006"}
     )
     assert "RUNTIME_COMPATIBLE_DATABASE_REVISIONS" not in inspect.getsource(
         checkpoint_repository
     )
+
+
+class _MetadataResult:
+    def __init__(self, *, row=None, rows=None) -> None:
+        self._row = row
+        self._rows = rows
+
+    async def fetchone(self):
+        return self._row
+
+    async def fetchall(self):
+        return self._rows
+
+
+def _metadata_connection(*, revisions: list[str]):
+    connection = AsyncMock()
+    connection.execute.side_effect = [
+        _MetadataResult(
+            row=(
+                "email_agent",
+                "public",
+                "127.0.0.1",
+                5432,
+                "160000",
+                "UTC",
+                "7500000000000000001",
+            )
+        ),
+        _MetadataResult(rows=[(revision,) for revision in revisions]),
+        _MetadataResult(rows=[(value,) for value in range(1, 11)]),
+    ]
+    return connection
+
+
+@pytest.mark.asyncio
+async def test_cleanup_metadata_accepts_exact_greenfield_head(monkeypatch):
+    from src.maintenance import checkpoint_repository
+
+    monkeypatch.setattr(
+        checkpoint_repository.AsyncPostgresSaver,
+        "MIGRATIONS",
+        tuple(range(11)),
+    )
+    metadata = await _read_database_metadata(
+        _metadata_connection(revisions=["20260716_0006"])
+    )
+
+    assert metadata.alembic_revision == "20260716_0006"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "revisions",
+    [
+        [],
+        ["20260713_0005"],
+        ["20260713_0005", "20260716_0006"],
+    ],
+    ids=["unversioned", "legacy-0005", "multiple-heads"],
+)
+async def test_cleanup_metadata_rejects_non_current_revision(revisions, monkeypatch):
+    from src.maintenance import checkpoint_repository
+
+    monkeypatch.setattr(
+        checkpoint_repository.AsyncPostgresSaver,
+        "MIGRATIONS",
+        tuple(range(11)),
+    )
+    connection = _metadata_connection(revisions=revisions)
+
+    with pytest.raises(CheckpointRepositoryError) as error:
+        await _read_database_metadata(connection)
+
+    assert error.value.code == "cleanup_schema_revision_mismatch"
+    assert connection.execute.await_count == 3
 
 
 def test_candidate_limit_is_applied_before_checkpoint_lateral_aggregates():

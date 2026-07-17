@@ -476,6 +476,10 @@ class InboxLease:
     pipeline_name: str
     generation: int
     fencing_token: int
+    execution_epoch: int
+    authority_epoch: int
+    capability_hash: str
+    lease_session_id: str
     lease_owner: str
     attempts: int
     event: NormalizedIngressEvent
@@ -496,6 +500,18 @@ class InboxLease:
             )
         _require_int("generation", self.generation, minimum=1)
         _require_int("fencing_token", self.fencing_token, minimum=1)
+        _require_int("execution_epoch", self.execution_epoch, minimum=0)
+        _require_int("authority_epoch", self.authority_epoch, minimum=1)
+        object.__setattr__(
+            self,
+            "capability_hash",
+            _require_sha256("capability_hash", self.capability_hash),
+        )
+        object.__setattr__(
+            self,
+            "lease_session_id",
+            _require_uuid("lease_session_id", self.lease_session_id),
+        )
         _require_text("lease_owner", self.lease_owner, max_length=128)
         _require_int("attempts", self.attempts, minimum=0)
         if not isinstance(self.event, NormalizedIngressEvent):

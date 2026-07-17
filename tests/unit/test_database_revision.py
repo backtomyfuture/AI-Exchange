@@ -32,10 +32,10 @@ _ROLE_BOUNDARY = {
 }
 
 
-def test_sync_reconciliation_revision_is_dormant_0005_head() -> None:
-    assert database_schema.SYNC_RECONCILIATION_DATABASE_REVISION == "20260713_0005"
-    assert database_schema.SYNC_RECONCILIATION_DATABASE_REVISION in (
-        database_schema.RUNTIME_COMPATIBLE_DATABASE_REVISIONS
+def test_runtime_revision_is_exact_greenfield_0006_head() -> None:
+    assert EXPECTED_DATABASE_REVISION == "20260716_0006"
+    assert database_schema.RUNTIME_COMPATIBLE_DATABASE_REVISIONS == frozenset(
+        {EXPECTED_DATABASE_REVISION}
     )
 
 
@@ -134,8 +134,42 @@ async def test_require_current_database_rejects_missing_or_stale_revision(
 
 
 @pytest.mark.asyncio
+async def test_runtime_gate_accepts_only_0006_when_flags_are_disabled() -> None:
+    schema_contract = AsyncMock()
+    with (
+        patch.object(
+            database_schema,
+            "require_runtime_database_role",
+            new=AsyncMock(),
+        ),
+        patch.object(
+            database_schema,
+            "get_current_database_revision",
+            new=AsyncMock(return_value="20260716_0006"),
+        ),
+        patch.object(
+            database_schema,
+            "require_database_schema_contract",
+            new=schema_contract,
+        ),
+    ):
+        await database_schema.require_runtime_database(
+            "postgresql://test/test",
+            **_PHASE_2_FLAGS_DISABLED,
+            **_ROLE_BOUNDARY,
+        )
+
+    schema_contract.assert_awaited_once_with(
+        "postgresql://test/test",
+        target_schema="public",
+        require_complete=True,
+        expected_revision="20260716_0006",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "current_revision",
+    "legacy_revision",
     [
         "20260710_0002",
         "20260710_0003",
@@ -143,16 +177,26 @@ async def test_require_current_database_rejects_missing_or_stale_revision(
         "20260713_0005",
     ],
 )
-async def test_runtime_gate_accepts_compatible_revisions_when_phase2_flags_disabled(
-    current_revision,
-):
-    with patch(
-        "src.db.schema.get_current_database_revision",
-        new=AsyncMock(return_value=current_revision),
+async def test_runtime_gate_rejects_every_legacy_revision(
+    legacy_revision: str,
+) -> None:
+    with (
+        patch.object(
+            database_schema,
+            "require_runtime_database_role",
+            new=AsyncMock(),
+        ),
+        patch.object(
+            database_schema,
+            "get_current_database_revision",
+            new=AsyncMock(return_value=legacy_revision),
+        ),
+        pytest.raises(DatabaseRevisionError, match="20260716_0006"),
     ):
         await database_schema.require_runtime_database(
             "postgresql://test/test",
             **_PHASE_2_FLAGS_DISABLED,
+            **_ROLE_BOUNDARY,
         )
 
 
@@ -164,7 +208,7 @@ async def test_runtime_gate_accepts_compatible_revisions_when_phase2_flags_disab
         "ingestion_shadow_enabled",
     ],
 )
-async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_enabled(
+async def test_runtime_flags_do_not_select_a_different_revision(
     enabled_flag,
 ):
     flags = {**_PHASE_2_FLAGS_DISABLED, enabled_flag: True}
@@ -178,7 +222,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         ),
         patch(
             "src.db.schema.get_current_database_revision",
-            new=AsyncMock(return_value="20260713_0005"),
+            new=AsyncMock(return_value="20260716_0006"),
         ),
         patch.object(
             database_schema,
@@ -195,7 +239,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
-        expected_revision="20260713_0005",
+        expected_revision="20260716_0006",
     )
 
     with (
@@ -207,7 +251,7 @@ async def test_runtime_gate_requires_expand_revision_when_any_phase_2_flag_is_en
         ),
         patch(
             "src.db.schema.get_current_database_revision",
-            new=AsyncMock(return_value="20260710_0002"),
+            new=AsyncMock(return_value="20260713_0005"),
         ),
         pytest.raises(DatabaseRevisionError, match="python -m src.db.bootstrap"),
     ):
@@ -310,6 +354,11 @@ async def test_runtime_gate_rejects_unversioned_unknown_and_multiple_heads(
     current_revision,
 ):
     with (
+        patch.object(
+            database_schema,
+            "require_runtime_database_role",
+            new=AsyncMock(),
+        ),
         patch(
             "src.db.schema.get_current_database_revision",
             new=AsyncMock(return_value=current_revision),
@@ -319,14 +368,48 @@ async def test_runtime_gate_rejects_unversioned_unknown_and_multiple_heads(
         await database_schema.require_runtime_database(
             "postgresql://test/test",
             **_PHASE_2_FLAGS_DISABLED,
+            **_ROLE_BOUNDARY,
         )
 
 
 @pytest.mark.asyncio
+async def test_runtime_gate_requires_role_separation_even_when_flags_are_disabled():
+    revision_reader = AsyncMock(return_value="20260716_0006")
+
+    with (
+        patch.object(
+            database_schema,
+            "get_current_database_revision",
+            new=revision_reader,
+        ),
+        pytest.raises(DatabaseRoleError, match="database_role_preflight_failed"),
+    ):
+        await database_schema.require_runtime_database(
+            "postgresql://runtime/private",
+            **_PHASE_2_FLAGS_DISABLED,
+            role_separation_required=False,
+        )
+
+    revision_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_runtime_gate_checks_role_invariants_before_revision():
-    role_gate = AsyncMock()
-    revision_reader = AsyncMock(return_value=EXPECTED_DATABASE_REVISION)
-    schema_contract = AsyncMock()
+    call_order: list[str] = []
+
+    async def record_role(*_args, **_kwargs) -> None:
+        call_order.append("role")
+
+    async def record_revision(*_args, **_kwargs) -> str:
+        call_order.append("revision")
+        return EXPECTED_DATABASE_REVISION
+
+    async def record_schema_contract(*_args, **_kwargs) -> None:
+        call_order.append("schema_contract")
+
+    role_gate = AsyncMock(side_effect=record_role)
+    revision_reader = AsyncMock(side_effect=record_revision)
+    schema_contract = AsyncMock(side_effect=record_schema_contract)
 
     with (
         patch.object(
@@ -367,6 +450,7 @@ async def test_runtime_gate_checks_role_invariants_before_revision():
         require_complete=True,
         expected_revision=EXPECTED_DATABASE_REVISION,
     )
+    assert call_order == ["role", "revision", "schema_contract"]
 
 
 @pytest.mark.asyncio

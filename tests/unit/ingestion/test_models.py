@@ -572,6 +572,10 @@ def test_inbox_lease_includes_received_and_expiry_times(
         pipeline_name="durable_v1",
         generation=3,
         fencing_token=5,
+        execution_epoch=0,
+        authority_epoch=1,
+        capability_hash="a" * 64,
+        lease_session_id="00000000-0000-4000-8000-000000000002",
         lease_owner="worker-1",
         attempts=1,
         event=normalized_event,
@@ -582,6 +586,10 @@ def test_inbox_lease_includes_received_and_expiry_times(
     assert lease.received_at == ingestion_time
     assert lease.lease_until == ingestion_time + timedelta(seconds=30)
     assert lease.pipeline_name == "durable_v1"
+    assert lease.execution_epoch == 0
+    assert lease.authority_epoch == 1
+    assert lease.capability_hash == "a" * 64
+    assert lease.lease_session_id == "00000000-0000-4000-8000-000000000002"
     with pytest.raises(FrozenInstanceError):
         lease.attempts = 2  # type: ignore[misc]
 
@@ -596,12 +604,52 @@ def test_inbox_lease_requires_pipeline_name(
             account_id=8,
             generation=3,
             fencing_token=5,
+            execution_epoch=0,
+            authority_epoch=1,
+            capability_hash="a" * 64,
+            lease_session_id="00000000-0000-4000-8000-000000000002",
             lease_owner="worker-1",
             attempts=1,
             event=normalized_event,
             received_at=ingestion_time,
             lease_until=ingestion_time + timedelta(seconds=30),
         )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "execution_epoch",
+        "authority_epoch",
+        "capability_hash",
+        "lease_session_id",
+    ],
+)
+def test_inbox_lease_requires_exact_runtime_execution_stamp(
+    normalized_event: NormalizedIngressEvent,
+    ingestion_time: datetime,
+    missing_field: str,
+) -> None:
+    values: dict[str, object] = {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "account_id": 8,
+        "pipeline_name": "durable_v1",
+        "generation": 3,
+        "fencing_token": 5,
+        "execution_epoch": 0,
+        "authority_epoch": 1,
+        "capability_hash": "a" * 64,
+        "lease_session_id": "00000000-0000-4000-8000-000000000002",
+        "lease_owner": "worker-1",
+        "attempts": 1,
+        "event": normalized_event,
+        "received_at": ingestion_time,
+        "lease_until": ingestion_time + timedelta(seconds=30),
+    }
+    del values[missing_field]
+
+    with pytest.raises(TypeError, match=missing_field):
+        InboxLease(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -617,6 +665,17 @@ def test_inbox_lease_requires_pipeline_name(
         {"pipeline_name": 1},
         {"generation": 0},
         {"fencing_token": True},
+        {"execution_epoch": -1},
+        {"execution_epoch": True},
+        {"execution_epoch": 2**63},
+        {"authority_epoch": 0},
+        {"authority_epoch": True},
+        {"authority_epoch": 2**63},
+        {"capability_hash": "A" * 64},
+        {"capability_hash": "a" * 63},
+        {"capability_hash": 1},
+        {"lease_session_id": "not-a-uuid"},
+        {"lease_session_id": 1},
         {"lease_owner": ""},
         {"lease_owner": "x" * 129},
         {"attempts": -1},
@@ -637,6 +696,10 @@ def test_inbox_lease_rejects_invalid_fields(
         "pipeline_name": "durable_v1",
         "generation": 3,
         "fencing_token": 5,
+        "execution_epoch": 0,
+        "authority_epoch": 1,
+        "capability_hash": "a" * 64,
+        "lease_session_id": "00000000-0000-4000-8000-000000000002",
         "lease_owner": "worker-1",
         "attempts": 1,
         "event": normalized_event,
@@ -657,6 +720,10 @@ def test_inbox_lease_rejects_account_mismatch_and_non_future_expiry(
         "pipeline_name": "durable_v1",
         "generation": 3,
         "fencing_token": 5,
+        "execution_epoch": 0,
+        "authority_epoch": 1,
+        "capability_hash": "a" * 64,
+        "lease_session_id": "00000000-0000-4000-8000-000000000002",
         "lease_owner": "worker-1",
         "attempts": 1,
         "event": normalized_event,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -28,6 +30,9 @@ from src.ingestion.repository import (
     _ProcessingInboxRow,
     _ProcessingResolution,
     _expired_candidate_from_row,
+    _leases_equal,
+    _processing_attempt_event_key,
+    _processing_result_event_key,
     _require_email_id,
     _require_email_version,
 )
@@ -103,6 +108,10 @@ def _lease(event: NormalizedIngressEvent) -> InboxLease:
         pipeline_name="legacy_compat",
         generation=3,
         fencing_token=7,
+        execution_epoch=0,
+        authority_epoch=1,
+        capability_hash="a" * 64,
+        lease_session_id="00000000-0000-4000-8000-000000000002",
         lease_owner="worker-task8",
         attempts=1,
         event=event,
@@ -118,6 +127,10 @@ def _expired_candidate(lease: InboxLease) -> _ExpiredLeaseCandidate:
         pipeline_name=lease.pipeline_name,
         generation=lease.generation,
         fencing_token=lease.fencing_token,
+        execution_epoch=lease.execution_epoch,
+        authority_epoch=lease.authority_epoch,
+        capability_hash=lease.capability_hash,
+        lease_session_id=lease.lease_session_id,
         lease_owner=lease.lease_owner,
         attempts=lease.attempts,
         event=lease.event,
@@ -147,6 +160,10 @@ def _lease_database_row(
         "pipeline_name": lease.pipeline_name,
         "generation": lease.generation,
         "fencing_token": lease.fencing_token,
+        "execution_epoch": lease.execution_epoch,
+        "authority_epoch": lease.authority_epoch,
+        "capability_hash": lease.capability_hash,
+        "lease_session_id": lease.lease_session_id,
         "lease_owner": lease.lease_owner,
         "lease_until": lease.lease_until,
         "attempts": lease.attempts,
@@ -170,7 +187,10 @@ def _email_database_row(
         "version": 4,
         "owner_generation": lease.generation,
         "owner_fencing_token": lease.fencing_token,
+        "owner_authority_epoch": lease.authority_epoch,
+        "owner_capability_hash": lease.capability_hash,
         "processing_inbox_id": lease.id,
+        "processing_execution_epoch": lease.execution_epoch,
         "create_seen_at": now,
         "processing_started_at": now,
         "source_deleted_at": None,
@@ -198,7 +218,10 @@ def _email(
         "version": 4,
         "owner_generation": lease.generation,
         "owner_fencing_token": lease.fencing_token,
+        "owner_authority_epoch": lease.authority_epoch,
+        "owner_capability_hash": lease.capability_hash,
         "processing_inbox_id": lease.id,
+        "processing_execution_epoch": lease.execution_epoch,
         "create_seen_at": datetime.now(UTC),
         "processing_started_at": datetime.now(UTC),
         "source_deleted_at": None,
@@ -258,6 +281,141 @@ def _patch_transaction_setup(
 ) -> None:
     monkeypatch.setattr(repository, "_configure_transaction", AsyncMock())
     monkeypatch.setattr(repository, "_acquire_account_lock", AsyncMock())
+
+
+@pytest.mark.parametrize(
+    ("field", "current_value", "stale_value"),
+    (
+        ("execution_epoch", 2, 1),
+        ("authority_epoch", 2, 1),
+        ("capability_hash", "b" * 64, "a" * 64),
+        (
+            "lease_session_id",
+            "00000000-0000-4000-8000-000000000003",
+            "00000000-0000-4000-8000-000000000002",
+        ),
+    ),
+)
+def test_lease_equality_includes_every_runtime_authorization_stamp(
+    normalized_event: NormalizedIngressEvent,
+    field: str,
+    current_value: object,
+    stale_value: object,
+) -> None:
+    current = replace(_lease(normalized_event), **{field: current_value})
+    stale = replace(current, **{field: stale_value})
+
+    assert _leases_equal(current, current) is True
+    assert _leases_equal(stale, current) is False
+    assert _leases_equal(current, stale) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "current_value", "stale_value"),
+    (
+        ("execution_epoch", 2, 1),
+        ("authority_epoch", 2, 1),
+        ("capability_hash", "b" * 64, "a" * 64),
+        (
+            "lease_session_id",
+            "00000000-0000-4000-8000-000000000003",
+            "00000000-0000-4000-8000-000000000002",
+        ),
+    ),
+)
+async def test_processing_authorization_rejects_each_stale_runtime_stamp_before_io(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    current_value: object,
+    stale_value: object,
+) -> None:
+    current = replace(_lease(normalized_event), **{field: current_value})
+    stale = replace(current, **{field: stale_value})
+    repository = InboxRepository(object())
+    transaction_calls = 0
+
+    def forbidden_transaction(_connection: object) -> object:
+        nonlocal transaction_calls
+        transaction_calls += 1
+        raise AssertionError("stale lease must fail before receipt lookup")
+
+    monkeypatch.setattr(repository, "transaction", forbidden_transaction)
+
+    with pytest.raises(ProcessingCompletionRejected):
+        await repository._require_authorized_processing_attempt(
+            object(),  # type: ignore[arg-type]
+            lease=current,
+            email=_email(current),
+            inbox=_inbox(current, lease=stale),
+            expected_email_version=4,
+            ownership_state=PipelineGenerationState.CURRENT_INGRESS,
+            require_unexpired=True,
+        )
+
+    assert transaction_calls == 0
+
+
+def test_processing_receipt_event_keys_bind_execution_epoch_exactly(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    lease = _lease(normalized_event)
+    attempt_epoch_0 = _processing_attempt_event_key(lease.id, 0, lease.attempts)
+    attempt_epoch_1 = _processing_attempt_event_key(lease.id, 1, lease.attempts)
+    result_epoch_0 = _processing_result_event_key(
+        lease.id,
+        0,
+        lease.attempts,
+        "success",
+    )
+    result_epoch_1 = _processing_result_event_key(
+        lease.id,
+        1,
+        lease.attempts,
+        "success",
+    )
+
+    assert (
+        attempt_epoch_0
+        == hashlib.sha256(
+            b"email-processing-attempt-v1\x00"
+            + lease.id.encode("ascii")
+            + b"\x000\x00"
+            + str(lease.attempts).encode("ascii")
+        ).hexdigest()
+    )
+    assert (
+        attempt_epoch_1
+        == hashlib.sha256(
+            b"email-processing-attempt-v1\x00"
+            + lease.id.encode("ascii")
+            + b"\x001\x00"
+            + str(lease.attempts).encode("ascii")
+        ).hexdigest()
+    )
+    assert (
+        result_epoch_0
+        == hashlib.sha256(
+            b"email-processing-result-v1\x00"
+            + lease.id.encode("ascii")
+            + b"\x000\x00"
+            + str(lease.attempts).encode("ascii")
+            + b"\x00success"
+        ).hexdigest()
+    )
+    assert (
+        result_epoch_1
+        == hashlib.sha256(
+            b"email-processing-result-v1\x00"
+            + lease.id.encode("ascii")
+            + b"\x001\x00"
+            + str(lease.attempts).encode("ascii")
+            + b"\x00success"
+        ).hexdigest()
+    )
+    assert attempt_epoch_0 != attempt_epoch_1
+    assert result_epoch_0 != result_epoch_1
 
 
 @pytest.mark.parametrize(

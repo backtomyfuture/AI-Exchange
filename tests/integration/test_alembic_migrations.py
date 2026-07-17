@@ -399,19 +399,19 @@ def test_baseline_replaces_existing_processed_emails_view_idempotently(
 
 
 @pytest.mark.integration
-def test_legacy_schema_upgrades_idempotently(alembic_runner, legacy_schema):
-    alembic_runner.upgrade(legacy_schema, "head")
-    alembic_runner.upgrade(legacy_schema, "head")
+def test_nonempty_legacy_schema_requires_greenfield_reinitialize(
+    alembic_runner,
+    legacy_schema,
+):
+    with pytest.raises(DBAPIError, match="greenfield_reinitialize_required"):
+        alembic_runner.upgrade(legacy_schema, "head")
 
-    assert legacy_schema.scalar("SELECT count(*) FROM alembic_version") == 1
     assert legacy_schema.scalar("SELECT count(*) FROM emails_log") == 2
     assert (
         legacy_schema.scalar("SELECT subject FROM emails_log WHERE id = 'legacy-1'")
         == "First legacy email"
     )
-    assert legacy_schema.column_exists("emails_log", "error_message")
-    assert legacy_schema.column_exists("emails_log", "content_ref")
-    assert legacy_schema.column_exists("emails_log", "version")
+    assert not legacy_schema.table_exists("pipeline_runtime_authority")
 
 
 @pytest.mark.integration
@@ -460,7 +460,7 @@ async def test_bootstrap_reports_the_revision_read_from_the_isolated_database(
     )
     actual_revision = schema.scalar("SELECT version_num FROM alembic_version")
 
-    assert actual_revision == "20260713_0005"
+    assert actual_revision == "20260716_0006"
     assert summary["alembic"] == actual_revision
     assert revision_reader.await_count == 2
 

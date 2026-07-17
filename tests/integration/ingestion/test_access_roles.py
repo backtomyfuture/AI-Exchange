@@ -22,11 +22,14 @@ from src.db.bootstrap import (
 )
 from src.db.roles import (
     DatabaseRoleError,
+    _security_definer_contract_sql,
+    _target_foreign_keys_exact_sql,
+    _target_trigger_contract_exact_sql,
     require_maintenance_database_role,
     require_migration_database_role,
     require_runtime_database_role,
 )
-from src.db.schema import require_runtime_database
+from src.db.schema import DatabaseRevisionError, require_runtime_database
 from src.maintenance.checkpoint_cleanup import CheckpointCleaner
 from src.maintenance.checkpoint_repository import PostgresCheckpointRepository
 from src.maintenance.cleanup_artifacts import PlanArtifactStore
@@ -519,15 +522,260 @@ _EXPECTED_MIGRATION_ACL_0005 = {
     )
 }
 
+_GREENFIELD_SELECT_ONLY_RELATIONS = (
+    "audit_events",
+    "emails",
+    "event_inbox",
+    "pipeline_command_receipts",
+    "pipeline_folder_scopes",
+    "pipeline_initializations",
+    "pipeline_ownership",
+    "pipeline_runtime_authority",
+    "pipeline_runtime_capabilities",
+    "pipeline_runtime_instances",
+    "sync_cold_start_plans",
+    "sync_cursors",
+)
+_EXPECTED_RUNTIME_ACL_0006 = {
+    (
+        "table",
+        relation,
+        "",
+        "SELECT",
+        False,
+    )
+    for relation in (
+        "alembic_version",
+        "emails_log",
+        "checkpoints",
+        "checkpoint_blobs",
+        "checkpoint_writes",
+        *_GREENFIELD_SELECT_ONLY_RELATIONS,
+    )
+}
+for _privilege, _columns_by_relation in (
+    (
+        "INSERT",
+        {
+            relation: _RUNTIME_INSERT_COLUMNS[relation]
+            for relation in (
+                "checkpoints",
+                "checkpoint_blobs",
+                "checkpoint_writes",
+            )
+        },
+    ),
+    (
+        "UPDATE",
+        {
+            relation: _RUNTIME_UPDATE_COLUMNS[relation]
+            for relation in ("checkpoints", "checkpoint_writes")
+        },
+    ),
+):
+    _EXPECTED_RUNTIME_ACL_0006.update(
+        (
+            "column",
+            relation,
+            column,
+            _privilege,
+            False,
+        )
+        for relation, columns in _columns_by_relation.items()
+        for column in columns
+    )
+
+_EXPECTED_MAINTENANCE_ACL_0006 = {
+    ("table", relation, "", "SELECT", False)
+    for relation in (
+        "alembic_version",
+        "checkpoint_migrations",
+        "emails_log",
+        "checkpoints",
+        "checkpoint_blobs",
+        "checkpoint_writes",
+        *_GREENFIELD_SELECT_ONLY_RELATIONS,
+    )
+} | {
+    ("table", relation, "", "DELETE", False)
+    for relation in ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+}
+
+_AUDITOR_0006_FULL_SELECT_RELATIONS = (
+    "audit_events",
+    "pipeline_command_receipts",
+    "pipeline_initializations",
+    "pipeline_ownership",
+    "pipeline_runtime_authority",
+    "pipeline_runtime_capabilities",
+    "pipeline_runtime_instances",
+)
+_AUDITOR_0006_SELECT_COLUMNS = {
+    "pipeline_folder_scopes": (
+        "initialization_id",
+        "account_id",
+        "canonical_key",
+        "scope_hash",
+        "policy_manifest_hash",
+        "created_at",
+    ),
+    "event_inbox": (
+        "id",
+        "account_id",
+        "source",
+        "raw_event_type",
+        "change_kind",
+        "dedupe_key",
+        "source_event_at",
+        "processing_policy",
+        "pipeline_name",
+        "generation",
+        "fencing_token",
+        "execution_epoch",
+        "authority_epoch",
+        "capability_hash",
+        "status",
+        "lease_owner",
+        "lease_session_id",
+        "lease_until",
+        "attempts",
+        "available_at",
+        "processing_started_at",
+        "effect_started_at",
+        "safe_error_code",
+        "received_at",
+        "updated_at",
+    ),
+    "emails": (
+        "id",
+        "account_id",
+        "status",
+        "version",
+        "owner_generation",
+        "owner_fencing_token",
+        "owner_authority_epoch",
+        "owner_capability_hash",
+        "processing_inbox_id",
+        "processing_execution_epoch",
+        "create_seen_at",
+        "processing_started_at",
+        "source_deleted_at",
+        "external_effects_started_at",
+        "safe_error_code",
+        "is_read",
+        "is_read_refresh_required",
+        "created_at",
+        "updated_at",
+    ),
+}
+_EXPECTED_AUDITOR_ACL_0006 = (
+    _EXPECTED_AUDITOR_ACL
+    | {
+        ("table", relation, "", "SELECT", False)
+        for relation in _AUDITOR_0006_FULL_SELECT_RELATIONS
+    }
+    | {
+        ("column", relation, column, "SELECT", False)
+        for relation, columns in _AUDITOR_0006_SELECT_COLUMNS.items()
+        for column in columns
+    }
+)
+
+_EXPECTED_RUNTIME_ROUTINES_0006 = {
+    "greenfield_get_runtime_authority": "p_account_id bigint",
+    "greenfield_register_web_instance": (
+        "p_account_id bigint, p_instance_id text, p_session_id uuid, "
+        "p_expected_authority_epoch bigint, p_expected_authority_version bigint, "
+        "p_schema_revision text, p_protocol_version bigint, p_build_id text, "
+        "p_config_hash text, p_capability_hash text, p_lease_seconds bigint"
+    ),
+    "greenfield_heartbeat_web_instance": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_expected_authority_epoch bigint, p_expected_capability_hash text, "
+        "p_accepted_count bigint, p_rejected_count bigint, p_lease_seconds bigint"
+    ),
+    "greenfield_drain_web_instance": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_expected_authority_epoch bigint, p_expected_capability_hash text"
+    ),
+    "greenfield_insert_webhook_event": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_external_email_id text, p_folder_key text, p_raw_event_type text, "
+        "p_change_kind text, p_dedupe_key text, p_source_version text, "
+        "p_source_event_at timestamp with time zone, p_payload jsonb, "
+        "p_processing_policy text"
+    ),
+    "greenfield_claim_inbox": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_lease_owner text, p_limit bigint, p_lease_seconds bigint"
+    ),
+    "greenfield_renew_inbox": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_inbox_id uuid, p_execution_epoch bigint, p_lease_owner text, "
+        "p_attempts bigint, p_lease_seconds bigint"
+    ),
+    "greenfield_apply_email_event": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_inbox_id uuid, p_execution_epoch bigint, "
+        "p_expected_email_version bigint"
+    ),
+    "greenfield_begin_inbox_effect": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_inbox_id uuid, p_execution_epoch bigint, p_attempts bigint"
+    ),
+    "greenfield_finish_inbox": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_inbox_id uuid, p_execution_epoch bigint, p_attempts bigint, "
+        "p_completion jsonb"
+    ),
+    "greenfield_fail_inbox": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_inbox_id uuid, p_execution_epoch bigint, p_attempts bigint, "
+        "p_safe_error_code text, p_safe_error_summary text"
+    ),
+    "greenfield_reap_inbox": (
+        "p_account_id bigint, p_session_id uuid, p_expected_lease_version bigint, "
+        "p_limit bigint"
+    ),
+}
+_EXPECTED_MAINTENANCE_ROUTINES_0006 = {
+    "greenfield_initialize_runtime": (
+        "p_account_id bigint, p_capability_hash text, p_predecessor_hash text, "
+        "p_capability_stage text, p_schema_revision text, p_schema_digest text, "
+        "p_protocol_version bigint, p_minimum_build_id text, p_config_hash text, "
+        "p_adapter_hash text, p_policy_manifest_hash text, "
+        "p_evidence_manifest_hash text, p_policy_manifest_json text, "
+        "p_policy_scope_count bigint, p_actor text, p_reason text, "
+        "p_idempotency_key text, p_canonical_payload_hash text"
+    ),
+    "greenfield_get_runtime_authority": "p_account_id bigint",
+    "greenfield_pause_runtime": (
+        "p_account_id bigint, p_expected_authority_epoch bigint, "
+        "p_expected_version bigint, p_expected_capability_hash text, "
+        "p_actor text, p_reason text, p_idempotency_key text, "
+        "p_canonical_payload_hash text"
+    ),
+    "greenfield_resume_ingress": (
+        "p_account_id bigint, p_expected_authority_epoch bigint, "
+        "p_expected_version bigint, p_expected_capability_hash text, "
+        "p_actor text, p_reason text, p_idempotency_key text, "
+        "p_canonical_payload_hash text"
+    ),
+    "greenfield_requeue_inbox": (
+        "p_account_id bigint, p_inbox_id uuid, p_expected_execution_epoch bigint, "
+        "p_expected_email_version bigint, p_actor text, p_reason text, "
+        "p_idempotency_key text, p_canonical_payload_hash text"
+    ),
+}
+
 
 async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
-    if revision == "20260713_0005":
-        await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
-        return
     if revision not in {
         "20260710_0002",
         "20260710_0003",
         "20260713_0004",
+        "20260713_0005",
+        "20260716_0006",
     }:
         raise AssertionError("unsupported test revision")
     alembic_runner.upgrade(schema, revision)
@@ -538,6 +786,7 @@ async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
         runtime_role=schema.runtime_role,
         maintenance_role=schema.maintenance_role,
         auditor_role=schema.auditor_role,
+        business_revision=revision,
     )
 
 
@@ -577,6 +826,53 @@ def _direct_relation_acl(schema, role_name: str):
                 "WHERE relation_schema.nspname = 'public' "
                 "AND role.rolname = %s",
                 (role_name, role_name),
+            ).fetchall()
+        }
+
+
+def _direct_routine_acl(
+    schema,
+    role_name: str,
+) -> set[tuple[str, str, str, bool]]:
+    with psycopg.connect(schema.dsn, autocommit=True) as conn:
+        return {
+            tuple(row)
+            for row in conn.execute(
+                "SELECT routine.proname::pg_catalog.text, "
+                "pg_catalog.pg_get_function_identity_arguments(routine.oid), "
+                "grant_acl.privilege_type::pg_catalog.text, "
+                "grant_acl.is_grantable "
+                "FROM pg_catalog.pg_proc AS routine "
+                "JOIN pg_catalog.pg_namespace AS routine_schema "
+                "ON routine_schema.oid = routine.pronamespace "
+                "CROSS JOIN LATERAL pg_catalog.aclexplode(routine.proacl) "
+                "AS grant_acl "
+                "JOIN pg_catalog.pg_roles AS role "
+                "ON role.oid = grant_acl.grantee "
+                "WHERE routine_schema.nspname = 'public' "
+                "AND role.rolname = %s",
+                (role_name,),
+            ).fetchall()
+        }
+
+
+def _public_routine_acl(schema) -> set[tuple[str, str, str, bool]]:
+    with psycopg.connect(schema.dsn, autocommit=True) as conn:
+        return {
+            tuple(row)
+            for row in conn.execute(
+                "SELECT routine.proname::pg_catalog.text, "
+                "pg_catalog.pg_get_function_identity_arguments(routine.oid), "
+                "grant_acl.privilege_type::pg_catalog.text, "
+                "grant_acl.is_grantable "
+                "FROM pg_catalog.pg_proc AS routine "
+                "JOIN pg_catalog.pg_namespace AS routine_schema "
+                "ON routine_schema.oid = routine.pronamespace "
+                "CROSS JOIN LATERAL pg_catalog.aclexplode("
+                "COALESCE(routine.proacl, "
+                "pg_catalog.acldefault('f', routine.proowner))) AS grant_acl "
+                "WHERE routine_schema.nspname = 'public' "
+                "AND grant_acl.grantee = 0"
             ).fetchall()
         }
 
@@ -638,6 +934,198 @@ async def test_0005_managed_role_acls_match_independent_manifests(
         "pipeline_command_receipts": schema.migration_role,
         "cold_start_command_receipts": schema.migration_role,
     }
+    await require_migration_database_role(
+        schema.dsn,
+        **schema.bootstrap_identity,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0006_managed_role_acls_and_routines_match_independent_manifests(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
+
+    assert _direct_relation_acl(schema, schema.runtime_role) == (
+        _EXPECTED_RUNTIME_ACL_0006
+    )
+    assert _direct_relation_acl(schema, schema.maintenance_role) == (
+        _EXPECTED_MAINTENANCE_ACL_0006
+    )
+    assert _direct_relation_acl(schema, schema.auditor_role) == (
+        _EXPECTED_AUDITOR_ACL_0006
+    )
+
+    runtime_routines = _direct_routine_acl(schema, schema.runtime_role)
+    maintenance_routines = _direct_routine_acl(schema, schema.maintenance_role)
+    assert runtime_routines == {
+        (name, identity_arguments, "EXECUTE", False)
+        for name, identity_arguments in _EXPECTED_RUNTIME_ROUTINES_0006.items()
+    }
+    assert maintenance_routines == {
+        (name, identity_arguments, "EXECUTE", False)
+        for name, identity_arguments in _EXPECTED_MAINTENANCE_ROUTINES_0006.items()
+    }
+    for routine_acl in (runtime_routines, maintenance_routines):
+        assert all(
+            identity_arguments and privilege == "EXECUTE" and grantable is False
+            for _name, identity_arguments, privilege, grantable in routine_acl
+        )
+    assert _direct_routine_acl(schema, schema.auditor_role) == set()
+    assert _public_routine_acl(schema) == set()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0006_all_role_gates_accept_exact_relation_and_routine_acls(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
+
+    schema_oid = "'public'::pg_catalog.regnamespace"
+    migration_oid = "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)"
+    hook_contract = schema.scalar(
+        "SELECT pg_catalog.jsonb_build_object("
+        f"'foreign_keys', {_target_foreign_keys_exact_sql(schema_oid)}, "
+        "'triggers', "
+        f"{_target_trigger_contract_exact_sql(schema_oid, migration_oid)}, "
+        "'security_definers', "
+        f"{_security_definer_contract_sql(schema_oid, migration_oid)})"
+    )
+    assert hook_contract == {
+        "foreign_keys": True,
+        "triggers": True,
+        "security_definers": True,
+    }
+
+    for gate, dsn, identity in (
+        (
+            require_migration_database_role,
+            schema.dsn,
+            schema.bootstrap_identity,
+        ),
+        (
+            require_runtime_database_role,
+            schema.runtime_dsn,
+            schema.runtime_identity,
+        ),
+        (
+            require_maintenance_database_role,
+            schema.maintenance_dsn,
+            schema.maintenance_identity,
+        ),
+    ):
+        await gate(dsn, **identity)
+    await require_checkpoint_auditor_database_role(
+        schema.auditor_dsn,
+        expected_auditor_role=schema.auditor_role,
+        expected_runtime_role=schema.runtime_role,
+        expected_migration_role=schema.migration_role,
+        expected_maintenance_role=schema.maintenance_role,
+        target_schema="public",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0006_governed_relations_have_no_raw_write_path_for_managed_roles(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
+
+    with psycopg.connect(schema.dsn, autocommit=True) as connection:
+        rows = connection.execute(
+            "SELECT role.rolname, relation.relname, "
+            "has_table_privilege(role.oid, relation.oid, 'INSERT'), "
+            "has_table_privilege(role.oid, relation.oid, 'UPDATE'), "
+            "has_table_privilege(role.oid, relation.oid, 'DELETE'), "
+            "has_table_privilege(role.oid, relation.oid, 'TRUNCATE'), "
+            "has_table_privilege(role.oid, relation.oid, 'TRIGGER'), "
+            "has_any_column_privilege(role.oid, relation.oid, 'INSERT'), "
+            "has_any_column_privilege(role.oid, relation.oid, 'UPDATE') "
+            "FROM pg_catalog.pg_roles AS role "
+            "CROSS JOIN pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS relation_schema "
+            "ON relation_schema.oid = relation.relnamespace "
+            "WHERE role.rolname = ANY(%s::pg_catalog.text[]) "
+            "AND relation_schema.nspname = 'public' "
+            "AND relation.relname = ANY(%s::pg_catalog.text[])",
+            (
+                [schema.runtime_role, schema.maintenance_role],
+                list(_GREENFIELD_SELECT_ONLY_RELATIONS),
+            ),
+        ).fetchall()
+    assert len(rows) == 2 * len(_GREENFIELD_SELECT_ONLY_RELATIONS)
+    assert all(not any(row[2:]) for row in rows)
+
+    for execute, statement in (
+        (schema.runtime_execute, "INSERT INTO audit_events DEFAULT VALUES"),
+        (
+            schema.maintenance_execute,
+            "UPDATE event_inbox SET status = status",
+        ),
+        (
+            schema.runtime_execute,
+            "MERGE INTO emails AS target "
+            "USING (SELECT NULL::pg_catalog.uuid AS id) AS source "
+            "ON target.id = source.id "
+            "WHEN MATCHED THEN UPDATE SET status = target.status",
+        ),
+        (schema.runtime_execute, "DELETE FROM emails"),
+        (schema.maintenance_execute, "TRUNCATE pipeline_ownership"),
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            execute(statement)
+
+    for dsn in (schema.runtime_dsn, schema.maintenance_dsn):
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                connection.execute("SELECT * FROM cold_start_command_receipts LIMIT 0")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with connection.cursor().copy("COPY audit_events FROM STDIN"):
+                    pass
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0006_auditor_sees_only_redacted_operational_columns(
+    postgres_database_factory,
+    alembic_runner,
+):
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
+
+    with psycopg.connect(schema.auditor_dsn, autocommit=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT account_id, status, safe_error_code FROM event_inbox LIMIT 0"
+            ).description
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT account_id, status, version FROM emails LIMIT 0"
+            ).description
+            is not None
+        )
+        for statement in (
+            "SELECT external_email_id FROM event_inbox LIMIT 0",
+            "SELECT payload FROM event_inbox LIMIT 0",
+            "SELECT content_ref FROM emails LIMIT 0",
+            "SELECT * FROM sync_cursors LIMIT 0",
+            "SELECT * FROM sync_cold_start_plans LIMIT 0",
+            "SELECT * FROM cold_start_command_receipts LIMIT 0",
+            "SELECT * FROM public.greenfield_get_runtime_authority(8)",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                connection.execute(statement)
 
 
 @pytest.mark.integration
@@ -804,18 +1292,12 @@ async def test_runtime_checkpointer_crud_works_without_delete_capability(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "revision",
-    ["20260710_0002", "20260710_0003", "20260713_0004"],
-)
-async def test_maintenance_role_can_execute_cleanup_but_not_access_durable_data(
+async def test_0006_maintenance_role_can_cleanup_checkpoints_without_mutating_governed_data(
     postgres_database_factory,
-    alembic_runner,
     tmp_path,
-    revision,
 ):
     schema = postgres_database_factory()
-    await _prepare_revision(schema, alembic_runner, revision)
+    await bootstrap_database(schema.dsn, **schema.bootstrap_identity)
     now = datetime.now(UTC).replace(microsecond=0)
     thread_id = "maintenance-cleanup-thread"
     await _put_runtime_checkpoint(schema, thread_id, now - timedelta(hours=25))
@@ -865,13 +1347,7 @@ async def test_maintenance_role_can_execute_cleanup_but_not_access_durable_data(
             )
             == 0
         )
-    durable_access_error = (
-        psycopg.errors.UndefinedTable
-        if revision == "20260710_0002"
-        else psycopg.errors.InsufficientPrivilege
-    )
-    with pytest.raises(durable_access_error):
-        schema.maintenance_execute("SELECT * FROM event_inbox")
+    schema.maintenance_execute("SELECT * FROM event_inbox LIMIT 0")
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         schema.maintenance_execute(
             "UPDATE emails_log SET status = 'sent' WHERE id = "
@@ -886,54 +1362,23 @@ async def test_maintenance_role_can_execute_cleanup_but_not_access_durable_data(
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("revision", "acl_drift"),
-    [
-        (revision, acl_drift)
-        for revision, drifts in (
-            (
-                "20260710_0002",
-                (
-                    "missing_checkpoint_select",
-                    "missing_checkpoint_delete",
-                    "unexpected_emails_update",
-                    "unexpected_app_kv_select",
-                    "select_grant_option",
-                ),
-            ),
-            (
-                "20260710_0003",
-                (
-                    "missing_checkpoint_select",
-                    "missing_checkpoint_delete",
-                    "unexpected_event_inbox_select",
-                    "unexpected_event_inbox_update",
-                    "unexpected_event_inbox_delete",
-                    "select_grant_option",
-                ),
-            ),
-            (
-                "20260713_0004",
-                (
-                    "missing_checkpoint_select",
-                    "missing_checkpoint_delete",
-                    "unexpected_event_inbox_select",
-                    "unexpected_event_inbox_update",
-                    "unexpected_event_inbox_delete",
-                    "select_grant_option",
-                ),
-            ),
-        )
-        for acl_drift in drifts
-    ],
+    "acl_drift",
+    (
+        "missing_checkpoint_select",
+        "missing_checkpoint_delete",
+        "unexpected_emails_update",
+        "unexpected_event_inbox_update",
+        "unexpected_event_inbox_delete",
+        "select_grant_option",
+    ),
 )
-async def test_real_role_gates_reject_maintenance_acl_drift(
+async def test_0006_role_gates_reject_maintenance_acl_drift(
     postgres_database_factory,
     alembic_runner,
-    revision,
     acl_drift,
 ):
     schema = postgres_database_factory()
-    await _prepare_revision(schema, alembic_runner, revision)
+    await _prepare_revision(schema, alembic_runner, "20260716_0006")
     maintenance = sql.Identifier(schema.maintenance_role)
 
     if acl_drift == "missing_checkpoint_select":
@@ -946,10 +1391,6 @@ async def test_real_role_gates_reject_maintenance_acl_drift(
         )
     elif acl_drift == "unexpected_emails_update":
         schema.execute(sql.SQL("GRANT UPDATE ON emails_log TO {}").format(maintenance))
-    elif acl_drift == "unexpected_app_kv_select":
-        schema.execute(
-            sql.SQL("GRANT SELECT ON app_kv_store TO {}").format(maintenance)
-        )
     elif acl_drift.startswith("unexpected_event_inbox_"):
         privilege = acl_drift.removeprefix("unexpected_event_inbox_").upper()
         schema.execute(
@@ -988,25 +1429,39 @@ async def test_real_role_gates_reject_maintenance_acl_drift(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_real_0002_runtime_bridge_passes_exact_role_and_schema_contracts(
+@pytest.mark.parametrize(
+    "revision",
+    (
+        "20260710_0002",
+        "20260710_0003",
+        "20260713_0004",
+        "20260713_0005",
+    ),
+)
+async def test_legacy_runtime_revisions_fail_closed(
     postgres_database_factory,
     alembic_runner,
+    revision,
 ):
     schema = postgres_database_factory()
-    await _prepare_revision(schema, alembic_runner, "20260710_0002")
+    await _prepare_revision(schema, alembic_runner, revision)
 
-    await require_runtime_database(
-        schema.runtime_dsn,
-        durable_inbox_enabled=False,
-        ingestion_shadow_enabled=False,
-        sync_reconciliation_enabled=False,
-        role_separation_required=True,
-        expected_runtime_role=schema.runtime_role,
-        expected_migration_role=schema.migration_role,
-        expected_maintenance_role=schema.maintenance_role,
-        expected_auditor_role=schema.auditor_role,
-        target_schema="public",
-    )
+    with pytest.raises(
+        DatabaseRevisionError,
+        match=r"expected one of \[20260716_0006\]",
+    ):
+        await require_runtime_database(
+            schema.runtime_dsn,
+            durable_inbox_enabled=False,
+            ingestion_shadow_enabled=False,
+            sync_reconciliation_enabled=False,
+            role_separation_required=True,
+            expected_runtime_role=schema.runtime_role,
+            expected_migration_role=schema.migration_role,
+            expected_maintenance_role=schema.maintenance_role,
+            expected_auditor_role=schema.auditor_role,
+            target_schema="public",
+        )
 
 
 @pytest.mark.integration

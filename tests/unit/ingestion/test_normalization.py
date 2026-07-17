@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 from datetime import UTC, datetime
 from typing import Any
 
@@ -663,6 +664,106 @@ def test_webhook_normalizes_trusted_body_timestamp(
     event = _normalize_webhook(_webhook_payload(timestamp=value))
 
     assert event.source_event_at == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0002-01-01T00:00:00Z", datetime(2, 1, 1, tzinfo=UTC)),
+        (
+            "0002-01-01T00:00:00.000001Z",
+            datetime(2, 1, 1, 0, 0, 0, 1, tzinfo=UTC),
+        ),
+        (
+            "9998-12-31T23:59:59.999999Z",
+            datetime(9998, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+        ),
+        ("0002-01-01T08:00:00+08:00", datetime(2, 1, 1, tzinfo=UTC)),
+        (
+            "9999-01-01T07:59:59.999999+08:00",
+            datetime(9998, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+        ),
+    ],
+)
+def test_webhook_accepts_source_event_at_inside_utc_database_window(
+    value: object,
+    expected: datetime,
+) -> None:
+    event = _normalize_webhook(_webhook_payload(timestamp=value))
+
+    assert event.source_event_at == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0001-12-31T23:59:59.999999Z",
+        "9999-01-01T00:00:00Z",
+        "9999-01-01T00:00:00.000001Z",
+        "0002-01-01T07:59:59.999999+08:00",
+        "9999-01-01T08:00:00+08:00",
+    ],
+)
+def test_webhook_rejects_iso_source_event_at_outside_utc_database_window(
+    value: str,
+) -> None:
+    with pytest.raises(IngressValidationError) as caught:
+        _normalize_webhook(_webhook_payload(timestamp=value))
+
+    assert caught.value.safe_code is IngressValidationCode.TIMESTAMP_INVALID
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (-62_104_060_800, datetime(2, 1, 1, tzinfo=UTC)),
+        (253_370_764_799, datetime(9998, 12, 31, 23, 59, 59, tzinfo=UTC)),
+        (-62_104_060_800.0, datetime(2, 1, 1, tzinfo=UTC)),
+        (
+            math.nextafter(253_370_764_800.0, -math.inf),
+            datetime(9998, 12, 31, 23, 59, 59, 999969, tzinfo=UTC),
+        ),
+    ],
+)
+def test_webhook_accepts_last_safe_numeric_source_event_at(
+    value: int | float,
+    expected: datetime,
+) -> None:
+    event = _normalize_webhook(_webhook_payload(timestamp=value))
+
+    assert event.source_event_at == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -62_104_060_801,
+        253_370_764_800,
+        math.nextafter(-62_104_060_800.0, -math.inf),
+        253_370_764_800.0,
+    ],
+)
+def test_webhook_rejects_first_unsafe_numeric_source_event_at(
+    value: int | float,
+) -> None:
+    with pytest.raises(IngressValidationError) as caught:
+        _normalize_webhook(_webhook_payload(timestamp=value))
+
+    assert caught.value.safe_code is IngressValidationCode.TIMESTAMP_INVALID
+
+
+def test_webhook_preserves_bool_and_nan_timestamp_rejection_semantics() -> None:
+    with pytest.raises(IngressValidationError) as bool_caught:
+        _normalize_webhook(_webhook_payload(timestamp=True))
+    assert bool_caught.value.safe_code is IngressValidationCode.TIMESTAMP_INVALID
+
+    nan_payload = _webhook_payload(timestamp=float("nan"))
+    with pytest.raises(IngressValidationError) as nan_caught:
+        _normalize_webhook(
+            nan_payload,
+            raw_body=json.dumps(nan_payload, allow_nan=True).encode("utf-8"),
+        )
+    assert nan_caught.value.safe_code is IngressValidationCode.INVALID_BODY
 
 
 @pytest.mark.parametrize(

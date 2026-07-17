@@ -8,17 +8,8 @@ from src.db.roles import DatabaseRoleError, require_runtime_database_role
 from src.db.schema_contract import require_database_schema_contract
 
 
-EXPECTED_DATABASE_REVISION = "20260710_0002"
-PHASE_2_DATABASE_REVISION = "20260713_0004"
-SYNC_RECONCILIATION_DATABASE_REVISION = "20260713_0005"
-RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset(
-    {
-        EXPECTED_DATABASE_REVISION,
-        "20260710_0003",
-        PHASE_2_DATABASE_REVISION,
-        SYNC_RECONCILIATION_DATABASE_REVISION,
-    }
-)
+EXPECTED_DATABASE_REVISION = "20260716_0006"
+RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset({EXPECTED_DATABASE_REVISION})
 
 
 class DatabaseRevisionError(RuntimeError):
@@ -59,40 +50,34 @@ async def require_runtime_database(
     expected_auditor_role: str = "",
     target_schema: str = "public",
 ) -> None:
-    """Apply the revision gate and reject unverified reconciliation activation."""
+    """Require the one greenfield schema and reject unavailable capabilities."""
     if sync_reconciliation_enabled:
         raise DatabaseRevisionError("sync_reconciliation_capability_unavailable")
 
-    phase_2_enabled = any(
-        (
-            durable_inbox_enabled,
-            ingestion_shadow_enabled,
-        )
-    )
-    if phase_2_enabled and not role_separation_required:
+    if not role_separation_required:
         raise DatabaseRoleError("database_role_preflight_failed")
-    allowed = (
-        frozenset({SYNC_RECONCILIATION_DATABASE_REVISION})
-        if phase_2_enabled
-        else RUNTIME_COMPATIBLE_DATABASE_REVISIONS
+
+    # Retained keyword arguments are a call-shape compatibility seam only. They
+    # cannot select a predecessor revision or mint database authority.
+    _ = durable_inbox_enabled, ingestion_shadow_enabled
+    await require_runtime_database_role(
+        dsn,
+        expected_runtime_role=expected_runtime_role,
+        expected_migration_role=expected_migration_role,
+        expected_maintenance_role=expected_maintenance_role,
+        expected_auditor_role=expected_auditor_role,
+        target_schema=target_schema,
     )
-    if role_separation_required:
-        await require_runtime_database_role(
-            dsn,
-            expected_runtime_role=expected_runtime_role,
-            expected_migration_role=expected_migration_role,
-            expected_maintenance_role=expected_maintenance_role,
-            expected_auditor_role=expected_auditor_role,
-            target_schema=target_schema,
-        )
-    current_revision = await _require_database_revision(dsn, allowed)
-    if role_separation_required:
-        await require_database_schema_contract(
-            dsn,
-            target_schema=target_schema,
-            require_complete=True,
-            expected_revision=current_revision,
-        )
+    current_revision = await _require_database_revision(
+        dsn,
+        RUNTIME_COMPATIBLE_DATABASE_REVISIONS,
+    )
+    await require_database_schema_contract(
+        dsn,
+        target_schema=target_schema,
+        require_complete=True,
+        expected_revision=current_revision,
+    )
 
 
 async def _require_database_revision(

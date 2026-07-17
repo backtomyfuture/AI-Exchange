@@ -6,6 +6,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from src.db.access_contract import GREENFIELD_DATABASE_REVISION
 from src.db.bootstrap import bootstrap_database
 from src.db.roles import (
     DatabaseRoleError,
@@ -1179,7 +1180,7 @@ async def test_bootstrap_resolves_builtin_types_before_target_domains(empty_sche
         **empty_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260713_0005"
+    assert summary["alembic"] == GREENFIELD_DATABASE_REVISION
     shadowed_columns = empty_schema.scalar(
         "SELECT count(*) "
         "FROM pg_catalog.pg_attribute AS attribute "
@@ -1695,7 +1696,7 @@ async def test_bootstrap_accepts_inaccessible_legacy_processed_view(
         **separated_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == "20260713_0005"
+    assert summary["alembic"] == GREENFIELD_DATABASE_REVISION
     await require_runtime_database_role(
         separated_schema.runtime_dsn,
         **separated_schema.runtime_identity,
@@ -1729,7 +1730,6 @@ async def test_runtime_gate_rejects_dangerous_relation_privilege(
     "capability",
     [
         "missing_select",
-        "missing_insert",
         "table_update",
         "column_update",
         "select_grant_option",
@@ -1743,14 +1743,6 @@ async def test_runtime_gate_rejects_audit_mutation_or_delegation(
     if capability == "missing_select":
         mutation = sql.SQL("REVOKE SELECT ON public.audit_events FROM {}").format(
             sql.Identifier(separated_schema.runtime_role)
-        )
-    elif capability == "missing_insert":
-        mutation = sql.SQL(
-            "REVOKE INSERT (id, event_key, account_id, email_id, object_type, "
-            "object_fingerprint, action, result, actor, reason, safe_metadata) "
-            "ON public.audit_events FROM {}"
-        ).format(
-            sql.Identifier(separated_schema.runtime_role),
         )
     elif capability == "table_update":
         mutation = sql.SQL("GRANT UPDATE ON public.audit_events TO {}").format(

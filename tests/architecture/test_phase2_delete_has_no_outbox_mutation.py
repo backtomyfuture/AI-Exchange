@@ -219,6 +219,7 @@ _SAFE_ATTRIBUTE_CALL_PATHS = frozenset(
         "inbox_id.encode",
         "item.get",
         "left.keys",
+        "re.fullmatch",
         "right.keys",
         "selected_cursor.fetchone",
         "self._connection.execute",
@@ -944,6 +945,15 @@ def _is_trusted_hashlib_import(node: ast.AST) -> bool:
     )
 
 
+def _is_trusted_re_import(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Import)
+        and len(node.names) == 1
+        and node.names[0].name == "re"
+        and node.names[0].asname is None
+    )
+
+
 def _is_trusted_safe_import(name: str, node: ast.AST) -> bool:
     source = _TRUSTED_SAFE_IMPORT_SOURCES.get(name)
     return (
@@ -994,6 +1004,13 @@ def _untrusted_safe_module_names(tree: ast.Module) -> frozenset[str]:
         or not _is_trusted_hashlib_import(hashlib_bindings[0])
     ):
         untrusted.add("hashlib")
+    re_bindings = [node for node in binding_nodes if "re" in _node_binding_names(node)]
+    if (
+        has_star_import
+        or len(re_bindings) != 1
+        or not _is_trusted_re_import(re_bindings[0])
+    ):
+        untrusted.add("re")
     return frozenset(untrusted)
 
 
@@ -2506,6 +2523,12 @@ def test_safe_callable_allowlist_rejects_untrusted_module_binders() -> None:
             "import evil as hashlib",
             'hashlib.sha256(b"payload")',
             "call:hashlib.sha256",
+        ),
+        (
+            "regex-module",
+            "import evil as re",
+            're.fullmatch("[a-z]+", "payload")',
+            "call:re.fullmatch",
         ),
         (
             "imported-callable",

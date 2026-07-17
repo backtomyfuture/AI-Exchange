@@ -204,6 +204,10 @@ def _lease(normalized_event) -> InboxLease:
         pipeline_name="durable_v1",
         generation=1,
         fencing_token=1,
+        execution_epoch=0,
+        authority_epoch=1,
+        capability_hash="a" * 64,
+        lease_session_id="00000000-0000-4000-8000-000000000002",
         lease_owner="worker-1",
         attempts=0,
         event=normalized_event,
@@ -233,6 +237,10 @@ def _lease_database_row(
         "pipeline_name": "durable_v1",
         "generation": 1,
         "fencing_token": 1,
+        "execution_epoch": 0,
+        "authority_epoch": 1,
+        "capability_hash": "a" * 64,
+        "lease_session_id": "00000000-0000-4000-8000-000000000002",
         "lease_owner": "worker",
         "lease_until": now + timedelta(seconds=60),
         "attempts": 0,
@@ -252,7 +260,10 @@ def _email_database_row(**overrides: object) -> dict[str, object]:
         "version": 0,
         "owner_generation": 1,
         "owner_fencing_token": 1,
+        "owner_authority_epoch": 1,
+        "owner_capability_hash": "a" * 64,
         "processing_inbox_id": None,
+        "processing_execution_epoch": None,
         "create_seen_at": datetime.now(UTC),
         "processing_started_at": None,
         "source_deleted_at": None,
@@ -755,6 +766,10 @@ def test_tuple_and_dict_rows_decode_to_the_same_lease(normalized_event) -> None:
         "pipeline_name",
         "generation",
         "fencing_token",
+        "execution_epoch",
+        "authority_epoch",
+        "capability_hash",
+        "lease_session_id",
         "lease_owner",
         "lease_until",
         "attempts",
@@ -776,13 +791,54 @@ def test_tuple_and_dict_rows_decode_to_the_same_lease(normalized_event) -> None:
         "durable_v1",
         1,
         1,
+        7,
+        9,
+        "b" * 64,
+        "00000000-0000-4000-8000-000000000003",
         "worker",
         now + timedelta(seconds=60),
         0,
         now,
     )
 
-    assert _lease_from_row(values) == _lease_from_row(dict(zip(columns, values)))
+    tuple_lease = _lease_from_row(values)
+    dict_lease = _lease_from_row(dict(zip(columns, values)))
+
+    assert tuple_lease == dict_lease
+    assert (
+        tuple_lease.execution_epoch,
+        tuple_lease.authority_epoch,
+        tuple_lease.capability_hash,
+        tuple_lease.lease_session_id,
+    ) == (
+        7,
+        9,
+        "b" * 64,
+        "00000000-0000-4000-8000-000000000003",
+    )
+
+
+def test_tuple_and_dict_rows_decode_email_owner_and_execution_stamps() -> None:
+    processing_inbox_id = str(uuid4())
+    row = _email_database_row(
+        owner_authority_epoch=11,
+        owner_capability_hash="c" * 64,
+        processing_inbox_id=processing_inbox_id,
+        processing_execution_epoch=13,
+    )
+    columns = tuple(row)
+    values = tuple(row[column] for column in columns)
+
+    tuple_email = _email_from_row(values)
+    dict_email = _email_from_row(dict(zip(columns, values)))
+
+    assert tuple_email == dict_email
+    assert (
+        tuple_email.owner_authority_epoch,
+        tuple_email.owner_capability_hash,
+        tuple_email.processing_inbox_id,
+        tuple_email.processing_execution_epoch,
+    ) == (11, "c" * 64, processing_inbox_id, 13)
 
 
 def test_row_values_rejects_mapping_with_missing_columns_as_fixed_invariant() -> None:
@@ -809,7 +865,15 @@ def test_lease_decoder_rejects_nonmapping_payload_as_fixed_invariant(
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    (("version", True), ("is_read", 1), ("is_read_refresh_required", 1)),
+    (
+        ("version", True),
+        ("owner_authority_epoch", True),
+        ("owner_capability_hash", "A" * 64),
+        ("processing_execution_epoch", True),
+        ("processing_execution_epoch", -1),
+        ("is_read", 1),
+        ("is_read_refresh_required", 1),
+    ),
 )
 def test_email_decoder_rejects_nonexact_scalar_types_as_fixed_invariant(
     field: str,
@@ -823,6 +887,31 @@ def test_email_decoder_rejects_nonexact_scalar_types_as_fixed_invariant(
     assert caught.value.operation == "event_inbox_invariant"
     assert caught.value.retryable is False
     assert str(caught.value) == "email aggregate database row is invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("execution_epoch", True),
+        ("execution_epoch", -1),
+        ("authority_epoch", 0),
+        ("capability_hash", "A" * 64),
+        ("lease_session_id", "not-a-session"),
+    ),
+)
+def test_lease_decoder_rejects_invalid_runtime_stamps_as_fixed_invariant(
+    normalized_event: NormalizedIngressEvent,
+    field: str,
+    value: object,
+) -> None:
+    row = _lease_database_row(normalized_event, **{field: value})
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        _lease_from_row(row)
+
+    assert caught.value.operation == "event_inbox_invariant"
+    assert caught.value.retryable is False
+    assert str(caught.value) == "event inbox database row is invalid"
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,8 @@ _SYNC_ITEM_ALLOWED_KEYS: Final = frozenset(
 _SYNC_RECEIVED_TIME_PATTERN: Final = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
 )
+_SOURCE_EVENT_AT_MIN: Final = datetime(2, 1, 1, tzinfo=UTC)
+_SOURCE_EVENT_AT_MAX_EXCLUSIVE: Final = datetime(9999, 1, 1, tzinfo=UTC)
 
 
 class _InvalidJson(ValueError):
@@ -505,6 +507,12 @@ def _source_version(payload: Mapping[str, Any]) -> str | None:
     )
 
 
+def _require_source_event_at_range(value: datetime) -> datetime:
+    if not (_SOURCE_EVENT_AT_MIN <= value < _SOURCE_EVENT_AT_MAX_EXCLUSIVE):
+        _raise(IngressValidationCode.TIMESTAMP_INVALID)
+    return value
+
+
 def _source_event_at(payload: Mapping[str, Any]) -> datetime | None:
     if "timestamp" not in payload or payload["timestamp"] is None:
         return None
@@ -512,23 +520,23 @@ def _source_event_at(payload: Mapping[str, Any]) -> datetime | None:
     if isinstance(value, bool):
         _raise(IngressValidationCode.TIMESTAMP_INVALID)
     if isinstance(value, int):
-        if value < 0 or value > 253_402_300_799:
-            _raise(IngressValidationCode.TIMESTAMP_INVALID)
         try:
-            return datetime.fromtimestamp(value, UTC)
+            parsed = datetime.fromtimestamp(value, UTC)
         except (OverflowError, OSError, ValueError):
             raise IngressValidationError(
                 IngressValidationCode.TIMESTAMP_INVALID
             ) from None
+        return _require_source_event_at_range(parsed)
     if isinstance(value, float):
-        if not math.isfinite(value) or value < 0 or value > 253_402_300_799:
+        if not math.isfinite(value):
             _raise(IngressValidationCode.TIMESTAMP_INVALID)
         try:
-            return datetime.fromtimestamp(value, UTC)
+            parsed = datetime.fromtimestamp(value, UTC)
         except (OverflowError, OSError, ValueError):
             raise IngressValidationError(
                 IngressValidationCode.TIMESTAMP_INVALID
             ) from None
+        return _require_source_event_at_range(parsed)
     if not isinstance(value, str):
         _raise(IngressValidationCode.TIMESTAMP_INVALID)
     candidate = value.strip()
@@ -539,7 +547,7 @@ def _source_event_at(payload: Mapping[str, Any]) -> datetime | None:
         offset = parsed.utcoffset()
         if parsed.tzinfo is None or offset is None:
             _raise(IngressValidationCode.TIMESTAMP_INVALID)
-        return parsed.astimezone(UTC)
+        return _require_source_event_at_range(parsed.astimezone(UTC))
     except (TypeError, ValueError, OverflowError):
         raise IngressValidationError(IngressValidationCode.TIMESTAMP_INVALID) from None
 

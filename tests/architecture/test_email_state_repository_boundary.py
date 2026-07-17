@@ -120,6 +120,15 @@ _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES = {
     },
     (
         "src/db/bootstrap.py",
+        "_grant_routine_access",
+        "cursor.execute",
+    ): {
+        # GRANT EXECUTE is admitted only after the exact routine manifest is
+        # validated and reconciled against pg_proc by the ratcheted function.
+        "3058732c7773db93ea9a773938b1e51d44e7cf5692ab487f13a15fa0971e7a24": 1,
+    },
+    (
+        "src/db/bootstrap.py",
         "_require_empty_event_inbox_for_0004",
         "cursor.execute",
     ): {
@@ -133,6 +142,16 @@ _TRUSTED_DYNAMIC_SQL_EXECUTION_SHAPES = {
         # Column-level and relation-level REVOKE shapes.
         "41552e769455347793db4a5394928a7abe40942dbb33215c24517460489e320d": 1,
         "56c99b6192c33c5d72d39bfe60fd0f59c8572498518e53e7d994a1d7a1982086": 1,
+    },
+    (
+        "src/db/bootstrap.py",
+        "_revoke_routine_access",
+        "cursor.execute",
+    ): {
+        # Routine-wide PUBLIC and role revocations use separately frozen AST
+        # shapes so neither query can be substituted or repeated silently.
+        "e02a23b8e16437cdb7a3cac51064988cfcbe49d44fe87d2ebf20d35ab52ddefb": 1,
+        "1b6ccddfdbc744e8ebc31360889747fe8e3d4c368a1a52b3ec845723ba62808a": 1,
     },
     (
         "src/db/roles.py",
@@ -292,6 +311,40 @@ _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "63444311ebb01488cb6c230996f80c0e95ae40c9f8ded64a105b10ff00d287a3"
     ),
 }
+_TASK10G_TASK7_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/db/bootstrap.py",
+        "src/db/roles.py",
+        "src/ingestion/models.py",
+    }
+)
+_TASK10G_TASK8_SUCCESSOR_PATHS = frozenset({"src/ingestion/worker.py"})
+_TASK10G_TASK9G_SUCCESSOR_PATHS = frozenset(
+    {
+        "src/ingestion/normalization.py",
+        "src/ingestion/repository.py",
+    }
+)
+_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    "src/db/bootstrap.py": (
+        "27160b8d55a27a147a97b96e82a116e5d249acfd8bc51b87ce2b8945e3adc3f9"
+    ),
+    "src/db/roles.py": (
+        "95ab9de4b7ba0f33b364c960ebbcf0497db820a6cb779324159f38d194df6849"
+    ),
+    "src/ingestion/models.py": (
+        "8c12ee8abd5e8f501cddba941c8dabba9b4512ce6cdc68940a29808ed925b37f"
+    ),
+    "src/ingestion/normalization.py": (
+        "c22d79b73a0aeaffd76046a1be28a10b66b0dc4f3040019ccec002f06050e688"
+    ),
+    "src/ingestion/repository.py": (
+        "6087475a59cc3647d0330a8bd4117c2b2bbe8e84376bdf8aef74faabea387e55"
+    ),
+    "src/ingestion/worker.py": (
+        "20e87718472f4a39e6f5277f17321b3ef5cad83f5b25c9a4ca92c5652827a32a"
+    ),
+}
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "scripts/reprocess_email.py": (
         "5214cf76cd516974cd453f7b203b05d4a962023b202c28ea9d3f5ceef5a6e24b"
@@ -299,8 +352,10 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     "src/db/auditor.py": (
         "3db5f148a405402f21ca61fa3e465f7453cda8f99b7ed36986d2e2fb8903fde9"
     ),
-    "src/db/bootstrap.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256["src/db/bootstrap.py"],
-    "src/db/roles.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256["src/db/roles.py"],
+    "src/db/bootstrap.py": _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256[
+        "src/db/bootstrap.py"
+    ],
+    "src/db/roles.py": _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256["src/db/roles.py"],
     "src/ingestion/cold_start.py": _TASK7_REVIEWED_STRUCTURAL_AST_SHA256[
         "src/ingestion/cold_start.py"
     ],
@@ -1839,6 +1894,22 @@ async def _ensure_checkpoint_index(cur, migration, evil):
     ) == [4]
 
 
+def test_bootstrap_routine_acl_exceptions_do_not_admit_email_dml() -> None:
+    source = """
+async def _revoke_routine_access(cursor):
+    await cursor.execute("UPDATE emails SET status = 'sent'")
+
+async def _grant_routine_access(cursor):
+    await cursor.execute("DELETE FROM emails")
+"""
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert _find_email_mutations(
+        source,
+        filename=str(project_root / "src" / "db" / "bootstrap.py"),
+    ) == [3, 6]
+
+
 def test_dynamic_non_sql_allowlist_freezes_server_constructor_shape_and_count() -> None:
     source = """
 async def inject_test_email():
@@ -1941,8 +2012,12 @@ def test_task7_reviewed_structural_ast_requires_explicit_review() -> None:
     assert _TASK8_TASK7_SUCCESSOR_PATHS == {"src/ingestion/repository.py"}
     assert _TASK8_TASK7_SUCCESSOR_PATHS <= set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256)
     assert _TASK8_TASK7_SUCCESSOR_PATHS <= set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256)
-    historical_paths = (
-        set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK8_TASK7_SUCCESSOR_PATHS
+    assert _TASK10G_TASK7_SUCCESSOR_PATHS <= set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256)
+    assert _TASK10G_TASK7_SUCCESSOR_PATHS <= set(
+        _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = set(_TASK7_REVIEWED_STRUCTURAL_AST_SHA256) - (
+        _TASK8_TASK7_SUCCESSOR_PATHS | _TASK10G_TASK7_SUCCESSOR_PATHS
     )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
@@ -1963,8 +2038,12 @@ def test_task8_reviewed_structural_ast_requires_explicit_review() -> None:
     project_root = Path(__file__).resolve().parents[2]
     assert _TASK9G_TASK8_SUCCESSOR_PATHS == {"src/ingestion/repository.py"}
     assert _TASK9G_TASK8_SUCCESSOR_PATHS <= set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256)
-    historical_paths = (
-        set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK9G_TASK8_SUCCESSOR_PATHS
+    assert _TASK10G_TASK8_SUCCESSOR_PATHS <= set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256)
+    assert _TASK10G_TASK8_SUCCESSOR_PATHS <= set(
+        _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = set(_TASK8_REVIEWED_STRUCTURAL_AST_SHA256) - (
+        _TASK9G_TASK8_SUCCESSOR_PATHS | _TASK10G_TASK8_SUCCESSOR_PATHS
     )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
@@ -1987,14 +2066,46 @@ def test_task9g_reviewed_structural_ast_requires_explicit_review() -> None:
     assert _TASK9G_NON_SQL_SUCCESSOR_PATHS <= set(
         _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256
     )
+    assert _TASK10G_TASK9G_SUCCESSOR_PATHS <= set(
+        _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    assert _TASK10G_TASK9G_SUCCESSOR_PATHS <= set(
+        _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    )
+    historical_paths = (
+        set(_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256) - _TASK10G_TASK9G_SUCCESSOR_PATHS
+    )
     actual = {
         relative: _normalized_file_ast_sha256(project_root / relative)
-        for relative in _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256
+        for relative in historical_paths
+    }
+    expected = {
+        relative: _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256[relative]
+        for relative in historical_paths
     }
 
-    assert actual == _TASK9G_REVIEWED_STRUCTURAL_AST_SHA256, (
-        "Task-9G structural review required before updating its normalized AST "
-        f"SHA-256 ratchet: expected {_TASK9G_REVIEWED_STRUCTURAL_AST_SHA256}, "
+    assert actual == expected, (
+        "Task-9G structural review required before changing a path that has no "
+        f"explicit Task-10G reviewed successor: expected {expected}, got {actual}"
+    )
+
+
+def test_task10g_reviewed_structural_ast_requires_explicit_review() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    predecessor_paths = (
+        _TASK10G_TASK7_SUCCESSOR_PATHS
+        | _TASK10G_TASK8_SUCCESSOR_PATHS
+        | _TASK10G_TASK9G_SUCCESSOR_PATHS
+    )
+    assert predecessor_paths == set(_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256)
+    actual = {
+        relative: _normalized_file_ast_sha256(project_root / relative)
+        for relative in _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256
+    }
+
+    assert actual == _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256, (
+        "Task-10G structural review required before updating its normalized AST "
+        f"SHA-256 ratchet: expected {_TASK10G_REVIEWED_STRUCTURAL_AST_SHA256}, "
         f"got {actual}"
     )
 

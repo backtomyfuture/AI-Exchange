@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,7 +66,6 @@ _MAX_LEASE_SECONDS: Final = 3600
 _MAX_RETRIES: Final = 5
 _MAX_BACKOFF_SECONDS: Final = 900
 _AUDIT_ACTOR: Final = "inbox_repository"
-_PROCESSING_EXECUTION_EPOCH: Final = 0
 _PROCESSING_ATTEMPT_ACTION: Final = "email.processing_attempt"
 _PROCESSING_ATTEMPT_REASON: Final = "email.processing_attempt_authorized"
 _PROCESSING_ATTEMPT_OBJECT_TYPE: Final = "email_processing_attempt"
@@ -130,6 +130,10 @@ _LEASE_COLUMNS = (
     "pipeline_name",
     "generation",
     "fencing_token",
+    "execution_epoch",
+    "authority_epoch",
+    "capability_hash",
+    "lease_session_id",
     "lease_owner",
     "lease_until",
     "attempts",
@@ -148,7 +152,10 @@ _EMAIL_COLUMNS = (
     "version",
     "owner_generation",
     "owner_fencing_token",
+    "owner_authority_epoch",
+    "owner_capability_hash",
     "processing_inbox_id",
+    "processing_execution_epoch",
     "create_seen_at",
     "processing_started_at",
     "source_deleted_at",
@@ -181,7 +188,10 @@ class _EmailRow:
     version: int
     owner_generation: int
     owner_fencing_token: int
+    owner_authority_epoch: int
+    owner_capability_hash: str
     processing_inbox_id: str | None
+    processing_execution_epoch: int | None
     create_seen_at: object | None
     processing_started_at: object | None
     source_deleted_at: object | None
@@ -215,6 +225,10 @@ class _ExpiredLeaseCandidate:
     pipeline_name: str
     generation: int
     fencing_token: int
+    execution_epoch: int
+    authority_epoch: int
+    capability_hash: str
+    lease_session_id: str
     lease_owner: str
     attempts: int
     event: NormalizedIngressEvent
@@ -431,6 +445,10 @@ def _lease_from_row(row: object) -> InboxLease:
             pipeline_name=values["pipeline_name"],
             generation=values["generation"],
             fencing_token=values["fencing_token"],
+            execution_epoch=values["execution_epoch"],
+            authority_epoch=values["authority_epoch"],
+            capability_hash=str(values["capability_hash"]),
+            lease_session_id=str(values["lease_session_id"]),
             lease_owner=values["lease_owner"],
             attempts=values["attempts"],
             event=event,
@@ -473,6 +491,13 @@ def _expired_candidate_from_row(row: object) -> _ExpiredLeaseCandidate:
         )
         generation = _require_bigint("generation", values["generation"])
         fencing_token = _require_bigint("fencing_token", values["fencing_token"])
+        execution_epoch = values["execution_epoch"]
+        authority_epoch = _require_bigint(
+            "authority_epoch",
+            values["authority_epoch"],
+        )
+        capability_hash = str(values["capability_hash"])
+        lease_session_id = str(UUID(str(values["lease_session_id"])))
         lease_owner = _require_exact_text(
             "lease_owner",
             values["lease_owner"],
@@ -486,6 +511,11 @@ def _expired_candidate_from_row(row: object) -> _ExpiredLeaseCandidate:
             or not isinstance(attempts, int)
             or attempts < 0
             or attempts > POSTGRES_BIGINT_MAX
+            or isinstance(execution_epoch, bool)
+            or not isinstance(execution_epoch, int)
+            or execution_epoch < 0
+            or execution_epoch > POSTGRES_BIGINT_MAX
+            or re.fullmatch(r"[0-9a-f]{64}", capability_hash) is None
             or not isinstance(received_at, datetime)
             or received_at.tzinfo is None
             or not isinstance(lease_until, datetime)
@@ -498,6 +528,10 @@ def _expired_candidate_from_row(row: object) -> _ExpiredLeaseCandidate:
             pipeline_name=pipeline_name,
             generation=generation,
             fencing_token=fencing_token,
+            execution_epoch=execution_epoch,
+            authority_epoch=authority_epoch,
+            capability_hash=capability_hash,
+            lease_session_id=lease_session_id,
             lease_owner=lease_owner,
             attempts=attempts,
             event=event,
@@ -533,6 +567,13 @@ def _email_from_row(row: object) -> _EmailRow:
             "owner_fencing_token",
             values["owner_fencing_token"],
         )
+        owner_authority_epoch = _require_bigint(
+            "owner_authority_epoch",
+            values["owner_authority_epoch"],
+        )
+        owner_capability_hash = str(values["owner_capability_hash"])
+        if re.fullmatch(r"[0-9a-f]{64}", owner_capability_hash) is None:
+            raise ValueError
         is_read = values["is_read"]
         if is_read is not None and not isinstance(is_read, bool):
             raise ValueError
@@ -540,6 +581,14 @@ def _email_from_row(row: object) -> _EmailRow:
         if not isinstance(refresh_required, bool):
             raise ValueError
         processing_inbox_id = values["processing_inbox_id"]
+        processing_execution_epoch = values["processing_execution_epoch"]
+        if processing_execution_epoch is not None and (
+            isinstance(processing_execution_epoch, bool)
+            or not isinstance(processing_execution_epoch, int)
+            or processing_execution_epoch < 0
+            or processing_execution_epoch > POSTGRES_BIGINT_MAX
+        ):
+            raise ValueError
         return _EmailRow(
             id=str(values["id"]),
             account_id=account_id,
@@ -549,9 +598,12 @@ def _email_from_row(row: object) -> _EmailRow:
             version=version,
             owner_generation=owner_generation,
             owner_fencing_token=owner_fencing_token,
+            owner_authority_epoch=owner_authority_epoch,
+            owner_capability_hash=owner_capability_hash,
             processing_inbox_id=(
                 str(processing_inbox_id) if processing_inbox_id is not None else None
             ),
+            processing_execution_epoch=processing_execution_epoch,
             create_seen_at=values["create_seen_at"],
             processing_started_at=values["processing_started_at"],
             source_deleted_at=values["source_deleted_at"],
@@ -634,6 +686,10 @@ def _leases_equal(persisted: _LeaseToken, supplied: _LeaseToken) -> bool:
             persisted.pipeline_name,
             persisted.generation,
             persisted.fencing_token,
+            persisted.execution_epoch,
+            persisted.authority_epoch,
+            persisted.capability_hash,
+            persisted.lease_session_id,
             persisted.lease_owner,
             persisted.attempts,
             persisted.received_at,
@@ -645,6 +701,10 @@ def _leases_equal(persisted: _LeaseToken, supplied: _LeaseToken) -> bool:
             supplied.pipeline_name,
             supplied.generation,
             supplied.fencing_token,
+            supplied.execution_epoch,
+            supplied.authority_epoch,
+            supplied.capability_hash,
+            supplied.lease_session_id,
             supplied.lease_owner,
             supplied.attempts,
             supplied.received_at,
@@ -678,12 +738,16 @@ def _leases_equal(persisted: _LeaseToken, supplied: _LeaseToken) -> bool:
     )
 
 
-def _processing_attempt_event_key(inbox_id: str, attempts: int) -> str:
+def _processing_attempt_event_key(
+    inbox_id: str,
+    execution_epoch: int,
+    attempts: int,
+) -> str:
     payload = (
         b"email-processing-attempt-v1\x00"
         + inbox_id.encode("ascii")
         + b"\x00"
-        + str(_PROCESSING_EXECUTION_EPOCH).encode("ascii")
+        + str(execution_epoch).encode("ascii")
         + b"\x00"
         + str(attempts).encode("ascii")
     )
@@ -702,6 +766,7 @@ def _processing_attempt_fingerprint(email_id: str, inbox_id: str) -> str:
 
 def _processing_result_event_key(
     inbox_id: str,
+    execution_epoch: int,
     attempts: int,
     operation: str,
 ) -> str:
@@ -709,7 +774,7 @@ def _processing_result_event_key(
         b"email-processing-result-v1\x00"
         + inbox_id.encode("ascii")
         + b"\x00"
-        + str(_PROCESSING_EXECUTION_EPOCH).encode("ascii")
+        + str(execution_epoch).encode("ascii")
         + b"\x00"
         + str(attempts).encode("ascii")
         + b"\x00"
@@ -736,6 +801,10 @@ def _lease_token_hash(lease: _LeaseToken) -> str:
         "pipeline_name": lease.pipeline_name,
         "generation": lease.generation,
         "fencing_token": lease.fencing_token,
+        "execution_epoch": lease.execution_epoch,
+        "authority_epoch": lease.authority_epoch,
+        "capability_hash": lease.capability_hash,
+        "lease_session_id": lease.lease_session_id,
         "lease_owner": lease.lease_owner,
         "attempts": lease.attempts,
         "received_at": lease.received_at.isoformat(),
@@ -1202,7 +1271,10 @@ class InboxRepository:
         completion: ProcessingCompletion | None,
     ) -> dict[str, object]:
         metadata: dict[str, object] = {
-            "execution_epoch": _PROCESSING_EXECUTION_EPOCH,
+            "execution_epoch": lease.execution_epoch,
+            "authority_epoch": lease.authority_epoch,
+            "capability_hash": lease.capability_hash,
+            "lease_session_id": lease.lease_session_id,
             "attempts": lease.attempts,
             "generation": lease.generation,
             "fencing_token": lease.fencing_token,
@@ -1234,6 +1306,7 @@ class InboxRepository:
     ) -> bool:
         event_key = _processing_result_event_key(
             lease.id,
+            lease.execution_epoch,
             lease.attempts,
             operation,
         )
@@ -1302,6 +1375,7 @@ class InboxRepository:
     ) -> None:
         event_key = _processing_result_event_key(
             lease.id,
+            lease.execution_epoch,
             lease.attempts,
             operation,
         )
@@ -1365,6 +1439,11 @@ class InboxRepository:
         expected_link = (
             None if resolution.inbox_status is InboxStatus.COMPLETED else lease.id
         )
+        expected_execution_epoch = (
+            None
+            if resolution.inbox_status is InboxStatus.COMPLETED
+            else lease.execution_epoch
+        )
         expected_attempts = (
             resolution.attempts if operation == "failure" else lease.attempts
         )
@@ -1372,6 +1451,7 @@ class InboxRepository:
             email.status is not resolution.email_status
             or email.version != expected_email_version + 1
             or email.processing_inbox_id != expected_link
+            or email.processing_execution_epoch != expected_execution_epoch
             or email.safe_error_code != resolution.safe_code
             or email.safe_error_summary != resolution.safe_summary
             or inbox.status is not resolution.inbox_status
@@ -1456,6 +1536,9 @@ class InboxRepository:
             or email.source_deleted_at is not None
             or email.owner_generation != lease.generation
             or email.owner_fencing_token != lease.fencing_token
+            or email.owner_authority_epoch != lease.authority_epoch
+            or email.owner_capability_hash != lease.capability_hash
+            or email.processing_execution_epoch != lease.execution_epoch
             or inbox.status is not InboxStatus.LEASED
             or inbox.lease is None
             or not _leases_equal(inbox.lease, lease)
@@ -1974,7 +2057,9 @@ class InboxRepository:
                     email_update = sql.SQL(
                         "UPDATE {} SET status = %s, version = version + 1, "
                         "processing_inbox_id = CASE WHEN %s THEN processing_inbox_id "
-                        "ELSE NULL END, safe_error_code = %s, "
+                        "ELSE NULL END, processing_execution_epoch = CASE "
+                        "WHEN %s THEN processing_execution_epoch ELSE NULL END, "
+                        "safe_error_code = %s, "
                         "safe_error_summary = %s, updated_at = "
                         "pg_catalog.clock_timestamp() WHERE id = %s "
                         "AND account_id = %s AND status = 'processing' "
@@ -1986,6 +2071,7 @@ class InboxRepository:
                         email_update,
                         (
                             resolution.email_status.value,
+                            terminal_failure,
                             terminal_failure,
                             resolution.safe_code,
                             resolution.safe_summary,
@@ -2989,13 +3075,14 @@ class EmailEventTransaction:
         insert = sql.SQL(
             "INSERT INTO {} ("
             "id, account_id, external_email_id, source_folder_key, status, "
-            "owner_generation, owner_fencing_token, processing_inbox_id, "
-            "create_seen_at, processing_started_at, source_deleted_at, "
+            "owner_generation, owner_fencing_token, owner_authority_epoch, "
+            "owner_capability_hash, processing_inbox_id, "
+            "processing_execution_epoch, create_seen_at, processing_started_at, source_deleted_at, "
             "external_effects_started_at, safe_error_code, safe_error_summary, "
             "content_ref, is_read, is_read_refresh_required"
             ") VALUES ("
-            "%s, %s, %s, %s, 'ingested', %s, %s, NULL, NULL, NULL, NULL, "
-            "NULL, NULL, NULL, NULL, %s, %s"
+            "%s, %s, %s, %s, 'ingested', %s, %s, %s, %s, NULL, NULL, "
+            "NULL, NULL, NULL, NULL, NULL, NULL, NULL, %s, %s"
             ") ON CONFLICT (account_id, external_email_id) DO NOTHING RETURNING id"
         ).format(self._repository._table("emails"))
         try:
@@ -3008,6 +3095,8 @@ class EmailEventTransaction:
                     lease.event.folder,
                     lease.generation,
                     lease.fencing_token,
+                    lease.authority_epoch,
+                    lease.capability_hash,
                     source_is_read,
                     source_is_read is None,
                 ),
@@ -3121,10 +3210,17 @@ class EmailEventTransaction:
         email: _EmailRow,
         lease: InboxLease,
     ) -> bool:
-        event_key = _processing_attempt_event_key(lease.id, lease.attempts)
+        event_key = _processing_attempt_event_key(
+            lease.id,
+            lease.execution_epoch,
+            lease.attempts,
+        )
         fingerprint = _processing_attempt_fingerprint(email.id, lease.id)
         metadata = {
-            "execution_epoch": _PROCESSING_EXECUTION_EPOCH,
+            "execution_epoch": lease.execution_epoch,
+            "authority_epoch": lease.authority_epoch,
+            "capability_hash": lease.capability_hash,
+            "lease_session_id": lease.lease_session_id,
             "attempts": lease.attempts,
             "generation": lease.generation,
             "fencing_token": lease.fencing_token,
@@ -3173,10 +3269,17 @@ class EmailEventTransaction:
         email: _EmailRow,
         lease: InboxLease,
     ) -> bool:
-        event_key = _processing_attempt_event_key(lease.id, lease.attempts)
+        event_key = _processing_attempt_event_key(
+            lease.id,
+            lease.execution_epoch,
+            lease.attempts,
+        )
         fingerprint = _processing_attempt_fingerprint(email.id, lease.id)
         metadata = {
-            "execution_epoch": _PROCESSING_EXECUTION_EPOCH,
+            "execution_epoch": lease.execution_epoch,
+            "authority_epoch": lease.authority_epoch,
+            "capability_hash": lease.capability_hash,
+            "lease_session_id": lease.lease_session_id,
             "attempts": lease.attempts,
             "generation": lease.generation,
             "fencing_token": lease.fencing_token,
@@ -3233,6 +3336,8 @@ class EmailEventTransaction:
         update = sql.SQL(
             "UPDATE {} AS e SET status = 'processing', version = e.version + 1, "
             "processing_inbox_id = COALESCE(e.processing_inbox_id, %s), "
+            "processing_execution_epoch = COALESCE("
+            "e.processing_execution_epoch, %s), "
             "create_seen_at = COALESCE(e.create_seen_at, "
             "pg_catalog.clock_timestamp()), "
             "processing_started_at = COALESCE(e.processing_started_at, "
@@ -3250,6 +3355,7 @@ class EmailEventTransaction:
             update,
             (
                 lease.id,
+                lease.execution_epoch,
                 source_folder_key,
                 is_read,
                 refresh_required,
@@ -3280,6 +3386,8 @@ class EmailEventTransaction:
             "source_deleted_at = COALESCE(e.source_deleted_at, "
             "pg_catalog.clock_timestamp()), processing_inbox_id = CASE "
             "WHEN %s THEN NULL ELSE e.processing_inbox_id END, "
+            "processing_execution_epoch = CASE WHEN %s THEN NULL "
+            "ELSE e.processing_execution_epoch END, "
             "safe_error_code = CASE WHEN %s THEN NULL ELSE e.safe_error_code END, "
             "safe_error_summary = CASE WHEN %s THEN NULL "
             "ELSE e.safe_error_summary END, updated_at = pg_catalog.clock_timestamp() "
@@ -3292,6 +3400,7 @@ class EmailEventTransaction:
             update,
             (
                 decision.new_status.value,
+                clears_processing,
                 clears_processing,
                 clears_processing,
                 clears_processing,
@@ -3390,6 +3499,8 @@ class EmailEventTransaction:
             cross_generation = (
                 email.owner_generation != lease.generation
                 or email.owner_fencing_token != lease.fencing_token
+                or email.owner_authority_epoch != lease.authority_epoch
+                or email.owner_capability_hash != lease.capability_hash
             )
             if (
                 cross_generation
@@ -3419,6 +3530,7 @@ class EmailEventTransaction:
                     if (
                         email.status is not EmailStatus.PROCESSING
                         or email.processing_inbox_id != lease.id
+                        or email.processing_execution_epoch != lease.execution_epoch
                     ):
                         raise _invariant_error(
                             "email processing receipt conflicts with aggregate state"
@@ -3444,7 +3556,9 @@ class EmailEventTransaction:
                 kind=lease.event.kind,
                 source_is_read=_source_is_read(lease.event),
                 processing_owner_matches=(
-                    not inserted and email.processing_inbox_id == lease.id
+                    not inserted
+                    and email.processing_inbox_id == lease.id
+                    and email.processing_execution_epoch == lease.execution_epoch
                 ),
                 external_effects_started=(
                     not inserted and email.external_effects_started_at is not None

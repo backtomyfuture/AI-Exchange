@@ -11,18 +11,23 @@ import psycopg
 from psycopg.rows import dict_row
 
 from src.db.access_contract import (
+    AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
     AUDITOR_RELATION_ACCESS,
     AUDITOR_RELATION_ACCESS_BY_REVISION,
     FOREIGN_KEY_SPECS_BY_REVISION,
+    MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
     MAINTENANCE_RELATION_ACCESS,
     MAINTENANCE_RELATION_ACCESS_BY_REVISION,
     PHASE2_RELATIONS,
     PHASE2_RELATIONS_BY_REVISION,
     PHASE2_VIEW_SPECS_BY_REVISION,
+    RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
     RUNTIME_RELATION_ACCESS,
     RUNTIME_RELATION_ACCESS_BY_REVISION,
     RelationAccess,
+    RoutineAccess,
     TRIGGER_FUNCTIONS_BY_REVISION,
+    TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION,
     TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION,
     TRIGGER_SPECS_BY_REVISION,
 )
@@ -625,10 +630,15 @@ def _relation_access_contract_sql(
         }
         legacy_manifest = manifest
         latest_manifest = manifest
+        greenfield_manifest = manifest
     else:
         base_manifest = manifests_by_revision["20260710_0002"]
         legacy_manifest = manifests_by_revision["20260713_0004"]
         latest_manifest = manifests_by_revision["20260713_0005"]
+        greenfield_manifest = manifests_by_revision.get(
+            "20260716_0006",
+            manifest,
+        )
     selected_difference = "unexpected" if allow_missing else "difference"
     return f"""(
         WITH actual_access(
@@ -691,6 +701,15 @@ def _relation_access_contract_sql(
         ) AS (
             VALUES {expected_values(latest_manifest)}
         ),
+        expected_access_0006(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            VALUES {expected_values(greenfield_manifest)}
+        ),
         difference_0002 AS (
             SELECT * FROM (
                 SELECT * FROM actual_access
@@ -744,6 +763,24 @@ def _relation_access_contract_sql(
             SELECT * FROM actual_access
             EXCEPT
             SELECT * FROM expected_access_0005
+        ),
+        difference_0006 AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM expected_access_0006
+            ) AS unexpected_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access_0006
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_access
+        ),
+        unexpected_0006 AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access_0006
         )
         SELECT CASE
             WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
@@ -766,8 +803,210 @@ def _relation_access_contract_sql(
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0004)
             WHEN {_phase2_profile_matches_sql(schema_oid, "20260713_0005")}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0005)
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
+                THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0006)
             ELSE false
         END
+    )"""
+
+
+def _selected_access_revision_sql(
+    schema_oid: str,
+    revisions: tuple[str, ...],
+) -> str:
+    """Resolve only one reviewed structural profile without trusting settings."""
+
+    clauses = "\n".join(
+        "WHEN "
+        + _phase2_profile_matches_sql(schema_oid, revision)
+        + " THEN "
+        + _sql_text_literal(revision)
+        + "::pg_catalog.text"
+        for revision in sorted(set(revisions), reverse=True)
+        if revision in PHASE2_RELATIONS_BY_REVISION
+        and revision in PHASE2_VIEW_SPECS_BY_REVISION
+    )
+    return f"CASE\n{clauses}\nELSE NULL::pg_catalog.text\nEND"
+
+
+def _routine_manifest_rows_sql(
+    manifests_by_revision: dict[str, tuple[RoutineAccess, ...]],
+) -> str:
+    rows = [
+        "("
+        + ", ".join(
+            (
+                _sql_text_literal(revision),
+                _sql_text_literal(spec.name),
+                _sql_text_literal(spec.identity_arguments),
+            )
+        )
+        + ")"
+        for revision, manifest in manifests_by_revision.items()
+        for spec in manifest
+    ]
+    if rows:
+        return "VALUES " + ",\n".join(rows)
+    return (
+        "SELECT NULL::pg_catalog.text, NULL::pg_catalog.text, "
+        "NULL::pg_catalog.text WHERE false"
+    )
+
+
+def _routine_execute_contract_sql(
+    schema_oid: str,
+    role_oid: str,
+    manifests_by_revision: dict[str, tuple[RoutineAccess, ...]],
+    *,
+    allow_missing: bool = False,
+) -> str:
+    """Require one exact effective EXECUTE set keyed by identity arguments."""
+
+    selected_difference = "unexpected_access" if allow_missing else "difference"
+    return f"""(
+        WITH selected_revision(revision) AS (
+            SELECT {
+        _selected_access_revision_sql(
+            schema_oid,
+            tuple(manifests_by_revision),
+        )
+    }
+        ),
+        expected_by_revision(
+            revision,
+            routine_name,
+            identity_arguments
+        ) AS (
+            {_routine_manifest_rows_sql(manifests_by_revision)}
+        ),
+        expected_access(routine_name, identity_arguments) AS (
+            SELECT routine_name, identity_arguments
+            FROM expected_by_revision
+            WHERE revision = (SELECT revision FROM selected_revision)
+        ),
+        actual_access(routine_name, identity_arguments) AS (
+            SELECT
+                routine.proname::pg_catalog.text,
+                pg_catalog.pg_get_function_identity_arguments(routine.oid)
+                    ::pg_catalog.text
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND pg_catalog.has_function_privilege(
+                  {role_oid}, routine.oid, 'EXECUTE'
+              )
+        ),
+        difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access EXCEPT SELECT * FROM expected_access
+            ) AS unexpected_execute
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access EXCEPT SELECT * FROM actual_access
+            ) AS missing_execute
+        ),
+        unexpected_access AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access
+        )
+        SELECT (SELECT revision IS NOT NULL FROM selected_revision)
+        AND NOT EXISTS (SELECT 1 FROM {selected_difference})
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(
+                    routine.proacl,
+                    pg_catalog.acldefault('f', routine.proowner)
+                )
+            ) AS routine_acl
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine_acl.privilege_type = 'EXECUTE'
+              AND (
+                  routine_acl.grantee = 0
+                  OR (
+                      routine_acl.grantee = {role_oid}
+                      AND routine_acl.is_grantable
+                  )
+              )
+        )
+    )"""
+
+
+def _security_definer_contract_sql(
+    schema_oid: str,
+    migration_oid: str,
+) -> str:
+    """Allow only the revision's fixed migration-owned greenfield routines."""
+
+    manifests: dict[str, tuple[RoutineAccess, ...]] = {}
+    for revision in RUNTIME_ROUTINE_EXECUTE_BY_REVISION:
+        identities = {
+            (spec.name, spec.identity_arguments): spec
+            for spec in (
+                *RUNTIME_ROUTINE_EXECUTE_BY_REVISION[revision],
+                *MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[revision],
+            )
+        }
+        manifests[revision] = tuple(identities[key] for key in sorted(identities))
+
+    return f"""(
+        WITH selected_revision(revision) AS (
+            SELECT {
+        _selected_access_revision_sql(
+            schema_oid,
+            tuple(manifests),
+        )
+    }
+        ),
+        expected_by_revision(
+            revision,
+            routine_name,
+            identity_arguments
+        ) AS (
+            {_routine_manifest_rows_sql(manifests)}
+        ),
+        expected_functions(routine_name, identity_arguments) AS (
+            SELECT routine_name, identity_arguments
+            FROM expected_by_revision
+            WHERE revision = (SELECT revision FROM selected_revision)
+        ),
+        actual_functions(routine_name, identity_arguments) AS (
+            SELECT
+                routine.proname::pg_catalog.text,
+                pg_catalog.pg_get_function_identity_arguments(routine.oid)
+                    ::pg_catalog.text
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine.prosecdef
+        ),
+        function_difference AS (
+            SELECT * FROM (
+                SELECT * FROM actual_functions
+                EXCEPT
+                SELECT * FROM expected_functions
+            ) AS unexpected_function
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_functions
+                EXCEPT
+                SELECT * FROM actual_functions
+            ) AS missing_function
+        )
+        SELECT (SELECT revision IS NOT NULL FROM selected_revision)
+        AND NOT EXISTS (SELECT 1 FROM function_difference)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            WHERE routine.pronamespace = {schema_oid}
+              AND routine.prosecdef
+              AND (
+                  routine.proowner IS DISTINCT FROM {migration_oid}
+                  OR routine.prokind <> 'f'
+                  OR routine.proconfig IS DISTINCT FROM
+                     ARRAY['search_path=pg_catalog']::pg_catalog.text[]
+              )
+        )
     )"""
 
 
@@ -1006,6 +1245,14 @@ def _checkpoint_auditor_access_contract_sql(
             manifests_by_revision=AUDITOR_RELATION_ACCESS_BY_REVISION,
         )
     }
+        AND {
+        _routine_execute_contract_sql(
+            schema_oid,
+            auditor_oid,
+            AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
+            allow_missing=allow_missing,
+        )
+    }
     )"""
 
 
@@ -1142,30 +1389,25 @@ def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
               OR parent.relnamespace = {schema_oid}
           )
     )"""
-    legacy_revision = "20260713_0004"
-    latest_revision = "20260713_0005"
-    return f"""(
-        (
-            {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
-            AND {no_foreign_keys}
-        ) OR (
-            {_phase2_profile_matches_sql(schema_oid, legacy_revision)}
+    revision_contracts = [
+        f"""(
+            {_phase2_profile_matches_sql(schema_oid, revision)}
             AND {
-        _target_foreign_keys_exact_for_specs_sql(
-            schema_oid,
-            FOREIGN_KEY_SPECS_BY_REVISION[legacy_revision],
-        )
-    }
-        ) OR (
-            {_phase2_profile_matches_sql(schema_oid, latest_revision)}
-            AND {
-        _target_foreign_keys_exact_for_specs_sql(
-            schema_oid,
-            FOREIGN_KEY_SPECS_BY_REVISION[latest_revision],
-        )
-    }
-        )
+            _target_foreign_keys_exact_for_specs_sql(
+                schema_oid,
+                specs,
+            )
+        }
+        )"""
+        for revision, specs in FOREIGN_KEY_SPECS_BY_REVISION.items()
+        if revision in PHASE2_RELATIONS_BY_REVISION
+        and revision in PHASE2_VIEW_SPECS_BY_REVISION
+    ]
+    no_foreign_key_contract = f"""(
+        {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+        AND {no_foreign_keys}
     )"""
+    return "(" + " OR ".join((no_foreign_key_contract, *revision_contracts)) + ")"
 
 
 def _target_trigger_contract_exact_for_revision_sql(
@@ -1176,6 +1418,14 @@ def _target_trigger_contract_exact_for_revision_sql(
     trigger_specs = TRIGGER_SPECS_BY_REVISION[revision]
     trigger_functions = TRIGGER_FUNCTIONS_BY_REVISION[revision]
     trigger_function_digests = TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION[revision]
+    trigger_function_search_paths = TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION[revision]
+    if (
+        set(trigger_function_digests) != set(trigger_functions)
+        or set(trigger_function_search_paths) != set(trigger_functions)
+        or not set(trigger_function_search_paths.values())
+        <= {"target_schema", "pg_catalog"}
+    ):
+        raise RuntimeError("Trigger function contract manifest is invalid")
     expected_trigger_rows = ",\n".join(
         "("
         + ", ".join(
@@ -1218,6 +1468,13 @@ def _target_trigger_contract_exact_for_revision_sql(
             (
                 _sql_text_literal(function_name),
                 _sql_text_literal(trigger_function_digests[function_name]),
+                (
+                    "ARRAY['search_path=' || (SELECT schema.nspname "
+                    "FROM pg_catalog.pg_namespace AS schema WHERE schema.oid = "
+                    f"{schema_oid})]::pg_catalog.text[]"
+                    if trigger_function_search_paths[function_name] == "target_schema"
+                    else "ARRAY['search_path=pg_catalog']::pg_catalog.text[]"
+                ),
             )
         )
         + ")"
@@ -1336,7 +1593,8 @@ def _target_trigger_contract_exact_for_revision_sql(
                         pg_catalog.convert_to(routine.prosrc, 'UTF8')
                     ),
                     'hex'
-                )::pg_catalog.text AS source_sha256
+                )::pg_catalog.text AS source_sha256,
+                routine.proconfig AS configuration
             FROM pg_catalog.pg_proc AS routine
             JOIN pg_catalog.pg_language AS language
               ON language.oid = routine.prolang
@@ -1347,15 +1605,12 @@ def _target_trigger_contract_exact_for_revision_sql(
               AND language.lanname = 'plpgsql'
               AND NOT routine.prosecdef
               AND pg_catalog.pg_get_function_identity_arguments(routine.oid) = ''
-              AND routine.proconfig = ARRAY[
-                  'search_path=' || (
-                      SELECT schema.nspname
-                      FROM pg_catalog.pg_namespace AS schema
-                      WHERE schema.oid = {schema_oid}
-                  )
-              ]::pg_catalog.text[]
         ),
-        expected_trigger_functions(function_name, source_sha256) AS (
+        expected_trigger_functions(
+            function_name,
+            source_sha256,
+            configuration
+        ) AS (
             VALUES {expected_function_rows}
         ),
         unapproved_trigger_functions AS (
@@ -1430,32 +1685,33 @@ def _target_trigger_contract_exact_sql(
                   'pg_catalog.trigger'::pg_catalog.regtype
         )
     )"""
-    legacy_revision = "20260713_0004"
-    latest_revision = "20260713_0005"
-    return f"""(
-        (
-            {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
-            AND {no_trigger_hooks}
-        ) OR (
-            {_phase2_profile_matches_sql(schema_oid, legacy_revision)}
+    revisions = (
+        set(TRIGGER_SPECS_BY_REVISION)
+        & set(TRIGGER_FUNCTIONS_BY_REVISION)
+        & set(TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION)
+        & set(TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION)
+        & set(FOREIGN_KEY_SPECS_BY_REVISION)
+        & set(PHASE2_RELATIONS_BY_REVISION)
+        & set(PHASE2_VIEW_SPECS_BY_REVISION)
+    )
+    revision_contracts = [
+        f"""(
+            {_phase2_profile_matches_sql(schema_oid, revision)}
             AND {
-        _target_trigger_contract_exact_for_revision_sql(
-            schema_oid,
-            migration_oid,
-            legacy_revision,
-        )
-    }
-        ) OR (
-            {_phase2_profile_matches_sql(schema_oid, latest_revision)}
-            AND {
-        _target_trigger_contract_exact_for_revision_sql(
-            schema_oid,
-            migration_oid,
-            latest_revision,
-        )
-    }
-        )
+            _target_trigger_contract_exact_for_revision_sql(
+                schema_oid,
+                migration_oid,
+                revision,
+            )
+        }
+        )"""
+        for revision in sorted(revisions)
+    ]
+    no_trigger_contract = f"""(
+        {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+        AND {no_trigger_hooks}
     )"""
+    return "(" + " OR ".join((no_trigger_contract, *revision_contracts)) + ")"
 
 
 def _runtime_relation_capability_sql(role_oid: str, relation_oid: str) -> str:
@@ -1489,6 +1745,109 @@ def _runtime_relation_capability_sql(role_oid: str, relation_oid: str) -> str:
     )"""
 
 
+def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
+    """Keep legacy audit writes while proving 0006 is SELECT-only."""
+
+    grant_option_denied = f"""(
+        NOT pg_catalog.has_table_privilege(
+            {role_oid}, audit_relation.oid, 'SELECT WITH GRANT OPTION'
+        )
+        AND NOT pg_catalog.has_table_privilege(
+            {role_oid}, audit_relation.oid, 'INSERT WITH GRANT OPTION'
+        )
+        AND NOT pg_catalog.has_table_privilege(
+            {role_oid}, audit_relation.oid, 'UPDATE WITH GRANT OPTION'
+        )
+        AND NOT pg_catalog.has_any_column_privilege(
+            {role_oid}, audit_relation.oid, 'SELECT WITH GRANT OPTION'
+        )
+        AND NOT pg_catalog.has_any_column_privilege(
+            {role_oid}, audit_relation.oid, 'INSERT WITH GRANT OPTION'
+        )
+        AND NOT pg_catalog.has_any_column_privilege(
+            {role_oid}, audit_relation.oid, 'UPDATE WITH GRANT OPTION'
+        )
+    )"""
+    greenfield_select_only = f"""NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS audit_relation
+        WHERE audit_relation.relnamespace = {schema_oid}
+          AND audit_relation.relname = 'audit_events'
+          AND (
+              audit_relation.relkind <> 'r'
+              OR NOT pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'SELECT'
+              )
+              OR NOT {grant_option_denied}
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'INSERT'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'UPDATE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'DELETE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'TRUNCATE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'REFERENCES'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'TRIGGER'
+              )
+              OR pg_catalog.has_any_column_privilege(
+                  {role_oid}, audit_relation.oid, 'INSERT'
+              )
+              OR pg_catalog.has_any_column_privilege(
+                  {role_oid}, audit_relation.oid, 'UPDATE'
+              )
+              OR pg_catalog.has_any_column_privilege(
+                  {role_oid}, audit_relation.oid, 'REFERENCES'
+              )
+          )
+    )"""
+    legacy_insert = f"""NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS audit_relation
+        WHERE audit_relation.relnamespace = {schema_oid}
+          AND audit_relation.relname = 'audit_events'
+          AND (
+              audit_relation.relkind <> 'r'
+              OR NOT pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'SELECT'
+              )
+              OR NOT pg_catalog.has_any_column_privilege(
+                  {role_oid}, audit_relation.oid, 'INSERT'
+              )
+              OR NOT {grant_option_denied}
+              OR pg_catalog.has_any_column_privilege(
+                  {role_oid}, audit_relation.oid, 'UPDATE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'UPDATE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'DELETE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'TRUNCATE'
+              )
+              OR pg_catalog.has_table_privilege(
+                  {role_oid}, audit_relation.oid, 'TRIGGER'
+              )
+          )
+    )"""
+    return f"""(
+        CASE
+            WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
+                THEN {greenfield_select_only}
+            ELSE {legacy_insert}
+        END
+    )"""
+
+
 def _target_execution_hooks_denied_sql(
     schema_oid: str,
     runtime_oid: str,
@@ -1499,12 +1858,8 @@ def _target_execution_hooks_denied_sql(
     return f"""(
     {_target_foreign_keys_exact_sql(schema_oid)}
     AND {_target_trigger_contract_exact_sql(schema_oid, migration_oid)}
+    AND {_security_definer_contract_sql(schema_oid, migration_oid)}
     AND NOT EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_proc AS routine
-        WHERE routine.pronamespace = {schema_oid}
-          AND routine.prosecdef
-        UNION ALL
         SELECT 1
         FROM pg_catalog.pg_inherits AS inheritance
         JOIN pg_catalog.pg_class AS child_relation
@@ -1861,14 +2216,6 @@ def _runtime_counterpart_privileges_sql(
                   )
               )
         )
-        AND NOT EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_proc AS routine
-            WHERE routine.pronamespace = {schema_oid}
-              AND pg_catalog.has_function_privilege(
-                  {role_oid}, routine.oid, 'EXECUTE'
-              )
-        )
     )"""
 
 
@@ -1961,13 +2308,16 @@ def _maintenance_counterpart_privileges_sql(
             SELECT 1
             FROM pg_catalog.pg_proc AS routine
             WHERE routine.pronamespace = {schema_oid}
-              AND (
-                  routine.proowner = {role_oid}
-                  OR pg_catalog.has_function_privilege(
-                      {role_oid}, routine.oid, 'EXECUTE'
-                  )
-              )
+              AND routine.proowner = {role_oid}
         )
+        AND {
+        _routine_execute_contract_sql(
+            schema_oid,
+            role_oid,
+            MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
+            allow_missing=allow_missing_access,
+        )
+    }
         AND NOT EXISTS (
             SELECT 1
             FROM pg_catalog.pg_type AS object_type
@@ -2416,6 +2766,13 @@ SELECT
         manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
     )
 }
+      AND {
+    _routine_execute_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
+    )
+}
       AS runtime_access_contract_exact,
     role.runtime_oid IS NOT NULL AND
       {
@@ -2425,6 +2782,14 @@ SELECT
         RUNTIME_RELATION_ACCESS,
         allow_missing=True,
         manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
+    )
+}
+      AND {
+    _routine_execute_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
+        allow_missing=True,
     )
 }
       AS runtime_access_contract_reconcilable,
@@ -2690,14 +3055,15 @@ SELECT
         WHERE schema_acl.privilege_type = 'CREATE'
           AND schema_acl.grantee IS DISTINCT FROM role.migration_oid
     ) AS schema_create_exclusive,
-    role.migration_oid IS NOT NULL AND NOT EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_proc AS routine
-        WHERE routine.pronamespace = role.schema_oid
-          AND pg_catalog.has_function_privilege(
-              role.current_oid, routine.oid, 'EXECUTE'
-          )
-    ) AS routines_execute_denied,
+    role.migration_oid IS NOT NULL AND
+      {
+    _routine_execute_contract_sql(
+        "role.schema_oid",
+        "role.current_oid",
+        RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
+    )
+}
+      AS routines_execute_denied,
     pg_catalog.current_setting('session_replication_role') = 'origin'
       AND NOT pg_catalog.has_parameter_privilege(
           role.current_oid, 'session_replication_role', 'SET'
@@ -2824,56 +3190,8 @@ SELECT
     ) AS dangerous_relation_privileges_denied,
     {_sequence_update_denied_sql("role.current_oid", "role.schema_oid")}
       AS sequence_update_denied,
-    NOT EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_class AS audit_relation
-        WHERE audit_relation.relnamespace = role.schema_oid
-          AND audit_relation.relname = 'audit_events'
-          AND (
-              audit_relation.relkind <> 'r'
-              OR NOT pg_catalog.has_table_privilege(
-                  role.current_oid, audit_relation.oid, 'SELECT'
-              )
-              OR NOT pg_catalog.has_any_column_privilege(
-                  role.current_oid, audit_relation.oid, 'INSERT'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid,
-                  audit_relation.oid,
-                  'SELECT WITH GRANT OPTION'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid,
-                  audit_relation.oid,
-                  'INSERT WITH GRANT OPTION'
-              )
-              OR pg_catalog.has_any_column_privilege(
-                  role.current_oid,
-                  audit_relation.oid,
-                  'SELECT WITH GRANT OPTION'
-              )
-              OR pg_catalog.has_any_column_privilege(
-                  role.current_oid,
-                  audit_relation.oid,
-                  'INSERT WITH GRANT OPTION'
-              )
-              OR pg_catalog.has_any_column_privilege(
-                  role.current_oid, audit_relation.oid, 'UPDATE'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid, audit_relation.oid, 'UPDATE'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid, audit_relation.oid, 'DELETE'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid, audit_relation.oid, 'TRUNCATE'
-              )
-              OR pg_catalog.has_table_privilege(
-                  role.current_oid, audit_relation.oid, 'TRIGGER'
-              )
-          )
-    ) AS audit_permissions_valid
+    {_runtime_audit_permissions_sql("role.current_oid", "role.schema_oid")}
+      AS audit_permissions_valid
 FROM role_context AS role
 """
 
@@ -3045,6 +3363,13 @@ SELECT
         "role.runtime_oid",
         RUNTIME_RELATION_ACCESS,
         manifests_by_revision=RUNTIME_RELATION_ACCESS_BY_REVISION,
+    )
+}
+      AND {
+    _routine_execute_contract_sql(
+        "role.schema_oid",
+        "role.runtime_oid",
+        RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
     )
 }
       AS runtime_access_contract_exact,

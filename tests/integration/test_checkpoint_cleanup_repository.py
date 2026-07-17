@@ -232,7 +232,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
     assert [candidate.thread_id for candidate in snapshot.candidates] == ["old-sent"]
     assert snapshot.candidates[0].updated_at.tzinfo is not None
-    assert snapshot.alembic_revision == "20260713_0005"
+    assert snapshot.alembic_revision == "20260716_0006"
     assert snapshot.checkpoint_revision == len(AsyncPostgresSaver.MIGRATIONS) - 1
     assert len(snapshot.database_fingerprint) == 64
     assert snapshot.database_timezone
@@ -251,7 +251,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
     ],
     ids=["0002-metadata", "0003-metadata", "0004-metadata", "0005-metadata"],
 )
-async def test_scan_metadata_allowlist_reports_stored_revision_value(
+async def test_scan_rejects_predecessor_business_revisions(
     checkpoint_schema,
     revision,
 ):
@@ -261,9 +261,11 @@ async def test_scan_metadata_allowlist_reports_stored_revision_value(
     )
     await _valid_thread(checkpoint_schema.dsn, f"compatible-{revision}")
 
-    snapshot = await _scan(checkpoint_schema.dsn)
+    with pytest.raises(CheckpointRepositoryError) as error:
+        await _scan(checkpoint_schema.dsn)
 
-    assert snapshot.alembic_revision == revision
+    assert error.value.code == "cleanup_schema_revision_mismatch"
+    assert str(error.value) == "cleanup_schema_revision_mismatch"
 
 
 @pytest.mark.parametrize(

@@ -72,6 +72,10 @@ def _same_lease_except_deadline(current: InboxLease, successor: object) -> bool:
         and successor.pipeline_name == current.pipeline_name
         and successor.generation == current.generation
         and successor.fencing_token == current.fencing_token
+        and successor.execution_epoch == current.execution_epoch
+        and successor.authority_epoch == current.authority_epoch
+        and successor.capability_hash == current.capability_hash
+        and successor.lease_session_id == current.lease_session_id
         and successor.lease_owner == current.lease_owner
         and successor.attempts == current.attempts
         and successor.event == current.event

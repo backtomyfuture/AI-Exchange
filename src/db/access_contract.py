@@ -8,6 +8,7 @@ from typing import Final
 
 PHASE2_DATABASE_REVISION: Final = "20260713_0004"
 SYNC_RECONCILIATION_DATABASE_REVISION: Final = "20260713_0005"
+GREENFIELD_DATABASE_REVISION: Final = "20260716_0006"
 PHASE2_RELATIONS: Final = (
     "audit_events",
     "emails",
@@ -25,6 +26,20 @@ PHASE2_RELATIONS_BY_REVISION: Final[dict[str, tuple[str, ...]]] = {
         "pipeline_command_receipts",
         "sync_cold_start_plans",
     ),
+    GREENFIELD_DATABASE_REVISION: (
+        "audit_events",
+        "emails",
+        "event_inbox",
+        "pipeline_command_receipts",
+        "pipeline_folder_scopes",
+        "pipeline_initializations",
+        "pipeline_ownership",
+        "pipeline_runtime_authority",
+        "pipeline_runtime_capabilities",
+        "pipeline_runtime_instances",
+        "sync_cold_start_plans",
+        "sync_cursors",
+    ),
 }
 
 
@@ -41,6 +56,16 @@ PHASE2_VIEW_SPECS_BY_REVISION: Final[dict[str, tuple[ViewSpec, ...]]] = {
     "20260710_0003": (),
     PHASE2_DATABASE_REVISION: (),
     SYNC_RECONCILIATION_DATABASE_REVISION: (
+        ViewSpec(
+            name="cold_start_command_receipts",
+            relation_kind="v",
+            check_option="CASCADED",
+            definition_sha256=(
+                "66461da92b70d58eaa079c2850896a42d920a4fbe7b78e0cb43474470f938b26"
+            ),
+        ),
+    ),
+    GREENFIELD_DATABASE_REVISION: (
         ViewSpec(
             name="cold_start_command_receipts",
             relation_kind="v",
@@ -702,6 +727,14 @@ class RelationAccess:
     delete: bool = False
 
 
+@dataclass(frozen=True)
+class RoutineAccess:
+    """One exact ``pg_get_function_identity_arguments`` execute grant."""
+
+    name: str
+    identity_arguments: str
+
+
 RUNTIME_RELATION_ACCESS: Final[dict[str, RelationAccess]] = {
     "alembic_version": RelationAccess(table_privileges=("SELECT",)),
     "emails_log": RelationAccess(
@@ -1001,6 +1034,25 @@ RUNTIME_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]]
             ),
         ),
     },
+    GREENFIELD_DATABASE_REVISION: {
+        "alembic_version": RelationAccess(table_privileges=("SELECT",)),
+        "emails_log": RelationAccess(table_privileges=("SELECT",)),
+        "checkpoints": RUNTIME_RELATION_ACCESS["checkpoints"],
+        "checkpoint_blobs": RUNTIME_RELATION_ACCESS["checkpoint_blobs"],
+        "checkpoint_writes": RUNTIME_RELATION_ACCESS["checkpoint_writes"],
+        "pipeline_ownership": RelationAccess(table_privileges=("SELECT",)),
+        "event_inbox": RelationAccess(table_privileges=("SELECT",)),
+        "sync_cursors": RelationAccess(table_privileges=("SELECT",)),
+        "emails": RelationAccess(table_privileges=("SELECT",)),
+        "audit_events": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_command_receipts": RelationAccess(table_privileges=("SELECT",)),
+        "sync_cold_start_plans": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_capabilities": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_initializations": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_folder_scopes": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_authority": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_instances": RelationAccess(table_privileges=("SELECT",)),
+    },
 }
 
 MAINTENANCE_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]] = {
@@ -1105,6 +1157,21 @@ MAINTENANCE_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAcces
             table_privileges=("SELECT", "INSERT"),
         ),
     },
+    GREENFIELD_DATABASE_REVISION: {
+        **MAINTENANCE_RELATION_ACCESS,
+        "pipeline_ownership": RelationAccess(table_privileges=("SELECT",)),
+        "event_inbox": RelationAccess(table_privileges=("SELECT",)),
+        "sync_cursors": RelationAccess(table_privileges=("SELECT",)),
+        "emails": RelationAccess(table_privileges=("SELECT",)),
+        "audit_events": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_command_receipts": RelationAccess(table_privileges=("SELECT",)),
+        "sync_cold_start_plans": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_capabilities": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_initializations": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_folder_scopes": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_authority": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_instances": RelationAccess(table_privileges=("SELECT",)),
+    },
 }
 
 AUDITOR_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]] = {
@@ -1117,6 +1184,218 @@ AUDITOR_RELATION_ACCESS_BY_REVISION: Final[dict[str, dict[str, RelationAccess]]]
             table_privileges=("SELECT",),
         ),
     },
+    GREENFIELD_DATABASE_REVISION: {
+        **AUDITOR_RELATION_ACCESS,
+        "pipeline_runtime_capabilities": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_initializations": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_authority": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_runtime_instances": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_ownership": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_command_receipts": RelationAccess(table_privileges=("SELECT",)),
+        "audit_events": RelationAccess(table_privileges=("SELECT",)),
+        "pipeline_folder_scopes": RelationAccess(
+            select_columns=(
+                "initialization_id",
+                "account_id",
+                "canonical_key",
+                "scope_hash",
+                "policy_manifest_hash",
+                "created_at",
+            )
+        ),
+        "event_inbox": RelationAccess(
+            select_columns=(
+                "id",
+                "account_id",
+                "source",
+                "raw_event_type",
+                "change_kind",
+                "dedupe_key",
+                "source_event_at",
+                "processing_policy",
+                "pipeline_name",
+                "generation",
+                "fencing_token",
+                "execution_epoch",
+                "authority_epoch",
+                "capability_hash",
+                "status",
+                "lease_owner",
+                "lease_session_id",
+                "lease_until",
+                "attempts",
+                "available_at",
+                "processing_started_at",
+                "effect_started_at",
+                "safe_error_code",
+                "received_at",
+                "updated_at",
+            )
+        ),
+        "emails": RelationAccess(
+            select_columns=(
+                "id",
+                "account_id",
+                "status",
+                "version",
+                "owner_generation",
+                "owner_fencing_token",
+                "owner_authority_epoch",
+                "owner_capability_hash",
+                "processing_inbox_id",
+                "processing_execution_epoch",
+                "create_seen_at",
+                "processing_started_at",
+                "source_deleted_at",
+                "external_effects_started_at",
+                "safe_error_code",
+                "is_read",
+                "is_read_refresh_required",
+                "created_at",
+                "updated_at",
+            )
+        ),
+    },
+}
+
+
+RUNTIME_ROUTINE_EXECUTE_BY_REVISION: Final[dict[str, tuple[RoutineAccess, ...]]] = {
+    "20260710_0002": (),
+    "20260710_0003": (),
+    PHASE2_DATABASE_REVISION: (),
+    SYNC_RECONCILIATION_DATABASE_REVISION: (),
+    GREENFIELD_DATABASE_REVISION: (
+        RoutineAccess(
+            "greenfield_get_runtime_authority",
+            "p_account_id bigint",
+        ),
+        RoutineAccess(
+            "greenfield_register_web_instance",
+            "p_account_id bigint, p_instance_id text, p_session_id uuid, "
+            "p_expected_authority_epoch bigint, p_expected_authority_version "
+            "bigint, p_schema_revision text, p_protocol_version bigint, "
+            "p_build_id text, p_config_hash text, p_capability_hash text, "
+            "p_lease_seconds bigint",
+        ),
+        RoutineAccess(
+            "greenfield_heartbeat_web_instance",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_expected_authority_epoch bigint, "
+            "p_expected_capability_hash text, p_accepted_count bigint, "
+            "p_rejected_count bigint, p_lease_seconds bigint",
+        ),
+        RoutineAccess(
+            "greenfield_drain_web_instance",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_expected_authority_epoch bigint, "
+            "p_expected_capability_hash text",
+        ),
+        RoutineAccess(
+            "greenfield_insert_webhook_event",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_external_email_id text, "
+            "p_folder_key text, p_raw_event_type text, p_change_kind text, "
+            "p_dedupe_key text, p_source_version text, "
+            "p_source_event_at timestamp with time zone, p_payload jsonb, "
+            "p_processing_policy text",
+        ),
+        RoutineAccess(
+            "greenfield_claim_inbox",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_lease_owner text, "
+            "p_limit bigint, p_lease_seconds bigint",
+        ),
+        RoutineAccess(
+            "greenfield_renew_inbox",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_inbox_id uuid, "
+            "p_execution_epoch bigint, p_lease_owner text, p_attempts bigint, "
+            "p_lease_seconds bigint",
+        ),
+        RoutineAccess(
+            "greenfield_apply_email_event",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_inbox_id uuid, "
+            "p_execution_epoch bigint, p_expected_email_version bigint",
+        ),
+        RoutineAccess(
+            "greenfield_begin_inbox_effect",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_inbox_id uuid, "
+            "p_execution_epoch bigint, p_attempts bigint",
+        ),
+        RoutineAccess(
+            "greenfield_finish_inbox",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_inbox_id uuid, "
+            "p_execution_epoch bigint, p_attempts bigint, p_completion jsonb",
+        ),
+        RoutineAccess(
+            "greenfield_fail_inbox",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_inbox_id uuid, "
+            "p_execution_epoch bigint, p_attempts bigint, "
+            "p_safe_error_code text, p_safe_error_summary text",
+        ),
+        RoutineAccess(
+            "greenfield_reap_inbox",
+            "p_account_id bigint, p_session_id uuid, "
+            "p_expected_lease_version bigint, p_limit bigint",
+        ),
+    ),
+}
+
+MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION: Final[dict[str, tuple[RoutineAccess, ...]]] = {
+    "20260710_0002": (),
+    "20260710_0003": (),
+    PHASE2_DATABASE_REVISION: (),
+    SYNC_RECONCILIATION_DATABASE_REVISION: (),
+    GREENFIELD_DATABASE_REVISION: (
+        RoutineAccess(
+            "greenfield_initialize_runtime",
+            "p_account_id bigint, p_capability_hash text, p_predecessor_hash "
+            "text, p_capability_stage text, p_schema_revision text, "
+            "p_schema_digest text, p_protocol_version bigint, "
+            "p_minimum_build_id text, p_config_hash text, p_adapter_hash text, "
+            "p_policy_manifest_hash text, p_evidence_manifest_hash text, "
+            "p_policy_manifest_json text, p_policy_scope_count bigint, "
+            "p_actor text, p_reason text, p_idempotency_key text, "
+            "p_canonical_payload_hash text",
+        ),
+        RoutineAccess(
+            "greenfield_get_runtime_authority",
+            "p_account_id bigint",
+        ),
+        RoutineAccess(
+            "greenfield_pause_runtime",
+            "p_account_id bigint, p_expected_authority_epoch bigint, "
+            "p_expected_version bigint, p_expected_capability_hash text, "
+            "p_actor text, p_reason text, p_idempotency_key text, "
+            "p_canonical_payload_hash text",
+        ),
+        RoutineAccess(
+            "greenfield_resume_ingress",
+            "p_account_id bigint, p_expected_authority_epoch bigint, "
+            "p_expected_version bigint, p_expected_capability_hash text, "
+            "p_actor text, p_reason text, p_idempotency_key text, "
+            "p_canonical_payload_hash text",
+        ),
+        RoutineAccess(
+            "greenfield_requeue_inbox",
+            "p_account_id bigint, p_inbox_id uuid, "
+            "p_expected_execution_epoch bigint, p_expected_email_version "
+            "bigint, p_actor text, p_reason text, p_idempotency_key text, "
+            "p_canonical_payload_hash text",
+        ),
+    ),
+}
+
+AUDITOR_ROUTINE_EXECUTE_BY_REVISION: Final[dict[str, tuple[RoutineAccess, ...]]] = {
+    "20260710_0002": (),
+    "20260710_0003": (),
+    PHASE2_DATABASE_REVISION: (),
+    SYNC_RECONCILIATION_DATABASE_REVISION: (),
+    GREENFIELD_DATABASE_REVISION: (),
 }
 
 
@@ -1184,70 +1463,284 @@ FOREIGN_KEY_SPECS: Final = (
     ),
 )
 
+_SYNC_RECONCILIATION_FOREIGN_KEY_SPECS: Final = (
+    *FOREIGN_KEY_SPECS,
+    ForeignKeySpec(
+        "fk_sync_cold_start_plan_ownership",
+        "sync_cold_start_plans",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "pipeline_ownership",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_sync_cold_start_plan_active_cursor",
+        "sync_cold_start_plans",
+        (
+            "cursor_binding_plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "s",
+        update_action="a",
+        deferrable=True,
+        initially_deferred=True,
+    ),
+    ForeignKeySpec(
+        "fk_sync_cursors_cold_start_plan",
+        "sync_cursors",
+        (
+            "cold_start_plan_id",
+            "account_id",
+            "folder_key",
+            "cursor",
+            "version",
+            "cold_start_plan_state",
+        ),
+        "sync_cold_start_plans",
+        (
+            "plan_id",
+            "account_id",
+            "folder_key",
+            "apply_cursor",
+            "apply_cursor_version",
+            "state",
+        ),
+        "s",
+        update_action="a",
+        deferrable=True,
+        initially_deferred=True,
+    ),
+)
+
+
+_GREENFIELD_RETAINED_FOREIGN_KEYS: Final = frozenset(
+    {
+        "fk_audit_events_email",
+        "fk_emails_pipeline_ownership",
+        "fk_event_inbox_pipeline_ownership",
+        "fk_sync_cold_start_plan_active_cursor",
+        "fk_sync_cold_start_plan_ownership",
+        "fk_sync_cursors_cold_start_plan",
+    }
+)
+_GREENFIELD_FOREIGN_KEY_SPECS: Final = (
+    *(
+        spec
+        for spec in _SYNC_RECONCILIATION_FOREIGN_KEY_SPECS
+        if spec.name in _GREENFIELD_RETAINED_FOREIGN_KEYS
+    ),
+    ForeignKeySpec(
+        "fk_emails_processing_inbox",
+        "emails",
+        (
+            "processing_inbox_id",
+            "account_id",
+            "external_email_id",
+            "owner_generation",
+            "owner_fencing_token",
+            "processing_execution_epoch",
+            "owner_authority_epoch",
+            "owner_capability_hash",
+        ),
+        "event_inbox",
+        (
+            "id",
+            "account_id",
+            "external_email_id",
+            "generation",
+            "fencing_token",
+            "execution_epoch",
+            "authority_epoch",
+            "capability_hash",
+        ),
+        "s",
+        update_action="a",
+        deferrable=True,
+        initially_deferred=True,
+    ),
+    ForeignKeySpec(
+        "fk_emails_runtime_capability",
+        "emails",
+        ("owner_capability_hash",),
+        "pipeline_runtime_capabilities",
+        ("capability_hash",),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_event_inbox_lease_session",
+        "event_inbox",
+        (
+            "lease_session_id",
+            "account_id",
+            "generation",
+            "fencing_token",
+            "authority_epoch",
+            "capability_hash",
+        ),
+        "pipeline_runtime_instances",
+        (
+            "session_id",
+            "account_id",
+            "generation",
+            "fencing_token",
+            "authority_epoch",
+            "capability_hash",
+        ),
+        "s",
+    ),
+    ForeignKeySpec(
+        "fk_event_inbox_runtime_capability",
+        "event_inbox",
+        ("capability_hash",),
+        "pipeline_runtime_capabilities",
+        ("capability_hash",),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_folder_scopes_initialization",
+        "pipeline_folder_scopes",
+        ("initialization_id", "account_id", "policy_manifest_hash"),
+        "pipeline_initializations",
+        ("initialization_id", "account_id", "policy_manifest_hash"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_initializations_capability",
+        "pipeline_initializations",
+        (
+            "capability_hash",
+            "capability_stage_ordinal",
+            "policy_manifest_hash",
+        ),
+        "pipeline_runtime_capabilities",
+        ("capability_hash", "stage_ordinal", "policy_manifest_hash"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_initializations_ownership",
+        "pipeline_initializations",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "pipeline_ownership",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_initializations_receipt",
+        "pipeline_initializations",
+        (
+            "command_receipt_id",
+            "account_id",
+            "receipt_command_name",
+            "authority_epoch",
+        ),
+        "pipeline_command_receipts",
+        ("id", "account_id", "command_name", "authority_epoch"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_runtime_authority_capability",
+        "pipeline_runtime_authority",
+        (
+            "capability_hash",
+            "capability_stage_ordinal",
+            "schema_revision",
+            "protocol_version",
+            "build_id",
+            "config_hash",
+            "policy_manifest_hash",
+        ),
+        "pipeline_runtime_capabilities",
+        (
+            "capability_hash",
+            "stage_ordinal",
+            "schema_revision",
+            "protocol_version",
+            "minimum_build_id",
+            "config_hash",
+            "policy_manifest_hash",
+        ),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_runtime_authority_initialization",
+        "pipeline_runtime_authority",
+        (
+            "initialization_id",
+            "account_id",
+            "generation",
+            "fencing_token",
+            "pipeline_name",
+            "policy_manifest_hash",
+        ),
+        "pipeline_initializations",
+        (
+            "initialization_id",
+            "account_id",
+            "generation",
+            "fencing_token",
+            "pipeline_name",
+            "policy_manifest_hash",
+        ),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_runtime_authority_ownership",
+        "pipeline_runtime_authority",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "pipeline_ownership",
+        ("account_id", "generation", "fencing_token", "pipeline_name"),
+        "f",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_runtime_capabilities_predecessor",
+        "pipeline_runtime_capabilities",
+        ("predecessor_hash", "predecessor_stage_ordinal"),
+        "pipeline_runtime_capabilities",
+        ("capability_hash", "stage_ordinal"),
+        "s",
+    ),
+    ForeignKeySpec(
+        "fk_pipeline_runtime_instances_capability",
+        "pipeline_runtime_instances",
+        (
+            "capability_hash",
+            "capability_stage_ordinal",
+            "schema_revision",
+            "protocol_version",
+            "build_id",
+            "config_hash",
+        ),
+        "pipeline_runtime_capabilities",
+        (
+            "capability_hash",
+            "stage_ordinal",
+            "schema_revision",
+            "protocol_version",
+            "minimum_build_id",
+            "config_hash",
+        ),
+        "f",
+    ),
+)
+
 FOREIGN_KEY_SPECS_BY_REVISION: Final[dict[str, tuple[ForeignKeySpec, ...]]] = {
     "20260710_0003": FOREIGN_KEY_SPECS,
     PHASE2_DATABASE_REVISION: FOREIGN_KEY_SPECS,
-    SYNC_RECONCILIATION_DATABASE_REVISION: (
-        *FOREIGN_KEY_SPECS,
-        ForeignKeySpec(
-            "fk_sync_cold_start_plan_ownership",
-            "sync_cold_start_plans",
-            ("account_id", "generation", "fencing_token", "pipeline_name"),
-            "pipeline_ownership",
-            ("account_id", "generation", "fencing_token", "pipeline_name"),
-            "f",
-        ),
-        ForeignKeySpec(
-            "fk_sync_cold_start_plan_active_cursor",
-            "sync_cold_start_plans",
-            (
-                "cursor_binding_plan_id",
-                "account_id",
-                "folder_key",
-                "apply_cursor",
-                "apply_cursor_version",
-                "state",
-            ),
-            "sync_cursors",
-            (
-                "cold_start_plan_id",
-                "account_id",
-                "folder_key",
-                "cursor",
-                "version",
-                "cold_start_plan_state",
-            ),
-            "s",
-            update_action="a",
-            deferrable=True,
-            initially_deferred=True,
-        ),
-        ForeignKeySpec(
-            "fk_sync_cursors_cold_start_plan",
-            "sync_cursors",
-            (
-                "cold_start_plan_id",
-                "account_id",
-                "folder_key",
-                "cursor",
-                "version",
-                "cold_start_plan_state",
-            ),
-            "sync_cold_start_plans",
-            (
-                "plan_id",
-                "account_id",
-                "folder_key",
-                "apply_cursor",
-                "apply_cursor_version",
-                "state",
-            ),
-            "s",
-            update_action="a",
-            deferrable=True,
-            initially_deferred=True,
-        ),
-    ),
+    SYNC_RECONCILIATION_DATABASE_REVISION: (_SYNC_RECONCILIATION_FOREIGN_KEY_SPECS),
+    GREENFIELD_DATABASE_REVISION: _GREENFIELD_FOREIGN_KEY_SPECS,
 }
 
 
@@ -1337,6 +1830,106 @@ TRIGGER_SPECS_BY_REVISION: Final[dict[str, tuple[TriggerSpec, ...]]] = {
             34,
         ),
     ),
+    GREENFIELD_DATABASE_REVISION: (
+        *(
+            spec
+            for spec in TRIGGER_SPECS
+            if spec.name
+            in {
+                "trg_audit_events_guard_row",
+                "trg_audit_events_guard_truncate",
+                "trg_pipeline_ownership_guard_row",
+                "trg_pipeline_ownership_guard_truncate",
+            }
+        ),
+        TriggerSpec(
+            "trg_pipeline_command_receipts_guard_row",
+            "pipeline_command_receipts",
+            "reject_pipeline_command_receipts_mutation",
+            27,
+        ),
+        TriggerSpec(
+            "trg_pipeline_command_receipts_guard_truncate",
+            "pipeline_command_receipts",
+            "reject_pipeline_command_receipts_mutation",
+            34,
+        ),
+        TriggerSpec(
+            "trg_emails_runtime_identity",
+            "emails",
+            "guard_emails_runtime_identity",
+            21,
+            is_constraint=True,
+            is_deferrable=True,
+            is_initially_deferred=True,
+        ),
+        TriggerSpec(
+            "trg_event_inbox_runtime_identity",
+            "event_inbox",
+            "guard_event_inbox_runtime_identity",
+            23,
+        ),
+        TriggerSpec(
+            "trg_pipeline_folder_scopes_guard_row",
+            "pipeline_folder_scopes",
+            "reject_pipeline_folder_scopes_mutation",
+            31,
+        ),
+        TriggerSpec(
+            "trg_pipeline_folder_scopes_guard_truncate",
+            "pipeline_folder_scopes",
+            "reject_pipeline_folder_scopes_mutation",
+            34,
+        ),
+        TriggerSpec(
+            "trg_pipeline_initializations_guard_row",
+            "pipeline_initializations",
+            "reject_pipeline_initializations_mutation",
+            31,
+        ),
+        TriggerSpec(
+            "trg_pipeline_initializations_guard_truncate",
+            "pipeline_initializations",
+            "reject_pipeline_initializations_mutation",
+            34,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_authority_guard_row",
+            "pipeline_runtime_authority",
+            "guard_pipeline_runtime_authority",
+            31,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_authority_guard_truncate",
+            "pipeline_runtime_authority",
+            "guard_pipeline_runtime_authority",
+            34,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_capabilities_guard_row",
+            "pipeline_runtime_capabilities",
+            "reject_pipeline_runtime_capabilities_mutation",
+            27,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_capabilities_guard_truncate",
+            "pipeline_runtime_capabilities",
+            "reject_pipeline_runtime_capabilities_mutation",
+            34,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_instances_guard_row",
+            "pipeline_runtime_instances",
+            "guard_pipeline_runtime_instances",
+            31,
+        ),
+        TriggerSpec(
+            "trg_pipeline_runtime_instances_guard_truncate",
+            "pipeline_runtime_instances",
+            "guard_pipeline_runtime_instances",
+            34,
+        ),
+    ),
 }
 
 TRIGGER_FUNCTIONS: Final = tuple(sorted({spec.function for spec in TRIGGER_SPECS}))
@@ -1371,6 +1964,63 @@ TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION: Final[dict[str, dict[str, str]]] = {
             "2a5ebd74102b1adf35afc2bf49d0a2317b867c5f57c7d0080361826f28b97f16"
         ),
     },
+    GREENFIELD_DATABASE_REVISION: {
+        "guard_emails_runtime_identity": (
+            "7bc574d299fa3bc6f2ad10d027776f53e24473d77a2edac35cc587d69d5452e1"
+        ),
+        "guard_event_inbox_runtime_identity": (
+            "f314df8f1cdd5d1c67160c14243e7da906f84749f17a6a59eeba7ba76e42f576"
+        ),
+        "guard_pipeline_ownership": (
+            "c898a988c2bfca60837cda5ce37ef8cdb00fd12312c312b3ceecd90b3356fc5c"
+        ),
+        "guard_pipeline_runtime_authority": (
+            "9ce80deea362439e39fe9f02739145042b40d553f06ca689dd79e41ecb2fe059"
+        ),
+        "guard_pipeline_runtime_instances": (
+            "20feb0f127036518702fd6d3ea4d13575a36fca70942109796643a1431b34f6d"
+        ),
+        "reject_audit_events_mutation": (
+            "5ba2612faea4adf49b92395f87102f166df17b65aa64bf3f42ab5172bf375c5b"
+        ),
+        "reject_pipeline_command_receipts_mutation": (
+            "2a5ebd74102b1adf35afc2bf49d0a2317b867c5f57c7d0080361826f28b97f16"
+        ),
+        "reject_pipeline_folder_scopes_mutation": (
+            "4f0c3e20e0f837d713b3bc89b536b4bf4421b736ebe81961daa4245dd5e1e044"
+        ),
+        "reject_pipeline_initializations_mutation": (
+            "d74a5146da3ed09d01bde3725343ee536f64d6ca151b79fa0be802fd30d5bbea"
+        ),
+        "reject_pipeline_runtime_capabilities_mutation": (
+            "4f451f9f20e5538a7bd18117b7cd207474350055e2baa20f9595f38f11b20461"
+        ),
+    },
+}
+
+# Trigger routines created with ``SET search_path FROM CURRENT`` are bound to
+# the deployment target schema.  Greenfield guards use ``pg_catalog`` instead;
+# keep that distinction revisioned so the role preflight can prove it exactly.
+TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION: Final[dict[str, dict[str, str]]] = {
+    revision: {
+        name: (
+            "pg_catalog"
+            if revision == GREENFIELD_DATABASE_REVISION
+            and name
+            in {
+                "guard_emails_runtime_identity",
+                "guard_event_inbox_runtime_identity",
+                "guard_pipeline_runtime_authority",
+                "guard_pipeline_runtime_instances",
+                "reject_pipeline_folder_scopes_mutation",
+                "reject_pipeline_initializations_mutation",
+                "reject_pipeline_runtime_capabilities_mutation",
+            }
+            else "target_schema"
+        )
+        for name in functions
+    }
+    for revision, functions in TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION.items()
 }
 
 TRIGGER_FUNCTIONS_BY_REVISION: Final[dict[str, tuple[str, ...]]] = {

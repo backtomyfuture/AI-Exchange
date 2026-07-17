@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import version as package_version
@@ -16,10 +17,14 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import sql
 
 from src.db.access_contract import (
+    AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
     AUDITOR_RELATION_ACCESS_BY_REVISION,
+    MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
     MAINTENANCE_RELATION_ACCESS_BY_REVISION,
+    RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
     RUNTIME_RELATION_ACCESS_BY_REVISION,
     RelationAccess,
+    RoutineAccess,
 )
 from src.db.migration_settings import load_migration_settings
 from src.db.roles import require_migration_database_role
@@ -30,6 +35,16 @@ from src.db.schema_contract import require_database_schema_contract
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_CONFIG_PATH = PROJECT_ROOT / "alembic.ini"
+_ROUTINE_NAME = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z", flags=re.ASCII)
+_ROUTINE_IDENTITY_ARGUMENTS = re.compile(
+    r"(?:[a-z_][a-z0-9_]*[ ]+)?"
+    r"(?:(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*(?:\[\])?"
+    r"|timestamp with time zone)"
+    r"(?:,[ ]+(?:[a-z_][a-z0-9_]*[ ]+)?"
+    r"(?:(?:[a-z_][a-z0-9_]*\.)?[a-z_][a-z0-9_]*(?:\[\])?"
+    r"|timestamp with time zone))*\Z",
+    flags=re.ASCII,
+)
 _CHECKPOINT_PACKAGE_NAME = "langgraph-checkpoint-postgres"
 _CHECKPOINT_PACKAGE_VERSION = "3.0.4"
 _CHECKPOINT_MIGRATION_COUNT = 10
@@ -305,6 +320,84 @@ async def _grant_relation_access(
                 )
 
 
+def _validate_routine_manifest(manifest: tuple[RoutineAccess, ...]) -> None:
+    identities: set[tuple[str, str]] = set()
+    for spec in manifest:
+        if type(spec) is not RoutineAccess:
+            raise RuntimeError("Database routine access contract is invalid")
+        identity = (spec.name, spec.identity_arguments)
+        if (
+            type(spec.name) is not str
+            or type(spec.identity_arguments) is not str
+            or _ROUTINE_NAME.fullmatch(spec.name) is None
+            or _ROUTINE_IDENTITY_ARGUMENTS.fullmatch(spec.identity_arguments) is None
+            or identity in identities
+        ):
+            raise RuntimeError("Database routine access contract is invalid")
+        identities.add(identity)
+
+
+async def _revoke_routine_access(
+    conn: psycopg.AsyncConnection,
+    *,
+    target_schema: str,
+    roles: tuple[str, ...],
+) -> None:
+    schema = sql.Identifier(target_schema)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            sql.SQL(
+                "REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM PUBLIC"
+            ).format(schema)
+        )
+        for role in roles:
+            await cursor.execute(
+                sql.SQL(
+                    "REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {} FROM {}"
+                ).format(schema, sql.Identifier(role))
+            )
+
+
+async def _grant_routine_access(
+    conn: psycopg.AsyncConnection,
+    *,
+    target_schema: str,
+    role: str,
+    manifest: tuple[RoutineAccess, ...],
+) -> None:
+    _validate_routine_manifest(manifest)
+    if not manifest:
+        return
+
+    expected = {(spec.name, spec.identity_arguments) for spec in manifest}
+    names = sorted({spec.name for spec in manifest})
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT routine.proname::pg_catalog.text, "
+            "pg_catalog.pg_get_function_identity_arguments(routine.oid) "
+            "FROM pg_catalog.pg_proc AS routine "
+            "JOIN pg_catalog.pg_namespace AS routine_schema "
+            "ON routine_schema.oid = routine.pronamespace "
+            "WHERE routine_schema.nspname = %s "
+            "AND routine.proname = ANY(%s::pg_catalog.text[]) "
+            "ORDER BY routine.proname, routine.oid",
+            (target_schema, names),
+        )
+        actual = {(str(row[0]), str(row[1])) for row in await cursor.fetchall()}
+        if actual != expected:
+            raise RuntimeError("Database routine access contract is unavailable")
+
+        for spec in manifest:
+            await cursor.execute(
+                sql.SQL("GRANT EXECUTE ON FUNCTION {}.{}({}) TO {}").format(
+                    sql.Identifier(target_schema),
+                    sql.Identifier(spec.name),
+                    sql.SQL(spec.identity_arguments),
+                    sql.Identifier(role),
+                )
+            )
+
+
 async def _apply_database_access_contract(
     dsn: str,
     *,
@@ -319,6 +412,9 @@ async def _apply_database_access_contract(
         selected_revision not in RUNTIME_RELATION_ACCESS_BY_REVISION
         or selected_revision not in MAINTENANCE_RELATION_ACCESS_BY_REVISION
         or selected_revision not in AUDITOR_RELATION_ACCESS_BY_REVISION
+        or selected_revision not in RUNTIME_ROUTINE_EXECUTE_BY_REVISION
+        or selected_revision not in MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION
+        or selected_revision not in AUDITOR_ROUTINE_EXECUTE_BY_REVISION
     ):
         raise RuntimeError("Database access contract revision is unavailable")
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
@@ -336,6 +432,26 @@ async def _apply_database_access_contract(
                 role=role,
             )
             await _grant_relation_access(
+                conn,
+                target_schema=target_schema,
+                role=role,
+                manifest=manifest,
+            )
+        routine_manifests = (
+            (runtime_role, RUNTIME_ROUTINE_EXECUTE_BY_REVISION[selected_revision]),
+            (
+                maintenance_role,
+                MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[selected_revision],
+            ),
+            (auditor_role, AUDITOR_ROUTINE_EXECUTE_BY_REVISION[selected_revision]),
+        )
+        await _revoke_routine_access(
+            conn,
+            target_schema=target_schema,
+            roles=tuple(role for role, _manifest in routine_manifests),
+        )
+        for role, manifest in routine_manifests:
+            await _grant_routine_access(
                 conn,
                 target_schema=target_schema,
                 role=role,
