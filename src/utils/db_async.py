@@ -19,6 +19,21 @@ from src.storage import ContentRef
 
 logger = logging.getLogger(__name__)
 
+CAS_ONLY_EMAIL_STATUSES = frozenset(
+    {"approved", "sending", "send_unknown", "sent"}
+)
+EMAIL_STATUS_CAS_TRANSITIONS = frozenset(
+    {
+        ("waiting_approval", "approved"),
+        ("waiting_approval", "rejected"),
+        ("waiting_approval", "saving_draft"),
+        ("approved", "sending"),
+        ("sending", "sent"),
+        ("saving_draft", "draft_saved"),
+        ("recovering", "error"),
+    }
+)
+
 
 def normalize_timestamp_input(value: Any) -> Any:
     """Normalize timestamp input before DB write."""
@@ -340,6 +355,14 @@ class AsyncDatabaseManager:
             "approver_user_id", "rejection_reason",
         }
         JSONB_COLUMNS = {"classification", "routing_log", "active_skills"}
+        if status is not None and (
+            not isinstance(status, str)
+            or not status.strip()
+            or len(status.encode("utf-8")) > 64
+        ):
+            raise ValueError("invalid_email_status")
+        if status in CAS_ONLY_EMAIL_STATUSES:
+            raise ValueError("status_requires_compare_and_set")
         try:
             async with self.get_connection() as conn:
                 update_fields = ["updated_at = CURRENT_TIMESTAMP"]
@@ -364,7 +387,17 @@ class AsyncDatabaseManager:
                     return
 
                 params.append(email_id)
-                query = f"UPDATE emails_log SET {', '.join(update_fields)} WHERE id = %s"
+                if status is not None:
+                    params.append(sorted(CAS_ONLY_EMAIL_STATUSES))
+                    query = (
+                        f"UPDATE emails_log SET {', '.join(update_fields)} "
+                        "WHERE id = %s AND status <> ALL(%s)"
+                    )
+                else:
+                    query = (
+                        f"UPDATE emails_log SET {', '.join(update_fields)} "
+                        "WHERE id = %s"
+                    )
 
                 async with conn.cursor() as cur:
                     await cur.execute(query, tuple(params))
@@ -400,6 +433,21 @@ class AsyncDatabaseManager:
         target: str,
     ) -> bool:
         """Atomically transition an email when its current status is expected."""
+        if (
+            not isinstance(email_id, str)
+            or not email_id.strip()
+            or type(expected) is not frozenset
+            or len(expected) != 1
+            or not isinstance(target, str)
+            or not target
+        ):
+            raise ValueError("invalid_email_status_transition")
+        source = next(iter(expected))
+        if (
+            not isinstance(source, str)
+            or (source, target) not in EMAIL_STATUS_CAS_TRANSITIONS
+        ):
+            raise ValueError("email_status_transition_not_allowed")
         try:
             async with self.get_connection() as conn:
                 async with conn.cursor() as cur:
@@ -435,6 +483,7 @@ class AsyncDatabaseManager:
             or not immediate
             or not stale
             or any(not isinstance(status, str) or not status for status in immediate | stale)
+            or bool((immediate | stale) & CAS_ONLY_EMAIL_STATUSES)
             or isinstance(stale_after_seconds, bool)
             or not isinstance(stale_after_seconds, int)
             or stale_after_seconds <= 0
@@ -522,6 +571,51 @@ class AsyncDatabaseManager:
                 message="manual-review transition failed",
             ) from None
 
+    async def compare_and_set_send_unknown(
+        self,
+        email_id: str,
+        *,
+        error_code: str,
+    ) -> bool:
+        """Quarantine one started send without making it retryable."""
+        if (
+            not isinstance(email_id, str)
+            or not email_id.strip()
+            or not isinstance(error_code, str)
+            or not error_code
+            or len(error_code.encode("utf-8")) > 256
+        ):
+            raise ValueError("invalid_send_unknown_transition")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE emails_log
+                        SET status = %s,
+                            error_message = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND status = %s
+                        """,
+                        (
+                            "send_unknown",
+                            error_code,
+                            email_id,
+                            "sending",
+                        ),
+                    )
+                    return cur.rowcount == 1
+        except psycopg.Error as exc:
+            logger.error(
+                "Send-unknown transition failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="compare_and_set_send_unknown",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="send-unknown transition failed",
+            ) from None
+
     async def recover_incomplete_approval_states(self) -> int:
         """Fail closed for approval/send transitions left ambiguous at restart."""
         try:
@@ -530,7 +624,10 @@ class AsyncDatabaseManager:
                     await cur.execute(
                         """
                         UPDATE emails_log
-                        SET status = %s,
+                        SET status = CASE status
+                                WHEN %s THEN %s
+                                ELSE %s
+                            END,
                             error_message = CASE status
                                 WHEN %s THEN %s
                                 WHEN %s THEN %s
@@ -542,6 +639,8 @@ class AsyncDatabaseManager:
                         WHERE status = ANY(%s)
                         """,
                         (
+                            "sending",
+                            "send_unknown",
                             "manual_review",
                             "approved",
                             "approval_handoff_incomplete",

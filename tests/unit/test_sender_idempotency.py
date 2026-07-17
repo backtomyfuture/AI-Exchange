@@ -11,6 +11,7 @@ import pytest
 from src.graph.dependencies import GraphDependencies
 from src.graph.state_factory import build_initial_graph_state
 from src.domain.errors import DatabaseOperationError
+from src.domain.send_result import ExchangeSendResult
 from src.nodes.sender import send_final_email
 from src.storage import ContentRef
 
@@ -109,6 +110,24 @@ class LockBackedFakeDB:
             )
             return won
 
+    async def compare_and_set_send_unknown(self, email_id, *, error_code):
+        async with self._lock:
+            before = self.status
+            won = before == "sending" and "send_unknown" not in self.fail_targets
+            if won:
+                self.status = "send_unknown"
+                self.error_message = error_code
+            self.transitions.append(
+                {
+                    "email_id": email_id,
+                    "expected": frozenset({"sending"}),
+                    "target": "send_unknown",
+                    "before": before,
+                    "won": won,
+                }
+            )
+            return won
+
     async def update_status(self, email_id, status, **kwargs):
         # Kept only so the pre-Task-8 implementation fails assertions instead
         # of crashing because an old non-CAS method is absent.
@@ -166,11 +185,21 @@ def _runtime(*, status="approved", remote_result=True, fail_targets=()):
         reply = AsyncMock(side_effect=remote_result)
         forward = AsyncMock(side_effect=remote_result)
     else:
-        reply = AsyncMock(return_value=remote_result)
-        forward = AsyncMock(return_value=remote_result)
+        typed_result = (
+            ExchangeSendResult.sent()
+            if remote_result is True
+            else ExchangeSendResult.unknown()
+        )
+        reply = AsyncMock(return_value=typed_result)
+        forward = AsyncMock(return_value=typed_result)
     db = LockBackedFakeDB(status, fail_targets=fail_targets)
     ctx = SimpleNamespace(
-        exchange_client=SimpleNamespace(reply_email=reply, forward_email=forward),
+        exchange_client=SimpleNamespace(
+            reply_email_result=reply,
+            forward_email_result=forward,
+            reply_email=reply,
+            forward_email=forward,
+        ),
         db_manager=db,
         email_processor=SimpleNamespace(process_sent_email=MagicMock()),
     )
@@ -199,14 +228,14 @@ async def test_concurrent_sender_invocations_make_one_remote_call(action):
         )
 
     selected_remote = (
-        ctx.exchange_client.forward_email
+        ctx.exchange_client.forward_email_result
         if action == "forward"
-        else ctx.exchange_client.reply_email
+        else ctx.exchange_client.reply_email_result
     )
     other_remote = (
-        ctx.exchange_client.reply_email
+        ctx.exchange_client.reply_email_result
         if action == "forward"
-        else ctx.exchange_client.forward_email
+        else ctx.exchange_client.forward_email_result
     )
     assert selected_remote.await_count == 1
     other_remote.assert_not_awaited()
@@ -314,11 +343,28 @@ async def test_ambiguous_remote_outcome_moves_to_manual_and_is_not_retried(
 
     _assert_manual_delta(first, code="send_outcome_unknown")
     assert second["next_step"] == "end"
-    assert db.status == "manual_review"
+    assert db.status == "send_unknown"
     assert db.error_message == "send_outcome_unknown"
     assert ctx.exchange_client.reply_email.await_count == 1
     ctx.exchange_client.forward_email.assert_not_awaited()
     ctx.email_processor.process_sent_email.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_send_is_quarantined_before_cancellation_propagates():
+    dependencies, ctx, db = _runtime(remote_result=asyncio.CancelledError())
+    state = _state()
+
+    with patch("src.init_app.get_app_context", return_value=ctx):
+        with pytest.raises(asyncio.CancelledError):
+            await send_final_email(deepcopy(state), dependencies)
+        second = await send_final_email(deepcopy(state), dependencies)
+
+    assert db.status == "send_unknown"
+    assert db.error_message == "send_outcome_unknown"
+    assert second == {"next_step": "end"}
+    assert ctx.exchange_client.reply_email_result.await_count == 1
+    ctx.exchange_client.forward_email_result.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -352,7 +398,7 @@ async def test_remote_success_with_completion_cas_loss_never_sends_again():
 
     _assert_manual_delta(first, code="send_outcome_unknown")
     assert second["next_step"] == "end"
-    assert db.status == "manual_review"
+    assert db.status == "send_unknown"
     assert db.error_message == "send_outcome_unknown"
     assert ctx.exchange_client.reply_email.await_count == 1
     ctx.exchange_client.forward_email.assert_not_awaited()
@@ -438,7 +484,7 @@ async def test_send_completion_raise_before_commit_moves_unknown_to_manual():
         result = await send_final_email(_state(), dependencies)
 
     _assert_manual_delta(result, code="send_outcome_unknown")
-    assert db.status == "manual_review"
+    assert db.status == "send_unknown"
     ctx.exchange_client.reply_email.assert_awaited_once()
 
 
@@ -506,5 +552,5 @@ async def test_sender_failure_delta_and_logs_never_contain_sensitive_payloads(ca
     for sentinel in (BODY_SENTINEL, DRAFT_SENTINEL, EXCEPTION_SENTINEL):
         assert sentinel not in serialized
         assert sentinel not in caplog.text
-    assert db.status == "manual_review"
+    assert db.status == "send_unknown"
     assert db.error_message == "send_outcome_unknown"

@@ -121,6 +121,12 @@ class AppContext:
 
         if self.db_manager:
             await self.db_manager.open()
+            recovered = await self.db_manager.recover_incomplete_approval_states()
+            if recovered:
+                logger.warning(
+                    "Quarantined incomplete approval/send states: count=%s",
+                    recovered,
+                )
 
         if self.pool:
             await self.pool.open()

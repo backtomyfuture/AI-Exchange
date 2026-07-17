@@ -7,12 +7,14 @@ from collections.abc import Sequence
 
 from langchain_core.runnables import RunnableConfig
 
+from src.domain.send_result import ExchangeSendOutcome, ExchangeSendResult
 from src.graph.dependencies import GraphDependencies
 from src.graph.state import AgentState
 from src.graph.state_factory import hydrate_graph_content, sanitize_graph_delta
 from src.safety.approval_claim import (
     claim_send,
     complete_send,
+    mark_send_unknown,
     move_to_manual_review,
 )
 from src.safety.manual_review import build_manual_review_delta
@@ -56,10 +58,9 @@ async def send_final_email(
 
     async def fail_after_send(code: str) -> AgentState:
         try:
-            await move_to_manual_review(
+            await mark_send_unknown(
                 email_id,
                 ctx.db_manager,
-                expected=frozenset({"sending"}),
                 code=code,
             )
         except Exception as exc:
@@ -172,26 +173,32 @@ async def send_final_email(
 
     try:
         if action == "forward":
-            success = await ctx.exchange_client.forward_email(
+            send_result = await ctx.exchange_client.forward_email_result(
                 email_id=email_id,
                 to=_deduplicate([*final_to, *final_cc]),
                 body=draft,
             )
         else:
-            success = await ctx.exchange_client.reply_email(
+            send_result = await ctx.exchange_client.reply_email_result(
                 email_id=email_id,
                 body=draft,
                 to=final_to,
                 cc=final_cc,
             )
+    except asyncio.CancelledError:
+        await asyncio.shield(fail_after_send("send_outcome_unknown"))
+        raise
     except Exception as exc:
         logger.error(
             "Exchange send outcome is unknown: error_type=%s",
             type(exc).__name__,
         )
-        success = False
+        send_result = ExchangeSendResult.unknown()
 
-    if success is not True:
+    if (
+        not isinstance(send_result, ExchangeSendResult)
+        or send_result.outcome is not ExchangeSendOutcome.SENT
+    ):
         return await fail_after_send("send_outcome_unknown")
 
     try:

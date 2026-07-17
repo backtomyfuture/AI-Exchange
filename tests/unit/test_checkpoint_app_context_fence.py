@@ -18,6 +18,9 @@ async def test_setup_async_rejects_unbound_checkpoint_write_guard_before_io() ->
     context = AppContext()
     context.db_manager = MagicMock()
     context.db_manager.open = AsyncMock()
+    context.db_manager.recover_incomplete_approval_states = AsyncMock(
+        return_value=0
+    )
     context.pool = MagicMock()
     context.pool.open = AsyncMock()
     context.exchange_client = MagicMock()
@@ -92,6 +95,9 @@ async def test_setup_async_builds_graph_with_bound_fenced_saver() -> None:
     context = AppContext()
     context.db_manager = MagicMock()
     context.db_manager.open = AsyncMock()
+    context.db_manager.recover_incomplete_approval_states = AsyncMock(
+        return_value=0
+    )
     context.pool = MagicMock()
     context.pool.open = AsyncMock()
     context.exchange_client = MagicMock()
@@ -119,3 +125,72 @@ async def test_setup_async_builds_graph_with_bound_fenced_saver() -> None:
         dependencies=context.graph_dependencies,
     )
     assert context.graph is graph
+
+
+async def test_setup_async_recovers_ambiguous_sends_before_other_startup_io() -> None:
+    from src.init_app import AppContext
+
+    events: list[str] = []
+    context = AppContext()
+    context.db_manager = MagicMock()
+    context.db_manager.open = AsyncMock(
+        side_effect=lambda: events.append("db.open")
+    )
+    context.db_manager.recover_incomplete_approval_states = AsyncMock(
+        side_effect=lambda: events.append("send.recover") or 1
+    )
+    context.pool = MagicMock()
+    context.pool.open = AsyncMock(
+        side_effect=lambda: events.append("checkpoint.open")
+    )
+    context.exchange_client = MagicMock()
+    context.exchange_client.get_all_folders = AsyncMock(
+        side_effect=lambda: events.append("exchange.folders") or []
+    )
+    context.graph_dependencies = object()
+    context.bind_checkpoint_write_guard(AsyncMock())
+    settings = SimpleNamespace(
+        EXCHANGE_FOLDERS_FULL="",
+        EXCHANGE_FOLDERS_ARCHIVE="",
+    )
+
+    with (
+        patch("src.init_app.get_settings", return_value=settings),
+        patch("src.init_app.FencedAsyncPostgresSaver", return_value=object()),
+        patch("src.init_app.build_graph", return_value=object()),
+    ):
+        await context.setup_async()
+
+    assert events == [
+        "db.open",
+        "send.recover",
+        "checkpoint.open",
+        "exchange.folders",
+    ]
+
+
+async def test_setup_async_fails_closed_when_send_recovery_fails() -> None:
+    from src.domain.errors import DatabaseOperationError
+    from src.init_app import AppContext
+
+    context = AppContext()
+    context.db_manager = MagicMock()
+    context.db_manager.open = AsyncMock()
+    context.db_manager.recover_incomplete_approval_states = AsyncMock(
+        side_effect=DatabaseOperationError(
+            operation="recover_incomplete_approval_states",
+            retryable=True,
+            message="bounded recovery failure",
+        )
+    )
+    context.pool = MagicMock()
+    context.pool.open = AsyncMock()
+    context.exchange_client = MagicMock()
+    context.exchange_client.get_all_folders = AsyncMock(return_value=[])
+    context.bind_checkpoint_write_guard(AsyncMock())
+
+    with pytest.raises(DatabaseOperationError):
+        await context.setup_async()
+
+    context.pool.open.assert_not_awaited()
+    context.exchange_client.get_all_folders.assert_not_awaited()

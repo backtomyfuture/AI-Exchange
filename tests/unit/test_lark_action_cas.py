@@ -62,6 +62,22 @@ class ActionDB:
             self.error_message = error_code
             return True
 
+    async def compare_and_set_send_unknown(
+        self,
+        email_id: str,
+        *,
+        error_code: str,
+    ) -> bool:
+        async with self._lock:
+            self.transitions.append(
+                (email_id, frozenset({"sending"}), "send_unknown")
+            )
+            if self.status != "sending":
+                return False
+            self.status = "send_unknown"
+            self.error_message = error_code
+            return True
+
 
 class ActionDraftStore:
     def __init__(self, db: ActionDB, value: str = "FINAL-DRAFT") -> None:
@@ -988,6 +1004,30 @@ async def test_normal_graph_return_cleans_confirmed_sent_state(
         {"configurable": {"thread_id": "mail-action"}},
     )
 
+    cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_quarantines_started_send_as_send_unknown(
+    action_runtime,
+    monkeypatch,
+):
+    db, _drafts, state, graph = action_runtime
+    db.status = "sending"
+    graph.ainvoke.side_effect = RuntimeError("private graph failure")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(lark_app, "db_manager", db)
+    monkeypatch.setattr(lark_app, "graph", graph)
+    monkeypatch.setattr(lark_app, "_cleanup_action_drive_tokens", cleanup)
+
+    await lark_app._resume_graph_then_cleanup(
+        "mail-action",
+        state,
+        {"configurable": {"thread_id": "mail-action"}},
+    )
+
+    assert db.status == "send_unknown"
+    assert db.error_message == "send_outcome_unknown"
     cleanup.assert_awaited_once()
 
 

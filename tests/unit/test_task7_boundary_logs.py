@@ -112,7 +112,7 @@ async def test_draft_status_database_failure_does_not_log_content(caplog):
     with pytest.raises(DatabaseOperationError) as caught:
         await manager.update_status(
             "mail-1",
-            "approved",
+            "drafted",
             final_draft=SECRET,
         )
 

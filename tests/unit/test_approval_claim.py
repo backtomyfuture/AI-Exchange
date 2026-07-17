@@ -304,10 +304,12 @@ async def test_startup_recovery_is_atomic_bounded_and_reports_affected_rows() ->
     query, params = cursor.executions[-1]
     normalized = " ".join(query.lower().split())
     assert normalized.startswith("update emails_log set")
-    assert "status = %s" in normalized
+    assert "status = case status" in normalized
     assert "error_message = case status" in normalized
     assert "where status = any(%s)" in normalized
     assert params == (
+        "sending",
+        "send_unknown",
         "manual_review",
         "approved",
         "approval_handoff_incomplete",
@@ -351,6 +353,7 @@ async def test_startup_recovery_is_idempotent_and_filters_other_states() -> None
             "sent",
             "manual_review",
             "draft_saved",
+            "send_unknown",
         ):
             assert untouched not in params[-1]
 
@@ -381,4 +384,32 @@ async def test_manual_review_transition_persists_safe_code_atomically(
         "send_outcome_unknown",
         "mail-unknown-send",
         ["sending"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("rowcount", "expected_result"), [(1, True), (0, False)])
+async def test_send_unknown_transition_is_one_way_and_atomic(
+    rowcount: int,
+    expected_result: bool,
+) -> None:
+    cursor = FakeCursor(rowcount=rowcount)
+    manager = _manager(cursor)
+
+    result = await manager.compare_and_set_send_unknown(
+        "mail-unknown-send",
+        error_code="send_outcome_unknown",
+    )
+
+    assert result is expected_result
+    query, params = cursor.executions[-1]
+    normalized = " ".join(query.lower().split())
+    assert "set status = %s" in normalized
+    assert "error_message = %s" in normalized
+    assert "where id = %s and status = %s" in normalized
+    assert params == (
+        "send_unknown",
+        "send_outcome_unknown",
+        "mail-unknown-send",
+        "sending",
     )

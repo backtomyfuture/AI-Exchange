@@ -201,6 +201,39 @@ async def test_update_status_wraps_database_failure(db_manager, failing_connecti
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "protected_status",
+    ["approved", "sending", "send_unknown", "sent"],
+)
+async def test_update_status_rejects_cas_only_targets_before_database_io(
+    db_manager,
+    protected_status: str,
+):
+    db_manager.get_connection = lambda: pytest.fail("database must not be touched")
+
+    with pytest.raises(ValueError, match="status_requires_compare_and_set"):
+        await db_manager.update_status("mail-status", protected_status)
+
+
+@pytest.mark.asyncio
+async def test_update_status_cannot_overwrite_started_or_terminal_send_states(
+    db_manager,
+):
+    cursor = FakeCursor(rowcount=1)
+    db_manager.get_connection = connection_factory(cursor)
+
+    await db_manager.update_status("mail-status", "ingested")
+
+    query, params = cursor.executions[-1]
+    assert "WHERE id = %s AND status <> ALL(%s)" in query
+    assert params == (
+        "ingested",
+        "mail-status",
+        ["approved", "send_unknown", "sending", "sent"],
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("rowcount", "expected"), [(1, True), (0, False)])
 async def test_compare_and_set_status_reports_whether_transition_won(
     db_manager, rowcount, expected
@@ -218,6 +251,45 @@ async def test_compare_and_set_status_reports_whether_transition_won(
     query, params = cursor.executions[-1]
     assert "WHERE id=%s AND status=ANY(%s)" in query
     assert params == ("approved", "mail-cas", ["waiting_approval"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("send_unknown", "approved"),
+        ("sent", "approved"),
+        ("sending", "approved"),
+        ("approved", "sent"),
+    ],
+)
+async def test_compare_and_set_status_rejects_send_state_bypasses_before_io(
+    db_manager,
+    source: str,
+    target: str,
+):
+    db_manager.get_connection = lambda: pytest.fail("database must not be touched")
+
+    with pytest.raises(ValueError, match="email_status_transition_not_allowed"):
+        await db_manager.compare_and_set_status(
+            "mail-cas",
+            expected=frozenset({source}),
+            target=target,
+        )
+
+
+@pytest.mark.asyncio
+async def test_compare_and_set_status_rejects_ambiguous_source_set_before_io(
+    db_manager,
+):
+    db_manager.get_connection = lambda: pytest.fail("database must not be touched")
+
+    with pytest.raises(ValueError, match="invalid_email_status_transition"):
+        await db_manager.compare_and_set_status(
+            "mail-cas",
+            expected=frozenset({"waiting_approval", "approved"}),
+            target="sending",
+        )
 
 
 @pytest.mark.asyncio

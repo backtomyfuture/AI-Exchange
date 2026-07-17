@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from pydantic import SecretStr
 
 from src.config import Settings
+from src.domain.send_result import ExchangeSendOutcome, ExchangeSendResult
 from src.utils.exchange_api import ExchangeClient
 
 
@@ -247,6 +248,112 @@ async def test_send_email_success(mock_settings):
         args, kwargs = mock_http.post.call_args
         assert kwargs["json"]["to"] == ["test@example.com"]
         assert kwargs["json"]["subject"] == "Subj"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["reply", "forward"])
+async def test_existing_email_send_returns_typed_confirmed_result(
+    mock_settings,
+    operation: str,
+):
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = AsyncMock()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"code": 200, "data": {"ignored": True}}
+    mock_http.post.return_value = response
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        if operation == "reply":
+            result = await client.reply_email_result(
+                "mail-1",
+                "body-secret",
+                to=["to@example.com"],
+                cc=["cc@example.com"],
+            )
+        else:
+            result = await client.forward_email_result(
+                "mail-1",
+                ["to@example.com"],
+                "body-secret",
+            )
+
+    assert result == ExchangeSendResult.sent()
+    assert result.outcome is ExchangeSendOutcome.SENT
+    assert result.confirmed_sent is True
+    assert result.safe_code == "exchange.send.confirmed"
+    mock_http.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "payload", "json_error"),
+    [
+        (500, {"code": 200}, None),
+        (200, {"code": 500}, None),
+        (200, ["not-an-object"], None),
+        (200, None, ValueError("private invalid response")),
+    ],
+    ids=["http-error", "unconfirmed-code", "non-object", "invalid-json"],
+)
+async def test_existing_email_send_maps_every_non_confirmation_to_unknown(
+    mock_settings,
+    status_code: int,
+    payload,
+    json_error: Exception | None,
+):
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = AsyncMock()
+    response = MagicMock(status_code=status_code)
+    if json_error is None:
+        response.json.return_value = payload
+    else:
+        response.json.side_effect = json_error
+    mock_http.post.return_value = response
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        result = await client.reply_email_result(
+            "mail-1",
+            "body-secret",
+            to=["to@example.com"],
+        )
+
+    assert result.outcome is ExchangeSendOutcome.UNKNOWN
+    assert result.status_code == status_code
+    assert result.confirmed_sent is False
+    assert result.safe_code == "exchange.send.outcome_unknown"
+    mock_http.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_existing_email_send_exception_is_unknown_without_retry(mock_settings):
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = AsyncMock()
+    mock_http.post.side_effect = httpx.ReadTimeout("private timeout detail")
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        result = await client.forward_email_result(
+            "mail-1",
+            ["to@example.com"],
+            "body-secret",
+        )
+
+    assert result == ExchangeSendResult.unknown()
+    mock_http.post.assert_awaited_once()
 
 
 @pytest.mark.asyncio

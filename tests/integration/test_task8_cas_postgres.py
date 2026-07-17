@@ -170,20 +170,25 @@ async def test_startup_recovery_maps_incomplete_states_and_preserves_others(
     migrated_postgres_pool: AsyncConnectionPool,
     database_manager: AsyncDatabaseManager,
 ) -> None:
-    recovery_cases = {
+    manual_recovery_cases = {
         "approved": "approval_handoff_incomplete",
-        "sending": "send_outcome_unknown",
         "saving_draft": "draft_save_outcome_unknown",
         "recovering": "self_healing_interrupted",
     }
+    send_recovery_cases = {"sending": "send_outcome_unknown"}
     protected_statuses = {
         "waiting_approval",
         "rejected",
         "sent",
         "manual_review",
         "draft_saved",
+        "send_unknown",
     }
-    for status in (*recovery_cases, *protected_statuses):
+    for status in (
+        *manual_recovery_cases,
+        *send_recovery_cases,
+        *protected_statuses,
+    ):
         await _insert_email(
             migrated_postgres_pool,
             f"task8-recovery-{status}",
@@ -193,13 +198,20 @@ async def test_startup_recovery_maps_incomplete_states_and_preserves_others(
 
     affected = await database_manager.recover_incomplete_approval_states()
 
-    assert affected == len(recovery_cases)
-    for initial_status, error_code in recovery_cases.items():
+    assert affected == len(manual_recovery_cases) + len(send_recovery_cases)
+    for initial_status, error_code in manual_recovery_cases.items():
         status, _, error_message = await _read_email(
             migrated_postgres_pool,
             f"task8-recovery-{initial_status}",
         )
         assert status == "manual_review"
+        assert error_message == error_code
+    for initial_status, error_code in send_recovery_cases.items():
+        status, _, error_message = await _read_email(
+            migrated_postgres_pool,
+            f"task8-recovery-{initial_status}",
+        )
+        assert status == "send_unknown"
         assert error_message == error_code
     for protected_status in protected_statuses:
         status, _, error_message = await _read_email(

@@ -39,6 +39,7 @@ from src.safety.approval_claim import (
     claim_rejection,
     complete_draft_save,
     get_approval_action_lock,
+    mark_send_unknown,
     move_to_manual_review,
 )
 from src.safety.input_limits import input_limits_from_settings
@@ -471,8 +472,13 @@ async def _resume_graph_then_cleanup(
             recovery_codes = {
                 "approved": "approval_handoff_failed",
                 "rejected": "approval_handoff_failed",
-                "sending": "send_outcome_unknown",
             }
+            if persisted_status == "sending":
+                return await mark_send_unknown(
+                    email_id,
+                    db_manager,
+                    code="send_outcome_unknown",
+                )
             recovery_code = recovery_codes.get(persisted_status)
             if recovery_code:
                 return await move_to_manual_review(
@@ -485,6 +491,7 @@ async def _resume_graph_then_cleanup(
                 "sent",
                 "draft_saved",
                 "manual_review",
+                "send_unknown",
             }
         except Exception as recovery_exc:
             logger.error(
@@ -511,6 +518,7 @@ async def _resume_graph_then_cleanup(
                     "rejected",
                     "draft_saved",
                     "manual_review",
+                    "send_unknown",
                 }
         except asyncio.CancelledError:
             logger.warning("Action graph resume was cancelled")

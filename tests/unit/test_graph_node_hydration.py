@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.runnables import RunnableLambda
 
+from src.domain.send_result import ExchangeSendResult
 from src.graph.dependencies import GraphDependencies
 from src.graph.builder import build_graph
 from src.graph.state_factory import build_initial_graph_state, hydrate_graph_content
@@ -356,7 +357,11 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
         return True
 
     ctx = SimpleNamespace(
-        exchange_client=SimpleNamespace(reply_email=AsyncMock(return_value=True)),
+        exchange_client=SimpleNamespace(
+            reply_email_result=AsyncMock(
+                return_value=ExchangeSendResult.sent()
+            )
+        ),
         db_manager=SimpleNamespace(
             compare_and_set_status=AsyncMock(side_effect=compare_and_set_status),
         ),
@@ -366,7 +371,7 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
     with patch("src.init_app.get_app_context", return_value=ctx):
         result = await send_final_email(state, dependencies)
 
-    ctx.exchange_client.reply_email.assert_awaited_once_with(
+    ctx.exchange_client.reply_email_result.assert_awaited_once_with(
         email_id="mail-1",
         body="COMPLETE-DRAFT-SENTINEL",
         to=["to@example.com"],

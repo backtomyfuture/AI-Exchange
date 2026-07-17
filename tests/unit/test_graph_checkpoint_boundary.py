@@ -11,6 +11,7 @@ from langgraph.graph import END, StateGraph
 
 from src.exchange_service import _dispatch_notification, _run_ai_pipeline
 from src.graph.builder import build_graph
+from src.domain.send_result import ExchangeSendResult
 from src.graph.dependencies import GraphDependencies
 from src.graph.state import AgentState
 from src.graph.state_factory import (
@@ -311,7 +312,11 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         ),
     )
     sender_context = SimpleNamespace(
-        exchange_client=SimpleNamespace(reply_email=AsyncMock(return_value=True)),
+        exchange_client=SimpleNamespace(
+            reply_email_result=AsyncMock(
+                return_value=ExchangeSendResult.sent()
+            )
+        ),
         db_manager=database,
         content_store=content_store,
         graph=graph,
@@ -477,7 +482,7 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
             assert len(scheduled) == 1
             await asyncio.wrap_future(scheduled[0])
 
-    sender_context.exchange_client.reply_email.assert_awaited_once_with(
+    sender_context.exchange_client.reply_email_result.assert_awaited_once_with(
         email_id=email["id"],
         body=human_draft,
         to=["recipient@example.com"],

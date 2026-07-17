@@ -13,6 +13,7 @@ from src.domain.errors import (
     SyncCursorInvalidError,
     SyncTransientError,
 )
+from src.domain.send_result import ExchangeSendResult
 from src.ingestion.models import (
     MAX_SYNC_CHANGES_PER_BATCH,
     POSTGRES_BIGINT_MAX,
@@ -965,9 +966,68 @@ class ExchangeClient:
             )
         return None
 
-    async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
+    async def _send_existing_email_result(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        operation: str,
+    ) -> ExchangeSendResult:
+        """Issue exactly one request and conservatively classify its outcome."""
+        try:
+            client = self.http_client
+            logger.info("Calling Exchange %s endpoint", operation)
+            response = await client.post(endpoint, json=payload, timeout=15.0)
+            status_code = (
+                response.status_code
+                if type(response.status_code) is int
+                and 100 <= response.status_code <= 599
+                else None
+            )
+            if status_code != 200:
+                logger.error(
+                    "Exchange %s outcome is unknown: status=%s",
+                    operation,
+                    status_code,
+                )
+                return ExchangeSendResult.unknown(status_code=status_code)
+
+            try:
+                response_payload = response.json()
+            except Exception as exc:
+                logger.error(
+                    "Exchange %s response is invalid: error_type=%s",
+                    operation,
+                    type(exc).__name__,
+                )
+                return ExchangeSendResult.unknown(status_code=status_code)
+
+            if (
+                isinstance(response_payload, dict)
+                and type(response_payload.get("code")) is int
+                and response_payload["code"] == 200
+            ):
+                return ExchangeSendResult.sent()
+
+            logger.error("Exchange %s response did not confirm send", operation)
+            return ExchangeSendResult.unknown(status_code=status_code)
+        except Exception as exc:
+            logger.error(
+                "Exchange %s exception: error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            return ExchangeSendResult.unknown()
+
+    async def reply_email_result(
+        self,
+        email_id: str,
+        body: str,
+        to: List[str] | None = None,
+        cc: List[str] | None = None,
+    ) -> ExchangeSendResult:
         """
-        New Interface: Reply to an existing email.
+        Reply once and return a typed result. Any non-confirmation is unknown.
         """
         endpoint = f"{self.api_url}/reply"
         
@@ -982,18 +1042,22 @@ class ExchangeClient:
         if cc:
             payload["cc"] = cc
 
-        client = self.http_client
-        try:
-            logger.info("Calling Exchange reply endpoint")
-            response = await client.post(endpoint, json=payload, timeout=15.0)
-            if response.status_code == 200:
-                return response.json().get("code") == 200
-            else:
-                logger.error("Reply failed: status=%s", response.status_code)
-                return False
-        except Exception as exc:
-            logger.error("Reply exception: error_type=%s", type(exc).__name__)
-            return False
+        return await self._send_existing_email_result(
+            endpoint=endpoint,
+            payload=payload,
+            operation="reply",
+        )
+
+    async def reply_email(
+        self,
+        email_id: str,
+        body: str,
+        to: List[str] | None = None,
+        cc: List[str] | None = None,
+    ) -> bool:
+        """Compatibility wrapper for callers that still require a bool."""
+        result = await self.reply_email_result(email_id, body, to=to, cc=cc)
+        return result.confirmed_sent
 
     async def resolve_contact(self, query: str) -> Optional[str]:
         """
@@ -1043,9 +1107,14 @@ class ExchangeClient:
         
         return None
 
-    async def forward_email(self, email_id: str, to: List[str], body: str) -> bool:
+    async def forward_email_result(
+        self,
+        email_id: str,
+        to: List[str],
+        body: str,
+    ) -> ExchangeSendResult:
         """
-        New Interface: Forward an existing email.
+        Forward once and return a typed result. Any non-confirmation is unknown.
         """
         endpoint = f"{self.api_url}/forward"
         
@@ -1057,15 +1126,18 @@ class ExchangeClient:
             "body_type": "html"
         }
 
-        client = self.http_client
-        try:
-            logger.info("Calling Exchange forward endpoint")
-            response = await client.post(endpoint, json=payload, timeout=15.0)
-            if response.status_code == 200:
-                return response.json().get("code") == 200
-            else:
-                logger.error("Forward failed: status=%s", response.status_code)
-                return False
-        except Exception as exc:
-            logger.error("Forward exception: error_type=%s", type(exc).__name__)
-            return False
+        return await self._send_existing_email_result(
+            endpoint=endpoint,
+            payload=payload,
+            operation="forward",
+        )
+
+    async def forward_email(
+        self,
+        email_id: str,
+        to: List[str],
+        body: str,
+    ) -> bool:
+        """Compatibility wrapper for callers that still require a bool."""
+        result = await self.forward_email_result(email_id, to, body)
+        return result.confirmed_sent

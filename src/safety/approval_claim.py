@@ -85,6 +85,15 @@ async def move_to_manual_review(
     )
 
 
+async def mark_send_unknown(email_id: str, db_manager: Any, *, code: object) -> bool:
+    """Persist a terminal quarantine for an already-started remote send."""
+    bounded_id = _bounded_action_id(email_id, field="email_id")
+    return await db_manager.compare_and_set_send_unknown(
+        bounded_id,
+        error_code=normalize_manual_review_code(code),
+    )
+
+
 async def complete_send(email_id: str, db_manager: Any) -> bool:
     bounded_id = _bounded_action_id(email_id, field="email_id")
     return await db_manager.compare_and_set_status(
