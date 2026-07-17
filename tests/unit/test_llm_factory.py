@@ -4,7 +4,6 @@ LLM 工厂单元测试
 测试 Provider 系统的 LLM 创建功能（含向后兼容的 LLMFactory 包装）
 """
 
-import pytest
 from unittest.mock import patch
 from src.utils.llm_factory import LLMFactory
 

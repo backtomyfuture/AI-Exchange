@@ -5,7 +5,6 @@ Skills系统通用测试
 """
 
 import pytest
-from unittest.mock import Mock, AsyncMock
 import sys
 import os
 

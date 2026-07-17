@@ -78,9 +78,9 @@ async def handle_stats(args: str) -> dict[str, Any] | str:
 
         total = sum(int(r["cnt"]) for r in rows)
         return _build_stats_card(rows, period, total)
-    except Exception as e:
-        logger.error("handle_stats failed: %s", e)
-        return f"查询失败: {e}"
+    except Exception as exc:
+        logger.error("handle_stats failed: error_type=%s", type(exc).__name__)
+        return "查询失败，请稍后重试"
 
 
 async def handle_queue(args: str) -> str:
@@ -110,9 +110,9 @@ async def handle_pending(args: str) -> str:
         for row in rows:
             lines.append(f"  · [{(row.get('subject') or '无主题')[:30]}] from {row.get('sender', '未知')}")
         return "\n".join(lines)
-    except Exception as e:
-        logger.error("handle_pending failed: %s", e)
-        return f"查询失败: {e}"
+    except Exception as exc:
+        logger.error("handle_pending failed: error_type=%s", type(exc).__name__)
+        return "查询失败，请稍后重试"
 
 
 async def handle_search(args: str) -> str:
@@ -185,9 +185,9 @@ async def handle_routing(args: str) -> str:
         lines.append(f"  Confidence: {cls.get('confidence', '?')}")
         lines.append(f"  Need Reply: {cls.get('need_reply', '?')}")
         return "\n".join(lines)
-    except Exception as e:
-        logger.error("handle_routing failed: %s", e)
-        return f"查询失败: {e}"
+    except Exception as exc:
+        logger.error("handle_routing failed: error_type=%s", type(exc).__name__)
+        return "查询失败，请稍后重试"
 
 
 async def handle_test_rule(args: str) -> str:
@@ -203,8 +203,9 @@ async def handle_test_rule(args: str) -> str:
         from src.router.engine import get_routing_engine
         engine = get_routing_engine()
         report = engine.dry_run(subject=subject, sender=sender)
-    except Exception as e:
-        return f"规则引擎错误: {e}"
+    except Exception as exc:
+        logger.error("handle_test_rule failed: error_type=%s", type(exc).__name__)
+        return "规则引擎错误，请稍后重试"
 
     lines = ["🧪 规则沙盒测试结果:\n"]
     lines.append(f"  发件人: {sender}")
@@ -257,6 +258,6 @@ async def handle_ai_report(args: str) -> str:
             f"  用户编辑后批准: {edited} 封",
         ]
         return "\n".join(lines)
-    except Exception as e:
-        logger.error("handle_ai_report failed: %s", e)
-        return f"查询失败: {e}"
+    except Exception as exc:
+        logger.error("handle_ai_report failed: error_type=%s", type(exc).__name__)
+        return "查询失败，请稍后重试"

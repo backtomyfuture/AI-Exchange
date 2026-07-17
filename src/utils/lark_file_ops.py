@@ -42,7 +42,7 @@ def upload_file_to_drive(name: str, content: bytes, size: int,
 
         response = lark_api_client.drive.v1.file.upload_all(request)
         if not response.success():
-            logger.error(f"Failed to upload file {name}: {response.code} - {response.msg}")
+            logger.error("Lark file upload rejected: code=%s", response.code)
             return None
 
         data = response.data
@@ -51,10 +51,13 @@ def upload_file_to_drive(name: str, content: bytes, size: int,
         if not url and file_token:
             url = f"https://www.feishu.cn/file/{file_token}"
 
-        logger.info(f"File uploaded. Token: {file_token}, URL: {url}")
+        logger.info("Lark file uploaded successfully")
         return {"file_token": file_token, "url": url}
-    except Exception as e:
-        logger.error(f"Exception uploading file {name}: {e}")
+    except Exception as exc:
+        logger.error(
+            "Lark file upload failed: error_type=%s",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -76,11 +79,14 @@ def delete_file_from_drive(file_token: str, *, lark_api_client=None) -> bool:
 
         response = lark_api_client.drive.v1.file.delete(request)
         if not response.success():
-            logger.warning(f"Failed to delete file {file_token}: {response.code} - {response.msg}")
+            logger.warning("Lark file delete rejected: code=%s", response.code)
             return False
 
-        logger.info(f"File deleted (moved to trash): {file_token}")
+        logger.info("Lark file moved to trash")
         return True
-    except Exception as e:
-        logger.error(f"Exception deleting file {file_token}: {e}")
+    except Exception as exc:
+        logger.error(
+            "Lark file delete failed: error_type=%s",
+            type(exc).__name__,
+        )
         return False

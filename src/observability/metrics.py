@@ -95,6 +95,32 @@ webhook_queue_depth = Gauge(
     "Current length of the Exchange webhook ingest queue.",
 )
 
+durable_inbox_items = Gauge(
+    "durable_inbox_items",
+    "Current durable Inbox items by bounded status.",
+    labelnames=("status",),
+)
+
+durable_inbox_oldest_pending_seconds = Gauge(
+    "durable_inbox_oldest_pending_seconds",
+    "Age of the oldest pending or retryable durable Inbox item.",
+)
+
+durable_ingress_ready = Gauge(
+    "durable_ingress_ready",
+    "Whether the schema, policy, authority and Web session are ready.",
+)
+
+durable_ingestion_snapshot_ok = Gauge(
+    "durable_ingestion_snapshot_ok",
+    "Whether the latest durable queue snapshot was read successfully.",
+)
+
+durable_processing_active = Gauge(
+    "durable_processing_active",
+    "Whether final durable processing is active; Phase 2 remains standby.",
+)
+
 circuit_breaker_state = Gauge(
     "circuit_breaker_state",
     "Circuit breaker state: 0=closed, 1=half_open, 2=open.",
@@ -128,6 +154,30 @@ def record_email_status(status: str) -> None:
     emails_processed_total.labels(status=status).inc()
 
 
+def record_durable_ingestion(stats, *, ready: bool) -> None:
+    """Update the bounded Phase-2 queue and runtime health gauges."""
+
+    durable_ingress_ready.set(1 if ready else 0)
+    durable_processing_active.set(0)
+    if stats is None:
+        durable_ingestion_snapshot_ok.set(0)
+        return
+
+    durable_ingestion_snapshot_ok.set(1)
+    values = {
+        "pending": int(getattr(stats, "pending", 0)),
+        "retry_wait": int(getattr(stats, "retry_wait", 0)),
+        "leased": int(getattr(stats, "leased", 0)),
+        "manual_review": int(getattr(stats, "manual_review", 0)),
+        "dead_letter": int(getattr(stats, "dead_letter", 0)),
+    }
+    for status, count in values.items():
+        durable_inbox_items.labels(status=status).set(max(0, count))
+    oldest = float(getattr(stats, "oldest_pending_seconds", 0.0))
+    durable_inbox_oldest_pending_seconds.set(max(0.0, oldest))
+    webhook_queue_depth.set(values["pending"] + values["retry_wait"])
+
+
 def render_metrics() -> tuple[bytes, str]:
     """Serialize the current registry for the ``/metrics`` HTTP endpoint."""
     return generate_latest(), CONTENT_TYPE_LATEST
@@ -140,10 +190,16 @@ __all__ = [
     "llm_call_duration_seconds",
     "card_dispatch_total",
     "webhook_queue_depth",
+    "durable_inbox_items",
+    "durable_inbox_oldest_pending_seconds",
+    "durable_ingress_ready",
+    "durable_ingestion_snapshot_ok",
+    "durable_processing_active",
     "circuit_breaker_state",
     "record_card_dispatch",
     "record_circuit_breaker_state",
     "record_email_status",
+    "record_durable_ingestion",
     "render_metrics",
     "CONTENT_TYPE_LATEST",
     "generate_latest",

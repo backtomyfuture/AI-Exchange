@@ -8,7 +8,6 @@ Skill依赖解析单元测试
 - 依赖链解析
 """
 
-import pytest
 from src.router.dependency import resolve_skill_order
 
 

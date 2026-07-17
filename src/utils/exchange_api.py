@@ -1,8 +1,301 @@
-import httpx
-import re
 import logging
-from typing import List, Dict, Any, Optional
+import math
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
+
+import httpx
+
+from src.domain.errors import (
+    SyncAuthorizationError,
+    SyncContractError,
+    SyncCursorInvalidError,
+    SyncTransientError,
+)
+from src.domain.send_result import ExchangeSendResult
+from src.ingestion.models import (
+    MAX_SYNC_CHANGES_PER_BATCH,
+    POSTGRES_BIGINT_MAX,
+    SyncBatch,
+)
+from src.ingestion.normalization import validate_sync_change_contract
+from src.safety.http_response import read_json_limited
+from src.safety.input_limits import input_limits_from_settings
+from src.security.redaction import fingerprint_identifier
+
 logger = logging.getLogger("ExchangeClient")
+
+SENTITEMS_FOLDER_ALIASES = {"已发送邮件", "已发送", "sent items", "sentitems", "sent"}
+DRAFTS_FOLDER_ALIASES = {"草稿", "drafts", "draft"}
+
+_SYNC_CONTRACT_VERSION = "exchange_sync_contract_v2"
+_SYNC_CONTRACT_HEADER = "X-Exchange-Sync-Contract"
+_SYNC_CURSOR_ERROR_HEADER = "X-Exchange-Sync-Error"
+_SYNC_CURSOR_ERROR_VALUE = "exchange_sync_cursor_invalid_v2"
+_SYNC_ONLY_FIELDS = [
+    "id",
+    "subject",
+    "sender",
+    "datetime_received",
+    "is_read",
+    "has_attachments",
+]
+_SYNC_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=135.0,
+    write=10.0,
+    pool=10.0,
+)
+_ASCII_DECIMAL = re.compile(r"[0-9]+\Z")
+_HTTP_MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+_HTTP_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_HTTP_WEEKDAYS_LONG = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+_IMF_FIXDATE = re.compile(
+    r"(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
+    r"(?P<day>[0-9]{2}) "
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?P<year>[0-9]{4}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) GMT"
+)
+_RFC850_DATE = re.compile(
+    r"(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"(?P<day>[0-9]{2})-"
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
+    r"(?P<year>[0-9]{2}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) GMT"
+)
+_ASCTIME_DATE = re.compile(
+    r"(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?P<day> [0-9]|[0-9]{2}) "
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2}) "
+    r"(?P<year>[0-9]{4})"
+)
+_SYNC_ROOT_PATH = "/api/v1/exchange"
+_SYNC_EMAILS_PATH = "/api/v1/exchange/emails"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _header_is_exact(response: httpx.Response, name: str, expected: str) -> bool:
+    return response.headers.get_list(name, split_commas=False) == [expected]
+
+
+def _content_encoding_is_safe(response: httpx.Response) -> bool:
+    values = response.headers.get_list("content-encoding", split_commas=False)
+    return not values or values == ["identity"]
+
+
+def _parse_exact_http_date(raw: str, *, now: datetime) -> datetime | None:
+    match = _IMF_FIXDATE.fullmatch(raw)
+    long_weekday = False
+    obsolete_year = False
+    if match is None:
+        match = _RFC850_DATE.fullmatch(raw)
+        long_weekday = match is not None
+        obsolete_year = match is not None
+    if match is None:
+        match = _ASCTIME_DATE.fullmatch(raw)
+    if match is None or now.tzinfo is None or now.utcoffset() is None:
+        return None
+
+    try:
+        current = now.astimezone(UTC)
+        month = _HTTP_MONTHS[match.group("month")]
+        day = int(match.group("day"))
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        second = int(match.group("second"))
+        if second > 60:
+            return None
+        year = int(match.group("year"))
+        if obsolete_year:
+            year += current.year - (current.year % 100)
+            candidate_clock = (month, day, hour, minute, second, 0)
+            current_clock = (
+                current.month,
+                current.day,
+                current.hour,
+                current.minute,
+                current.second,
+                current.microsecond,
+            )
+            if year < current.year - 50 or (
+                year == current.year - 50 and candidate_clock < current_clock
+            ):
+                year += 100
+            elif year > current.year + 50 or (
+                year == current.year + 50 and candidate_clock > current_clock
+            ):
+                year -= 100
+        parsed = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            min(second, 59),
+            tzinfo=UTC,
+        )
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+    weekdays = _HTTP_WEEKDAYS_LONG if long_weekday else _HTTP_WEEKDAYS
+    if match.group("weekday") != weekdays[parsed.weekday()]:
+        return None
+    return parsed + timedelta(seconds=1) if second == 60 else parsed
+
+
+def _retry_after_seconds(response: httpx.Response) -> int | None:
+    values = response.headers.get_list("retry-after", split_commas=False)
+    if len(values) != 1:
+        return None
+    raw = values[0]
+    if _ASCII_DECIMAL.fullmatch(raw) is not None:
+        significant = raw.lstrip("0") or "0"
+        if len(significant) > 4:
+            return 3600
+        return min(int(significant), 3600)
+    try:
+        now = _utc_now()
+        retry_at = _parse_exact_http_date(raw, now=now)
+        if retry_at is None:
+            return None
+        delta = (retry_at - now).total_seconds()
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return min(math.ceil(max(0.0, delta)), 3600)
+
+
+def _valid_exact_text(value: object, *, max_length: int) -> bool:
+    if type(value) is not str or not value or len(value) > max_length:
+        return False
+    if value != value.strip() or any(
+        ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _derive_emails_base_url(configured_url: str) -> str:
+    if (
+        type(configured_url) is not str
+        or not configured_url
+        or "?" in configured_url
+        or "#" in configured_url
+        or any(character.isspace() for character in configured_url)
+        or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in configured_url
+        )
+    ):
+        raise ValueError("invalid Exchange Sync URL")
+    parsed = urlsplit(configured_url)
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        raise ValueError("unsupported Exchange Sync URL")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid Exchange Sync URL")
+    _ = parsed.port
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    if path == _SYNC_ROOT_PATH:
+        path = _SYNC_EMAILS_PATH
+    elif path != _SYNC_EMAILS_PATH:
+        raise ValueError("invalid Exchange Sync URL path")
+    return f"{parsed.scheme.casefold()}://{parsed.netloc}{path}"
+
+
+def _sync_batch_from_payload(payload: object, *, limit: int) -> SyncBatch:
+    if not isinstance(payload, dict) or set(payload) != {"code", "msg", "data"}:
+        raise ValueError("invalid Exchange Sync wrapper")
+    if type(payload["code"]) is not int or payload["code"] != 200:
+        raise ValueError("invalid Exchange Sync wrapper code")
+    if payload["msg"] != "OK" or type(payload["msg"]) is not str:
+        raise ValueError("invalid Exchange Sync wrapper message")
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != {
+        "sync_state",
+        "includes_last",
+        "items",
+    }:
+        raise ValueError("invalid Exchange Sync data")
+    items = data["items"]
+    if not isinstance(items, list) or len(items) > limit:
+        raise ValueError("invalid Exchange Sync item count")
+    changes = tuple(validate_sync_change_contract(item) for item in items)
+    return SyncBatch(
+        contract_version=_SYNC_CONTRACT_VERSION,
+        cursor=data["sync_state"],
+        changes=changes,
+        includes_last=data["includes_last"],
+    )
+
+
+def _normalize_folder_name(name: str | None) -> str:
+    return re.sub(r"[\s_-]+", "", (name or "").strip().casefold())
+
+
+def _resolve_system_folder(
+    folders: list[tuple[str, str]],
+    *,
+    configured_name: str,
+    aliases: set[str],
+) -> tuple[str | None, frozenset[str]]:
+    """Resolve one system folder without depending on response order."""
+    configured_normalized = _normalize_folder_name(configured_name)
+    configured_matches = {
+        folder_id
+        for folder_id, folder_name in folders
+        if _normalize_folder_name(folder_name) == configured_normalized
+    }
+    if len(configured_matches) > 1:
+        return None, frozenset(configured_matches)
+    if len(configured_matches) == 1:
+        return next(iter(configured_matches)), frozenset(configured_matches)
+
+    normalized_aliases = {_normalize_folder_name(alias) for alias in aliases}
+    alias_matches = {
+        folder_id
+        for folder_id, folder_name in folders
+        if _normalize_folder_name(folder_name) in normalized_aliases
+    }
+    if len(alias_matches) == 1:
+        return next(iter(alias_matches)), frozenset(alias_matches)
+    return None, frozenset(alias_matches)
 
 class ExchangeClient:
     """
@@ -14,14 +307,22 @@ class ExchangeClient:
             from src.config import get_settings
             settings = get_settings()
             
-        self.api_url = settings.EXCHANGE_API_URL.rstrip("/")
+        configured_api_url = settings.EXCHANGE_API_URL
+        self.api_url = configured_api_url.rstrip("/")
         from src.config import resolve_secret
         self.api_key = resolve_secret(settings.EXCHANGE_API_KEY)
         self.account_id = settings.EXCHANGE_ACCOUNT_ID
-        self.ssl_verify = settings.EXCHANGE_SSL_VERIFY
+        ssl_verify = bool(settings.EXCHANGE_SSL_VERIFY)
+        ca_file = str(getattr(settings, "EXCHANGE_CA_FILE", "") or "").strip()
+        self.ssl_verify: bool | str = ca_file if ssl_verify and ca_file else ssl_verify
+        self._input_limits = input_limits_from_settings(settings)
 
         if not self.api_url:
             self.api_url = "http://localhost:8000/mock/exchange"
+            configured_api_url = self.api_url
+
+        self._sync_configured_api_url = configured_api_url
+        self._sync_emails_base_url: str | None = None
 
         self._http_client: httpx.AsyncClient | None = None
 
@@ -52,6 +353,121 @@ class ExchangeClient:
             await self._http_client.aclose()
             self._http_client = None
 
+    def _sync_endpoint(self) -> str:
+        if self._sync_emails_base_url is None:
+            self._sync_emails_base_url = _derive_emails_base_url(
+                self._sync_configured_api_url
+            )
+        return f"{self._sync_emails_base_url}/sync"
+
+    async def sync_emails(
+        self,
+        account_id: int,
+        folder: str,
+        sync_state: str,
+        limit: int,
+    ) -> SyncBatch:
+        """Fetch exactly one authenticated, bounded Exchange Sync v2 page."""
+
+        endpoint: str | None = None
+        invalid_input = not (
+            type(account_id) is int
+            and 1 <= account_id <= POSTGRES_BIGINT_MAX
+            and _valid_exact_text(folder, max_length=512)
+            and _valid_exact_text(sync_state, max_length=8192)
+            and type(limit) is int
+            and 1 <= limit <= MAX_SYNC_CHANGES_PER_BATCH
+        )
+        if not invalid_input:
+            try:
+                endpoint = self._sync_endpoint()
+            except Exception:
+                invalid_input = True
+        if invalid_input or endpoint is None:
+            raise SyncContractError()
+
+        payload = {
+            "account_id": account_id,
+            "folder": folder,
+            "sync_state": sync_state,
+            "limit": limit,
+            "only_fields": _SYNC_ONLY_FIELDS,
+        }
+        failure: Exception | None = None
+        batch: SyncBatch | None = None
+        try:
+            client = self.http_client
+            async with client.stream(
+                "POST",
+                endpoint,
+                json=payload,
+                headers={"Accept-Encoding": "identity"},
+                timeout=_SYNC_TIMEOUT,
+                follow_redirects=False,
+            ) as response:
+                status = response.status_code
+                if status in {401, 403}:
+                    failure = SyncAuthorizationError()
+                elif status == 400:
+                    if _header_is_exact(
+                        response,
+                        _SYNC_CONTRACT_HEADER,
+                        _SYNC_CONTRACT_VERSION,
+                    ) and _header_is_exact(
+                        response,
+                        _SYNC_CURSOR_ERROR_HEADER,
+                        _SYNC_CURSOR_ERROR_VALUE,
+                    ):
+                        failure = SyncCursorInvalidError()
+                    else:
+                        failure = SyncContractError()
+                elif status in {408, 429} or 500 <= status <= 599:
+                    failure = SyncTransientError(
+                        retry_after_seconds=_retry_after_seconds(response)
+                    )
+                elif status != 200:
+                    failure = SyncContractError()
+                elif not _header_is_exact(
+                    response,
+                    _SYNC_CONTRACT_HEADER,
+                    _SYNC_CONTRACT_VERSION,
+                ) or not _content_encoding_is_safe(response):
+                    failure = SyncContractError()
+                else:
+                    try:
+                        response_payload = await read_json_limited(
+                            response,
+                            max_bytes=self._input_limits.exchange_response_bytes,
+                            max_structure_tokens=32 + (21 * limit),
+                        )
+                        batch = _sync_batch_from_payload(response_payload, limit=limit)
+                    except httpx.DecodingError:
+                        failure = SyncContractError()
+                    except httpx.TimeoutException:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except httpx.TransportError:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except Exception:
+                        failure = SyncContractError()
+        except httpx.DecodingError:
+            failure = SyncContractError()
+        except httpx.TimeoutException:
+            failure = SyncTransientError()
+        except httpx.TransportError:
+            failure = SyncTransientError()
+        except Exception:
+            failure = SyncContractError()
+
+        if failure is not None:
+            raise failure
+        if batch is None:
+            raise SyncContractError()
+        return batch
+
     async def get_all_folders(self, force_refresh: bool = False) -> dict:
         """
         Fetch all folders and build in-memory cache/tree.
@@ -70,8 +486,9 @@ class ExchangeClient:
         params = {"account_id": self.account_id}
 
         client = self.http_client
-        try:
-            for endpoint in dict.fromkeys(endpoints):
+        last_error_type: str | None = None
+        for endpoint in dict.fromkeys(endpoints):
+            try:
                 response = await client.get(
                     endpoint,
                     params=params,
@@ -81,24 +498,33 @@ class ExchangeClient:
                     folders = response.json().get("data", {}).get("folders", [])
                     self._build_folder_cache(folders)
                     logger.info(
-                        "Folder cache loaded from %s: %s folders. sentitems=%s, drafts=%s",
-                        endpoint,
+                        "Folder cache loaded: count=%d sentitems=%s drafts=%s",
                         len(self._folder_cache),
-                        self.sentitems_folder_id,
-                        self.drafts_folder_id,
+                        bool(self.sentitems_folder_id),
+                        bool(self.drafts_folder_id),
                     )
                     return self._folder_cache
                 logger.warning(
-                    "Folder endpoint returned %s: %s",
+                    "Folder endpoint returned non-success: status=%s",
                     response.status_code,
-                    endpoint,
                 )
+            except Exception as exc:
+                last_error_type = type(exc).__name__
+                logger.warning(
+                    "Folder endpoint request failed: error_type=%s",
+                    last_error_type,
+                )
+        if last_error_type is None:
             logger.warning(
                 "Failed to get folders from all candidate endpoints. "
                 "Routing will use safe fallback mode."
             )
-        except Exception as e:
-            logger.error("Exception getting folders: %s", e)
+        else:
+            logger.error(
+                "Failed to get folders from all candidate endpoints: "
+                "error_type=%s; routing will use safe fallback mode.",
+                last_error_type,
+            )
 
         self._folder_cache = {}
         self._folder_tree = {}
@@ -110,6 +536,7 @@ class ExchangeClient:
         self._folder_tree = {}
         self.sentitems_folder_id = None
         self.drafts_folder_id = None
+        system_folder_candidates: list[tuple[str, str]] = []
 
         for folder in folders:
             folder_id = folder.get("id")
@@ -125,16 +552,38 @@ class ExchangeClient:
                 "children": [],
                 "folder_class": folder.get("folder_class", ""),
             }
+            system_folder_candidates.append((folder_id, folder_name))
 
-            if folder_name == self._sentitems_name:
-                self.sentitems_folder_id = folder_id
-            elif folder_name == self._drafts_name:
-                self.drafts_folder_id = folder_id
+        self.sentitems_folder_id, sentitems_candidates = _resolve_system_folder(
+            system_folder_candidates,
+            configured_name=self._sentitems_name,
+            aliases=SENTITEMS_FOLDER_ALIASES,
+        )
+        self.drafts_folder_id, drafts_candidates = _resolve_system_folder(
+            system_folder_candidates,
+            configured_name=self._drafts_name,
+            aliases=DRAFTS_FOLDER_ALIASES,
+        )
+        if sentitems_candidates & drafts_candidates:
+            self.sentitems_folder_id = None
+            self.drafts_folder_id = None
 
         for folder_id, node in self._folder_tree.items():
             parent_id = node["parent_id"]
             if parent_id and parent_id in self._folder_tree:
                 self._folder_tree[parent_id]["children"].append(folder_id)
+
+    def _is_sentitems_folder(self, folder_name: str) -> bool:
+        aliases = {self._sentitems_name, *SENTITEMS_FOLDER_ALIASES}
+        return _normalize_folder_name(folder_name) in {
+            _normalize_folder_name(alias) for alias in aliases
+        }
+
+    def _is_drafts_folder(self, folder_name: str) -> bool:
+        aliases = {self._drafts_name, *DRAFTS_FOLDER_ALIASES}
+        return _normalize_folder_name(folder_name) in {
+            _normalize_folder_name(alias) for alias in aliases
+        }
 
     def compute_folder_policies(
         self,
@@ -227,22 +676,32 @@ class ExchangeClient:
         try:
             # 1. 获取列表
             list_url = f"{self.api_url}/list"
-            logger.info("正在拉取邮件列表: %s (params: %s)", list_url, params)
+            logger.info("Fetching Exchange email list")
 
-            response = await client.get(list_url, params=params, timeout=10.0)
-            if response.status_code != 200:
-                logger.error("列表获取失败: %s - %s", response.status_code, response.text)
-                return []
-
-            data = response.json()
+            async with client.stream(
+                "GET",
+                list_url,
+                params=params,
+                timeout=10.0,
+            ) as response:
+                if response.status_code != 200:
+                    logger.error("列表获取失败: status=%s", response.status_code)
+                    return []
+                data = await read_json_limited(
+                    response,
+                    max_bytes=self._input_limits.exchange_response_bytes,
+                )
             # 打印原始数据结构以供调试
-            logger.info(
-                "列表接口返回数据状态: %s, 消息: %s",
-                data.get("code"),
-                data.get("message"),
-            )
+            logger.info("Exchange email list returned: code=%s", data.get("code"))
 
-            items = data.get("data", {}).get("items", [])
+            list_data = data.get("data")
+            if not isinstance(list_data, dict):
+                logger.warning("列表接口 data 字段不是对象")
+                return []
+            items = list_data.get("items", [])
+            if not isinstance(items, list):
+                logger.warning("列表接口 items 字段不是数组")
+                return []
             if not items:
                 logger.info("目前没有未读邮件。")
 
@@ -268,36 +727,50 @@ class ExchangeClient:
                 detail_url = f"{self.api_url}/{encoded_id}"
 
                 try:
-                    logger.info("正在请求详情: %s", detail_url)
-                    detail_resp = await client.get(
+                    logger.info(
+                        "Fetching Exchange email detail: email=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
+                    )
+                    async with client.stream(
+                        "GET",
                         detail_url,
                         params={"account_id": self.account_id},
-                        timeout=10.0
-                    )
-                    if detail_resp.status_code == 200:
-                        detail_data = detail_resp.json().get("data", {})
-                        if detail_data:
-                            # 确保包含 ID，以便后续跟踪
-                            if "id" not in detail_data:
-                                detail_data["id"] = email_id
-                            full_emails.append(detail_data)
+                        timeout=10.0,
+                    ) as detail_resp:
+                        if detail_resp.status_code == 200:
+                            detail_payload = await read_json_limited(
+                                detail_resp,
+                                max_bytes=self._input_limits.exchange_response_bytes,
+                            )
+                            detail_data = detail_payload.get("data")
+                            if isinstance(detail_data, dict) and detail_data:
+                                # 确保包含 ID，以便后续跟踪
+                                if "id" not in detail_data:
+                                    detail_data["id"] = email_id
+                                full_emails.append(detail_data)
+                            else:
+                                logger.warning(
+                                    "Exchange email detail was empty: email=%s",
+                                    fingerprint_identifier(email_id, namespace="email"),
+                                )
                         else:
-                            logger.warning("邮件详情为空 (ID: %s)", email_id)
-                    else:
-                        logger.error(
-                            "详情获取失败 (ID: %s): %s - %s",
-                            email_id,
-                            detail_resp.status_code,
-                            detail_resp.text,
-                        )
+                            logger.error(
+                                "Exchange email detail failed: email=%s status=%s",
+                                fingerprint_identifier(email_id, namespace="email"),
+                                detail_resp.status_code,
+                            )
                 except Exception as detail_err:
-                    logger.error("请求详情异常 (ID: %s): %s", email_id, detail_err)
+                    logger.error(
+                        "Exchange email detail raised: email=%s error_type=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
+                        type(detail_err).__name__,
+                    )
 
             if full_emails:
                 logger.info("成功获取 %s 封邮件的完整详情", len(full_emails))
             return full_emails
         except Exception as e:
-            logger.error("获取邮件异常: %s", e)
+            logger.error("获取邮件异常: error_type=%s", type(e).__name__)
             return []
 
     async def send_email(self, to: str, subject: str, body: str) -> bool:
@@ -324,7 +797,7 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            logger.info("正在请求保存草稿接口: %s", endpoint)
+            logger.info("Calling Exchange create-draft endpoint")
             response = await client.post(
                 endpoint,
                 json=payload,
@@ -332,10 +805,13 @@ class ExchangeClient:
             )
             response.raise_for_status()
             return True
-        except Exception as e:
-            logger.error("保存草稿失败: %s", e)
-            if hasattr(e, 'response') and e.response:
-                logger.error("Server response: %s", e.response.text)
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "保存草稿失败: status=%s error_type=%s",
+                status_code,
+                type(exc).__name__,
+            )
             return False
 
     async def _send_payload(self, to: str, subject: str, body: str, is_draft: bool = False) -> bool:
@@ -367,20 +843,26 @@ class ExchangeClient:
         client = self.http_client
         try:
             action = "保存草稿" if is_draft else "发送邮件"
-            logger.info("正在请求%s接口: %s", action, endpoint)
+            logger.info("Calling Exchange draft endpoint: action=%s", action)
             response = await client.post(
                 endpoint,
                 json=payload,
                 timeout=10.0
             )
             if response.status_code == 404 and is_draft:
-                logger.warning("Draft endpoint 404. %s", response.text)
+                logger.warning("Draft endpoint rejected request: status=404")
                 return False
 
             response.raise_for_status()
             return True
-        except Exception as e:
-            logger.error("%s失败: %s", action, e)
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "%s失败: status=%s error_type=%s",
+                action,
+                status_code,
+                type(exc).__name__,
+            )
             return False
 
     async def mark_as_read(self, email_id: str, is_read: bool = True) -> bool:
@@ -404,14 +886,15 @@ class ExchangeClient:
                 return data.get('code') == 200
             else:
                 logger.warning(
-                    "Mark as read failed (ID: %s): %s - %s",
-                    email_id,
+                    "Mark as read failed: status=%s",
                     response.status_code,
-                    response.text,
                 )
                 return False
-        except Exception as e:
-            logger.error("Failed to mark email %s as read: %s", email_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to mark email as read: error_type=%s",
+                type(exc).__name__,
+            )
             return False
 
     async def move_email(self, email_id: str, folder_id: str) -> bool:
@@ -425,8 +908,13 @@ class ExchangeClient:
         try:
             response = await client.post(endpoint, json=payload, timeout=5.0)
             return response.status_code == 200
-        except Exception as e:
-            logger.error("Failed to move email %s to %s: %s", email_id, folder_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to move Exchange email: email=%s folder=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                fingerprint_identifier(folder_id, namespace="exchange_folder"),
+                type(exc).__name__,
+            )
             return False
 
     async def delete_email(self, email_id: str) -> bool:
@@ -439,11 +927,19 @@ class ExchangeClient:
         try:
             response = await client.delete(endpoint, timeout=5.0)
             return response.status_code == 200
-        except Exception as e:
-            logger.error("Failed to delete email %s: %s", email_id, e)
+        except Exception as exc:
+            logger.error(
+                "Failed to delete Exchange email: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
             return False
 
-    async def get_email(self, email_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
+    async def get_email(
+        self,
+        email_id: str,
+        account_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Fetch full details for a specific email by ID.
         """
@@ -454,25 +950,93 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            response = await client.get(
+            async with client.stream(
+                "GET",
                 endpoint,
                 params={"account_id": target_account_id},
-            )
-            if response.status_code == 200:
-                return response.json().get("data", {})
-            else:
+            ) as response:
+                if response.status_code == 200:
+                    payload = await read_json_limited(
+                        response,
+                        max_bytes=self._input_limits.exchange_response_bytes,
+                    )
+                    email_data = payload.get("data")
+                    return email_data if isinstance(email_data, dict) and email_data else None
                 logger.error(
-                    "Failed to get email details for %s: %s",
-                    email_id,
+                    "Failed to get Exchange email details: email=%s status=%s",
+                    fingerprint_identifier(email_id, namespace="email"),
                     response.status_code,
                 )
-        except Exception as e:
-            logger.error("Exception getting email %s: %s", email_id, e)
-        return {}
+        except Exception as exc:
+            logger.error(
+                "Exception getting Exchange email: email=%s error_type=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+                type(exc).__name__,
+            )
+        return None
 
-    async def reply_email(self, email_id: str, body: str, to: List[str] = None, cc: List[str] = None) -> bool:
+    async def _send_existing_email_result(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        operation: str,
+    ) -> ExchangeSendResult:
+        """Issue exactly one request and conservatively classify its outcome."""
+        try:
+            client = self.http_client
+            logger.info("Calling Exchange %s endpoint", operation)
+            response = await client.post(endpoint, json=payload, timeout=15.0)
+            status_code = (
+                response.status_code
+                if type(response.status_code) is int
+                and 100 <= response.status_code <= 599
+                else None
+            )
+            if status_code != 200:
+                logger.error(
+                    "Exchange %s outcome is unknown: status=%s",
+                    operation,
+                    status_code,
+                )
+                return ExchangeSendResult.unknown(status_code=status_code)
+
+            try:
+                response_payload = response.json()
+            except Exception as exc:
+                logger.error(
+                    "Exchange %s response is invalid: error_type=%s",
+                    operation,
+                    type(exc).__name__,
+                )
+                return ExchangeSendResult.unknown(status_code=status_code)
+
+            if (
+                isinstance(response_payload, dict)
+                and type(response_payload.get("code")) is int
+                and response_payload["code"] == 200
+            ):
+                return ExchangeSendResult.sent()
+
+            logger.error("Exchange %s response did not confirm send", operation)
+            return ExchangeSendResult.unknown(status_code=status_code)
+        except Exception as exc:
+            logger.error(
+                "Exchange %s exception: error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            return ExchangeSendResult.unknown()
+
+    async def reply_email_result(
+        self,
+        email_id: str,
+        body: str,
+        to: List[str] | None = None,
+        cc: List[str] | None = None,
+    ) -> ExchangeSendResult:
         """
-        New Interface: Reply to an existing email.
+        Reply once and return a typed result. Any non-confirmation is unknown.
         """
         endpoint = f"{self.api_url}/reply"
         
@@ -487,18 +1051,22 @@ class ExchangeClient:
         if cc:
             payload["cc"] = cc
 
-        client = self.http_client
-        try:
-            logger.info("正在请求回复接口: %s", endpoint)
-            response = await client.post(endpoint, json=payload, timeout=15.0)
-            if response.status_code == 200:
-                return response.json().get("code") == 200
-            else:
-                logger.error("Reply failed: %s - %s", response.status_code, response.text)
-                return False
-        except Exception as e:
-            logger.error("Reply exception: %s", e)
-            return False
+        return await self._send_existing_email_result(
+            endpoint=endpoint,
+            payload=payload,
+            operation="reply",
+        )
+
+    async def reply_email(
+        self,
+        email_id: str,
+        body: str,
+        to: List[str] | None = None,
+        cc: List[str] | None = None,
+    ) -> bool:
+        """Compatibility wrapper for callers that still require a bool."""
+        result = await self.reply_email_result(email_id, body, to=to, cc=cc)
+        return result.confirmed_sent
 
     async def resolve_contact(self, query: str) -> Optional[str]:
         """
@@ -535,18 +1103,27 @@ class ExchangeClient:
                     return data["data"][0].get("name")
             else:
                 logger.warning(
-                    "Contact resolve failed for '%s': %s",
-                    query,
+                    "Exchange contact resolution failed: query=%s status=%s",
+                    fingerprint_identifier(query, namespace="contact_query"),
                     response.status_code,
                 )
-        except Exception as e:
-            logger.error("Contact resolve exception for '%s': %s", query, e)
+        except Exception as exc:
+            logger.error(
+                "Exchange contact resolution raised: query=%s error_type=%s",
+                fingerprint_identifier(query, namespace="contact_query"),
+                type(exc).__name__,
+            )
         
         return None
 
-    async def forward_email(self, email_id: str, to: List[str], body: str) -> bool:
+    async def forward_email_result(
+        self,
+        email_id: str,
+        to: List[str],
+        body: str,
+    ) -> ExchangeSendResult:
         """
-        New Interface: Forward an existing email.
+        Forward once and return a typed result. Any non-confirmation is unknown.
         """
         endpoint = f"{self.api_url}/forward"
         
@@ -558,15 +1135,18 @@ class ExchangeClient:
             "body_type": "html"
         }
 
-        client = self.http_client
-        try:
-            logger.info("正在请求转发接口: %s", endpoint)
-            response = await client.post(endpoint, json=payload, timeout=15.0)
-            if response.status_code == 200:
-                return response.json().get("code") == 200
-            else:
-                logger.error("Forward failed: %s - %s", response.status_code, response.text)
-                return False
-        except Exception as e:
-            logger.error("Forward exception: %s", e)
-            return False
+        return await self._send_existing_email_result(
+            endpoint=endpoint,
+            payload=payload,
+            operation="forward",
+        )
+
+    async def forward_email(
+        self,
+        email_id: str,
+        to: List[str],
+        body: str,
+    ) -> bool:
+        """Compatibility wrapper for callers that still require a bool."""
+        result = await self.forward_email_result(email_id, to, body)
+        return result.confirmed_sent

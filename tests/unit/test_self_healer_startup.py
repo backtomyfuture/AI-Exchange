@@ -1,17 +1,22 @@
 import pytest
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from src.domain.email_state import ProcessingOutcome
+from src.safety.input_limits import InputLimitExceeded
 
 
 @pytest.mark.asyncio
 async def test_self_healer_get_stuck_emails_uses_pool():
     """SelfHealer should use get_connection async context manager."""
-    mock_cursor = AsyncMock()
+    mock_cursor = MagicMock()
     mock_cursor.fetchall = AsyncMock(return_value=[])
     mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
     mock_cursor.__aexit__ = AsyncMock(return_value=False)
 
-    mock_conn = AsyncMock()
+    mock_conn = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
     mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_conn.__aexit__ = AsyncMock(return_value=False)
@@ -30,10 +35,45 @@ async def test_self_healer_get_stuck_emails_uses_pool():
 
 
 @pytest.mark.asyncio
+async def test_self_healer_query_excludes_manual_and_approval_handoff_states():
+    """Startup recovery owns approved/sending; human review owns manual_review."""
+    mock_cursor = MagicMock()
+    mock_cursor.execute = AsyncMock()
+    mock_cursor.fetchall = AsyncMock(return_value=[])
+    mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
+    mock_cursor.__aexit__ = AsyncMock(return_value=False)
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=False)
+
+    mock_db = MagicMock()
+    mock_db.get_connection.return_value = mock_conn
+    mock_ctx = MagicMock()
+    mock_ctx.db_manager = mock_db
+
+    from src.utils.self_healing import SelfHealer
+
+    await SelfHealer(ctx=mock_ctx, interval_seconds=60).get_stuck_emails()
+
+    query = mock_cursor.execute.await_args.args[0].lower()
+    assert "'error'" in query
+    assert "'delivery_failed'" in query
+    for protected_status in (
+        "manual_review",
+        "approved",
+        "sending",
+        "saving_draft",
+        "recovering",
+    ):
+        assert f"'{protected_status}'" not in query
+
+
+@pytest.mark.asyncio
 async def test_db_get_records_by_date():
     """db_manager.get_records_by_date should query emails for a specific date."""
     from contextlib import asynccontextmanager
-    from unittest.mock import patch
 
     mock_cursor = AsyncMock()
     mock_cursor.fetchall = AsyncMock(return_value=[
@@ -57,3 +97,133 @@ async def test_db_get_records_by_date():
     result = await db.get_records_by_date(date(2026, 2, 12))
     assert len(result) == 1
     assert result[0]["subject"] == "Test"
+
+
+def _self_healing_context(email: dict) -> MagicMock:
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.__aenter__ = AsyncMock(return_value=cursor)
+    cursor.__aexit__ = AsyncMock(return_value=False)
+
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    connection.__aenter__ = AsyncMock(return_value=connection)
+    connection.__aexit__ = AsyncMock(return_value=False)
+
+    ctx = MagicMock()
+    ctx.exchange_client = MagicMock()
+    ctx.exchange_client.get_email = AsyncMock(return_value=email)
+    ctx.db_manager = MagicMock()
+    ctx.db_manager.get_connection.return_value = connection
+    ctx.db_manager.log_initial_email = AsyncMock()
+    ctx.db_manager.claim_self_healing = AsyncMock(return_value=True)
+    ctx.db_manager.compare_and_set_status = AsyncMock(return_value=True)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_reprocess_single_forces_retry_without_predelete():
+    from src.utils import self_healing
+
+    email = {"id": "exchange-id", "body": "ok", "attachments": []}
+    ctx = _self_healing_context(email)
+
+    with patch(
+        "src.utils.self_healing.process_and_archive_email",
+        new=AsyncMock(return_value=ProcessingOutcome.PROCESSED),
+    ) as mock_process:
+        result = await self_healing.SelfHealer(ctx, 60).reprocess_single("mail-1")
+
+    assert result is True
+    ctx.db_manager.claim_self_healing.assert_awaited_once()
+    ctx.db_manager.get_connection.assert_not_called()
+    mock_process.assert_awaited_once_with(email, ctx, force_reprocess=True)
+
+
+@pytest.mark.asyncio
+async def test_reprocess_oversized_email_preserves_existing_record(caplog):
+    from src.utils import self_healing
+
+    private_body = "private-oversized-body"
+    email = {"body": private_body, "attachments": []}
+    ctx = _self_healing_context(email)
+    real_process = self_healing.process_and_archive_email
+    caplog.set_level(logging.ERROR, logger="SelfHealing")
+
+    with patch(
+        "src.utils.self_healing.process_and_archive_email",
+        new=AsyncMock(wraps=real_process),
+    ) as process_spy, patch(
+        "src.exchange_service.get_settings",
+        return_value=SimpleNamespace(EMAIL_BODY_MAX_BYTES=5),
+    ):
+        result = await self_healing.SelfHealer(ctx, 60).reprocess_single("mail-2")
+
+    assert result is False
+    ctx.db_manager.get_connection.assert_not_called()
+    ctx.db_manager.log_initial_email.assert_not_awaited()
+    process_spy.assert_awaited_once_with(email, ctx, force_reprocess=True)
+    assert private_body not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stale_self_healer_batch_cannot_overwrite_manual_review():
+    from src.utils import self_healing
+
+    email = {"id": "exchange-id", "body": "ok", "attachments": []}
+    ctx = _self_healing_context(email)
+    ctx.db_manager.claim_self_healing.return_value = False
+
+    with patch(
+        "src.utils.self_healing.process_and_archive_email",
+        new=AsyncMock(return_value=ProcessingOutcome.PROCESSED),
+    ) as mock_process:
+        result = await self_healing.SelfHealer(ctx, 60).reprocess_single("mail-race")
+
+    assert result is False
+    ctx.exchange_client.get_email.assert_not_awaited()
+    mock_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_self_healer_failed_outcome_is_not_reported_as_recovered():
+    from src.utils import self_healing
+
+    email = {"id": "exchange-id", "body": "ok", "attachments": []}
+    ctx = _self_healing_context(email)
+
+    with patch(
+        "src.utils.self_healing.process_and_archive_email",
+        new=AsyncMock(return_value=ProcessingOutcome.FAILED),
+    ):
+        result = await self_healing.SelfHealer(ctx, 60).reprocess_single("mail-failed")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_reprocess_input_limit_does_not_log_exception_text(caplog):
+    from src.utils import self_healing
+
+    private_body = "private-body-from-exception"
+
+    class LeakyInputLimitExceeded(InputLimitExceeded):
+        def __str__(self) -> str:
+            return private_body
+
+    email = {"body": "ok", "attachments": []}
+    ctx = _self_healing_context(email)
+    error = LeakyInputLimitExceeded("body_bytes")
+    caplog.set_level(logging.ERROR, logger="SelfHealing")
+
+    with patch(
+        "src.utils.self_healing.process_and_archive_email",
+        new_callable=AsyncMock,
+        side_effect=error,
+    ) as mock_process:
+        result = await self_healing.SelfHealer(ctx, 60).reprocess_single("mail-3")
+
+    assert result is False
+    ctx.db_manager.get_connection.assert_not_called()
+    mock_process.assert_awaited_once_with(email, ctx, force_reprocess=True)
+    assert private_body not in caplog.text

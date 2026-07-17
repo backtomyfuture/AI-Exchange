@@ -1,4 +1,7 @@
-from pydantic import SecretStr
+from typing import Literal
+
+from psycopg.conninfo import make_conninfo
+from pydantic import Field, PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -12,7 +15,7 @@ def resolve_secret(value) -> str:
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env.runtime",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -23,20 +26,42 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "email_agent"
     POSTGRES_USER: str = "user"
     POSTGRES_PASSWORD: SecretStr = SecretStr("password")
+    POSTGRES_SCHEMA: str = "public"
+    POSTGRES_MIGRATION_OWNER_ROLE: str = "ai_exchange_migration_owner"
+    POSTGRES_MAINTENANCE_ROLE: str = "ai_exchange_checkpoint_maintenance"
+    POSTGRES_CHECKPOINT_AUDITOR_ROLE: str = "ai_exchange_checkpoint_auditor"
+    DATABASE_ROLE_SEPARATION_REQUIRED: bool = False
+
+    # Phase4-Lite keeps safe defaults off. A fresh single-account deployment may
+    # enable only Durable Inbox processing; Shadow and Sync remain out of scope.
+    DURABLE_INBOX_ENABLED: bool = False
+    INGESTION_SHADOW_ENABLED: bool = False
+    SYNC_RECONCILIATION_ENABLED: bool = False
+    INGESTION_INSTANCE_ID: str = "ai-exchange-web"
+    INGESTION_LEASE_SECONDS: PositiveInt = 30
+    INGESTION_HEARTBEAT_SECONDS: PositiveInt = 10
+    INGESTION_SHUTDOWN_SECONDS: int = Field(default=30, ge=1, le=30)
 
     # Exchange
     EXCHANGE_API_URL: str = ""
     EXCHANGE_API_KEY: SecretStr = SecretStr("")
     EXCHANGE_ACCOUNT_ID: int = 8
     EXCHANGE_ACCOUNT_EMAIL: str = ""
-    EXCHANGE_SSL_VERIFY: bool = False
+    EXCHANGE_SSL_VERIFY: bool = True
+    EXCHANGE_CA_FILE: str = ""
     EXCHANGE_WEBHOOK_SECRET: SecretStr = SecretStr("")
     EXCHANGE_FOLDERS_FULL: str = "收件箱"
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
     EXCHANGE_FOLDER_SENTITEMS: str = "已发送邮件"
     EXCHANGE_FOLDER_DRAFTS: str = "草稿"
+    WEBHOOK_MAX_BYTES: PositiveInt = 1_048_576
+    EXCHANGE_RESPONSE_MAX_BYTES: PositiveInt = 67_108_864
+    EMAIL_BODY_MAX_BYTES: PositiveInt = 10_485_760
+    EMAIL_ATTACHMENT_MAX_COUNT: PositiveInt = 20
+    EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: PositiveInt = 26_214_400
+    EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: PositiveInt = 52_428_800
     # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
-    LEADER_SENDERS: str = "lanjuan@tianjin-air.com,xt_zong@tianjin-air.com"
+    LEADER_SENDERS: str = ""
 
     # Lark
     LARK_APP_ID: str = ""
@@ -44,15 +69,25 @@ class Settings(BaseSettings):
     LARK_ENCRYPT_KEY: SecretStr = SecretStr("")
     LARK_CHAT_ID: str = ""
     LARK_DRIVE_FOLDER_TOKEN: str = ""
+    LARK_ALLOWED_OPEN_IDS: str = ""
 
     # Server
     EXTERNAL_URL: str = "http://localhost:8000"
+    METRICS_TOKEN: SecretStr = SecretStr("")
+
+    # Encrypted content storage. Empty key is an intentional fail-closed default.
+    CONTENT_STORE_ROOT: str = "/app/data/content"
+    CONTENT_STORE_KEY: SecretStr = SecretStr("")
+    CONTENT_STORE_KEY_VERSION: str = "v1"
 
     # LLM (global defaults)
     OPENAI_API_KEY: SecretStr = SecretStr("")
     OPENAI_API_BASE: str = ""
     LLM_MODEL: str = "gemini-3-flash"
     LLM_MAX_RPM: float = 15.0
+    LLM_MAX_INPUT_TOKENS: PositiveInt = 122_880
+    LLM_MAX_OUTPUT_TOKENS: PositiveInt = 8_192
+    LLM_MAX_TOTAL_TOKENS: PositiveInt = 131_072
 
     # Per-role model overrides (leave empty to use LLM_MODEL)
     LLM_CATEGORIZER_MODEL: str = ""
@@ -83,15 +118,20 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"
 
     # App
+    APP_ENV: Literal["development", "test", "production"] = "development"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
     @property
     def database_url(self) -> str:
         """Compute PostgreSQL DSN from individual fields."""
-        return (
-            f"postgresql://{self.POSTGRES_USER}:{resolve_secret(self.POSTGRES_PASSWORD)}"
-            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        return make_conninfo(
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            dbname=self.POSTGRES_DB,
+            user=self.POSTGRES_USER,
+            password=resolve_secret(self.POSTGRES_PASSWORD),
+            options=f"-csearch_path=pg_catalog,{self.POSTGRES_SCHEMA}",
         )
 
 

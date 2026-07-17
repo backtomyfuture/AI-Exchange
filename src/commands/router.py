@@ -29,6 +29,10 @@ class CommandRouter:
 
         try:
             return await handler(args)
-        except Exception as e:
-            logger.error("Command %s failed: %s", cmd, e)
-            return f"指令执行失败: {e}"
+        except Exception as exc:
+            logger.error(
+                "Command %s failed: error_type=%s",
+                cmd,
+                type(exc).__name__,
+            )
+            return "指令执行失败，请稍后重试"

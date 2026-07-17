@@ -81,7 +81,7 @@ class TestEmailRetriever:
         mock_qdrant_client.query_points.return_value = mock_search_result
         
         # 执行搜索
-        results = retriever.search("test", sender="boss@company.com")
+        retriever.search("test", sender="boss@company.com")
         
         # 验证filter被传递
         call_args = mock_qdrant_client.query_points.call_args

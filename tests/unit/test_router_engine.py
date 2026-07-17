@@ -9,9 +9,8 @@
 """
 
 import pytest
-from unittest.mock import AsyncMock, Mock, patch, MagicMock
+from unittest.mock import AsyncMock, Mock, patch
 from src.router.engine import RoutingEngine
-from src.graph.state import AgentState
 
 
 @pytest.fixture
@@ -92,7 +91,7 @@ class TestRoutingEngineTier1:
             with patch.object(engine, '_tier3_llm_route', new_callable=AsyncMock) as mock_t3:
                 mock_t3.return_value = ['skill_project_tracker']
                 
-                with patch.object(engine, '_apply_skills', return_value=sample_state) as mock_apply:
+                with patch.object(engine, '_apply_skills', return_value=sample_state):
                     result = await engine.execute_router(sample_state)
                     
                     # 验证进入Tier 3
@@ -100,8 +99,8 @@ class TestRoutingEngineTier1:
                     
                     # 验证routing_log记录流程
                     log = result.get("routing_log", [])
-                    assert any("Tier 1 No match" in str(l) for l in log)
-                    assert any("Tier 3" in str(l) for l in log)
+                    assert any("Tier 1 No match" in str(entry) for entry in log)
+                    assert any("Tier 3" in str(entry) for entry in log)
 
 
 class TestRoutingEngineTier3:
@@ -199,11 +198,11 @@ class TestRoutingEngineTier3:
                 assert len(result) == 1
 
 
-class TestRoutingEngineReducerDelta:
-    """Ensure execute_router returns only the delta for reducer-controlled lists."""
+class TestRoutingEngineReplacementLists:
+    """List fields are explicitly merged now that Graph reducers are removed."""
 
     @pytest.mark.asyncio
-    async def test_execute_router_returns_only_delta_for_routing_log(self, mock_settings):
+    async def test_execute_router_preserves_existing_routing_log(self, mock_settings):
         engine = RoutingEngine()
         state = {
             "email": {"id": "x", "subject": "s", "body": "b", "sender": "u@x.com"},
@@ -217,11 +216,11 @@ class TestRoutingEngineReducerDelta:
              patch.object(engine, "_apply_skills", return_value=state):
             result = await engine.execute_router(state)
 
-        # Delta only - not the merged list
         assert result["routing_log"] == [
+            "existing entry",
             "Tier 1 Match: ['skill_new']"
         ]
-        assert result["active_skills"] == ["skill_new"]
+        assert result["active_skills"] == ["already_active", "skill_new"]
 
     @pytest.mark.asyncio
     async def test_execute_router_filters_already_active_skills(self, mock_settings):
@@ -238,8 +237,7 @@ class TestRoutingEngineReducerDelta:
              patch.object(engine, "_apply_skills", return_value=state):
             result = await engine.execute_router(state)
 
-        # Only the new skill is returned in the delta; reducer would merge with existing.
-        assert result["active_skills"] == ["skill_fresh"]
+        assert result["active_skills"] == ["skill_already", "skill_fresh"]
 
 
 class TestRoutingEngineSkillApplication:
@@ -303,7 +301,7 @@ class TestRoutingEngineSkillApplication:
 
     @pytest.mark.asyncio
     async def test_apply_skills_with_error_handling(self, sample_state, mock_settings):
-        """测试Skill执行错误时的容错处理"""
+        """Skill执行错误必须整体失败，不能保留或继续部分路由。"""
         engine = RoutingEngine()
         
         # Mock一个会抛异常的skill
@@ -323,14 +321,12 @@ class TestRoutingEngineSkillApplication:
         
         with patch.object(engine.skill_manager, 'get_skill', side_effect=get_skill_side_effect):
             with patch('src.router.dependency.resolve_skill_order', return_value=['failing', 'normal']):
-                result = await engine._apply_skills(sample_state, ['failing', 'normal'])
-                
-                # 验证即使第一个skill失败,第二个仍然执行
+                with pytest.raises(RuntimeError, match="router_skill_failed"):
+                    await engine._apply_skills(sample_state, ['failing', 'normal'])
+
                 failing_skill.execute.assert_called_once()
-                normal_skill.execute.assert_called_once()
-                
-                # 验证正常skill的状态被合并
-                assert result["metadata"]["success"] is True
+                normal_skill.execute.assert_not_called()
+                assert "success" not in sample_state.get("metadata", {})
 
 
     @pytest.mark.asyncio

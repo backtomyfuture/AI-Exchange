@@ -1,16 +1,29 @@
 import logging
 from langchain_core.prompts import ChatPromptTemplate
+from src.config import get_settings
 from src.graph.state import AgentState
+from src.graph.dependencies import GraphDependencies
+from src.graph.state_factory import hydrate_email_from_state, sanitize_graph_delta
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    rendered_messages_for_budget,
+    token_budget_from_settings,
+)
+from src.safety.manual_review import build_manual_review_delta
 from src.utils.retry_decorator import with_llm_retry
 
 logger = logging.getLogger(__name__)
 
-async def generate_draft(state: AgentState) -> AgentState:
+async def generate_draft(
+    state: AgentState,
+    dependencies: GraphDependencies,
+) -> AgentState:
     """
     拟稿节点：参考检索到的背景生成邮件回复草稿。
     """
-    email = state.get("email", {})
-    context_list = state.get("context", [])
+    email = await hydrate_email_from_state(state, dependencies)
+    context_list = state.get("context_summaries", [])
 
     # 格式化背景信息
     context_str = ""
@@ -18,25 +31,7 @@ async def generate_draft(state: AgentState) -> AgentState:
         context_str += f"--- 历史邮件 {i+1} ---\n"
         context_str += f"发件人: {ctx.get('sender', '未知')}\n"
         context_str += f"主题: {ctx.get('subject', '无主题')}\n"
-        context_str += f"内容: {ctx.get('body', '')[:300]}...\n\n"
-
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("drafter", temperature=0.7)
-
-    feedback = state.get("feedback")
-    prev_draft = state.get("draft")
-
-    if feedback:
-        logger.info("Applying user feedback as final draft content.")
-        # 用户在弹窗中直接修改了草稿。逻辑：
-        # 弹窗输入 (feedback) 就是拟稿的全文正文。
-        # 直接使用用户的版本作为新草稿，跳过 LLM 处理以确保 100% 忠于用户的编辑并提高响应速度。
-        return {
-            "draft": feedback.strip(),
-            "feedback": None,
-            "approval_status": "pending",
-            "next_step": "approval",
-        }
+        context_str += f"内容摘要: {ctx.get('snippet', '')}\n\n"
     
     # --- 初始拟稿逻辑 (仅在没有 feedback 时执行) ---
     base_system_prompt = """你是一个专业的行政助手。
@@ -56,6 +51,14 @@ async def generate_draft(state: AgentState) -> AgentState:
         base_system_prompt = base_system_prompt + "\n\n" + modifier.strip()
 
     metadata = state.get("metadata") or {}
+
+    review_issues = metadata.get("review_issues", "")
+    if review_issues:
+        base_system_prompt += (
+            "\n\n【上一轮审核修订要求】:\n"
+            + str(review_issues)
+            + "\n请在新草稿中逐项修正，仍只输出完整回复正文。"
+        )
 
     style_guidance = metadata.get("style_guidance", "")
     if style_guidance:
@@ -89,44 +92,83 @@ async def generate_draft(state: AgentState) -> AgentState:
 {body}
 </email_content>""")
     ])
-    chain = prompt | llm
-    
-    @with_llm_retry(max_attempts=3)
-    async def invoke_with_retry(payload):
-        return await chain.ainvoke(payload)
-
-    # Check for Forwarding action - Skip LLM
+    # Forwarding skills may have already persisted their fixed draft in categorizer.
     classification = state.get("classification", {})
     if classification.get("action") == "forward":
-        logger.info("Action is 'forward'. Skipping LLM draft generation. Using existing draft.")
-        return state
+        draft_id = state.get("draft_id")
+        if not draft_id:
+            draft_id = await dependencies.drafts.save_draft(
+                state["email_id"],
+                "呈阅",
+            )
+        return sanitize_graph_delta(
+            state,
+            {
+                "draft_id": draft_id,
+                "approval_status": "pending",
+                "next_step": "approval",
+            },
+        )
 
+    payload = {
+        "context": context_str if context_str else "无相关历史背景",
+        "extra_context": extra_context,
+        "sender": email.get("sender", ""),
+        "subject": email.get("subject", ""),
+        "body": email.get("body", ""),
+    }
     try:
-        logger.info("Generating draft with LLM and retrieved context.")
-        response = await invoke_with_retry({
-            "context": context_str if context_str else "无相关历史背景",
-            "extra_context": extra_context,
-            "sender": email.get("sender", ""),
-            "subject": email.get("subject", ""),
-            "body": email.get("body", "")
-        })
-    except Exception as e:
-        # 如果达到最大重试次数，返回错误提示
-        from langchain_core.messages import AIMessage
-        response = AIMessage(content=f"Error generating draft: {str(e)}")
+        rendered_prompt = rendered_messages_for_budget(
+            prompt.format_messages(**payload)
+        )
+        enforce_model_input_budget(
+            "drafter",
+            rendered_prompt,
+            budget=token_budget_from_settings(get_settings()),
+        )
+
+        from src.providers.factory import get_llm_for_role
+        llm = get_llm_for_role("drafter", temperature=0.7)
+        chain = prompt | llm
+
+        @with_llm_retry(max_attempts=3)
+        async def invoke_with_retry(payload):
+            return await chain.ainvoke(payload)
+
+        logger.info(
+            "Generating draft: reviewer_rewrite=%s",
+            bool(review_issues),
+        )
+        response = await invoke_with_retry(payload)
+        response_content = getattr(response, "content", None)
+        if not isinstance(response_content, str):
+            return build_manual_review_delta(state, "drafter_model_failed")
+    except ModelInputTooLarge:
+        return build_manual_review_delta(state, "drafter_input_too_large")
+    except Exception as exc:
+        logger.error(
+            "Draft generation failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return build_manual_review_delta(state, "drafter_model_failed")
 
     # 更新状态，清除反馈以防循环
     import re
-    cleaned_draft = response.content
+    cleaned_draft = response_content
     # 保险起见，清理可能存在的标签
     cleaned_draft = re.sub(r'<thought>.*?</thought>', '', cleaned_draft, flags=re.DOTALL)
     cleaned_draft = re.sub(r'<draft>', '', cleaned_draft)
     cleaned_draft = re.sub(r'</draft>', '', cleaned_draft)
     cleaned_draft = cleaned_draft.strip()
+    if not cleaned_draft:
+        return build_manual_review_delta(state, "drafter_empty_response")
 
-    return {
-        "draft": cleaned_draft,
-        "feedback": None,
-        "approval_status": "pending",
-        "next_step": "approval",
-    }
+    draft_id = await dependencies.drafts.save_draft(state["email_id"], cleaned_draft)
+    return sanitize_graph_delta(
+        state,
+        {
+            "draft_id": draft_id,
+            "approval_status": "pending",
+            "next_step": "approval",
+        },
+    )

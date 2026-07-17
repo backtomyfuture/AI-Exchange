@@ -3,6 +3,7 @@ from typing import List, Optional, Any
 from openai import OpenAI, APIError, APIConnectionError
 
 from src.config import get_settings
+from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +58,11 @@ class EmailRetriever:
                 model=self.embedding_model
             )
             return response.data[0].embedding
-        except APIConnectionError as e:
-            logger.error(f"Failed to connect to embedding service: {e}")
+        except APIConnectionError as exc:
+            logger.error("Embedding service unavailable: error_type=%s", type(exc).__name__)
             return []
-        except APIError as e:
-            logger.error(f"API error generating embedding: {e}")
+        except APIError as exc:
+            logger.error("Embedding API failed: error_type=%s", type(exc).__name__)
             return []
 
     def search(
@@ -106,15 +107,15 @@ class EmailRetriever:
                 with_payload=True
             )
             return [hit.payload for hit in search_result.points]
-        except Exception as e:
+        except Exception as exc:
             # Keep broad handling to avoid hard dependency on qdrant exception classes.
-            if e.__class__.__name__ == "UnexpectedResponse":
-                logger.error(f"Qdrant search failed (unexpected response): {e}")
+            if exc.__class__.__name__ == "UnexpectedResponse":
+                logger.error("Qdrant search failed: error_type=UnexpectedResponse")
                 return []
-            if isinstance(e, ConnectionError):
-                logger.error(f"Qdrant connection error during search: {e}")
+            if isinstance(exc, ConnectionError):
+                logger.error("Qdrant search connection failed: error_type=%s", type(exc).__name__)
                 return []
-            logger.error(f"Qdrant search failed (unexpected response): {e}")
+            logger.error("Qdrant search failed: error_type=%s", type(exc).__name__)
             return []
 
     def search_by_thread(self, thread_id: str, limit: int = 20) -> List[dict]:
@@ -146,8 +147,12 @@ class EmailRetriever:
                 with_payload=True,
             )
             return [point.payload for point in points]
-        except Exception as e:
-            logger.error(f"Thread search failed for {thread_id}: {e}")
+        except Exception as exc:
+            logger.error(
+                "Thread search failed: thread=%s error_type=%s",
+                fingerprint_identifier(thread_id, namespace="thread"),
+                type(exc).__name__,
+            )
             return []
 
 

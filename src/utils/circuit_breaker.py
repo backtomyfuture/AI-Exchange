@@ -46,15 +46,15 @@ class CircuitBreaker:
         self._prune_expired()
         self.failure_count = len(self._failure_timestamps)
         self.last_failure_time = now
-        self.last_error = str(error)
+        self.last_error = type(error).__name__
 
         if not self._is_open and self.failure_count >= self.failure_threshold:
             self._is_open = True
             logger.critical(
-                "Circuit Breaker OPENED: %d failures in %ds window (error: %s)",
+                "Circuit Breaker OPENED: %d failures in %ds window error_type=%s",
                 self.failure_count,
                 self.window_seconds,
-                error,
+                type(error).__name__,
             )
             self._push_state_metric()
             return True

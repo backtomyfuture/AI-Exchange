@@ -6,7 +6,7 @@
 
 from functools import wraps
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
-from openai import RateLimitError, APIError, APIConnectionError
+from openai import RateLimitError
 
 from src.utils.rate_limiter import llm_rate_limiter
 

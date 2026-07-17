@@ -1,6 +1,6 @@
 import pytest
+from typing import get_args, get_type_hints
 from unittest.mock import MagicMock, patch, AsyncMock
-import json
 from src.utils import lark_app
 
 @pytest.fixture
@@ -20,6 +20,15 @@ def test_init_lark_app(mock_lark_deps, mock_env):
     assert lark_app.exchange_client == ex
     assert lark_app.lark_api_client is not None
     assert lark_app.card_builder is not None
+
+
+def test_init_lark_app_keeps_the_shared_graph_dependencies(mock_lark_deps, mock_env):
+    db, graph, ex = mock_lark_deps
+    dependencies = MagicMock()
+
+    lark_app.init_lark_app(db, graph, ex, dependencies=dependencies)
+
+    assert lark_app.graph_dependencies is dependencies
 
 @patch("lark_oapi.Client")
 def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
@@ -108,8 +117,48 @@ async def test_process_pdf_generation_handles_failure(mock_env):
 
     # Simulate generate_and_upload_pdf raising an exception inside the function.
     with patch(
-        "src.utils.lark_app.generate_and_upload_pdf",
+        "src.utils.lark_pdf_flow.generate_and_upload_pdf",
         new=AsyncMock(side_effect=RuntimeError("boom")),
+    ), patch(
+        "src.utils.lark_app._require_graph_dependencies",
+        return_value=MagicMock(),
     ):
         # Should not raise NameError or any other exception (the function swallows and logs).
         await lark_app.process_pdf_generation_and_reply("fake-id", state, "msg_456")
+
+
+@pytest.mark.asyncio
+async def test_process_pdf_shim_returns_explicit_flow_outcome(mock_env):
+    from src.utils.lark_pdf_flow import PdfFlowOutcome
+
+    state = MagicMock()
+    outcome = PdfFlowOutcome(
+        status="reply_sent_cleanup_pending",
+        retryable=True,
+        reply_sent=True,
+        cleanup_tokens=("cleanup-token",),
+    )
+    implementation = AsyncMock(return_value=outcome)
+
+    with patch(
+        "src.utils.lark_pdf_flow.process_pdf_generation_and_reply",
+        new=implementation,
+    ), patch(
+        "src.utils.lark_app._require_graph_dependencies",
+        return_value=MagicMock(),
+    ):
+        result = await lark_app.process_pdf_generation_and_reply(
+            "fake-id",
+            state,
+            "msg_456",
+        )
+
+    assert result is outcome
+    implementation.assert_awaited_once()
+
+
+def test_generate_pdf_shim_type_contract_includes_flow_outcome():
+    from src.utils.lark_pdf_flow import PdfFlowOutcome
+
+    return_hint = get_type_hints(lark_app.generate_and_upload_pdf)["return"]
+    assert PdfFlowOutcome in get_args(return_hint)

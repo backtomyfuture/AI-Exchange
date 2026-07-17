@@ -1,8 +1,5 @@
 import logging
-import io
 import os
-import tempfile
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -156,8 +153,7 @@ def convert_html_to_pdf(html_content: str) -> bytes:
         
         return pdf_bytes
         
-    except Exception as e:
-        logger.error(f"Error generating PDF (WeasyPrint): {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("PDF generation failed: error_type=%s", type(exc).__name__)
         # Re-raise the exception instead of returning empty bytes
         raise
-

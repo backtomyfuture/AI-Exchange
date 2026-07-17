@@ -1,0 +1,4 @@
+# Official PyPI wheels for uv 0.11.28 on Linux aarch64 and x86_64.
+uv==0.11.28 \
+    --hash=sha256:041e4b80bebc58d7142ac9394370cacd73185fd8d066d6675d14707d83408f6d \
+    --hash=sha256:49fe42df9f42056037473f3876adec1615709b57d3470ed39178ff420f3afb9f

@@ -2,13 +2,12 @@
 Lark Card Builder - 飞书卡片构建模块
 从 lark_app.py 拆分，负责卡片 JSON 结构的构建逻辑。
 """
-import os
 import re
 import logging
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
-from urllib.parse import quote
 from src.config import get_settings
+from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +78,8 @@ def html_to_lark_md(html_str: str) -> str:
         text = soup.get_text()
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
-    except Exception as e:
-        return f"Markdown解析出错: {e}"
+    except Exception:
+        return "Markdown解析失败"
 
 
 def extract_email_address(raw: str) -> Optional[str]:
@@ -136,7 +135,7 @@ class LarkCardBuilder:
 
         email_map = {}
         unresolved_emails = []
-        logger.info(f"Looking up Lark users for: {emails}")
+        logger.info("Looking up Lark users: count=%d", len(emails))
 
         # Phase 1: Lark lookup
         for email in emails:
@@ -159,7 +158,11 @@ class LarkCardBuilder:
                 resp = self.lark_api_client.contact.v3.user.get(req)
 
                 if not resp.success():
-                    logger.warning(f"Lookup failed for user_id='{user_id_input}' (email={email}): code={resp.code}, msg={resp.msg}")
+                    logger.warning(
+                        "Lark user lookup failed: user=%s code=%s",
+                        fingerprint_identifier(email, namespace="email"),
+                        resp.code,
+                    )
                     unresolved_emails.append(email)
                     continue
 
@@ -167,7 +170,11 @@ class LarkCardBuilder:
                     found_open_id = resp.data.user.open_id
                     found_name = resp.data.user.name
                     if found_open_id:
-                        logger.info(f"Resolved {email} -> {found_name} ({found_open_id})")
+                        logger.info(
+                            "Lark user resolved: email=%s open_id=%s",
+                            fingerprint_identifier(email, namespace="email"),
+                            fingerprint_identifier(found_open_id, namespace="lark_actor"),
+                        )
                         user_info = {'open_id': found_open_id, 'name': found_name}
                         email_map[email] = user_info
                         self._user_cache[email] = user_info
@@ -176,14 +183,21 @@ class LarkCardBuilder:
                 else:
                     unresolved_emails.append(email)
 
-            except Exception as e:
-                logger.error(f"Error resolving user {email}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Lark user resolution failed: email=%s error_type=%s",
+                    fingerprint_identifier(email, namespace="email"),
+                    type(exc).__name__,
+                )
                 unresolved_emails.append(email)
 
         # Phase 2: Exchange contact resolution fallback
         if unresolved_emails and self.exchange_client:
             import asyncio
-            logger.info(f"Falling back to Exchange contact resolve for: {unresolved_emails}")
+            logger.info(
+                "Falling back to Exchange contact resolution: count=%d",
+                len(unresolved_emails),
+            )
             for email in unresolved_emails:
                 try:
                     # Run async resolve_contact in sync context
@@ -199,14 +213,24 @@ class LarkCardBuilder:
                         name = asyncio.run(self.exchange_client.resolve_contact(email))
                     
                     if name:
-                        logger.info(f"Exchange resolved {email} -> {name}")
+                        logger.info(
+                            "Exchange contact resolved: email=%s",
+                            fingerprint_identifier(email, namespace="email"),
+                        )
                         user_info = {'name': name}  # No open_id
                         email_map[email] = user_info
                         self._user_cache[email] = user_info
                     else:
-                        logger.info(f"Exchange could not resolve {email}")
-                except Exception as e:
-                    logger.error(f"Exchange contact resolve error for {email}: {e}")
+                        logger.info(
+                            "Exchange contact unresolved: email=%s",
+                            fingerprint_identifier(email, namespace="email"),
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Exchange contact resolution failed: email=%s error_type=%s",
+                        fingerprint_identifier(email, namespace="email"),
+                        type(exc).__name__,
+                    )
 
         return email_map
 
@@ -240,13 +264,16 @@ class LarkCardBuilder:
                 open_id = str(getattr(user, "open_id", "") or "").strip()
                 if open_id:
                     results.append(open_id)
-        except Exception as e:
-            logger.warning("Prefix lookup failed: prefix=%s, err=%s", user_prefix, e)
+        except Exception as exc:
+            logger.warning(
+                "Prefix lookup failed: prefix=%s error_type=%s",
+                fingerprint_identifier(user_prefix, namespace="user_prefix"),
+                type(exc).__name__,
+            )
 
         logger.info(
-            "Recipient search stats: mode=prefix_only, keyword=%s, prefix=%s, hits=%s",
-            raw_keyword,
-            user_prefix,
+            "Recipient search stats: mode=prefix_only keyword_bytes=%d hits=%d",
+            len(raw_keyword.encode("utf-8")),
             len(results),
         )
         return results
@@ -518,7 +545,12 @@ class LarkCardBuilder:
 
         original_snippet = "无内容摘要"
         if context:
-            text = context[0].get('chunk_text') or context[0].get('body') or ""
+            text = (
+                context[0].get("snippet")
+                or context[0].get("chunk_text")
+                or context[0].get("body")
+                or ""
+            )
             text = text.strip()
             original_snippet = text[:150] + "..." if len(text) > 150 else text
 
@@ -617,13 +649,12 @@ class LarkCardBuilder:
         elements.append({"tag": "hr"})
 
         logger.info(
-            "Build Card Debug: Sender=%s, OriginalTo=%s, OriginalCc=%s, DraftTo=%s, DraftCc=%s, PDF=%s",
-            raw_sender,
-            original_to_list,
-            original_cc_list,
-            draft_to_list,
-            draft_cc_list,
-            pdf_url,
+            "Building approval card: original_to=%d original_cc=%d draft_to=%d draft_cc=%d pdf=%s",
+            len(original_to_list),
+            len(original_cc_list),
+            len(draft_to_list),
+            len(draft_cc_list),
+            bool(pdf_url),
         )
         resolved_pdf_url = self._normalize_pdf_url(pdf_url)
 
@@ -658,7 +689,12 @@ class LarkCardBuilder:
                      original_snippet = raw_body[:200]
              elif context:
                  # Fallback to context if body is missing
-                 text = context[0].get('chunk_text') or context[0].get('body') or ""
+                 text = (
+                     context[0].get("snippet")
+                     or context[0].get("chunk_text")
+                     or context[0].get("body")
+                     or ""
+                 )
                  text = text.strip()
                  # Try to remove Subject/Attachment lines if present in chunk
                  clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
@@ -684,7 +720,7 @@ class LarkCardBuilder:
                     att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
                 else:
                     # Skip attachments without URL (not uploaded)
-                    logger.debug(f"Skipping attachment without URL: {name}")
+                    logger.debug("Skipping attachment without URL")
                     continue
             
             if att_lines:
@@ -845,7 +881,12 @@ class LarkCardBuilder:
         elements.append({"tag": "hr"})
 
         # Debug logging for recipients
-        logger.info(f"Build Read-Only Card: Sender={raw_sender}, To={email_data.get('to')}, Subject={subject}, PDF={pdf_url}")
+        logger.info(
+            "Building read-only card: to_count=%d cc_count=%d pdf=%s",
+            len(to_list),
+            len(cc_list),
+            bool(pdf_url),
+        )
 
         resolved_pdf_url = self._normalize_pdf_url(pdf_url)
 
@@ -876,7 +917,12 @@ class LarkCardBuilder:
                 except Exception:
                     original_snippet = raw_body[:300]
             elif context:
-                text = context[0].get('chunk_text') or context[0].get('body') or ""
+                text = (
+                    context[0].get("snippet")
+                    or context[0].get("chunk_text")
+                    or context[0].get("body")
+                    or ""
+                )
                 text = text.strip()
                 clean_lines = [line for line in text.split('\n') if not line.lower().startswith(('subject:', '附件:', '【'))]
                 text = " ".join(clean_lines)
@@ -903,7 +949,7 @@ class LarkCardBuilder:
                     att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
                 else:
                     # Skip attachments without URL (not uploaded)
-                    logger.debug(f"Skipping attachment without URL: {name}")
+                    logger.debug("Skipping attachment without URL")
                     continue
             
             if att_lines:
@@ -912,7 +958,10 @@ class LarkCardBuilder:
         
         # Log filtered attachments for debugging
         if len(attachments) != len(real_attachments):
-            logger.info(f"Filtered {len(attachments) - len(real_attachments)} inline images from attachments")
+            logger.info(
+                "Filtered inline images from attachments: count=%d",
+                len(attachments) - len(real_attachments),
+            )
 
         elements.append({"tag": "hr"})
 
@@ -945,7 +994,11 @@ class LarkCardBuilder:
         # Debug Logging for Missing Recipients
         to_list = email_data.get("to", [])
         cc_list = email_data.get("cc", [])
-        logger.info(f"Compact Header Debug: Sender={raw_sender}, To={to_list} (len={len(to_list)}), Cc={cc_list} (len={len(cc_list)})")
+        logger.info(
+            "Building compact header: to_count=%d cc_count=%d",
+            len(to_list),
+            len(cc_list),
+        )
 
         columns = []
         

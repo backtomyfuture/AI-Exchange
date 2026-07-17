@@ -2,7 +2,7 @@ import os
 import yaml
 import importlib.util
 import logging
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 from src.router.base import BaseSkill, SkillManifest
 
 logger = logging.getLogger(__name__)
@@ -64,8 +64,12 @@ class SkillManager:
                     continue
                 logger.info(f"Loaded Skill: {manifest.name} ({skill_id})")
 
-            except Exception as e:
-                logger.error(f"Failed to load skill {skill_id}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Failed to load skill %s: error_type=%s",
+                    skill_id,
+                    type(exc).__name__,
+                )
 
     def get_skill(self, skill_id: str) -> Optional[BaseSkill]:
         return self.skills.get(skill_id)

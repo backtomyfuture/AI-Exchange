@@ -5,9 +5,12 @@ from src.nodes import categorizer, drafter
 
 
 @pytest.mark.asyncio
-async def test_categorize_email_success(mock_env):
+async def test_categorize_email_success(mock_env, graph_node_harness):
     """Test successful email categorization."""
-    state = {"email": {"subject": "Q", "body": "Context"}, "classification": {}}
+    state = graph_node_harness.state(
+        {"id": "node-category", "subject": "Q", "body": "Context"},
+        classification={},
+    )
 
     def fake_retry_decorator(**_kwargs):
         def _decorator(_fn):
@@ -25,10 +28,20 @@ async def test_categorize_email_success(mock_env):
 
         return _decorator
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm", return_value=MagicMock()), patch(
-        "src.nodes.categorizer.with_llm_retry", side_effect=fake_retry_decorator
+    routing_engine = MagicMock()
+    routing_engine.execute_router = AsyncMock(side_effect=lambda routed: routed)
+    with (
+        patch("src.nodes.categorizer.get_routing_engine", return_value=routing_engine),
+        patch("src.providers.factory.get_llm_for_role", return_value=MagicMock()),
+        patch(
+            "src.nodes.categorizer.with_llm_retry",
+            side_effect=fake_retry_decorator,
+        ),
     ):
-        result = await categorizer.categorize_email(state)
+        result = await categorizer.categorize_email(
+            state,
+            graph_node_harness.dependencies,
+        )
 
     assert result["classification"]["priority"] == "P1"
     assert result["classification"]["need_reply"] is True
@@ -36,29 +49,46 @@ async def test_categorize_email_success(mock_env):
 
 
 @pytest.mark.asyncio
-async def test_generate_draft_with_feedback(mock_env):
-    """Test draft generation when user provides feedback (bypass LLM)."""
-    state = {"email": {"subject": "Test"}, "feedback": "User rewrote this.", "draft": "Old draft"}
+async def test_generate_forward_draft_uses_store_not_feedback_state(
+    mock_env,
+    graph_node_harness,
+):
+    """Forward draft text is durable and Graph receives only its identifier."""
+    state = graph_node_harness.state(
+        {"id": "node-forward", "subject": "Test"},
+        classification={"action": "forward"},
+    )
 
     with patch("src.utils.llm_factory.LLMFactory.create_llm"):
-        result = await drafter.generate_draft(state)
+        result = await drafter.generate_draft(
+            state,
+            graph_node_harness.dependencies,
+        )
 
-    assert result["draft"] == "User rewrote this."
-    assert result["feedback"] is None
+    assert graph_node_harness.drafts[result["draft_id"]] == "呈阅"
+    assert "draft" not in result
+    assert "feedback" not in result
     assert result["next_step"] == "approval"
 
 
 @pytest.mark.asyncio
-async def test_generate_draft_no_feedback(mock_env):
+async def test_generate_draft_no_feedback(mock_env, graph_node_harness):
     """Test draft generation via LLM."""
-    state = {
-        "email": {"subject": "Subj", "body": "Body", "sender": "me"},
-        "context": [{"subject": "Hist", "body": "Old"}],
-        "feedback": None,
-    }
+    state = graph_node_harness.state(
+        {
+            "id": "node-draft",
+            "subject": "Subj",
+            "body": "Body",
+            "sender": "me",
+        },
+        context=[{"subject": "Hist", "body": "Old"}],
+    )
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create, patch(
-        "src.nodes.drafter.with_llm_retry", side_effect=lambda **_: (lambda fn: fn)
+    with (
+        patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create,
+        patch(
+            "src.nodes.drafter.with_llm_retry", side_effect=lambda **_: lambda fn: fn
+        ),
     ):
         mock_create.return_value = MagicMock()
         mock_response = MagicMock(content="Generated Draft Content")
@@ -66,8 +96,14 @@ async def test_generate_draft_no_feedback(mock_env):
         mock_chain.ainvoke = AsyncMock(return_value=mock_response)
         mock_prompt = MagicMock()
         mock_prompt.__or__.return_value = mock_chain
-        with patch("src.nodes.drafter.ChatPromptTemplate.from_messages", return_value=mock_prompt):
-            result = await drafter.generate_draft(state)
+        with patch(
+            "src.nodes.drafter.ChatPromptTemplate.from_messages",
+            return_value=mock_prompt,
+        ):
+            result = await drafter.generate_draft(
+                state,
+                graph_node_harness.dependencies,
+            )
 
-    assert result["draft"] == "Generated Draft Content"
+    assert graph_node_harness.drafts[result["draft_id"]] == "Generated Draft Content"
     assert result["next_step"] == "approval"

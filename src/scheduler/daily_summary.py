@@ -98,8 +98,8 @@ async def generate_daily_summary() -> Optional[str]:
         logger.info(f"Daily summary generated: {len(summary)} chars")
         return final_summary
         
-    except Exception as e:
-        logger.error(f"Error generating daily summary: {e}")
+    except Exception as exc:
+        logger.error("Daily summary generation failed: error_type=%s", type(exc).__name__)
         return None
 
 
@@ -142,10 +142,10 @@ async def send_daily_summary():
         if response.success():
             logger.info("Daily summary sent successfully.")
         else:
-            logger.error(f"Failed to send daily summary: {response.code} - {response.msg}")
+            logger.error("Daily summary send rejected: code=%s", response.code)
             
-    except Exception as e:
-        logger.error(f"Error sending daily summary: {e}")
+    except Exception as exc:
+        logger.error("Daily summary send failed: error_type=%s", type(exc).__name__)
 
 
 async def run_scheduler(send_time: time = None):
@@ -177,8 +177,8 @@ async def run_scheduler(send_time: time = None):
         # 执行摘要任务
         try:
             await send_daily_summary()
-        except Exception as e:
-            logger.error(f"Daily summary task failed: {e}")
+        except Exception as exc:
+            logger.error("Daily summary task failed: error_type=%s", type(exc).__name__)
         
         # 短暂休眠避免重复执行
         await asyncio.sleep(60)

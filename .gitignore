@@ -1,5 +1,8 @@
-# Environment variables
-.env
+# Environment variables and local credential files
+.env*
+!.env.example
+!.env.runtime.example
+secrets/
 
 # Python
 __pycache__/
@@ -8,6 +11,7 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.coverage*
 .pytest_cache/
 
 # Local data (Databases)
@@ -27,3 +31,11 @@ processed_emails.json
 # Docker logs
 *.log
 *.txt
+!requirements.bootstrap.txt
+
+# Generated local verification artifacts
+artifacts/
+
+# Real deployment manifests and operator release metadata are local-only.
+deploy/*/
+deploy/*.json

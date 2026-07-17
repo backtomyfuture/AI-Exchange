@@ -1,31 +1,34 @@
-import operator
-from typing import TypedDict, List, Optional, Any, Annotated
+from typing import Any, TypedDict
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """
-    LangGraph 状态定义，用于在节点间传递信息。
-    List 字段使用 operator.add reducer 以支持增量合并。
+    仅保存可安全进入 checkpoint 的小型元数据与持久化引用。
+
+    列表刻意不使用 append reducer；各节点必须返回经过统一上限处理的完整值。
     """
     # --- 基础数据层 ---
-    email: dict
+    email_id: str
+    email: dict[str, str]
+    content_ref: dict[str, Any]
     classification: dict
-    context: Annotated[List[dict], operator.add]
-    draft: str
+    context_summaries: list[dict[str, str]]
+    draft_id: str | None
+    draft_to: list[str]
+    draft_cc: list[str]
 
     # --- 路由与 Skill 控制层 ---
-    active_skills: Annotated[List[str], operator.add]
-    routing_log: Annotated[List[str], operator.add]
+    active_skills: list[str]
+    routing_log: list[str]
     priority_level: int
-    system_prompt_modifier: Optional[str]
-    tool_calls: Annotated[List[dict], operator.add]
+    system_prompt_modifier: str | None
+    tool_calls: list[dict[str, str]]
 
     # --- 执行与状态层 ---
     approval_status: str
-    feedback: Optional[str]
     next_step: str
-    pdf_token: Optional[str]
-    attachment_tokens: Annotated[List[str], operator.add]
-    metadata: Optional[dict]
-
-    # --- Memory 层 ---
-    reply_examples: Annotated[List[dict], operator.add]
+    pdf_token: str | None
+    attachment_tokens: list[str]
+    metadata: dict[str, Any]
+    review_result: dict[str, Any] | None
+    safe_error_summary: str | None
+    recipient_ui: dict[str, dict[str, Any]]

@@ -26,31 +26,17 @@ docker compose up -d qdrant postgres
 
 ### LangGraph checkpoint migration gotcha
 
-`langgraph-checkpoint-postgres` v3.0.4 uses `CREATE INDEX CONCURRENTLY` in migrations 6–8, which fails inside the default transaction block. Before the first app launch against a fresh database, run migrations with autocommit:
+`langgraph-checkpoint-postgres` v3.0.4 uses `CREATE INDEX CONCURRENTLY` in migrations 6–8. The explicit bootstrap command handles the required autocommit behavior. Bootstrap must use the isolated migration-owner Docker secret, never the runtime DSN. Do not execute this command until the Task 1B0-B catalog role verifier and the separate DBA ownership-transfer checkpoint have passed:
 
-```python
-import asyncio, psycopg
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-async def migrate():
-    conn = await psycopg.AsyncConnection.connect(
-        "postgresql://user:password@localhost:5432/email_agent", autocommit=True
-    )
-    cur = conn.cursor()
-    for i, m in enumerate(AsyncPostgresSaver.MIGRATIONS):
-        await cur.execute(m)
-        if i > 0:
-            await cur.execute("INSERT INTO checkpoint_migrations (v) VALUES (%s)", (i,))
-    await conn.close()
-
-asyncio.run(migrate())
+```bash
+docker compose --profile migration run --rm database-bootstrap
 ```
 
 Once the tables exist, subsequent `checkpointer.setup()` calls are no-ops.
 
-### .env setup
+### Environment setup
 
-Copy `.env.example` to `.env`. The only mandatory fix for tests: set `EXCHANGE_ACCOUNT_ID` to an integer (default `8`); the placeholder `your_account_id` causes a Pydantic validation error at import time.
+For direct local Python, copy `.env.runtime.example` to `.env.runtime`. For production Compose, copy `.env.example` to `.env`; Compose injects only an explicit runtime allowlist. Store the migration DSN only in the private file named by `MIGRATION_DATABASE_URL_FILE`. The only mandatory fix for tests is an integer `EXCHANGE_ACCOUNT_ID` (default `8`).
 
 ### Common commands
 

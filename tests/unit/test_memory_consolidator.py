@@ -9,14 +9,18 @@ from src.memory.consolidator import MemoryConsolidator
 @pytest.mark.asyncio
 async def test_consolidator_skips_with_few_records():
     """Consolidation should skip when not enough records."""
-    db = AsyncMock()
-    conn = AsyncMock()
-    cur = AsyncMock()
+    db = MagicMock()
+    conn = MagicMock()
+    cur = MagicMock()
     cur.fetchall = AsyncMock(return_value=[{"id": "1", "status": "sent"}])
-    conn.cursor.return_value.__aenter__ = AsyncMock(return_value=cur)
-    conn.cursor.return_value.__aexit__ = AsyncMock()
-    db.get_connection.return_value.__aenter__ = AsyncMock(return_value=conn)
-    db.get_connection.return_value.__aexit__ = AsyncMock()
+    cursor_cm = MagicMock()
+    cursor_cm.__aenter__ = AsyncMock(return_value=cur)
+    cursor_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.cursor.return_value = cursor_cm
+    conn_cm = MagicMock()
+    conn_cm.__aenter__ = AsyncMock(return_value=conn)
+    conn_cm.__aexit__ = AsyncMock(return_value=False)
+    db.get_connection.return_value = conn_cm
 
     consolidator = MemoryConsolidator(db_manager=db)
     result = await consolidator.consolidate(days=7, min_records=5)

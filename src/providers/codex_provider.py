@@ -60,16 +60,14 @@ class CodexChatModel(OAuthChatModel):
         }
 
         try:
-            try:
-                content = await _request_codex(DEFAULT_CODEX_URL, headers, body, verify=True)
-            except Exception as e:
-                if "CERTIFICATE_VERIFY_FAILED" not in str(e):
-                    raise
-                logger.warning("Codex API SSL 验证失败，使用 verify=False 重试")
-                content = await _request_codex(DEFAULT_CODEX_URL, headers, body, verify=False)
-            return content
-        except Exception as e:
-            logger.error("Codex API 错误: %s", e)
+            return await _request_codex(
+                DEFAULT_CODEX_URL,
+                headers,
+                body,
+                verify=True,
+            )
+        except Exception as exc:
+            logger.error("Codex API failed: error_type=%s", type(exc).__name__)
             raise
 
 
@@ -134,11 +132,12 @@ def _prompt_cache_key(input_items: list[dict[str, Any]]) -> str:
 async def _request_codex(
     url: str, headers: dict, body: dict, verify: bool
 ) -> str:
+    if verify is not True:
+        raise ValueError("Codex TLS verification must remain enabled")
     async with httpx.AsyncClient(timeout=120.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as resp:
             if resp.status_code != 200:
-                text = await resp.aread()
-                raise RuntimeError(_friendly_error(resp.status_code, text.decode("utf-8", "ignore")))
+                raise RuntimeError(_friendly_error(resp.status_code))
             return await _consume_sse(resp)
 
 
@@ -147,7 +146,11 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [
+                    data_line[5:].strip()
+                    for data_line in buffer
+                    if data_line.startswith("data:")
+                ]
                 buffer = []
                 if not data_lines:
                     continue
@@ -173,7 +176,7 @@ async def _consume_sse(response: httpx.Response) -> str:
     return content
 
 
-def _friendly_error(status_code: int, raw: str) -> str:
+def _friendly_error(status_code: int) -> str:
     if status_code == 429:
         return "ChatGPT 使用配额超限或触发速率限制。"
-    return f"HTTP {status_code}: {raw}"
+    return f"Codex API request failed (HTTP {status_code})"

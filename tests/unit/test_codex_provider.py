@@ -3,7 +3,9 @@
 Tests use mocking — actual OAuth + API calls are not made.
 """
 
-import json
+import logging
+
+import httpx
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -81,3 +83,89 @@ class TestCodexChatModel:
             result = await model.ainvoke([HumanMessage(content="test")])
             assert isinstance(result, AIMessage)
             assert result.content == "Codex reply"
+
+    @pytest.mark.asyncio
+    async def test_certificate_failure_never_retries_without_verification(self):
+        model = CodexChatModel(model_name="openai-codex/gpt-5.1-codex")
+        certificate_error = httpx.ConnectError("CERTIFICATE_VERIFY_FAILED")
+
+        with patch(
+            "src.providers.codex_provider._request_codex",
+            new_callable=AsyncMock,
+            side_effect=certificate_error,
+        ) as request_codex:
+            with pytest.raises(httpx.ConnectError):
+                await model._call_api(
+                    [HumanMessage(content="private-email-sentinel")],
+                    {
+                        "access_token": "oauth-token-sentinel",
+                        "account_id": "account-id-sentinel",
+                    },
+                )
+
+        assert request_codex.await_count == 1
+        assert request_codex.await_args.kwargs["verify"] is True
+
+    @pytest.mark.asyncio
+    async def test_codex_failure_log_omits_remote_error_body_and_prompt(self, caplog):
+        model = CodexChatModel(model_name="openai-codex/gpt-5.1-codex")
+        remote_error = "remote-body-sentinel private-email-sentinel"
+
+        with patch(
+            "src.providers.codex_provider._request_codex",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError(remote_error),
+        ):
+            with caplog.at_level(
+                logging.ERROR,
+                logger="src.providers.codex_provider",
+            ):
+                with pytest.raises(RuntimeError):
+                    await model._call_api(
+                        [HumanMessage(content="private-email-sentinel")],
+                        {
+                            "access_token": "oauth-token-sentinel",
+                            "account_id": "account-id-sentinel",
+                        },
+                    )
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert "RuntimeError" in rendered
+        assert remote_error not in rendered
+        assert "private-email-sentinel" not in rendered
+        assert "oauth-token-sentinel" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_non_success_response_body_is_not_copied_into_public_error():
+    from src.providers.codex_provider import _request_codex
+
+    class _StreamResponse:
+        status_code = 500
+
+        async def aread(self):
+            return b"remote-secret-body-sentinel"
+
+    class _StreamContext:
+        async def __aenter__(self):
+            return _StreamResponse()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    client = MagicMock()
+    client.stream.return_value = _StreamContext()
+
+    with patch("src.providers.codex_provider.httpx.AsyncClient") as client_type:
+        client_type.return_value.__aenter__ = AsyncMock(return_value=client)
+        client_type.return_value.__aexit__ = AsyncMock(return_value=None)
+        with pytest.raises(RuntimeError) as exc_info:
+            await _request_codex(
+                "https://example.test/codex",
+                {"Authorization": "Bearer token-sentinel"},
+                {"input": "private-prompt-sentinel"},
+                verify=True,
+            )
+
+    assert "HTTP 500" in str(exc_info.value)
+    assert "remote-secret-body-sentinel" not in str(exc_info.value)

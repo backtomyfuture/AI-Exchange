@@ -1,10 +1,24 @@
 
 import logging
+from copy import deepcopy
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from src.graph.state import AgentState
+from src.graph.dependencies import GraphDependencies
+from src.graph.state_factory import hydrate_email_from_state, sanitize_graph_delta
+from src.config import get_settings
+from src.safety.model_budget import (
+    ModelInputTooLarge,
+    enforce_model_input_budget,
+    rendered_messages_for_budget,
+    token_budget_from_settings,
+)
+from src.safety.manual_review import (
+    build_manual_review_delta,
+    manual_review_classification,
+)
 from src.utils.retry_decorator import with_llm_retry
 from src.router.engine import get_routing_engine
 
@@ -12,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 class EmailClassification(BaseModel):
     """邮件分类结果的结构化定义"""
+    model_config = ConfigDict(strict=True)
+
     priority: Literal["P0", "P1", "P2", "P3"] = Field(description="邮件优先级：P0最高，P3最低")
     need_reply: bool = Field(description="是否需要回复这封邮件")
     intent: Literal["咨询", "审批", "通知", "垃圾邮件"] = Field(description="邮件的主要意图")
@@ -19,20 +35,57 @@ class EmailClassification(BaseModel):
     reasoning: str = Field(description="简短的分类理由")
     confidence: float = Field(description="分类置信度，0.0 到 1.0 之间", ge=0.0, le=1.0)
 
-async def categorize_email(state: AgentState) -> AgentState:
+async def categorize_email(
+    state: AgentState,
+    dependencies: GraphDependencies,
+) -> AgentState:
     """
     分类节点：先执行路由引擎（Tier 1/2/3），再根据邮件内容进行优先级和意图分类。
     """
     # Step 0: Execute Routing Engine (Tier 1/2/3)
-    engine = get_routing_engine()
-    state = await engine.execute_router(state)
+    email = await hydrate_email_from_state(state, dependencies)
+    local_state = deepcopy(dict(state))
+    local_state["email"] = email
 
-    current_classification = state.get("classification", {})
+    engine = get_routing_engine()
+    try:
+        routed_state = await engine.execute_router(local_state)
+    except Exception as exc:
+        logger.error(
+            "Routing execution failed: error_type=%s",
+            type(exc).__name__,
+        )
+        code = "router_execution_failed"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
+        )
+    if routed_state.get("next_step") == "manual_review":
+        safe_code = routed_state.get("safe_error_summary")
+        return build_manual_review_delta(
+            state,
+            safe_code,
+            classification=manual_review_classification(safe_code),
+        )
+
+    routing_updates = {}
+    for key in (
+        "routing_log",
+        "active_skills",
+        "system_prompt_modifier",
+        "priority_level",
+        "metadata",
+        "tool_calls",
+    ):
+        if key in routed_state and routed_state.get(key) != state.get(key):
+            routing_updates[key] = routed_state[key]
+
+    current_classification = deepcopy(routed_state.get("classification", {}))
     if current_classification.get("action") in ["forward", "transfer"]:
         logger.info(f"Skipping LLM Categorization due to existing action: {current_classification.get('action')}")
 
         # Fill in missing classification fields that LLM would normally produce
-        email = state.get("email", {})
         if not current_classification.get("summary"):
             subject = email.get("subject", "")
             sender = email.get("sender", "")
@@ -47,28 +100,32 @@ async def categorize_email(state: AgentState) -> AgentState:
         if reasoning.startswith("Triggered by skill"):
             current_classification["reasoning"] = "系统规则自动触发转发"
 
-        updates = {"next_step": "drafter", "classification": current_classification}
-        # routing_log / active_skills are reducer-managed (operator.add).
-        # Only echo back non-reducer fields so we don't double-accumulate the lists.
-        if "system_prompt_modifier" in state:
-            updates["system_prompt_modifier"] = state["system_prompt_modifier"]
-        for key in ("routing_log", "active_skills"):
-            if key in state:
-                updates[key] = state[key]
-        return updates
+        updates = {
+            "next_step": "drafter",
+            "classification": current_classification,
+            **routing_updates,
+        }
+        routed_email = routed_state.get("email")
+        if isinstance(routed_email, dict):
+            for field in ("draft_to", "draft_cc"):
+                if field in routed_email:
+                    updates[field] = routed_email[field]
+        fixed_draft = routed_state.get("draft")
+        if isinstance(fixed_draft, str):
+            updates["draft_id"] = await dependencies.drafts.save_draft(
+                state["email_id"],
+                fixed_draft,
+            )
+        return sanitize_graph_delta(state, updates)
 
-    email = state.get("email", {})
     subject = email.get("subject", "")
     body = email.get("body", "")
 
-    from src.providers.factory import get_llm_for_role
-    llm = get_llm_for_role("categorizer", temperature=0)
-    
     # Use JsonOutputParser for robust parsing of LLM output
     parser = JsonOutputParser(pydantic_object=EmailClassification)
 
     experience_ctx = ""
-    experience_hints = (state.get("metadata") or {}).get("experience_hints", [])
+    experience_hints = (routed_state.get("metadata") or {}).get("experience_hints", [])
     if experience_hints:
         hint_lines = []
         for h in experience_hints[:3]:
@@ -89,38 +146,58 @@ async def categorize_email(state: AgentState) -> AgentState:
         experience=experience_ctx,
     )
 
-    chain = prompt | llm | parser
-
-    # 调用 LLM 进行分类
-    @with_llm_retry(max_attempts=3)
-    async def invoke_with_retry(payload):
-        return await chain.ainvoke(payload)
-
+    image_analysis = email.get("image_analysis", "")
+    image_info = (
+        "【注意：该邮件包含图片附件，以下是图片内容的解析结果】:\n"
+        f"{image_analysis}"
+        if image_analysis
+        else ""
+    )
+    payload = {"subject": subject, "body": body, "image_info": image_info}
     try:
+        rendered_prompt = rendered_messages_for_budget(
+            prompt.format_messages(**payload)
+        )
+        enforce_model_input_budget(
+            "categorizer",
+            rendered_prompt,
+            budget=token_budget_from_settings(get_settings()),
+        )
+
+        from src.providers.factory import get_llm_for_role
+        llm = get_llm_for_role("categorizer", temperature=0)
+        chain = prompt | llm | parser
+
+        @with_llm_retry(max_attempts=3)
+        async def invoke_with_retry(payload):
+            return await chain.ainvoke(payload)
+
         # Expected result is a dict because parser converts it
-        image_analysis = email.get("image_analysis", "")
-        image_info = f"【注意：该邮件包含图片附件，以下是图片内容的解析结果】:\n{image_analysis}" if image_analysis else ""
-        
-        result = await invoke_with_retry({"subject": subject, "body": body, "image_info": image_info})
+        result = await invoke_with_retry(payload)
         classification_result = EmailClassification(**result)
-        logger.info(f"Classification success: {classification_result}")
-    except Exception as e:
-        logger.error(f"Classification failed (Parsing Error or Max Retries): {e}")
-        # Fallback default
-        classification_result = EmailClassification(
-            priority="P3", 
-            need_reply=False, 
-            intent="通知", 
-            summary=subject or "分类失败，已降级处理",
-            reasoning=f"Auto-fallback due to error: {str(e)[:50]}",
-            confidence=0.0,
+        logger.info("Classification completed successfully")
+    except ModelInputTooLarge:
+        code = "categorizer_input_too_large"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
+        )
+    except Exception as exc:
+        logger.error(
+            "Classification failed; manual review required: error_type=%s",
+            type(exc).__name__,
+        )
+        code = "categorizer_model_failed"
+        return build_manual_review_delta(
+            state,
+            code,
+            classification=manual_review_classification(code),
         )
 
     updates = {
         "classification": classification_result.model_dump(),
         "next_step": "rag_search" if classification_result.need_reply else "end",
     }
-    for key in ("routing_log", "active_skills", "system_prompt_modifier"):
-        if key in state:
-            updates[key] = state[key]
-    return updates
+    updates.update(routing_updates)
+    return sanitize_graph_delta(state, updates)

@@ -1,8 +1,6 @@
 import pytest
 from unittest.mock import Mock, patch
 from src.router.tier1_reflex import Tier1ReflexRouter
-from src.router.manager import SkillManager
-import os
 
 @pytest.fixture
 def mock_settings():
