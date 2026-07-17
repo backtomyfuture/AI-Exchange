@@ -1,6 +1,8 @@
 import logging
 import os
 
+from src.security.pdf import make_restricted_url_fetcher
+
 logger = logging.getLogger(__name__)
 
 # Suppress verbose fontTools logs
@@ -64,8 +66,8 @@ def convert_html_to_pdf(html_content: str) -> bytes:
         
         # Suppress "Ignored `border-*:solid windowtext 1.0pt` at ... invalid value" warnings
         # by replacing the MS Word specific 'windowtext' color with standard 'black'
-        if html_content:
-            html_content = html_content.replace('windowtext', 'black')
+        assets = getattr(html_content, "assets", {})
+        html_text = str(html_content).replace("windowtext", "black")
 
         # Configure Fonts
         font_config = FontConfiguration()
@@ -146,7 +148,10 @@ def convert_html_to_pdf(html_content: str) -> bytes:
             }
         """
         # 转换 HTML 到 PDF 字节流
-        pdf_bytes = HTML(string=html_content).write_pdf(
+        pdf_bytes = HTML(
+            string=html_text,
+            url_fetcher=make_restricted_url_fetcher(assets),
+        ).write_pdf(
             stylesheets=[CSS(string=css_string, font_config=font_config)],
             font_config=font_config
         )

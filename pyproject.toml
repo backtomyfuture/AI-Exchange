@@ -39,4 +39,5 @@ dependencies = [
     "prometheus-client>=0.21.0",
     "alembic>=1.15,<2",
     "cryptography>=44,<46",
+    "nh3==0.3.2",
 ]
