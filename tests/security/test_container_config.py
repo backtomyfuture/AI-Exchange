@@ -237,6 +237,18 @@ def test_production_application_publishes_one_webhook_port():
     assert ports == ("${APP_PORT:-8000}:8000",)
 
 
+def test_production_full_folder_default_matches_runtime_and_template():
+    from src.config import Settings
+
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    environment = compose["services"]["ai-assistant-service"]["environment"]
+    template = _read_env_example()
+
+    assert environment["EXCHANGE_FOLDERS_FULL"] == "${EXCHANGE_FOLDERS_FULL:-收件箱}"
+    assert template["EXCHANGE_FOLDERS_FULL"] == "收件箱"
+    assert Settings(_env_file=None).EXCHANGE_FOLDERS_FULL == "收件箱"
+
+
 def test_production_shutdown_budget_covers_bounded_ingestion_drain():
     compose = _load_yaml(PRODUCTION_COMPOSE)
 
@@ -428,9 +440,10 @@ def test_database_provision_is_isolated_greenfield_admin_one_shot():
     assert service["environment"]["POSTGRES_MAINTENANCE_PASSWORD_FILE"] == (
         "/run/secrets/postgres_maintenance_password"
     )
-    assert service["environment"][
-        "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE"
-    ] == "/run/secrets/postgres_checkpoint_auditor_password"
+    assert (
+        service["environment"]["POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE"]
+        == "/run/secrets/postgres_checkpoint_auditor_password"
+    )
     assert "env_file" not in service
     assert not {
         "POSTGRES_ADMIN_USER",
