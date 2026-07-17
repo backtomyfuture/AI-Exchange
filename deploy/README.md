@@ -64,15 +64,18 @@ test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=n
 HEAD_REVISION="$(git rev-parse --verify HEAD)"
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check src/ tests/ scripts/prepare_ingestion_manifests.py
-docker compose -p "$PROJECT_NAME" build --pull \
-  database-provision database-bootstrap ingestion-maintenance ai-assistant-service
+# 只构建一次规范镜像。多个服务共用同一 tag 时并发 build 会各自产生
+# provenance 不同的 image，并以完成顺序覆盖 tag，破坏产物确定性。
+docker compose -p "$PROJECT_NAME" build --pull ai-assistant-service
 
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")"
 printf 'HEAD=%s\nimage=%s\n' "$HEAD_REVISION" "$IMAGE_ID"
 ```
 
 `RELEASE_IMAGE` 必须与 `.env` 中本次 `AI_EXCHANGE_IMAGE` 的精确 tag 一致；Compose 的全部
-应用/one-shot 服务固定使用这一 tag。把实际执行的检查及退出码、`HEAD_REVISION`、
+应用/one-shot 服务固定复用这一个 tag。不要再单独或并发构建 one-shot 服务；后续
+`run` 禁止传 `--build`，`up` 必须传 `--no-build`。把实际执行的检查及退出码、
+`HEAD_REVISION`、
 去掉 `sha256:` 前缀的 image ID 写入本地 release metadata JSON。保留这份文件用于
 操作审计；不要把示例 digest 当成真实结果。
 
