@@ -246,7 +246,7 @@ def test_production_full_folder_default_matches_runtime_and_template():
 
     assert environment["EXCHANGE_FOLDERS_FULL"] == "${EXCHANGE_FOLDERS_FULL:-收件箱}"
     assert template["EXCHANGE_FOLDERS_FULL"] == "收件箱"
-    assert Settings(_env_file=None).EXCHANGE_FOLDERS_FULL == "收件箱"
+    assert Settings.model_fields["EXCHANGE_FOLDERS_FULL"].default == "收件箱"
 
 
 def test_production_shutdown_budget_covers_bounded_ingestion_drain():
