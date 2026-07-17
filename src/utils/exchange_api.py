@@ -486,8 +486,8 @@ class ExchangeClient:
         params = {"account_id": self.account_id}
 
         client = self.http_client
-        try:
-            for endpoint in dict.fromkeys(endpoints):
+        for endpoint in dict.fromkeys(endpoints):
+            try:
                 response = await client.get(
                     endpoint,
                     params=params,
@@ -507,15 +507,15 @@ class ExchangeClient:
                     "Folder endpoint returned non-success: status=%s",
                     response.status_code,
                 )
-            logger.warning(
-                "Failed to get folders from all candidate endpoints. "
-                "Routing will use safe fallback mode."
-            )
-        except Exception as exc:
-            logger.error(
-                "Exception getting folders: error_type=%s",
-                type(exc).__name__,
-            )
+            except Exception as exc:
+                logger.warning(
+                    "Folder endpoint request failed: error_type=%s",
+                    type(exc).__name__,
+                )
+        logger.warning(
+            "Failed to get folders from all candidate endpoints. "
+            "Routing will use safe fallback mode."
+        )
 
         self._folder_cache = {}
         self._folder_tree = {}
