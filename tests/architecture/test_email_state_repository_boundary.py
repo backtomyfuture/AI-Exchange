@@ -446,7 +446,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "b65e45b233930fbb083f06854c76ce8fefce89221aca618a281151de33d7173c"
+        "97f3b9269f9193fda02bfeffdd0ee20007015abb0d216e81409fd8f4a5ea08c9"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {

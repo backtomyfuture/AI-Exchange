@@ -32,6 +32,7 @@ MANDATORY_COVERAGE_TARGETS = (
     "src/ingestion/*",
 )
 COMPOSE_PLACEHOLDERS = {
+    "AI_EXCHANGE_IMAGE": "ai-exchange:phase2-ci",
     "POSTGRES_ADMIN_USER": "phase2_ci_admin",
     "POSTGRES_ADMIN_PASSWORD": "phase2-ci-placeholder",
     "POSTGRES_DB": "email_agent",
@@ -94,6 +95,12 @@ def test_phase2_ci_uses_project_python_and_frozen_dependency_lock() -> None:
     assert "uv lock --check" in workflow
     assert "uv sync --frozen" in workflow
     assert "uv pip check --python .venv/bin/python" in workflow
+
+
+def test_phase2_ci_does_not_enable_an_empty_pip_cache() -> None:
+    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "cache: pip" not in workflow
 
 
 def test_phase2_ci_runs_pinned_ruff_without_mutating_the_lock() -> None:

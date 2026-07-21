@@ -11,8 +11,20 @@ import pytest
 from psycopg.pq import TransactionStatus
 
 import src.ingestion.sync as sync_module
-from src.domain.errors import DatabaseOperationError, SyncTransientError
-from src.ingestion.models import ChangeKind, IngressSource, ProcessingPolicy
+from src.domain.errors import (
+    DatabaseOperationError,
+    SyncAuthorizationError,
+    SyncContractError,
+    SyncCursorInvalidError,
+    SyncTransientError,
+)
+from src.ingestion.models import (
+    ChangeKind,
+    IngressSource,
+    ProcessingPolicy,
+    SyncBatch,
+    SyncChange,
+)
 from src.ingestion.policy import (
     FolderScope,
     PolicySnapshot,
@@ -3591,3 +3603,760 @@ async def test_run_folder_rejects_non_result_from_acquired_session() -> None:
     assert caught.value.operation == "sync_coordinator_result"
     assert provider.calls == [8]
     assert permit.events == []
+
+
+class _ScriptedSyncPageClient:
+    def __init__(self, *responses: object) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[int, str, str, int]] = []
+
+    async def sync_emails(
+        self,
+        account_id: int,
+        folder: str,
+        cursor: str,
+        page_limit: int,
+    ) -> object:
+        self.calls.append((account_id, folder, cursor, page_limit))
+        if not self._responses:
+            raise AssertionError("unexpected extra sync page request")
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+class _RejectingPolicyResolver:
+    def resolve(self, *_args: object) -> ProcessingPolicy:
+        raise ValueError("policy contract rejected")
+
+
+def _ordinary_sync_batch(
+    cursor: str,
+    *,
+    includes_last: bool,
+    email_id: str | None = None,
+) -> SyncBatch:
+    changes: tuple[SyncChange, ...] = ()
+    if email_id is not None:
+        changes = (
+            SyncChange(
+                kind=ChangeKind.CREATE,
+                external_email_id=email_id,
+                item={"id": email_id, "subject": "Coverage contract"},
+                source_version="v1",
+            ),
+        )
+    return SyncBatch(
+        contract_version="exchange_sync_contract_v2",
+        cursor=cursor,
+        changes=changes,
+        includes_last=includes_last,
+    )
+
+
+def _run_locked_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    page_client: object,
+    *,
+    immediate_result: SyncRunResult | None = None,
+    policy_resolver: object | None = None,
+) -> tuple[
+    SyncCoordinator,
+    object,
+    object,
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    coordinator = object.__new__(SyncCoordinator)
+    coordinator._page_client = page_client  # type: ignore[attr-defined]
+    coordinator._page_limit = 100  # type: ignore[attr-defined]
+    coordinator._policy_resolver = (  # type: ignore[attr-defined]
+        policy_resolver or ProcessingPolicyResolver()
+    )
+    ownership_snapshot = getattr(sync_module, "_OwnershipSnapshot")(
+        "pipeline-v2",
+        3,
+        9,
+    )
+    cursor_snapshot = getattr(sync_module, "_CursorSnapshot")(
+        "cursor-1",
+        "active",
+        7,
+        0,
+        False,
+    )
+    preflight_snapshot = getattr(sync_module, "_PreflightSnapshot")(
+        ownership_snapshot,
+        None if immediate_result is not None else cursor_snapshot,
+        immediate_result,
+    )
+    committed_pages: list[dict[str, object]] = []
+    committed_errors: list[dict[str, object]] = []
+
+    async def preflight(*_args: object) -> object:
+        return preflight_snapshot
+
+    async def commit_page(*_args: object, **kwargs: object) -> object:
+        committed_pages.append(kwargs)
+        expected = kwargs["expected"]
+        return getattr(sync_module, "_CursorSnapshot")(
+            kwargs["next_cursor"],
+            "active",
+            expected.version + 1,  # type: ignore[union-attr]
+            0,
+            False,
+        )
+
+    async def commit_error(*_args: object, **kwargs: object) -> SyncRunResult:
+        committed_errors.append(kwargs)
+        return SyncRunResult(
+            status=kwargs["target"],  # type: ignore[arg-type]
+            pages_committed=kwargs["pages_committed"],  # type: ignore[arg-type]
+            changes_observed=kwargs["changes_observed"],  # type: ignore[arg-type]
+            safe_code=kwargs["reason_code"],  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(coordinator, "_preflight", preflight)
+    monkeypatch.setattr(coordinator, "_commit_page", commit_page)
+    monkeypatch.setattr(coordinator, "_commit_error", commit_error)
+    return (
+        coordinator,
+        ownership_snapshot,
+        cursor_snapshot,
+        committed_pages,
+        committed_errors,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_locked_commits_each_valid_page_and_reports_caught_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedSyncPageClient(
+        _ordinary_sync_batch(
+            "cursor-2",
+            includes_last=False,
+            email_id="email-1",
+        ),
+        _ordinary_sync_batch(
+            "cursor-3",
+            includes_last=True,
+            email_id="email-2",
+        ),
+    )
+    coordinator, ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+    )
+    scope = _inbox_scope()
+    snapshot = PolicySnapshot(scopes=(scope,))
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        scope,
+        snapshot,
+        3,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result == SyncRunResult(SyncRunStatus.CAUGHT_UP, 2, 2, None)
+    assert client.calls == [
+        (8, "Inbox", "cursor-1", 100),
+        (8, "Inbox", "cursor-2", 100),
+    ]
+    assert [page["next_cursor"] for page in pages] == ["cursor-2", "cursor-3"]
+    assert all(page["ownership"] == ownership for page in pages)
+    assert [event.external_email_id for page in pages for event in page["events"]] == [
+        "email-1",
+        "email-2",
+    ]
+    assert not errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_error", "expected_status", "expected_code", "retry_after"),
+    [
+        (
+            SyncCursorInvalidError(),
+            SyncRunStatus.RESET_REQUIRED,
+            "exchange.sync.cursor_invalid",
+            None,
+        ),
+        (
+            SyncTransientError(retry_after_seconds=37),
+            SyncRunStatus.RETRY_SCHEDULED,
+            "exchange.sync.transient_failure",
+            37,
+        ),
+        (
+            SyncAuthorizationError(),
+            SyncRunStatus.BLOCKED_CONTRACT,
+            "exchange.sync.authorization_failed",
+            None,
+        ),
+        (
+            SyncContractError(),
+            SyncRunStatus.BLOCKED_CONTRACT,
+            "exchange.sync.contract_invalid",
+            None,
+        ),
+    ],
+    ids=["cursor-invalid", "transient", "authorization", "contract"],
+)
+async def test_run_locked_maps_typed_exchange_failures_to_durable_transitions(
+    monkeypatch: pytest.MonkeyPatch,
+    upstream_error: BaseException,
+    expected_status: SyncRunStatus,
+    expected_code: str,
+    retry_after: int | None,
+) -> None:
+    client = _ScriptedSyncPageClient(upstream_error)
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+    )
+    scope = _inbox_scope()
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        scope,
+        PolicySnapshot(scopes=(scope,)),
+        1,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result.status is expected_status
+    assert result.safe_code == expected_code
+    assert not pages
+    assert len(errors) == 1
+    assert errors[0]["target"] is expected_status
+    assert errors[0]["reason_code"] == expected_code
+    assert errors[0].get("retry_after_seconds") == retry_after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page", "policy_resolver", "expected_code"),
+    [
+        (object(), None, "sync.local_contract_invalid"),
+        (
+            _ordinary_sync_batch("cursor-1", includes_last=False),
+            None,
+            "sync.cursor_stalled",
+        ),
+        (
+            _ordinary_sync_batch(
+                "cursor-2",
+                includes_last=True,
+                email_id="email-1",
+            ),
+            _RejectingPolicyResolver(),
+            "sync.local_contract_invalid",
+        ),
+    ],
+    ids=["invalid-page", "stalled-cursor", "normalization-failure"],
+)
+async def test_run_locked_blocks_untrusted_or_nonprogressing_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    page: object,
+    policy_resolver: object | None,
+    expected_code: str,
+) -> None:
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        _ScriptedSyncPageClient(page),
+        policy_resolver=policy_resolver,
+    )
+    scope = _inbox_scope()
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        scope,
+        PolicySnapshot(scopes=(scope,)),
+        1,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result.status is SyncRunStatus.BLOCKED_CONTRACT
+    assert result.safe_code == expected_code
+    assert not pages
+    assert len(errors) == 1
+    assert errors[0]["reason_code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_run_locked_returns_preflight_result_without_calling_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    immediate = SyncRunResult(
+        SyncRunStatus.RETRY_DEFERRED,
+        0,
+        0,
+        "sync.retry_deferred",
+    )
+    client = _ScriptedSyncPageClient()
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+        immediate_result=immediate,
+    )
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        _inbox_scope(),
+        object(),
+        1,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result is immediate
+    assert not client.calls
+    assert not pages
+    assert not errors
+
+
+@pytest.mark.asyncio
+async def test_run_locked_reports_expired_budget_before_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedSyncPageClient()
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+    )
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        _inbox_scope(),
+        object(),
+        1,
+        asyncio.get_running_loop().time(),
+    )
+
+    assert result == SyncRunResult(
+        SyncRunStatus.BUDGET_EXHAUSTED,
+        0,
+        0,
+        "sync.budget_exhausted",
+    )
+    assert not client.calls
+    assert not pages
+    assert not errors
+
+
+@pytest.mark.asyncio
+async def test_run_locked_reports_budget_exhaustion_at_the_page_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ScriptedSyncPageClient(
+        _ordinary_sync_batch("cursor-2", includes_last=False)
+    )
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+    )
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        _inbox_scope(),
+        object(),
+        1,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result == SyncRunResult(
+        SyncRunStatus.BUDGET_EXHAUSTED,
+        1,
+        0,
+        "sync.budget_exhausted",
+    )
+    assert len(client.calls) == 1
+    assert len(pages) == 1
+    assert not errors
+
+
+class _ImmediateTimeout:
+    async def __aenter__(self) -> None:
+        raise TimeoutError
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_run_locked_converts_page_timeout_to_budget_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sync_module.asyncio,
+        "timeout",
+        lambda _seconds: _ImmediateTimeout(),
+    )
+    client = _ScriptedSyncPageClient()
+    coordinator, _ownership, _cursor, pages, errors = _run_locked_harness(
+        monkeypatch,
+        client,
+    )
+
+    result = await coordinator._run_locked(  # type: ignore[attr-defined]
+        _SyncSessionLease(object()),
+        8,
+        _inbox_scope(),
+        object(),
+        1,
+        asyncio.get_running_loop().time() + 5,
+    )
+
+    assert result == SyncRunResult(
+        SyncRunStatus.BUDGET_EXHAUSTED,
+        0,
+        0,
+        "sync.budget_exhausted",
+    )
+    assert not client.calls
+    assert not pages
+    assert not errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_deferred", [False, True], ids=["active", "deferred"])
+async def test_preflight_returns_exact_active_or_deferred_cursor_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_deferred: bool,
+) -> None:
+    _patch_direct_sync_transaction_dependencies(monkeypatch)
+    connection = _RowsConnection(
+        [
+            {
+                "cursor": "cursor-1",
+                "status": "active",
+                "version": 7,
+                "transient_failures": 2,
+                "retry_deferred": retry_deferred,
+            }
+        ]
+    )
+    coordinator = object.__new__(SyncCoordinator)
+
+    result = await coordinator._preflight(  # type: ignore[attr-defined]
+        _SyncSessionLease(connection),
+        8,
+        "INBOX",
+    )
+
+    if retry_deferred:
+        assert result.cursor is None
+        assert result.immediate_result == SyncRunResult(
+            SyncRunStatus.RETRY_DEFERRED,
+            0,
+            0,
+            "sync.retry_deferred",
+        )
+    else:
+        assert result.immediate_result is None
+        assert result.cursor.cursor == "cursor-1"
+        assert result.cursor.version == 7
+        assert result.cursor.transient_failures == 2
+
+
+@pytest.mark.asyncio
+async def test_expected_cursor_lock_accepts_only_the_exact_active_snapshot() -> None:
+    coordinator = object.__new__(SyncCoordinator)
+    cursor_snapshot = getattr(sync_module, "_CursorSnapshot")
+    expected = cursor_snapshot("cursor-1", "active", 7, 2, False)
+
+    await coordinator._lock_expected_cursor(  # type: ignore[attr-defined]
+        _SingleRowConnection(("cursor-1", "active", 7, 2)),
+        8,
+        "INBOX",
+        expected,
+    )
+
+    with pytest.raises(sync_module.StaleFence):
+        await coordinator._lock_expected_cursor(  # type: ignore[attr-defined]
+            _SingleRowConnection(("cursor-1", "active", 8, 2)),
+            8,
+            "INBOX",
+            expected,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    [SyncRunStatus.BLOCKED_CONTRACT, SyncRunStatus.RETRY_SCHEDULED],
+    ids=["blocked-contract", "retry-scheduled"],
+)
+async def test_error_transition_commits_each_supported_nonreset_state_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    target: SyncRunStatus,
+) -> None:
+    _patch_direct_sync_transaction_dependencies(monkeypatch)
+    coordinator = object.__new__(SyncCoordinator)
+    monkeypatch.setattr(coordinator, "_lock_expected_cursor", _noop_lock_expected)
+    ownership_snapshot = getattr(sync_module, "_OwnershipSnapshot")
+    cursor_snapshot = getattr(sync_module, "_CursorSnapshot")
+    connection = _RowsConnection([{"version": 8}, None])
+    reason_code = (
+        "exchange.sync.contract_invalid"
+        if target is SyncRunStatus.BLOCKED_CONTRACT
+        else "exchange.sync.transient_failure"
+    )
+
+    result = await coordinator._commit_error(  # type: ignore[attr-defined]
+        _SyncSessionLease(connection),
+        account_id=8,
+        folder="INBOX",
+        ownership=ownership_snapshot("pipeline-v2", 3, 9),
+        expected=cursor_snapshot("cursor-1", "active", 7, 2, False),
+        reason_code=reason_code,
+        target=target,
+        pages_committed=1,
+        changes_observed=2,
+        retry_after_seconds=37,
+    )
+
+    assert result == SyncRunResult(target, 1, 2, reason_code)
+    assert len(connection.statements) == 2
+    update_statement, update_params = connection.statements[0]
+    audit_statement, audit_params = connection.statements[1]
+    if target is SyncRunStatus.BLOCKED_CONTRACT:
+        assert "status = 'blocked_contract'" in update_statement
+        assert update_params[1] == SyncCoordinator._contract_fingerprint(
+            8,
+            "INBOX",
+            reason_code,
+        )
+    else:
+        assert "retry_after_at" in update_statement
+        assert update_params[0] == 3
+    assert "INSERT INTO public.audit_events" in audit_statement
+    assert audit_params[5] == reason_code
+
+
+class _RecordingInboxTransaction:
+    def __init__(self) -> None:
+        self.inserted: list[tuple[object, int, int]] = []
+
+    async def insert(
+        self,
+        event: object,
+        generation: int,
+        fencing_token: int,
+    ) -> None:
+        self.inserted.append((event, generation, fencing_token))
+
+
+class _RecordingInboxRepository:
+    def __init__(self) -> None:
+        self.transaction_boundary = _RecordingInboxTransaction()
+
+    def transaction(self, _connection: object) -> _RecordingInboxTransaction:
+        return self.transaction_boundary
+
+
+@pytest.mark.asyncio
+async def test_page_commit_inserts_events_before_advancing_the_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_sync_transaction_dependencies(monkeypatch)
+    coordinator = object.__new__(SyncCoordinator)
+    inbox = _RecordingInboxRepository()
+    coordinator._inbox_repository = inbox  # type: ignore[attr-defined]
+    monkeypatch.setattr(coordinator, "_lock_expected_cursor", _noop_lock_expected)
+    ownership_snapshot = getattr(sync_module, "_OwnershipSnapshot")
+    cursor_snapshot = getattr(sync_module, "_CursorSnapshot")
+    expected = cursor_snapshot("cursor-1", "active", 7, 2, False)
+    connection = _RowsConnection([{"version": 8}])
+    event = object()
+
+    result = await coordinator._commit_page(  # type: ignore[attr-defined]
+        _SyncSessionLease(connection),
+        account_id=8,
+        folder="INBOX",
+        ownership=ownership_snapshot("pipeline-v2", 3, 9),
+        expected=expected,
+        next_cursor="cursor-2",
+        events=(event,),
+    )
+
+    assert result.cursor == "cursor-2"
+    assert result.version == 8
+    assert result.transient_failures == 0
+    assert inbox.transaction_boundary.inserted == [(event, 3, 9)]
+
+
+class _CoordinatorOutcomeRunner:
+    def __init__(self, *, acquired: bool) -> None:
+        self.acquired = acquired
+
+    async def run(
+        self,
+        _account_id: int,
+        _folder: str,
+        operation: Callable[[object], object],
+    ) -> object:
+        outcome = getattr(sync_module, "_SyncSessionOutcome")
+        if not self.acquired:
+            return outcome(acquired=False, value=None)
+        value = await operation(_SyncSessionLease(object()))  # type: ignore[misc]
+        return outcome(acquired=True, value=value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acquired", [False, True], ids=["busy", "acquired"])
+async def test_run_folder_returns_busy_or_the_locked_sync_result(
+    monkeypatch: pytest.MonkeyPatch,
+    acquired: bool,
+) -> None:
+    scope = _inbox_scope()
+    coordinator, provider, _permit = _coordinator_for_scope_test(
+        PolicySnapshot(scopes=(scope,)),
+    )
+    coordinator._session_runner = _CoordinatorOutcomeRunner(  # type: ignore[assignment]
+        acquired=acquired
+    )
+    locked_result = SyncRunResult(SyncRunStatus.CAUGHT_UP, 1, 2, None)
+
+    async def run_locked(*_args: object) -> SyncRunResult:
+        return locked_result
+
+    monkeypatch.setattr(coordinator, "_run_locked", run_locked)
+
+    result = await coordinator.run_folder(8, "INBOX")
+
+    assert result == (
+        locked_result
+        if acquired
+        else SyncRunResult(SyncRunStatus.BUSY_SKIP, 0, 0, "sync.busy")
+    )
+    assert provider.calls == [8]
+
+
+@pytest.mark.asyncio
+async def test_shared_ownership_reader_rejects_a_missing_current_generation() -> None:
+    read_ownership = getattr(sync_module, "_read_current_ownership")
+
+    with pytest.raises(sync_module.StaleFence):
+        await read_ownership(_SingleRowConnection(None), 8)
+
+
+def test_retry_hint_reads_only_exact_trusted_error_state() -> None:
+    assert _trusted_retry_hint(object()) is None  # type: ignore[arg-type]
+    assert _trusted_retry_hint(SyncTransientError()) is None
+    corrupted = SyncTransientError(retry_after_seconds=1)
+    vars(corrupted)["retry_after_seconds"] = 3601
+    assert _trusted_retry_hint(corrupted) is None
+
+
+def test_sync_batch_revalidation_rejects_mutated_exact_dtos() -> None:
+    validate = getattr(sync_module, "_validated_sync_batch")
+
+    invalid_contract = _ordinary_sync_batch("cursor-2", includes_last=True)
+    object.__setattr__(invalid_contract, "contract_version", "wrong-contract")
+    assert validate(invalid_contract, 100) is None
+
+    invalid_member = _ordinary_sync_batch("cursor-2", includes_last=True)
+    object.__setattr__(invalid_member, "changes", (object(),))
+    assert validate(invalid_member, 100) is None
+
+    invalid_reconstruction = _ordinary_sync_batch(
+        "cursor-2",
+        includes_last=True,
+        email_id="email-1",
+    )
+    change = invalid_reconstruction.changes[0]
+    object.__setattr__(change, "source_version", "\ud800")
+    assert validate(invalid_reconstruction, 100) is None
+
+
+@pytest.mark.asyncio
+async def test_unlock_accepts_mapping_success_and_rejects_missing_column() -> None:
+    runner = object.__new__(_SyncSessionRunner)
+
+    assert await runner._unlock(  # type: ignore[attr-defined]
+        _SingleRowConnection({"released": True}),
+        (1, 2),
+    )
+    assert not await runner._unlock(  # type: ignore[attr-defined]
+        _SingleRowConnection({"unexpected": True}),
+        (1, 2),
+    )
+
+
+async def _raise_sync_operational_error(*_args: object, **_kwargs: object) -> object:
+    raise sync_module.psycopg.OperationalError("database-secret-must-not-escape")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    ["preflight", "commit-error", "commit-page"],
+)
+async def test_sync_transactions_normalize_psycopg_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    monkeypatch.setattr(
+        sync_module,
+        "_caller_owned_transaction",
+        _raise_sync_operational_error,
+    )
+    coordinator = object.__new__(SyncCoordinator)
+    ownership_snapshot = getattr(sync_module, "_OwnershipSnapshot")(
+        "pipeline-v2",
+        3,
+        9,
+    )
+    cursor_snapshot = getattr(sync_module, "_CursorSnapshot")(
+        "cursor-1",
+        "active",
+        7,
+        0,
+        False,
+    )
+
+    with pytest.raises(DatabaseOperationError) as caught:
+        if operation == "preflight":
+            await coordinator._preflight(  # type: ignore[attr-defined]
+                _SyncSessionLease(object()),
+                8,
+                "INBOX",
+            )
+        elif operation == "commit-error":
+            await coordinator._commit_error(  # type: ignore[attr-defined]
+                _SyncSessionLease(object()),
+                account_id=8,
+                folder="INBOX",
+                ownership=ownership_snapshot,
+                expected=cursor_snapshot,
+                reason_code="exchange.sync.cursor_invalid",
+                target=SyncRunStatus.RESET_REQUIRED,
+                pages_committed=0,
+                changes_observed=0,
+            )
+        else:
+            await coordinator._commit_page(  # type: ignore[attr-defined]
+                _SyncSessionLease(object()),
+                account_id=8,
+                folder="INBOX",
+                ownership=ownership_snapshot,
+                expected=cursor_snapshot,
+                next_cursor="cursor-2",
+                events=(),
+            )
+
+    assert caught.value.operation == {
+        "preflight": "sync_cursor_preflight",
+        "commit-error": "sync_error_transition",
+        "commit-page": "sync_page_commit",
+    }[operation]
+    assert "database-secret" not in str(caught.value)

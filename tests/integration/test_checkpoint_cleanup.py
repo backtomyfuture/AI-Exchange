@@ -16,7 +16,10 @@ from psycopg import sql
 from scripts import checkpoint_cleanup
 from src.db.bootstrap import bootstrap_database
 from src.maintenance.checkpoint_cleanup import CheckpointCleaner
-from src.maintenance.checkpoint_repository import PostgresCheckpointRepository
+from src.maintenance.checkpoint_repository import (
+    CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS,
+    PostgresCheckpointRepository,
+)
 from src.maintenance.cleanup_artifacts import (
     ArtifactAlreadyExistsError,
     PlanArtifactStore,
@@ -284,13 +287,7 @@ async def test_cli_plan_and_execute_use_distinct_roles_and_ed25519_v2(
 
 @pytest.mark.parametrize(
     "revision",
-    [
-        "20260710_0002",
-        "20260710_0003",
-        "20260713_0004",
-        "20260713_0005",
-    ],
-    ids=["0002-metadata", "0003-metadata", "0004-metadata", "0005-metadata"],
+    sorted(CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS),
 )
 async def test_cleanup_plan_metadata_allowlist_reports_stored_revision_value(
     checkpoint_schema,
