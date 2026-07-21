@@ -450,12 +450,15 @@ def test_exchange_webhook_rejects_non_json_media_type_before_body_consumption():
 
 
 def test_ingress_validation_error_returns_fixed_400(
+    caplog,
     webhook_ingress_service,
 ):
     client = TestClient(app)
+    private_payload_key = "private-email-id\nlog-injection-sentinel"
     payload = {
         "event_type": "NewMailEvent",
         "item_id": {"id": "AAMkAGQ"},
+        private_payload_key: "private-value",
     }
     body, signature = _build_signed_body(payload, "test-secret")
 
@@ -463,7 +466,10 @@ def test_ingress_validation_error_returns_fixed_400(
         IngressValidationCode.HEADER_EVENT_MISMATCH
     )
 
-    with patch("src.server.get_settings") as mock_settings:
+    with (
+        patch("src.server.get_settings") as mock_settings,
+        caplog.at_level(logging.WARNING, logger="WebServer"),
+    ):
         mock_settings.return_value = SimpleNamespace(
             EXCHANGE_WEBHOOK_SECRET="test-secret",
             WEBHOOK_MAX_BYTES=1_048_576,
@@ -480,6 +486,8 @@ def test_ingress_validation_error_returns_fixed_400(
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid webhook event"}
+    assert "safe_code=ingress.header_event_mismatch" in caplog.text
+    assert private_payload_key not in caplog.text
     webhook_ingress_service.accept.assert_awaited_once_with(
         raw_body=body,
         payload=payload,

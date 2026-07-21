@@ -752,8 +752,9 @@ async def exchange_webhook(request: Request):
         )
     except IngressValidationError as exc:
         logger.warning(
-            "Rejected invalid Exchange webhook event: error_type=%s",
+            "Rejected invalid Exchange webhook event: error_type=%s safe_code=%s",
             type(exc).__name__,
+            exc.safe_code.value,
         )
         raise HTTPException(status_code=400, detail="Invalid webhook event") from None
     except (
