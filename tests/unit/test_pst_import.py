@@ -323,7 +323,10 @@ class TestPypffParser:
 
     def test_iter_from_pst_uses_pypff_when_available(self):
         """Verify iter_from_pst prefers pypff over readpst."""
-        with patch("scripts.import_pst._iter_from_pst_pypff") as mock_pypff:
+        with (
+            patch.dict("sys.modules", {"pypff": MagicMock()}),
+            patch("scripts.import_pst._iter_from_pst_pypff") as mock_pypff,
+        ):
             mock_pypff.return_value = iter([])
             list(iter_from_pst(Path("/fake.pst")))
             mock_pypff.assert_called_once()
@@ -464,4 +467,3 @@ class TestExchangeImport:
             assert stats.total == 3
             assert stats.imported == 3
             assert stats.points_created == 0
-
