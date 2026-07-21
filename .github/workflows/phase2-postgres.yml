@@ -65,6 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           env \
+            AI_EXCHANGE_IMAGE=ai-exchange:phase2-ci \
             POSTGRES_ADMIN_USER=phase2_ci_admin \
             POSTGRES_ADMIN_PASSWORD=phase2-ci-placeholder \
             POSTGRES_DB=email_agent \
@@ -76,6 +77,7 @@ jobs:
             EXTERNAL_URL=https://phase2-ci.invalid \
             docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --quiet
           services="$(env \
+            AI_EXCHANGE_IMAGE=ai-exchange:phase2-ci \
             POSTGRES_ADMIN_USER=phase2_ci_admin \
             POSTGRES_ADMIN_PASSWORD=phase2-ci-placeholder \
             POSTGRES_DB=email_agent \

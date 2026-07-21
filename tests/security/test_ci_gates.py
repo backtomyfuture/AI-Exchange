@@ -32,6 +32,7 @@ MANDATORY_COVERAGE_TARGETS = (
     "src/ingestion/*",
 )
 COMPOSE_PLACEHOLDERS = {
+    "AI_EXCHANGE_IMAGE": "ai-exchange:phase2-ci",
     "POSTGRES_ADMIN_USER": "phase2_ci_admin",
     "POSTGRES_ADMIN_PASSWORD": "phase2-ci-placeholder",
     "POSTGRES_DB": "email_agent",
