@@ -8,6 +8,7 @@ import pytest
 from psycopg.pq import TransactionStatus
 from psycopg_pool import PoolTimeout
 
+import src.ingestion.ownership as ownership_module
 from src.domain.errors import DatabaseOperationError, ErrorKind, StaleFence
 from src.domain.email_state import PipelineGenerationState
 from src.ingestion.models import (
@@ -353,3 +354,123 @@ async def test_transaction_insert_database_failure_is_safely_wrapped() -> None:
     assert caught.value.operation == "insert_current_pipeline"
     assert caught.value.retryable is True
     assert "database-secret" not in str(caught.value)
+
+
+class _OwnershipCursor:
+    def __init__(self, row: object) -> None:
+        self._row = row
+
+    async def fetchone(self) -> object:
+        return self._row
+
+
+class _RecordingOwnershipConnection:
+    def __init__(self, *rows: object) -> None:
+        self._rows = list(rows)
+        self.statements: list[tuple[object, object]] = []
+
+    async def execute(
+        self,
+        statement: object,
+        params: object = None,
+    ) -> _OwnershipCursor:
+        self.statements.append((statement, params))
+        row = self._rows.pop(0) if self._rows else None
+        return _OwnershipCursor(row)
+
+
+@pytest.mark.asyncio
+async def test_ownership_sql_helpers_use_bounded_settings_and_exact_fence_params() -> (
+    None
+):
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    configuration = _RecordingOwnershipConnection()
+
+    await ownership._configure_transaction(configuration)  # type: ignore[arg-type]
+    await ownership._acquire_account_lock(configuration, 8)  # type: ignore[arg-type]
+
+    assert len(configuration.statements) == 2
+    assert configuration.statements[0][1] == ("5000ms", "15000ms", "15000ms")
+    assert configuration.statements[1][1] == (ownership_advisory_lock_key(8),)
+
+    row = {
+        "account_id": 8,
+        "generation": 3,
+        "pipeline_name": "pipeline-v2",
+        "state": "current_ingress",
+        "fencing_token": 9,
+    }
+    fenced = _RecordingOwnershipConnection(row)
+    generation = await ownership._fetch_exact(  # type: ignore[arg-type]
+        fenced,
+        account_id=8,
+        generation=3,
+        fencing_token=9,
+        for_update=True,
+    )
+
+    assert generation == PipelineGeneration(
+        account_id=8,
+        generation=3,
+        pipeline_name="pipeline-v2",
+        state=PipelineGenerationState.CURRENT_INGRESS,
+        fencing_token=9,
+    )
+    assert fenced.statements[0][1] == (8, 3, 9)
+
+    missing = _RecordingOwnershipConnection(None)
+    assert (
+        await ownership._fetch_exact(  # type: ignore[arg-type]
+            missing,
+            account_id=8,
+            generation=4,
+        )
+        is None
+    )
+    assert missing.statements[0][1] == (8, 4)
+
+
+@pytest.mark.asyncio
+async def test_ownership_audit_hashes_safe_fields_and_default_guard_denies_retirement() -> (
+    None
+):
+    ownership = PipelineOwnershipRepository(_NeverPool())
+    generation = _generation(PipelineGenerationState.QUIESCING)
+    connection = _RecordingOwnershipConnection()
+
+    await ownership._audit(  # type: ignore[arg-type]
+        connection,
+        generation,
+        action="pipeline.quiesce",
+        actor="operator",
+        reason="prepare cutover",
+    )
+
+    assert len(connection.statements) == 1
+    audit_params = connection.statements[0][1]
+    assert len(audit_params) == 8
+    assert audit_params[2] == 8
+    assert audit_params[4] == "pipeline.quiesce"
+    assert audit_params[5:7] == ("operator", "prepare cutover")
+    assert len(audit_params[1]) == 64
+    assert len(audit_params[3]) == 64
+
+    with pytest.raises(PipelineRetirementBlocked) as caught:
+        await ownership._retirement_guard.assert_ready(  # type: ignore[arg-type]
+            connection,
+            generation,
+        )
+    assert caught.value.safe_code is RetirementBlockCode.EVIDENCE_UNAVAILABLE
+
+
+def test_ownership_row_value_accepts_mapping_or_tuple_and_rejects_missing_data() -> (
+    None
+):
+    row_value = getattr(ownership_module, "_row_value")
+
+    assert row_value({"maximum_generation": 3}, 0, "maximum_generation") == 3
+    assert row_value((4,), 0, "maximum_generation") == 4
+    with pytest.raises(ValueError, match="missing"):
+        row_value({}, 0, "maximum_generation")
+    with pytest.raises(ValueError, match="invalid shape"):
+        row_value((), 0, "maximum_generation")
