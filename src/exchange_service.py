@@ -1281,6 +1281,16 @@ async def _delete_unclaimed_content_candidate(
         )
 
 
+def _log_content_persistence_failure(stage: str, error: BaseException) -> None:
+    """Emit bounded diagnostics without content, identifiers, refs, or values."""
+
+    logger.error(
+        "Content persistence stage failed: stage=%s error_type=%s",
+        stage,
+        type(error).__name__,
+    )
+
+
 async def _ensure_durable_content_ref(
     email_id: str,
     email_data: dict,
@@ -1291,9 +1301,22 @@ async def _ensure_durable_content_ref(
 ) -> ContentRef:
     """Persist content and its typed DB ref before any downstream operation."""
     if reuse_existing:
-        existing = await ctx.db_manager.get_content_ref(email_id)
+        try:
+            existing = await ctx.db_manager.get_content_ref(email_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as read_exc:
+            _log_content_persistence_failure("content_ref_readback", read_exc)
+            raise
         if existing is not None:
-            return _require_owned_ref(existing)
+            try:
+                return _require_owned_ref(existing)
+            except Exception as validation_exc:
+                _log_content_persistence_failure(
+                    "content_ref_validation",
+                    validation_exc,
+                )
+                raise
 
     settings = get_settings()
     await _authorize_external_effect(
@@ -1314,11 +1337,19 @@ async def _ensure_durable_content_ref(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as put_exc:
+        _log_content_persistence_failure("content_put", put_exc)
         if _effect_boundary is not None:
             raise GuardedExternalEffectFailed() from None
         raise
-    ref = _require_owned_ref(ref)
+    try:
+        ref = _require_owned_ref(ref)
+    except Exception as validation_exc:
+        _log_content_persistence_failure(
+            "content_ref_validation",
+            validation_exc,
+        )
+        raise
     try:
         claimed = await ctx.db_manager.set_content_ref_if_absent(email_id, ref)
     except asyncio.CancelledError as cancel_exc:
@@ -1332,10 +1363,7 @@ async def _ensure_durable_content_ref(
             logger.error("Content reference cancellation read-back was cancelled")
             raise cancel_exc from None
         except Exception as read_exc:
-            logger.error(
-                "Content reference cancellation outcome unknown: read_error_type=%s",
-                type(read_exc).__name__,
-            )
+            _log_content_persistence_failure("content_ref_readback", read_exc)
             raise cancel_exc from None
 
         if persisted_ref is not None:
@@ -1364,17 +1392,13 @@ async def _ensure_durable_content_ref(
             )
         raise cancel_exc from None
     except Exception as write_exc:
+        _log_content_persistence_failure("content_ref_cas", write_exc)
         if _effect_boundary is not None:
             raise
         try:
             persisted_ref = await ctx.db_manager.get_content_ref(email_id)
         except Exception as read_exc:
-            logger.error(
-                "Content reference commit outcome unknown: write_error_type=%s "
-                "read_error_type=%s",
-                type(write_exc).__name__,
-                type(read_exc).__name__,
-            )
+            _log_content_persistence_failure("content_ref_readback", read_exc)
             raise write_exc from None
 
         if persisted_ref is not None:
@@ -1425,6 +1449,7 @@ async def _ensure_durable_content_ref(
         )
         raise cancel_exc from None
     except Exception as read_exc:
+        _log_content_persistence_failure("content_ref_readback", read_exc)
         if _effect_boundary is not None:
             raise
         # A False CAS result proves this candidate was not claimed.  It is safe
@@ -1443,11 +1468,13 @@ async def _ensure_durable_content_ref(
             reason="false_claim_unresolved",
             _effect_boundary=_effect_boundary,
         )
-        raise DatabaseOperationError(
+        unresolved = DatabaseOperationError(
             operation="set_content_ref_if_absent",
             retryable=True,
             message="content reference claim unresolved",
         )
+        _log_content_persistence_failure("content_ref_readback", unresolved)
+        raise unresolved
     try:
         persisted_ref = _require_owned_ref(persisted_ref)
     except Exception:

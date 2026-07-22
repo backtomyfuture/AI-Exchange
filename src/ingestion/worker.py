@@ -210,6 +210,7 @@ class _InboxRepository(Protocol):
         lease: InboxLease,
         email_id: str,
         expected_email_version: int,
+        effect_kind: str,
     ) -> bool: ...
 
     async def finish_email_processing(
@@ -595,6 +596,7 @@ class DurableInboxWorker:
                     current,
                     application.email_id,
                     application.version,
+                    kind,
                 )
             )
 

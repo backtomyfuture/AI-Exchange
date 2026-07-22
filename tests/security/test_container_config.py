@@ -8,15 +8,17 @@ from typing import Any
 import pytest
 import yaml
 
+from src.deployment.configuration import USER_ENV_KEYS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
 EXCHANGE_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.exchange-tls.yml"
+WEBHOOK_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.webhook-tls.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
 BOOTSTRAP_REQUIREMENTS = PROJECT_ROOT / "requirements.bootstrap.txt"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
-RUNTIME_ENV_EXAMPLE = PROJECT_ROOT / ".env.runtime.example"
 DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
 GITIGNORE = PROJECT_ROOT / ".gitignore"
 POSTGRES_PEER_ACL_INIT = (
@@ -33,6 +35,10 @@ PINNED_POSTGRES_IMAGE = (
 PINNED_QDRANT_IMAGE = (
     "qdrant/qdrant:v1.17.0@"
     "sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb"
+)
+PINNED_WEBHOOK_TLS_IMAGE = (
+    "nginxinc/nginx-unprivileged:1.27.5-alpine@"
+    "sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0"
 )
 PINNED_UV_WHEEL_HASHES = {
     "041e4b80bebc58d7142ac9394370cacd73185fd8d066d6675d14707d83408f6d",
@@ -96,6 +102,26 @@ def test_production_data_service_images_are_digest_pinned():
     assert compose["services"]["qdrant"]["image"] == PINNED_QDRANT_IMAGE
 
 
+def test_qdrant_disables_telemetry_and_has_a_real_healthcheck():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    qdrant = compose["services"]["qdrant"]
+
+    assert qdrant["command"] == ["./entrypoint.sh", "--disable-telemetry"]
+    healthcheck = qdrant["healthcheck"]
+    assert healthcheck["test"][:3] == ["CMD", "/usr/bin/bash", "-ec"]
+    assert "GET /healthz HTTP/1.0" in healthcheck["test"][3]
+    assert "200 OK" in healthcheck["test"][3]
+
+
+def test_application_waits_for_healthy_qdrant():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+
+    dependency = compose["services"]["ai-assistant-service"]["depends_on"][
+        "qdrant"
+    ]
+    assert dependency == {"condition": "service_healthy"}
+
+
 def test_production_container_inputs_do_not_use_latest_tags():
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     compose = PRODUCTION_COMPOSE.read_text(encoding="utf-8")
@@ -106,7 +132,7 @@ def test_production_container_inputs_do_not_use_latest_tags():
 
 def test_all_application_one_shots_share_one_explicit_release_image():
     compose = _load_yaml(PRODUCTION_COMPOSE)
-    expected = "${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}"
+    expected = "${AI_EXCHANGE_IMAGE:-ai-exchange:local}"
 
     for service_name in (
         "database-provision",
@@ -182,34 +208,15 @@ def test_production_data_services_do_not_publish_host_ports(service_name: str):
     assert "ports" not in service
 
 
-@pytest.mark.parametrize(
-    ("service_name", "field_name", "source_name"),
-    [
-        ("postgres", "POSTGRES_USER", "POSTGRES_ADMIN_USER"),
-        ("postgres", "POSTGRES_PASSWORD", "POSTGRES_ADMIN_PASSWORD"),
-        ("postgres", "POSTGRES_DB", "POSTGRES_DB"),
-        ("ai-assistant-service", "POSTGRES_USER", "POSTGRES_RUNTIME_USER"),
-        (
-            "ai-assistant-service",
-            "POSTGRES_PASSWORD",
-            "POSTGRES_RUNTIME_PASSWORD",
-        ),
-        ("ai-assistant-service", "POSTGRES_DB", "POSTGRES_DB"),
-        ("ai-assistant-service", "EXTERNAL_URL", "EXTERNAL_URL"),
-    ],
-)
-def test_production_boundary_values_are_required_from_environment(
-    service_name: str,
-    field_name: str,
-    source_name: str,
-):
+@pytest.mark.parametrize("field_name", USER_ENV_KEYS)
+def test_user_configuration_is_required_from_environment(field_name: str):
     compose = _load_yaml(PRODUCTION_COMPOSE)
-    environment = compose["services"][service_name]["environment"]
+    environment = compose["services"]["ai-assistant-service"]["environment"]
 
     assert isinstance(environment, dict)
     configured = environment[field_name]
     assert isinstance(configured, str)
-    assert f"${{{source_name}:?" in configured
+    assert f"${{{field_name}:?" in configured
 
 
 def test_production_backend_network_is_internal_and_contains_only_data_services():
@@ -244,8 +251,8 @@ def test_production_full_folder_default_matches_runtime_and_template():
     environment = compose["services"]["ai-assistant-service"]["environment"]
     template = _read_env_example()
 
-    assert environment["EXCHANGE_FOLDERS_FULL"] == "${EXCHANGE_FOLDERS_FULL:-收件箱}"
-    assert template["EXCHANGE_FOLDERS_FULL"] == "收件箱"
+    assert "EXCHANGE_FOLDERS_FULL" not in environment
+    assert "EXCHANGE_FOLDERS_FULL" not in template
     assert Settings.model_fields["EXCHANGE_FOLDERS_FULL"].default == "收件箱"
 
 
@@ -294,6 +301,46 @@ def test_optional_exchange_tls_overlay_pins_dns_alias_and_read_only_ca():
     assert "host-gateway" not in EXCHANGE_TLS_COMPOSE.read_text(encoding="utf-8")
 
 
+def test_optional_webhook_tls_ingress_is_minimal_and_digest_pinned():
+    compose = _load_yaml(WEBHOOK_TLS_COMPOSE)
+    service = compose["services"]["webhook-tls-ingress"]
+
+    assert service["image"] == PINNED_WEBHOOK_TLS_IMAGE
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert _network_names(service) == {"edge"}
+    assert service["ports"] == ["${WEBHOOK_TLS_PORT:-8443}:8443"]
+    assert service["depends_on"] == {
+        "ai-assistant-service": {"condition": "service_healthy"}
+    }
+
+
+def test_optional_webhook_tls_ingress_mounts_only_reviewed_config_and_secrets():
+    compose = _load_yaml(WEBHOOK_TLS_COMPOSE)
+    service = compose["services"]["webhook-tls-ingress"]
+    config = (PROJECT_ROOT / "deploy" / "webhook-tls" / "nginx.conf").read_text(
+        encoding="utf-8"
+    )
+
+    assert service["volumes"] == [
+        {
+            "type": "bind",
+            "source": "./deploy/webhook-tls/nginx.conf",
+            "target": "/etc/nginx/nginx.conf",
+            "read_only": True,
+        }
+    ]
+    assert service["secrets"] == [
+        {"source": "webhook_tls_fullchain", "target": "webhook_tls_fullchain.pem"},
+        {"source": "webhook_tls_key", "target": "webhook_tls_key.pem"},
+    ]
+    assert "location = /webhooks/exchange" in config
+    assert "location = /ready" in config
+    assert "location /" in config and "return 404" in config
+    assert "ssl_protocols TLSv1.2 TLSv1.3" in config
+
+
 def test_production_application_has_no_source_or_test_bind_mounts():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     volumes = tuple(compose["services"]["ai-assistant-service"].get("volumes", ()))
@@ -307,14 +354,18 @@ def test_production_database_credentials_use_three_distinct_planes():
     postgres_environment = compose["services"]["postgres"]["environment"]
     runtime_environment = compose["services"]["ai-assistant-service"]["environment"]
 
-    assert "${POSTGRES_ADMIN_USER:" in postgres_environment["POSTGRES_USER"]
-    assert "${POSTGRES_ADMIN_PASSWORD:" in postgres_environment["POSTGRES_PASSWORD"]
-    assert "${POSTGRES_RUNTIME_USER:" in runtime_environment["POSTGRES_USER"]
-    assert "${POSTGRES_RUNTIME_PASSWORD:" in runtime_environment["POSTGRES_PASSWORD"]
+    assert postgres_environment["POSTGRES_USER"] == "ai_exchange_admin"
+    assert postgres_environment["POSTGRES_PASSWORD_FILE"] == (
+        "/run/secrets/postgres_admin_password"
+    )
+    assert runtime_environment["POSTGRES_USER"] == "ai_exchange_runtime"
+    assert runtime_environment["POSTGRES_PASSWORD_FILE"] == (
+        "/run/secrets/postgres_runtime_password"
+    )
     assert postgres_environment["POSTGRES_USER"] != runtime_environment["POSTGRES_USER"]
     assert (
-        postgres_environment["POSTGRES_PASSWORD"]
-        != runtime_environment["POSTGRES_PASSWORD"]
+        postgres_environment["POSTGRES_PASSWORD_FILE"]
+        != runtime_environment["POSTGRES_PASSWORD_FILE"]
     )
 
 
@@ -336,7 +387,11 @@ def test_production_application_uses_an_explicit_runtime_allowlist_only():
     service = compose["services"]["ai-assistant-service"]
 
     assert "env_file" not in service
-    assert "secrets" not in service
+    assert service["secrets"] == [
+        {"source": "postgres_runtime_password", "target": "postgres_runtime_password"},
+        {"source": "metrics_token", "target": "metrics_token"},
+        {"source": "content_store_key", "target": "content_store_key"},
+    ]
     forbidden_fragments = (
         "MIGRATION_DATABASE",
         "POSTGRES_ADMIN",
@@ -379,6 +434,7 @@ def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
         "POSTGRES_PASSWORD",
     }.intersection(service["environment"])
     assert set(compose["secrets"]) == {
+        "postgres_admin_password",
         "database_provision_admin_url",
         "postgres_migration_password",
         "postgres_runtime_password",
@@ -389,6 +445,8 @@ def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
         "checkpoint_auditor_database_url",
         "checkpoint_maintenance_database_url",
         "checkpoint_maintenance_receipt_ed25519_public_key",
+        "metrics_token",
+        "content_store_key",
     }
 
 
@@ -556,7 +614,7 @@ def test_build_and_vcs_ignore_all_environment_and_local_secret_files():
     assert ".env*" in gitignore
     assert "secrets/" in gitignore
     assert "!.env.example" in gitignore
-    assert "!.env.runtime.example" in gitignore
+    assert "!.env.runtime.example" not in gitignore
 
 
 def test_build_context_excludes_generated_test_and_lint_artifacts():
@@ -596,33 +654,13 @@ def test_vcs_ignores_coverage_artifacts_and_keeps_bootstrap_lockfile():
 
     assert ".coverage*" in gitignore
     assert "!requirements.bootstrap.txt" in gitignore
+    assert "!.env.runtime.example" not in gitignore
 
 
-def test_runtime_environment_template_excludes_control_plane_credentials():
-    values: dict[str, str] = {}
-    for raw_line in RUNTIME_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            values[key] = value
+def test_user_environment_template_is_the_exact_minimal_contract():
+    values = _read_env_example()
 
-    assert {"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"} <= values.keys()
-    assert not {
-        "MIGRATION_DATABASE_URL",
-        "MIGRATION_DATABASE_URL_FILE",
-        "CHECKPOINT_MAINTENANCE_DATABASE_URL",
-        "CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE",
-        "CHECKPOINT_AUDITOR_DATABASE_URL",
-        "CHECKPOINT_AUDITOR_DATABASE_URL_FILE",
-        "CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE",
-        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_B64",
-        "CHECKPOINT_MAINTENANCE_RECEIPT_HMAC_KEY_FILE",
-        "CHECKPOINT_CLEANUP_RECEIPT_HMAC_KEY_B64",
-        "POSTGRES_ADMIN_USER",
-        "POSTGRES_ADMIN_PASSWORD",
-        "POSTGRES_MIGRATION_USER",
-        "POSTGRES_MIGRATION_PASSWORD",
-    }.intersection(values)
+    assert tuple(values) == USER_ENV_KEYS
 
 
 @pytest.mark.parametrize(
@@ -650,50 +688,20 @@ def test_development_application_port_is_explicitly_loopback_only():
     assert ports == ("127.0.0.1:${APP_PORT:-8000}:8000",)
 
 
-def test_env_example_declares_all_minimum_security_controls():
-    values = _read_env_example()
-    required = {
-        "APP_ENV",
-        "AI_EXCHANGE_IMAGE",
-        "POSTGRES_PASSWORD",
-        "EXCHANGE_CA_FILE",
-        "EXCHANGE_TLS_HOSTNAME",
-        "EXCHANGE_TLS_IP",
-        "EXCHANGE_CA_FILE_HOST",
-        "METRICS_TOKEN",
-        "LARK_ALLOWED_OPEN_IDS",
-    }
-
-    assert required <= values.keys()
-    assert values["APP_ENV"] == "development"
-
-
-def test_env_example_declares_file_backed_greenfield_provisioning_secrets():
+def test_env_example_declares_only_user_managed_integrations():
     values = _read_env_example()
 
-    assert {
-        "DATABASE_PROVISION_ADMIN_URL_FILE",
-        "POSTGRES_MIGRATION_PASSWORD_FILE",
-        "POSTGRES_RUNTIME_PASSWORD_FILE",
-        "POSTGRES_MAINTENANCE_PASSWORD_FILE",
-        "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE",
-    } <= values.keys()
-    assert all(
-        values[name].startswith("./secrets/")
-        for name in (
-            "DATABASE_PROVISION_ADMIN_URL_FILE",
-            "POSTGRES_MIGRATION_PASSWORD_FILE",
-            "POSTGRES_RUNTIME_PASSWORD_FILE",
-            "POSTGRES_MAINTENANCE_PASSWORD_FILE",
-            "POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE",
-        )
-    )
+    assert set(values) == set(USER_ENV_KEYS)
+    assert not any(key.startswith("POSTGRES_") for key in values)
+    assert "METRICS_TOKEN" not in values
+    assert "CONTENT_STORE_KEY" not in values
 
 
 def test_env_example_enables_exchange_tls_verification_by_default():
-    values = _read_env_example()
+    from src.config import Settings
 
-    assert values["EXCHANGE_SSL_VERIFY"].casefold() == "true"
+    assert "EXCHANGE_SSL_VERIFY" not in _read_env_example()
+    assert Settings.model_fields["EXCHANGE_SSL_VERIFY"].default is True
 
 
 def test_env_example_does_not_ship_environment_specific_lark_identifiers():

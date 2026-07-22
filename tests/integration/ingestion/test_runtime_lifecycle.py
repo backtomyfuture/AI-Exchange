@@ -16,6 +16,7 @@ from src.domain.email_state import ProcessingOutcome
 from src.ingestion.legacy_adapter import LegacyProcessingAdapter
 from src.ingestion.models import ChangeKind, IngressSource, ProcessingPolicy
 from src.ingestion.policy import FolderScope, PolicySnapshot
+from src.ingestion.processing import GuardedExternalEffectFailed
 from src.ingestion.repository import InboxRepository
 from src.ingestion.runtime import build_ingestion_runtime
 from src.ingestion.runtime_authority import (
@@ -386,6 +387,154 @@ async def test_phase4_runtime_processes_webhook_to_completion_with_real_postgres
 
 
 @pytest.mark.asyncio
+async def test_phase4_runtime_retries_missing_detail_without_effect_marker(
+    empty_schema,
+) -> None:
+    await bootstrap_database(empty_schema.dsn, **empty_schema.bootstrap_identity)
+    await _initialize(empty_schema)
+
+    exchange_get_email = AsyncMock(return_value=None)
+    get_email_status = AsyncMock(return_value=None)
+    processing_context = SimpleNamespace(
+        exchange_client=SimpleNamespace(get_email=exchange_get_email),
+        db_manager=SimpleNamespace(get_email_status=get_email_status),
+    )
+    settings = _runtime_settings(empty_schema)
+    settings.DURABLE_INBOX_ENABLED = True
+    runtime = build_ingestion_runtime(
+        settings,
+        processing_context=processing_context,
+    )
+    raw_payload = _webhook_payload()
+    raw_body = json.dumps(
+        raw_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    await runtime.start()
+    try:
+        service = runtime.webhook_ingress_service
+        assert service is not None
+        receipt = await service.accept(
+            raw_body=raw_body,
+            payload=raw_payload,
+            header_event="NewMailEvent",
+        )
+        await _wait_for_inbox_status(empty_schema, receipt.inbox_id, "retry_wait")
+    finally:
+        await runtime.stop()
+
+    assert empty_schema.scalar(
+        "SELECT effect_started_at IS NULL FROM event_inbox WHERE id = %s",
+        (receipt.inbox_id,),
+    ) is True
+    assert empty_schema.scalar(
+        "SELECT status = 'retry_wait' "
+        "AND safe_error_code = 'inbox.transient_dependency' "
+        "FROM event_inbox WHERE id = %s",
+        (receipt.inbox_id,),
+    ) is True
+    assert empty_schema.scalar(
+        "SELECT status = 'retry_wait' "
+        "AND external_effects_started_at IS NULL "
+        "AND safe_error_code = 'inbox.transient_dependency' "
+        "FROM emails WHERE account_id = 8 AND external_email_id = %s",
+        ("runtime-message-1",),
+    ) is True
+    exchange_get_email.assert_awaited_once_with("runtime-message-1")
+    get_email_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_phase4_runtime_keeps_unknown_side_effect_in_manual_review(
+    empty_schema,
+    monkeypatch,
+) -> None:
+    await bootstrap_database(empty_schema.dsn, **empty_schema.bootstrap_identity)
+    await _initialize(empty_schema)
+
+    exchange_get_email = AsyncMock(
+        return_value={
+            "id": "runtime-message-1",
+            "subject": "Phase 4 integration",
+            "sender": "sender@example.test",
+            "body": "integration body",
+            "received_at": "2026-07-17T08:00:00+00:00",
+        }
+    )
+    processing_context = SimpleNamespace(
+        exchange_client=SimpleNamespace(get_email=exchange_get_email),
+        db_manager=SimpleNamespace(get_email_status=AsyncMock(return_value=None)),
+    )
+
+    async def fail_after_side_effect_authorization(_email_data, _context, **kwargs):
+        await kwargs["before_external_effect"]("feishu", 0, _HASH_A)
+        raise GuardedExternalEffectFailed()
+
+    guarded_processor = AsyncMock(side_effect=fail_after_side_effect_authorization)
+
+    class _TestLegacyProcessingAdapter(LegacyProcessingAdapter):
+        __slots__ = ()
+
+        def __init__(self, context, *, legacy_account_id: int):
+            super().__init__(
+                context,
+                legacy_account_id=legacy_account_id,
+                guarded_processor=guarded_processor,
+            )
+
+    monkeypatch.setattr(
+        "src.ingestion.legacy_adapter.LegacyProcessingAdapter",
+        _TestLegacyProcessingAdapter,
+    )
+    settings = _runtime_settings(empty_schema)
+    settings.DURABLE_INBOX_ENABLED = True
+    runtime = build_ingestion_runtime(
+        settings,
+        processing_context=processing_context,
+    )
+    raw_payload = _webhook_payload()
+    raw_body = json.dumps(
+        raw_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    await runtime.start()
+    try:
+        service = runtime.webhook_ingress_service
+        assert service is not None
+        receipt = await service.accept(
+            raw_body=raw_body,
+            payload=raw_payload,
+            header_event="NewMailEvent",
+        )
+        await _wait_for_inbox_status(empty_schema, receipt.inbox_id, "manual_review")
+    finally:
+        await runtime.stop()
+
+    assert empty_schema.scalar(
+        "SELECT status = 'manual_review' "
+        "AND effect_started_at IS NOT NULL "
+        "AND safe_error_code = 'inbox.effect_outcome_unknown' "
+        "FROM event_inbox WHERE id = %s",
+        (receipt.inbox_id,),
+    ) is True
+    assert empty_schema.scalar(
+        "SELECT status = 'manual_review' "
+        "AND external_effects_started_at IS NOT NULL "
+        "AND safe_error_code = 'inbox.effect_outcome_unknown' "
+        "FROM emails WHERE account_id = 8 AND external_email_id = %s",
+        ("runtime-message-1",),
+    ) is True
+    exchange_get_email.assert_awaited_once_with("runtime-message-1")
+    guarded_processor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_expired_runtime_session_cannot_begin_processing_effect(
     empty_schema,
 ) -> None:
@@ -479,6 +628,7 @@ async def test_expired_runtime_session_cannot_begin_processing_effect(
                 lease,
                 application.email_id,
                 application.version,
+                "feishu",
             )
             is False
         )

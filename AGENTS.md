@@ -36,7 +36,7 @@ Once the tables exist, subsequent `checkpointer.setup()` calls are no-ops.
 
 ### Environment setup
 
-For direct local Python, copy `.env.runtime.example` to `.env.runtime`. For production Compose, copy `.env.example` to `.env`; Compose injects only an explicit runtime allowlist. Store the migration DSN only in the private file named by `MIGRATION_DATABASE_URL_FILE`. The only mandatory fix for tests is an integer `EXCHANGE_ACCOUNT_ID` (default `8`).
+Local Python and production Compose now share one minimal `.env`. Copy `.env.example` to `.env`, fill only its 17 integration/model values, then run `.venv/bin/python scripts/configure_deployment.py`; database identities, security tokens, DSNs, limits, and advanced deployment state are generated under ignored `secrets/`. Compose still injects an explicit runtime allowlist, and migration/maintenance credentials never enter the application container. Use `PYTHON_DOTENV_DISABLED=1` when a test must be isolated from the local deployment configuration.
 
 ### Common commands
 

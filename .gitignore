@@ -1,7 +1,6 @@
 # Environment variables and local credential files
 .env*
 !.env.example
-!.env.runtime.example
 secrets/
 
 # Python
@@ -38,4 +37,6 @@ artifacts/
 
 # Real deployment manifests and operator release metadata are local-only.
 deploy/*/
+!deploy/webhook-tls/
+!deploy/webhook-tls/nginx.conf
 deploy/*.json

@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 
 from src.domain.email_state import ProcessingOutcome
-from src.domain.errors import ManualReviewRequired
+from src.domain.errors import ErrorKind, ManualReviewRequired
 from src.ingestion.email_events import (
     EmailEventApplication,
     EmailEventDecision,
@@ -35,8 +35,10 @@ from src.ingestion.processing import (
     ExternalEffectAuthorizationError,
     ExternalEffectKind,
     ProcessingPolicyRejected,
+    ReplaySafeExternalEffectFailed,
 )
 from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
+from src.storage.content_store import serialize_email_envelope
 
 
 def _lease(
@@ -228,6 +230,41 @@ async def test_archive_fetches_detail_uses_exact_old_path_and_maps_archived() ->
     assert completion.target_status is EmailStatus.ARCHIVED
     assert completion.legacy_outcome is ProcessingOutcome.ARCHIVED
     assert processor.await_args.kwargs["skip_analysis"] is True
+
+
+@pytest.mark.asyncio
+async def test_nested_folder_payload_is_materialized_for_content_storage() -> None:
+    ctx = _ctx(legacy_status="skipped")
+    processor = AsyncMock(return_value=ProcessingOutcome.PROCESSED)
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=processor,
+    )
+    lease = _lease()
+    lease = replace(
+        lease,
+        event=replace(
+            lease.event,
+            payload={
+                "id": "message-1",
+                "parent_folder_id": {
+                    "id": "INBOX",
+                    "changekey": "opaque-version",
+                },
+            },
+        ),
+    )
+
+    await adapter.process(
+        lease,
+        _application(),
+        before_external_effect=AsyncMock(return_value=None),
+    )
+
+    projected = processor.await_args.args[0]
+    assert projected["_parent_folder_id"] == "INBOX"
+    assert serialize_email_envelope("message-1", projected)
 
 
 @pytest.mark.asyncio
@@ -436,6 +473,80 @@ async def test_detail_identity_mismatch_fails_closed_before_legacy_path(
             before_external_effect=AsyncMock(return_value=None),
         )
     processor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_detail_is_retryable_instead_of_manual_review(caplog) -> None:
+    ctx = _ctx(legacy_status="skipped")
+    ctx.exchange_client.get_email.return_value = None
+    processor = AsyncMock(return_value=ProcessingOutcome.PROCESSED)
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=processor,
+    )
+
+    with pytest.raises(ReplaySafeExternalEffectFailed) as caught:
+        await adapter.process(
+            _lease(),
+            _application(),
+            before_external_effect=AsyncMock(return_value=None),
+        )
+
+    assert caught.value.kind is ErrorKind.TRANSIENT_DEPENDENCY
+    assert "stage=detail_fetch" in caplog.text
+    assert "error_type=ReplaySafeExternalEffectFailed" in caplog.text
+    processor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_detail_exception_is_redacted_and_wrapped_as_replay_safe(caplog) -> None:
+    ctx = _ctx(legacy_status="skipped")
+    ctx.exchange_client.get_email.side_effect = RuntimeError(
+        "PRIVATE-EXCHANGE-DETAIL"
+    )
+    processor = AsyncMock(return_value=ProcessingOutcome.PROCESSED)
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=processor,
+    )
+
+    with pytest.raises(ReplaySafeExternalEffectFailed) as caught:
+        await adapter.process(
+            _lease(),
+            _application(),
+            before_external_effect=AsyncMock(return_value=None),
+        )
+
+    assert caught.value.__cause__ is None
+    assert "stage=detail_fetch" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "PRIVATE-EXCHANGE-DETAIL" not in caplog.text
+    processor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guarded_processing_failure_logs_only_stage_and_type(caplog) -> None:
+    ctx = _ctx(legacy_status="skipped")
+    private_failure = RuntimeError("PRIVATE-GUARDED-DETAIL")
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=AsyncMock(side_effect=private_failure),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await adapter.process(
+            _lease(),
+            _application(),
+            before_external_effect=AsyncMock(return_value=None),
+        )
+
+    assert caught.value is private_failure
+    assert "stage=guarded_processing" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "PRIVATE-GUARDED-DETAIL" not in caplog.text
 
 
 @pytest.mark.asyncio

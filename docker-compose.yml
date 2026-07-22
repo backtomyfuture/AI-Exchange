@@ -2,10 +2,24 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
     restart: always
+    command: ["./entrypoint.sh", "--disable-telemetry"]
     expose:
       - "6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333;
+          printf 'GET /healthz HTTP/1.0\r\n\r\n' >&3;
+          grep -q '200 OK' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - backend
 
@@ -13,9 +27,12 @@ services:
     image: postgres:15@sha256:f30e3de0ac9cc938dac627ef2231099867c694b5f949fadb924c8c977428c399
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ai_exchange_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      POSTGRES_DB: email_agent
+    secrets:
+      - source: postgres_admin_password
+        target: postgres_admin_password
     expose:
       - "5432"
     volumes:
@@ -32,7 +49,7 @@ services:
   database-provision:
     profiles: ["database-provision"]
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     command: ["python", "-m", "src.db.provision"]
     # Administrator access exists only in this explicit greenfield one-shot.
@@ -48,12 +65,12 @@ services:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       DATABASE_PROVISION_ADMIN_URL_FILE: /run/secrets/database_provision_admin_url
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_DB: email_agent
+      POSTGRES_SCHEMA: public
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_RUNTIME_ROLE: ai_exchange_runtime
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
       POSTGRES_MIGRATION_PASSWORD_FILE: /run/secrets/postgres_migration_password
       POSTGRES_RUNTIME_PASSWORD_FILE: /run/secrets/postgres_runtime_password
       POSTGRES_MAINTENANCE_PASSWORD_FILE: /run/secrets/postgres_maintenance_password
@@ -79,7 +96,7 @@ services:
   database-bootstrap:
     profiles: ["migration"]
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     command: ["python", "-m", "src.db.bootstrap"]
     # Compose file-backed secrets cannot remap uid/gid/mode. The host source
@@ -96,11 +113,11 @@ services:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_RUNTIME_ROLE: ai_exchange_runtime
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
+      POSTGRES_SCHEMA: public
       TZ: Asia/Shanghai
     secrets:
       - source: migration_database_url
@@ -114,7 +131,7 @@ services:
   ingestion-maintenance:
     profiles: ["ingestion-maintenance"]
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/manage_ingestion.py"]
     command: ["--help"]
@@ -131,11 +148,11 @@ services:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       INGESTION_MAINTENANCE_DATABASE_URL_FILE: /run/secrets/ingestion_maintenance_database_url
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_RUNTIME_ROLE: ai_exchange_runtime
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
+      POSTGRES_SCHEMA: public
       TZ: Asia/Shanghai
     secrets:
       - source: ingestion_maintenance_database_url
@@ -149,7 +166,7 @@ services:
   checkpoint-maintenance:
     profiles: ["checkpoint-maintenance"]
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
     command: ["--help"]
@@ -167,11 +184,11 @@ services:
       PYTHONUNBUFFERED: "1"
       XDG_STATE_HOME: /var/lib
       CHECKPOINT_AUDITOR_DATABASE_URL_FILE: /run/secrets/checkpoint_auditor_database_url
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_RUNTIME_ROLE: ai_exchange_runtime
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_SCHEMA: public
       TZ: Asia/Shanghai
     secrets:
       - source: checkpoint_auditor_database_url
@@ -187,7 +204,7 @@ services:
   checkpoint-maintenance-execute:
     profiles: ["checkpoint-maintenance-execute"]
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
     command: ["execute", "--help"]
@@ -204,11 +221,11 @@ services:
       XDG_STATE_HOME: /var/lib
       CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE: /run/secrets/checkpoint_maintenance_database_url
       CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE: /run/secrets/checkpoint_maintenance_receipt_ed25519_public_key
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_RUNTIME_ROLE: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_RUNTIME_ROLE: ai_exchange_runtime
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
+      POSTGRES_SCHEMA: public
       TZ: Asia/Shanghai
     secrets:
       - source: checkpoint_maintenance_database_url
@@ -225,7 +242,7 @@ services:
 
   ai-assistant-service:
     build: .
-    image: ${AI_EXCHANGE_IMAGE:?AI_EXCHANGE_IMAGE is required}
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: always
     command: python -m src.main
     environment:
@@ -238,81 +255,49 @@ services:
       QDRANT_URL: http://qdrant:6333
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_RUNTIME_USER:?POSTGRES_RUNTIME_USER is required}
-      POSTGRES_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?POSTGRES_RUNTIME_PASSWORD is required}
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
-      POSTGRES_MIGRATION_OWNER_ROLE: ${POSTGRES_MIGRATION_OWNER_ROLE:?POSTGRES_MIGRATION_OWNER_ROLE is required}
-      POSTGRES_MAINTENANCE_ROLE: ${POSTGRES_MAINTENANCE_ROLE:?POSTGRES_MAINTENANCE_ROLE is required}
-      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ${POSTGRES_CHECKPOINT_AUDITOR_ROLE:?POSTGRES_CHECKPOINT_AUDITOR_ROLE is required}
+      POSTGRES_USER: ai_exchange_runtime
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_runtime_password
+      POSTGRES_DB: email_agent
+      POSTGRES_SCHEMA: public
+      POSTGRES_MIGRATION_OWNER_ROLE: ai_exchange_migration_owner
+      POSTGRES_MAINTENANCE_ROLE: ai_exchange_checkpoint_maintenance
+      POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
       DATABASE_ROLE_SEPARATION_REQUIRED: "true"
-      DURABLE_INBOX_ENABLED: ${DURABLE_INBOX_ENABLED:-false}
-      INGESTION_SHADOW_ENABLED: ${INGESTION_SHADOW_ENABLED:-false}
-      SYNC_RECONCILIATION_ENABLED: ${SYNC_RECONCILIATION_ENABLED:-false}
-      INGESTION_INSTANCE_ID: ${INGESTION_INSTANCE_ID:-ai-exchange-web}
-      INGESTION_LEASE_SECONDS: ${INGESTION_LEASE_SECONDS:-30}
-      INGESTION_HEARTBEAT_SECONDS: ${INGESTION_HEARTBEAT_SECONDS:-10}
-      INGESTION_SHUTDOWN_SECONDS: ${INGESTION_SHUTDOWN_SECONDS:-30}
-      EXCHANGE_API_URL: ${EXCHANGE_API_URL:-}
-      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
-      EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:-8}
-      EXCHANGE_ACCOUNT_EMAIL: ${EXCHANGE_ACCOUNT_EMAIL:-}
-      EXCHANGE_WEBHOOK_SECRET: ${EXCHANGE_WEBHOOK_SECRET:-}
-      EXCHANGE_SSL_VERIFY: ${EXCHANGE_SSL_VERIFY:-true}
-      EXCHANGE_CA_FILE: ${EXCHANGE_CA_FILE:-}
-      EXCHANGE_FOLDERS_FULL: ${EXCHANGE_FOLDERS_FULL:-收件箱}
+      DURABLE_INBOX_ENABLED: "true"
+      EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}
+      EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
+      EXCHANGE_ACCOUNT_EMAIL: ${EXCHANGE_ACCOUNT_EMAIL:?EXCHANGE_ACCOUNT_EMAIL is required}
+      EXCHANGE_WEBHOOK_SECRET: ${EXCHANGE_WEBHOOK_SECRET:?EXCHANGE_WEBHOOK_SECRET is required}
       EXCHANGE_FOLDERS_ARCHIVE: ${EXCHANGE_FOLDERS_ARCHIVE:-}
-      EXCHANGE_FOLDER_SENTITEMS: ${EXCHANGE_FOLDER_SENTITEMS:-Sent Items}
-      EXCHANGE_FOLDER_DRAFTS: ${EXCHANGE_FOLDER_DRAFTS:-Drafts}
       LEADER_SENDERS: ${LEADER_SENDERS:-}
-      WEBHOOK_MAX_BYTES: ${WEBHOOK_MAX_BYTES:-1048576}
-      EXCHANGE_RESPONSE_MAX_BYTES: ${EXCHANGE_RESPONSE_MAX_BYTES:-67108864}
-      EMAIL_BODY_MAX_BYTES: ${EMAIL_BODY_MAX_BYTES:-10485760}
-      EMAIL_ATTACHMENT_MAX_COUNT: ${EMAIL_ATTACHMENT_MAX_COUNT:-20}
-      EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: ${EMAIL_ATTACHMENT_SINGLE_MAX_BYTES:-26214400}
-      EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: ${EMAIL_ATTACHMENT_TOTAL_MAX_BYTES:-52428800}
-      LARK_APP_ID: ${LARK_APP_ID:-}
-      LARK_APP_SECRET: ${LARK_APP_SECRET:-}
-      LARK_ENCRYPT_KEY: ${LARK_ENCRYPT_KEY:-}
-      LARK_CHAT_ID: ${LARK_CHAT_ID:-}
+      LARK_APP_ID: ${LARK_APP_ID:?LARK_APP_ID is required}
+      LARK_APP_SECRET: ${LARK_APP_SECRET:?LARK_APP_SECRET is required}
+      LARK_ENCRYPT_KEY: ${LARK_ENCRYPT_KEY:?LARK_ENCRYPT_KEY is required}
+      LARK_CHAT_ID: ${LARK_CHAT_ID:?LARK_CHAT_ID is required}
       LARK_DRIVE_FOLDER_TOKEN: ${LARK_DRIVE_FOLDER_TOKEN:-}
-      LARK_ALLOWED_OPEN_IDS: ${LARK_ALLOWED_OPEN_IDS:-}
-      METRICS_TOKEN: ${METRICS_TOKEN:-}
-      CONTENT_STORE_ROOT: /app/data/content
-      CONTENT_STORE_KEY: ${CONTENT_STORE_KEY:-}
-      CONTENT_STORE_KEY_VERSION: ${CONTENT_STORE_KEY_VERSION:-v1}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
-      LLM_MODEL: ${LLM_MODEL:-gemini-3-flash}
-      LLM_MAX_RPM: ${LLM_MAX_RPM:-15}
-      LLM_MAX_INPUT_TOKENS: ${LLM_MAX_INPUT_TOKENS:-122880}
-      LLM_MAX_OUTPUT_TOKENS: ${LLM_MAX_OUTPUT_TOKENS:-8192}
-      LLM_MAX_TOTAL_TOKENS: ${LLM_MAX_TOTAL_TOKENS:-131072}
-      LLM_CATEGORIZER_MODEL: ${LLM_CATEGORIZER_MODEL:-}
-      LLM_DRAFTER_MODEL: ${LLM_DRAFTER_MODEL:-}
-      LLM_REVIEWER_MODEL: ${LLM_REVIEWER_MODEL:-}
-      LLM_ROUTER_MODEL: ${LLM_ROUTER_MODEL:-}
-      LLM_SUMMARY_MODEL: ${LLM_SUMMARY_MODEL:-}
-      LLM_CONSOLIDATOR_MODEL: ${LLM_CONSOLIDATOR_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
-      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
-      ZHIPUAI_API_KEY: ${ZHIPUAI_API_KEY:-}
-      XAI_API_KEY: ${XAI_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
-      POLLING_INTERVAL: ${POLLING_INTERVAL:-3600}
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-4B}
+      LARK_ALLOWED_OPEN_IDS: ${LARK_ALLOWED_OPEN_IDS:?LARK_ALLOWED_OPEN_IDS is required}
+      METRICS_TOKEN_FILE: /run/secrets/metrics_token
+      CONTENT_STORE_KEY_FILE: /run/secrets/content_store_key
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:?OPENAI_API_BASE is required}
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL is required}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?EMBEDDING_API_KEY is required}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:?EMBEDDING_BASE_URL is required}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:?EMBEDDING_MODEL is required}
       TZ: Asia/Shanghai
+    secrets:
+      - source: postgres_runtime_password
+        target: postgres_runtime_password
+      - source: metrics_token
+        target: metrics_token
+      - source: content_store_key
+        target: content_store_key
     ports:
       - "${APP_PORT:-8000}:8000"
     depends_on:
       qdrant:
-        condition: service_started
+        condition: service_healthy
       postgres:
         condition: service_healthy
     volumes:
@@ -345,23 +330,29 @@ volumes:
   qdrant_data:
 
 secrets:
+  postgres_admin_password:
+    file: ./secrets/postgres_admin_password
   database_provision_admin_url:
-    file: ${DATABASE_PROVISION_ADMIN_URL_FILE:-./secrets/database_provision_admin_url}
+    file: ./secrets/database_provision_admin_url
   postgres_migration_password:
-    file: ${POSTGRES_MIGRATION_PASSWORD_FILE:-./secrets/postgres_migration_password}
+    file: ./secrets/postgres_migration_password
   postgres_runtime_password:
-    file: ${POSTGRES_RUNTIME_PASSWORD_FILE:-./secrets/postgres_runtime_password}
+    file: ./secrets/postgres_runtime_password
   postgres_maintenance_password:
-    file: ${POSTGRES_MAINTENANCE_PASSWORD_FILE:-./secrets/postgres_maintenance_password}
+    file: ./secrets/postgres_maintenance_password
   postgres_checkpoint_auditor_password:
-    file: ${POSTGRES_CHECKPOINT_AUDITOR_PASSWORD_FILE:-./secrets/postgres_checkpoint_auditor_password}
+    file: ./secrets/postgres_checkpoint_auditor_password
   checkpoint_auditor_database_url:
-    file: ${CHECKPOINT_AUDITOR_DATABASE_URL_FILE:-./secrets/checkpoint_auditor_database_url}
+    file: ./secrets/checkpoint_auditor_database_url
   checkpoint_maintenance_database_url:
-    file: ${CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE:-./secrets/checkpoint_maintenance_database_url}
+    file: ./secrets/checkpoint_maintenance_database_url
   checkpoint_maintenance_receipt_ed25519_public_key:
-    file: ${CHECKPOINT_MAINTENANCE_RECEIPT_ED25519_PUBLIC_KEY_FILE:-./secrets/checkpoint_maintenance_receipt_ed25519_public_key}
+    file: ./secrets/checkpoint_maintenance_receipt_ed25519_public_key
   migration_database_url:
-    file: ${MIGRATION_DATABASE_URL_FILE:-./secrets/migration_database_url}
+    file: ./secrets/migration_database_url
   ingestion_maintenance_database_url:
-    file: ${INGESTION_MAINTENANCE_DATABASE_URL_FILE:-./secrets/ingestion_maintenance_database_url}
+    file: ./secrets/ingestion_maintenance_database_url
+  metrics_token:
+    file: ./secrets/metrics_token
+  content_store_key:
+    file: ./secrets/content_store_key

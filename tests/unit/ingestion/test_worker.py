@@ -136,7 +136,7 @@ class _InboxRepository:
         self.fail_calls: list[tuple[InboxLease, BaseException]] = []
         self.renew_calls: list[InboxLease] = []
         self.complete_calls: list[InboxLease] = []
-        self.effect_calls: list[tuple[InboxLease, str, int]] = []
+        self.effect_calls: list[tuple[InboxLease, str, int, str]] = []
         self.finish_calls: list[tuple[InboxLease, str, int, ProcessingCompletion]] = []
         self.failure_calls: list[tuple[InboxLease, str, int, BaseException]] = []
         self.renewed = asyncio.Event()
@@ -218,8 +218,11 @@ class _InboxRepository:
         lease: InboxLease,
         email_id: str,
         expected_email_version: int,
+        effect_kind: str,
     ) -> bool:
-        self.effect_calls.append((lease, email_id, expected_email_version))
+        self.effect_calls.append(
+            (lease, email_id, expected_email_version, effect_kind)
+        )
         return self.effect_result  # type: ignore[return-value]
 
     async def finish_email_processing(
@@ -687,7 +690,9 @@ async def test_heartbeat_rotation_authorizes_effect_and_finish_with_latest_token
     adapter.release.set()
     await task
 
-    assert inbox.effect_calls == [(renewed, application.email_id, application.version)]
+    assert inbox.effect_calls == [
+        (renewed, application.email_id, application.version, "detail")
+    ]
     assert inbox.finish_calls[0][:3] == (
         renewed,
         application.email_id,

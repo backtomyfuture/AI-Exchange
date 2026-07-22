@@ -42,57 +42,35 @@ uv sync --frozen
 
 ### 2. 配置环境变量
 
-直接在本机运行 Python 时，复制 `.env.runtime.example` 到 `.env.runtime`；
-使用生产 Compose 时，复制 `.env.example` 到 `.env`。`.env` 只保存 Compose
-控制面的普通配置和 runtime/admin 凭据；migration、checkpoint auditor 与
-checkpoint execute 的完整 DSN 必须分别写入 `MIGRATION_DATABASE_URL_FILE`、
-`CHECKPOINT_AUDITOR_DATABASE_URL_FILE` 和
-`CHECKPOINT_MAINTENANCE_DATABASE_URL_FILE` 指向的 0400/0600 文件，不能写回
-`.env`。首次部署还要准备 `DATABASE_PROVISION_ADMIN_URL_FILE` 与四个
-`POSTGRES_*_PASSWORD_FILE` 指向的 0400/0600 文件；这些文件只挂载到手动
-provisioning 容器，不进入应用或 migration 容器。四个密码文件分别是对应角色的
-唯一密码来源：runtime 文件必须与 `.env` 的 `POSTGRES_RUNTIME_PASSWORD` 一致，
-migration、maintenance、auditor DSN 必须使用各自密码文件中的同一密码；admin URL
-的密码必须与 `POSTGRES_ADMIN_PASSWORD` 一致。完整构建与初始化证据流程见
-[`deploy/README.md`](deploy/README.md)。
+复制模板并只填写其中列出的 17 项：
 
-migration DSN 的
-`options` 必须精确设置为 `-csearch_path=<目标 schema>`。不要显式把
-`pg_catalog` 放到目标 schema 后面：当它未显式列出时，PostgreSQL 会先解析
-系统目录，同时仍把未限定的新对象创建到目标 schema，从而避免同名类型劫持
-DDL。auditor 与 maintenance DSN 必须分别以各自角色登录，且 `options` 精确设置为
-`-csearch_path=pg_catalog,<目标 schema>`；它们只能用于各自独立维护容器。四个
-数据库身份必须互不相同。不要把 admin、migration、auditor 或 maintenance 凭据
-放入运行时配置。随后完成生产 preflight：
+```bash
+cp .env.example .env
+# 编辑 .env 后生成内部配置
+.venv/bin/python scripts/configure_deployment.py
+.venv/bin/python scripts/deploy_system.py check
+```
+
+`.env` 只包含服务地址、Exchange、飞书、LLM 和 Embedding 接入参数。数据库四角色、
+Metrics Token、ContentStore Key、迁移/维护 DSN、运行限额和部署状态均由配置工具生成到
+忽略版本控制的 `secrets/`，权限固定为 `0600`。已有旧版 `.env` 执行同一命令会原地
+迁移，并把正在使用的私网 TLS、归档目录和飞书云盘设置保存到自动管理的内部配置；
+不会输出任何密钥值。
+
+生产 preflight 仍会检查：
 
 - Exchange HTTPS URL、API key、账户 ID，以及与服务端完全一致且至少 16 字节的
   Webhook secret；
 - 飞书 `LARK_APP_ID`、至少 16 字节的 `LARK_APP_SECRET`/`LARK_ENCRYPT_KEY`、
   `LARK_CHAT_ID`，以及至少一个真实且非 `*` 的 `LARK_ALLOWED_OPEN_IDS`；
-- 至少 16 字节的 `METRICS_TOKEN`，和解码后严格 32 字节的 Base64
-  `CONTENT_STORE_KEY`；
-- 真实模型/Embedding 凭据与地址、四角色 PostgreSQL 配置，以及 Qdrant 配置；
+- 真实模型及 Embedding 凭据、地址和模型名；
 - 非占位、无用户信息的真实 HTTPS `EXTERNAL_URL`。本机冒烟可以用 HTTP curl 访问
   `127.0.0.1`，但 Compose 内这个生产配置仍必须是未来受控的 HTTPS 回调 origin；尚未
   配置反向代理时，不能宣称外部 Webhook 已经上线。
 
 Exchange 地址必须通过证书校验。若服务实际通过私网 IP 访问、证书却只覆盖 DNS
-名称，不要把 `EXCHANGE_SSL_VERIFY` 设为 `false`。把 `EXCHANGE_API_URL` 改为证书
-SAN 覆盖的主机名，并在 `.env` 设置 `EXCHANGE_TLS_HOSTNAME`、
-`EXCHANGE_TLS_IP`、`EXCHANGE_CA_FILE_HOST`；最后一个变量指向只含证书/信任链、
-不含私钥的可读 PEM 文件。如果服务端只发送叶子证书，单独挂载叶子证书不足以完成
-链校验；应从证书 AIA 指向的官方 CA 来源取得并核验中间证书与根证书，组成私有临时
-trust bundle，而不是关闭验证。此时所有 Compose 命令都追加 TLS 覆盖文件，例如：
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.exchange-tls.yml \
-  config --quiet
-```
-
-覆盖层只给应用容器增加精确 DNS 到 IP 映射，并把 PEM 只读挂载到固定容器路径；
-应用仍强制保持 TLS 验证。`EXCHANGE_TLS_HOSTNAME` 必须与 `EXCHANGE_API_URL` 的
-host 完全一致且被证书覆盖。若 Exchange 地址本身已使用可解析且证书链完整的域名，
-则不使用该覆盖层，并保持 `EXCHANGE_CA_FILE` 为空。
+名称，部署工具会复用已迁移的内部 DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书
+问题。新环境的特殊私网 TLS 初始化见 [`deploy/README.md`](deploy/README.md)。
 
 反方向的 Exchange Webhook 入口同样有外部前置：本 Compose 只提供容器内 HTTP，
 不包含公网 TLS 终止。正式环境必须由现有反向代理/入口提供真实可达的 HTTPS
@@ -103,6 +81,21 @@ host 完全一致且被证书覆盖。若 Exchange 地址本身已使用可解�
 还必须确认返回的目标 `data.status_code=200`，且 `data.response_body` 可解析为精确的
 `{"status":"ok","test":true}`。这些条件全部满足后才把订阅设为 active，再用一封
 真实测试邮件验证“Webhook 202 → Durable Inbox → 飞书卡片 → 用户点击 → 数据库状态变化”。
+
+没有公网 DNS、但已有覆盖公司子域名的证书时，可启用
+`docker-compose.webhook-tls.yml`。证书覆盖的内部主机名只需在 Exchange Gateway 的
+`extra_hosts` 中固定解析到本机私网 IP，不必关闭证书校验。把完整证书链和私钥分别保存为
+忽略版本控制且权限为 `0400` 或 `0600` 的 `secrets/webhook_tls_fullchain.pem` 与
+`secrets/webhook_tls_key.pem`。部署工具会在两者同时存在时自动追加 TLS 覆盖并沿用同一
+Compose project；只存在其中一个、文件为空、过大、权限过宽或为符号链接都会拒绝部署：
+
+```bash
+.venv/bin/python scripts/deploy_system.py check
+.venv/bin/python scripts/deploy_system.py redeploy
+```
+
+默认入口是 `8443`，只暴露 `/webhooks/exchange`、`/ready` 和自身健康检查；正式验收必须
+使用证书覆盖的主机名完成 TLS 校验，不能使用 `curl -k`。
 
 真实 Inbox opaque ID 从 Exchange 的 `emails/folders/all` 接口读取，并写入本次 policy
 manifest；不能用显示名 `INBOX` 代替。私网 TLS 场景可在镜像构建后，使用同一个
@@ -143,6 +136,19 @@ test -s "/tmp/ai-exchange-inbox-$PROJECT_NAME"
 
 ### 3. 运行系统
 
+已有系统的完整重建和重启只需要：
+
+```bash
+.venv/bin/python scripts/deploy_system.py redeploy
+```
+
+命令会校验 17 项用户配置与所有内部 secret，构建一个新的统一应用镜像，在不删除
+PostgreSQL、Qdrant 和 ContentStore 数据卷的前提下重建应用及可选 HTTPS 入口，并等待
+`/ready` 同时返回 `status=ready` 与 `processing=active`。
+
+以下内容仅适用于全新数据库的首次生产初始化；数据库 provisioning、migration 与
+Durable Inbox policy 仍是独立的安全门禁，详见 [`deploy/README.md`](deploy/README.md)。
+
 只从已经提交且干净的当前 HEAD 部署。先严格执行
 [`deploy/README.md`](deploy/README.md) 第 1 节：完整测试、显式构建当前镜像并记录
 image ID，不能复用旧镜像。为本次部署选择一个从未使用过的 Compose project name；
@@ -170,40 +176,9 @@ docker compose -p "$PROJECT_NAME" --profile migration run --rm database-bootstra
 精确子目录只读挂载给 `ingestion-maintenance initialize`。不要挂载整个 `deploy/`，
 不要手写 hash，也不要引用仓库中不存在的根级 `deploy/POLICY.json`。
 
-初始化成功并配置真实 Exchange、飞书、模型与 ContentStore 凭据后，在 `.env` 中只把
-`DURABLE_INBOX_ENABLED` 设为 `true`；Shadow 与 Sync 保持 `false`。
-`INGESTION_INSTANCE_ID` 必须保持固定值 `ai-exchange-web`，且不得对应用服务执行
-`--scale`。启动并验证：
-
-```bash
-docker compose -p "$PROJECT_NAME" up -d --no-build ai-assistant-service
-.venv/bin/python - <<'PY'
-import json
-import os
-import time
-import urllib.request
-
-url = f"http://127.0.0.1:{os.getenv('APP_PORT', '8000')}/ready"
-deadline = time.monotonic() + 180
-while time.monotonic() < deadline:
-    try:
-        with urllib.request.urlopen(url, timeout=3) as response:
-            payload = json.load(response)
-        if payload.get("status") == "ready" and payload.get("processing") == "active":
-            break
-    except Exception:
-        pass
-    time.sleep(2)
-else:
-    raise SystemExit("phase4_lite_readiness_timeout")
-PY
-```
-
-响应必须同时包含 `"status":"ready"` 与 `"processing":"active"`；仅 HTTP 200 或
-`processing=standby` 都不算成功。若上一节要求 Exchange TLS 覆盖层，上述每条 Compose
-命令都使用 `-f docker-compose.yml -f docker-compose.exchange-tls.yml`。
-若旧测试实例仍在并行运行，还必须先在新项目的 `.env` 选择未占用的 `APP_PORT`（隔离
-冒烟建议 `18081`）；不要停止、删除或接管旧项目来释放端口。
+初始化成功并配置真实 Exchange、飞书和模型凭据后，运行时会固定启用 Durable Inbox，
+并保持 Shadow 与 Sync 关闭；不得对应用服务执行 `--scale`。启动和就绪验证由
+`scripts/deploy_system.py redeploy` 完成。
 
 常规 `docker compose -p "$PROJECT_NAME" up -d` 不会启动带 profile 的 bootstrap 或维护容器，也不会
 挂载它们的私有文件。`database-provision` 是唯一接收 admin DSN 和四个角色密码

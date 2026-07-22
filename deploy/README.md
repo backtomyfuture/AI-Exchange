@@ -53,9 +53,10 @@ Metadata 使用以下严格结构。`checks` 和 `artifacts` 均至少一项，�
 BUILD_ID="release-20260717-1"
 PROJECT_NAME="ai-exchange-phase4-20260717-1"
 RELEASE_IMAGE="ai-exchange:phase4-lite-$BUILD_ID"
+export AI_EXCHANGE_IMAGE="$RELEASE_IMAGE"
 
 # PROJECT_NAME 是独立的 Compose-safe 小写 slug，不要直接拼接可能含点号/大写的 build id。
-# 把 .env 的 AI_EXCHANGE_IMAGE 设置为 RELEASE_IMAGE 后，再验证解析结果。
+# 镜像标签是本次部署进程的内部参数，不写入用户 `.env`。
 CONFIGURED_IMAGE="$(docker compose -p "$PROJECT_NAME" config --format json | \
   .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["services"]["ai-assistant-service"]["image"])')"
 test "$CONFIGURED_IMAGE" = "$RELEASE_IMAGE"
@@ -72,7 +73,7 @@ IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")"
 printf 'HEAD=%s\nimage=%s\n' "$HEAD_REVISION" "$IMAGE_ID"
 ```
 
-`RELEASE_IMAGE` 必须与 `.env` 中本次 `AI_EXCHANGE_IMAGE` 的精确 tag 一致；Compose 的全部
+`RELEASE_IMAGE` 必须与当前 shell 的 `AI_EXCHANGE_IMAGE` 精确一致；Compose 的全部
 应用/one-shot 服务固定复用这一个 tag。不要再单独或并发构建 one-shot 服务；后续
 `run` 禁止传 `--build`，`up` 必须传 `--no-build`。把实际执行的检查及退出码、
 `HEAD_REVISION`、
@@ -80,8 +81,9 @@ printf 'HEAD=%s\nimage=%s\n' "$HEAD_REVISION" "$IMAGE_ID"
 操作审计；不要把示例 digest 当成真实结果。
 
 本页所有 Compose 命令必须沿用同一个 `PROJECT_NAME`。如果 Exchange 需要私网 TLS
-覆盖，则每条命令还同时追加 `-f docker-compose.yml -f docker-compose.exchange-tls.yml`；
-所有 secret file 变量必须是绝对路径，不能隐式落到仓库的 `secrets/` 默认路径。
+覆盖，则每条命令同时使用自动生成的 `secrets/deployment.env` 和
+`docker-compose.exchange-tls.yml`。常规重部署优先使用 `scripts/deploy_system.py`，避免
+遗漏内部配置；用户 `.env` 始终只保留 17 项。
 
 ## 2. 生成并本地校验
 

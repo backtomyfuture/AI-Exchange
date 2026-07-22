@@ -95,6 +95,9 @@ _ASCTIME_DATE = re.compile(
 )
 _SYNC_ROOT_PATH = "/api/v1/exchange"
 _SYNC_EMAILS_PATH = "/api/v1/exchange/emails"
+# Gateway returns its own typed timeout at 50s; keep the client below the
+# reverse proxy's 60s ceiling while leaving room to receive that response.
+_EXCHANGE_DETAIL_TIMEOUT_SECONDS = 55.0
 
 
 def _utc_now() -> datetime:
@@ -954,6 +957,7 @@ class ExchangeClient:
                 "GET",
                 endpoint,
                 params={"account_id": target_account_id},
+                timeout=_EXCHANGE_DETAIL_TIMEOUT_SECONDS,
             ) as response:
                 if response.status_code == 200:
                     payload = await read_json_limited(

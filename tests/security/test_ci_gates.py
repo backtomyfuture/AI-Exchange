@@ -1,7 +1,9 @@
 """Static proof that release CI cannot silently skip the PostgreSQL contract."""
 
-from pathlib import Path
 import tomllib
+from pathlib import Path
+
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,15 +35,23 @@ MANDATORY_COVERAGE_TARGETS = (
 )
 COMPOSE_PLACEHOLDERS = {
     "AI_EXCHANGE_IMAGE": "ai-exchange:phase2-ci",
-    "POSTGRES_ADMIN_USER": "phase2_ci_admin",
-    "POSTGRES_ADMIN_PASSWORD": "phase2-ci-placeholder",
-    "POSTGRES_DB": "email_agent",
-    "POSTGRES_MIGRATION_OWNER_ROLE": "phase2_ci_migration_owner",
-    "POSTGRES_RUNTIME_USER": "phase2_ci_runtime",
-    "POSTGRES_RUNTIME_PASSWORD": "phase2-ci-placeholder",
-    "POSTGRES_MAINTENANCE_ROLE": "phase2_ci_maintenance",
-    "POSTGRES_CHECKPOINT_AUDITOR_ROLE": "phase2_ci_auditor",
     "EXTERNAL_URL": "https://phase2-ci.invalid",
+    "EXCHANGE_API_URL": ("https://exchange.phase2-ci.invalid/api/v1/exchange/emails"),
+    "EXCHANGE_API_KEY": "phase2-ci-exchange-key",
+    "EXCHANGE_ACCOUNT_ID": "8",
+    "EXCHANGE_ACCOUNT_EMAIL": "phase2-ci@example.invalid",
+    "EXCHANGE_WEBHOOK_SECRET": "phase2-ci-webhook-secret",
+    "LARK_APP_ID": "phase2-ci-lark-app",
+    "LARK_APP_SECRET": "phase2-ci-lark-secret",
+    "LARK_ENCRYPT_KEY": "phase2-ci-lark-encrypt",
+    "LARK_CHAT_ID": "phase2-ci-lark-chat",
+    "LARK_ALLOWED_OPEN_IDS": "phase2-ci-open-id",
+    "OPENAI_API_KEY": "phase2-ci-model-key",
+    "OPENAI_API_BASE": "https://models.phase2-ci.invalid/v1",
+    "LLM_MODEL": "phase2-ci-model",
+    "EMBEDDING_API_KEY": "phase2-ci-embedding-key",
+    "EMBEDDING_BASE_URL": "https://embeddings.phase2-ci.invalid/v1",
+    "EMBEDDING_MODEL": "phase2-ci-embedding-model",
 }
 
 
@@ -140,9 +150,14 @@ def test_phase2_ci_proves_hashed_runtime_wheels_exist_for_linux_architectures() 
 
 def test_phase2_ci_validates_production_compose_with_only_placeholders() -> None:
     workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+    parsed_workflow = yaml.safe_load(workflow)
+    compose_step = next(
+        step
+        for step in parsed_workflow["jobs"]["postgres-contract"]["steps"]
+        if step.get("name") == "Validate production Compose"
+    )
 
-    for name, value in COMPOSE_PLACEHOLDERS.items():
-        assert f"{name}={value}" in workflow
+    assert compose_step["env"] == COMPOSE_PLACEHOLDERS
     assert "--profile migration" in workflow
     assert "--profile checkpoint-maintenance" in workflow
     assert "--profile checkpoint-maintenance-execute" in workflow
