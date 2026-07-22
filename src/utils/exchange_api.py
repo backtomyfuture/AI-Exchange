@@ -104,6 +104,20 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _normalize_email_detail_recipients(
+    email_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Add canonical recipient fields without discarding gateway aliases."""
+    normalized = dict(email_data)
+    for canonical, gateway_field in (
+        ("to", "to_recipients"),
+        ("cc", "cc_recipients"),
+    ):
+        if not normalized.get(canonical) and gateway_field in normalized:
+            normalized[canonical] = normalized.get(gateway_field) or []
+    return normalized
+
+
 def _header_is_exact(response: httpx.Response, name: str, expected: str) -> bool:
     return response.headers.get_list(name, split_commas=False) == [expected]
 
@@ -965,7 +979,11 @@ class ExchangeClient:
                         max_bytes=self._input_limits.exchange_response_bytes,
                     )
                     email_data = payload.get("data")
-                    return email_data if isinstance(email_data, dict) and email_data else None
+                    return (
+                        _normalize_email_detail_recipients(email_data)
+                        if isinstance(email_data, dict) and email_data
+                        else None
+                    )
                 logger.error(
                     "Failed to get Exchange email details: email=%s status=%s",
                     fingerprint_identifier(email_id, namespace="email"),
