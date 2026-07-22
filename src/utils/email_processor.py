@@ -9,9 +9,9 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from langchain_core.messages import HumanMessage
 
 from src.config import get_settings
+from src.utils.email_body_projection import project_email_body_for_model
 from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
@@ -114,46 +114,6 @@ class EmailProcessor:
         return self.process_batch([email]) > 0
         
 
-    def _describe_image(self, base64_content: str, mime_type: str = "image/jpeg") -> str:
-        """
-        Use an LLM to generate a text description for an image.
-        """
-        try:
-            from src.providers.factory import get_llm
-            llm = get_llm(temperature=0.3)
-            
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": "请详细描述这张图片的内容，捕捉关键信息、文字和视觉元素。如果是一张图表或文档，请总结其核心数据或要点。请用中文回答。"},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_content}"
-                        },
-                    },
-                ]
-            )
-            
-            @retry(
-                wait=wait_random_exponential(multiplier=1, max=60),
-                stop=stop_after_attempt(5),
-                reraise=True
-            )
-            def invoke_with_retry(msg):
-                return llm.invoke([msg])
-
-            response = invoke_with_retry(message)
-            return response.content
-        except RateLimitError as exc:
-            logger.warning("Image analysis rate limited: error_type=%s", type(exc).__name__)
-            return "[图片解析失败: 请求限制]"
-        except APIConnectionError as exc:
-            logger.error("Image analysis connection failed: error_type=%s", type(exc).__name__)
-            return "[图片解析失败: 连接错误]"
-        except APIError as exc:
-            logger.error("Image analysis API failed: error_type=%s", type(exc).__name__)
-            return "[图片解析失败]"
-
     @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=1, max=10))
     def process_batch(self, batch_emails: List[Dict[str, Any]]) -> int:
         """
@@ -195,15 +155,12 @@ class EmailProcessor:
             if attachment_summaries:
                 parts.append("【包含的附件列表】:\n" + "\n".join(attachment_summaries))
                 
-            # Clean massive inline base64 images to prevent bloat
-            raw_body = email.get('body', '')
-            import re
-            if isinstance(raw_body, str):
-                raw_body = re.sub(r'data:image/[a-zA-Z0-9+.;=]+', '[Image]', raw_body)
-                if len(raw_body) > 50000:
-                    raw_body = raw_body[:50000] + "\n...[truncated]"
+            body_projection = project_email_body_for_model(email.get("body", ""))
+            projected_body = body_projection.text
+            if len(projected_body) > 50000:
+                projected_body = projected_body[:50000] + "\n...[truncated]"
                     
-            parts.append("【邮件正文】:\n" + raw_body)
+            parts.append("【邮件正文】:\n" + projected_body)
             
             full_text = "\n\n".join(parts)
             
@@ -234,6 +191,8 @@ class EmailProcessor:
                     # persist those bytes to Qdrant, while keeping the caller's
                     # dictionary untouched.
                     payload.pop("_image_attachments", None)
+                    payload.pop("image_analysis", None)
+                    payload["body"] = projected_body
                     payload["attachments_metadata"] = valid_attachments_metadata
                     
                     if "attachments" in payload:

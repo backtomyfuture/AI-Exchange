@@ -19,6 +19,7 @@ from src.safety.manual_review import (
     build_manual_review_delta,
     manual_review_classification,
 )
+from src.utils.email_body_projection import project_email_body_for_model
 from src.utils.retry_decorator import with_llm_retry
 from src.router.engine import get_routing_engine
 
@@ -44,6 +45,8 @@ async def categorize_email(
     """
     # Step 0: Execute Routing Engine (Tier 1/2/3)
     email = await hydrate_email_from_state(state, dependencies)
+    body_projection = project_email_body_for_model(email.get("body", ""))
+    email["body"] = body_projection.text
     local_state = deepcopy(dict(state))
     local_state["email"] = email
 
@@ -146,11 +149,10 @@ async def categorize_email(
         experience=experience_ctx,
     )
 
-    image_analysis = email.get("image_analysis", "")
     image_info = (
-        "【注意：该邮件包含图片附件，以下是图片内容的解析结果】:\n"
-        f"{image_analysis}"
-        if image_analysis
+        f"邮件包含 {body_projection.inline_image_count} 张内嵌图片；"
+        "图片内容将在确认需要回复后分析。"
+        if body_projection.inline_image_count
         else ""
     )
     payload = {"subject": subject, "body": body, "image_info": image_info}

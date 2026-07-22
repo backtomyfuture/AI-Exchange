@@ -322,7 +322,7 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/exchange_service.py": (
-        "156221ad005fc2f640a8587ece7aa14f4956c38e7a9e3caaa8d386062d4e36d9"
+        "474978e3799c23d125f1691167cd4fae8b64fdb327b1bb471c99ee16972ed299"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
@@ -481,7 +481,7 @@ _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
     ),
     "src/server.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
     "src/utils/email_processor.py": (
-        "ba933f7ec3b7c6be28039bcf050b580c45e6fdf0d4e555916525a7d96e3c2332"
+        "b553db7c12a4fd0a078b88a12f8edcbd9f61dbe597b52c38fa52bbdbf8478711"
     ),
 }
 _EMAIL_MUTATION = re.compile(

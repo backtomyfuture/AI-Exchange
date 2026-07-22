@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # 常量配置
 MAX_IMAGES = 6          # 单封邮件最多分析的图片数
 COMPRESS_SIZE = 512     # 压缩目标尺寸 (px)
-MAX_TOTAL_CHARS = 5000  # 图片描述总文本上限
+MAX_TOTAL_CHARS = 300   # 简短决策摘要总字符上限
 
 
 def _sample_images(images: List[Dict], max_count: int = MAX_IMAGES) -> List[Dict]:
@@ -126,7 +126,7 @@ async def analyze_images(image_attachments: List[Dict]) -> str:
         "text": (
             f"以下有 {len(sampled)} 张图片来自同一封邮件"
             f"{'（共 ' + str(total_count) + ' 张，已采样）' if total_count > len(sampled) else ''}。\n"
-            "请为每张图片编号并简要描述其核心内容（每张 80 字以内）。\n"
+            "请为每张图片编号并简要描述其核心内容（每张 40 字以内，整体不超过 300 字）。\n"
             "重点提取：文字信息、数据、表格、关键视觉元素。\n"
             "如果图片是签名/Logo等装饰性内容，简单标注即可。"
         )
@@ -163,6 +163,9 @@ async def analyze_images(image_attachments: List[Dict]) -> str:
     try:
         response = await invoke_with_retry()
         result = response.content
+        if not isinstance(result, str) or not result.strip():
+            raise RuntimeError("image_analysis_empty_response")
+        result = result.strip()
 
         # 截断过长的描述
         if len(result) > MAX_TOTAL_CHARS:

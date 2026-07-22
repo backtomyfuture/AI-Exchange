@@ -118,7 +118,9 @@ async def test_process_flow_new_email(mock_context):
         # Verify steps
         # Ingestion
         mock_context.email_processor.process_email.assert_called_with(email_data)
-        mock_context.db_manager.update_status.assert_any_call("msg_1", "ingested")
+        mock_context.db_manager.update_status.assert_any_call(
+            "msg_1", "ingested", error_message=None
+        )
         
         # Analysis updates
         mock_context.db_manager.update_status.assert_any_call("msg_1", "analyzed", classification=ANY)

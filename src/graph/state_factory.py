@@ -31,6 +31,9 @@ MAX_ROUTING_LOG_BYTES = 256
 MAX_ACTIVE_SKILLS = 16
 MAX_SKILL_BYTES = 128
 MAX_METADATA_TEXT_BYTES = 1_024
+# The visual summary is drafting context, not a transcript.  Keep enough room
+# for the rest of the LangGraph checkpoint (routing, context and review state).
+MAX_IMAGE_ANALYSIS_BYTES = 1_024
 MAX_REVIEW_TEXT_BYTES = 512
 MAX_TOKENS = 32
 
@@ -60,6 +63,7 @@ _METADATA_FIELDS = frozenset(
         "review_issues",
         "thread_summary",
         "style_guidance",
+        "image_analysis",
         "experience_hints",
         "preference_hints",
         "content_guard",
@@ -348,6 +352,7 @@ def _sanitize_metadata(current: object, value: object) -> dict[str, Any]:
         "review_issues": MAX_REVIEW_TEXT_BYTES,
         "thread_summary": MAX_METADATA_TEXT_BYTES,
         "style_guidance": MAX_METADATA_TEXT_BYTES,
+        "image_analysis": MAX_IMAGE_ANALYSIS_BYTES,
     }.items():
         if source.get(field) is not None:
             result[field] = truncate_utf8(source[field], max_bytes=limit)
@@ -556,6 +561,18 @@ async def hydrate_email_for_rendering(
     dependencies: GraphDependencies,
 ) -> dict[str, Any]:
     """Load attachment bytes only for an immediate trusted edge renderer."""
+    return await _hydrate_email_from_state(
+        state,
+        dependencies,
+        include_attachments=True,
+    )
+
+
+async def hydrate_email_for_image_analysis(
+    state: Mapping[str, Any],
+    dependencies: GraphDependencies,
+) -> dict[str, Any]:
+    """Load attachment bytes only for the immediate visual-summary boundary."""
     return await _hydrate_email_from_state(
         state,
         dependencies,

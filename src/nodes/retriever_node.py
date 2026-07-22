@@ -5,7 +5,11 @@ from copy import deepcopy
 from src.config import get_settings
 from src.graph.dependencies import GraphDependencies
 from src.graph.state import AgentState
-from src.graph.state_factory import hydrate_email_from_state, sanitize_graph_delta
+from src.graph.state_factory import (
+    hydrate_email_for_image_analysis,
+    hydrate_email_from_state,
+    sanitize_graph_delta,
+)
 from src.router.engine import get_routing_engine
 from src.safety.model_budget import (
     ModelInputTooLarge,
@@ -13,6 +17,8 @@ from src.safety.model_budget import (
     token_budget_from_settings,
 )
 from src.safety.manual_review import build_manual_review_delta
+from src.utils import image_analyzer
+from src.utils.email_body_projection import project_email_body_for_model
 from src.utils.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
@@ -28,6 +34,36 @@ def _merge_unique(existing: object, incoming: object) -> list:
     return result
 
 
+def _visual_analysis_inputs(email: object) -> list[dict[str, str]]:
+    if not isinstance(email, dict):
+        return []
+    attachments = email.get("attachments")
+    if not isinstance(attachments, list):
+        return []
+
+    images: list[dict[str, str]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        mime_type = attachment.get("content_type") or attachment.get("mime_type")
+        content = attachment.get("content")
+        if (
+            not isinstance(mime_type, str)
+            or not mime_type.casefold().startswith("image/")
+            or not isinstance(content, str)
+            or not content
+        ):
+            continue
+        images.append(
+            {
+                "name": str(attachment.get("name") or "image"),
+                "content": content,
+                "mime_type": mime_type,
+            }
+        )
+    return images
+
+
 async def retrieve_context(
     state: AgentState,
     dependencies: GraphDependencies,
@@ -37,6 +73,8 @@ async def retrieve_context(
     全程使用 ``asyncio.to_thread`` 避免阻塞事件循环。
     """
     email = await hydrate_email_from_state(state, dependencies)
+    body_projection = project_email_body_for_model(email.get("body", ""))
+    email["body"] = body_projection.text
     local_state = deepcopy(dict(state))
     local_state["email"] = email
     subject = email.get("subject", "")
@@ -109,6 +147,21 @@ async def retrieve_context(
     preference_hints = await _retrieve_user_preferences(subject, sender)
     if preference_hints:
         metadata["preference_hints"] = preference_hints
+
+    if (state.get("classification") or {}).get("need_reply") is True:
+        image_email = await hydrate_email_for_image_analysis(state, dependencies)
+        image_inputs = _visual_analysis_inputs(image_email)
+        if image_inputs:
+            try:
+                image_analysis = await image_analyzer.analyze_images(image_inputs)
+            except Exception as exc:
+                logger.warning(
+                    "Visual summary unavailable: error_type=%s",
+                    type(exc).__name__,
+                )
+                image_analysis = "图片分析暂不可用，请查看原始邮件图片。"
+            if image_analysis:
+                metadata["image_analysis"] = image_analysis
 
     context_summaries = []
     for result in results[:5]:

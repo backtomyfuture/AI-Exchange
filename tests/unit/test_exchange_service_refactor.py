@@ -177,6 +177,7 @@ async def test_guarded_remote_failure_stops_all_later_external_calls(
         "sender": "a@example.test",
         "attachments": [{"name": "a.txt", "content": "YQ=="}],
     }
+    ctx.email_processor.process_email.return_value = True
     with (
         patch(
             "src.exchange_service._snapshot_cleanup_handles",
@@ -185,6 +186,10 @@ async def test_guarded_remote_failure_stops_all_later_external_calls(
         patch(
             "src.exchange_service._checkpoint_ai_path_resources",
             new=AsyncMock(return_value=CleanupHandleSnapshot()),
+        ),
+        patch(
+            "src.exchange_service._run_ai_pipeline",
+            new=AsyncMock(return_value=_guarded_pipeline_result(need_reply=True)),
         ),
         patch(
             "src.exchange_service.lark_app.upload_file_to_drive",
@@ -200,8 +205,8 @@ async def test_guarded_remote_failure_stops_all_later_external_calls(
                 effect_scope=_scope("guard-remote-failure"),
             )
 
-    assert seen == ["content", "feishu"]
-    ctx.email_processor.process_email.assert_not_called()
+    assert seen == ["content", "qdrant", "feishu"]
+    ctx.email_processor.process_email.assert_called_once_with(email)
     ctx.exchange_client.mark_as_read.assert_not_awaited()
     ctx.content_store.delete.assert_not_awaited()
 

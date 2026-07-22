@@ -106,8 +106,11 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
         {
             "id": "budget-category",
             "subject": "budget-subject",
-            "body": "budget-body",
-            "image_analysis": "budget-image-analysis",
+            "body": (
+                "<p>budget-body</p>"
+                '<img src="data:image/png;base64,QUJDREVGRw==">'
+            ),
+            "image_analysis": "legacy-image-analysis-must-not-reach-categorizer",
         },
         classification={},
         metadata={
@@ -139,7 +142,11 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
     assert captured["role"] == "categorizer"
     assert "budget-subject" in captured["value"]
     assert "budget-body" in captured["value"]
-    assert "budget-image-analysis" in captured["value"]
+    assert "[内嵌图片]" in captured["value"]
+    assert "邮件包含 1 张内嵌图片" in captured["value"]
+    assert "data:image" not in captured["value"]
+    assert "QUJDREVGRw==" not in captured["value"]
+    assert "legacy-image-analysis-must-not-reach-categorizer" not in captured["value"]
     assert "budget-history-pattern" in captured["value"]
     assert "priority" in captured["value"]
     assert provider_calls == 0
@@ -165,7 +172,10 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
             "id": "budget-draft",
             "sender": "budget-sender",
             "subject": "budget-subject",
-            "body": "budget-body",
+            "body": (
+                "<p>budget-body</p>"
+                '<img src="data:image/png;base64,QUJDREVGRw==">'
+            ),
         },
         context=[
             {
@@ -180,6 +190,7 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
             "style_guidance": "budget-style-guidance",
             "preference_hints": [{"pattern": "budget-preference-hint"}],
             "thread_summary": "budget-thread-summary",
+            "image_analysis": "budget-visual-summary",
         },
     )
 
@@ -202,12 +213,16 @@ async def test_drafter_budgets_modifiers_history_and_metadata_before_retry(
         "budget-style-guidance",
         "budget-preference-hint",
         "budget-thread-summary",
+        "budget-visual-summary",
         "budget-history-body",
         "budget-sender",
         "budget-subject",
         "budget-body",
     ):
         assert fragment in captured["value"]
+    assert "[内嵌图片]" in captured["value"]
+    assert "data:image" not in captured["value"]
+    assert "QUJDREVGRw==" not in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
     assert result["next_step"] == "manual_review"
@@ -230,10 +245,13 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry(
         {
             "id": "budget-review",
             "subject": "budget-review-subject",
-            "body": "budget-review-body",
+            "body": (
+                "<p>budget-review-body</p>"
+                '<img src="data:image/png;base64,QUJDREVGRw==">'
+            ),
         },
         draft="budget-review-draft",
-        metadata={},
+        metadata={"image_analysis": "budget-review-visual-summary"},
     )
 
     with patch(
@@ -253,7 +271,11 @@ async def test_reviewer_budgets_complete_rendered_messages_before_retry(
     assert "邮件质量审核员" in captured["value"]
     assert "budget-review-subject" in captured["value"]
     assert "budget-review-body" in captured["value"]
+    assert "budget-review-visual-summary" in captured["value"]
     assert "budget-review-draft" in captured["value"]
+    assert "[内嵌图片]" in captured["value"]
+    assert "data:image" not in captured["value"]
+    assert "QUJDREVGRw==" not in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
     assert result["next_step"] == "manual_review"

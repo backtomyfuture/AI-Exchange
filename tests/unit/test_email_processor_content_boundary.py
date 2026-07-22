@@ -725,7 +725,13 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
     processor = EmailProcessor.__new__(EmailProcessor)
     processor.collection_name = "emails"
     processor.init_collection = MagicMock()
-    processor.text_splitter = SimpleNamespace(split_text=lambda _text: ["small chunk"])
+    captured = {}
+
+    def split_text(value):
+        captured["indexed_text"] = value
+        return ["small chunk"]
+
+    processor.text_splitter = SimpleNamespace(split_text=split_text)
     processor.openai_client = SimpleNamespace(
         embeddings=SimpleNamespace(
             create=lambda **_kwargs: SimpleNamespace(
@@ -738,7 +744,10 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
     email = {
         "id": "mail-image",
         "subject": "image",
-        "body": "body",
+        "body": (
+            "<p>VISIBLE-BODY-SENTINEL</p>"
+            '<img src="data:image/png;base64,BASE64-IMAGE-SENTINEL">'
+        ),
         "_image_attachments": [
             {
                 "content": "LEGACY-BASE64-IMAGE-SENTINEL",
@@ -760,6 +769,10 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
 
     assert email == before
     point = processor.qdrant_client.upsert.call_args.kwargs["points"][0]
+    assert "VISIBLE-BODY-SENTINEL" in captured["indexed_text"]
+    assert "[内嵌图片]" in captured["indexed_text"]
+    assert "data:image" not in captured["indexed_text"]
+    assert point.payload["body"] == "VISIBLE-BODY-SENTINEL\n[内嵌图片]"
     assert "_image_attachments" not in point.payload
     assert "BASE64-IMAGE-SENTINEL" not in str(point.payload)
     assert "LEGACY-BASE64-IMAGE-SENTINEL" not in str(point.payload)
@@ -769,6 +782,13 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
 async def test_attachment_upload_returns_only_tokens_without_mutating_email():
     email = {
         "attachments": [
+            {
+                "name": "inline-logo.png",
+                "content": "aW1hZ2U=",
+                "content_type": "image/png",
+                "content_id": "inline-logo.png",
+                "is_inline": True,
+            },
             {"name": "small.txt", "content": "c21hbGw="},
         ]
     }
@@ -777,7 +797,7 @@ async def test_attachment_upload_returns_only_tokens_without_mutating_email():
     with patch(
         "src.exchange_service.lark_app.upload_file_to_drive",
         return_value={"file_token": "file-token-1", "url": "https://example.invalid/file"},
-    ):
+    ) as upload:
         uploads = await _upload_attachments_to_lark(email)
 
     assert uploads.tokens == ("file-token-1",)
@@ -787,6 +807,7 @@ async def test_attachment_upload_returns_only_tokens_without_mutating_email():
             "lark_file_url": "https://example.invalid/file",
         },
     )
+    upload.assert_called_once_with("small.txt", b"small", 5)
     assert email == before
 
 
@@ -813,7 +834,7 @@ async def test_attachment_upload_respects_remaining_cleanup_handle_capacity():
 
 
 @pytest.mark.asyncio
-async def test_ai_path_passes_attachment_tokens_into_slim_pipeline_state():
+async def test_ai_path_uploads_and_decorates_business_attachments_after_ai():
     ctx = SimpleNamespace(
         db_manager=SimpleNamespace(
             get_content_ref=AsyncMock(return_value=_ref()),
@@ -823,49 +844,84 @@ async def test_ai_path_passes_attachment_tokens_into_slim_pipeline_state():
         graph=_stateful_graph(),
     )
     config = {"configurable": {"thread_id": "mail-1"}}
+    events = []
+    pipeline_result = {
+        "classification": {"need_reply": True},
+        "email": {
+            "id": "mail-1",
+            "attachments": [{"name": "small.txt"}],
+        },
+    }
+
+    async def run_pipeline(*_args, **_kwargs):
+        events.append("pipeline")
+        return pipeline_result
+
+    async def upload(*_args, **_kwargs):
+        events.append("upload")
+        return SimpleNamespace(
+            tokens=("file-token-1",),
+            links=(
+                {
+                    "name": "small.txt",
+                    "lark_file_url": "https://example.invalid/file",
+                },
+            ),
+        )
+
+    async def dispatch(_email_id, result, *_args, **_kwargs):
+        events.append("dispatch")
+        assert result["email"]["attachments"][0]["lark_file_url"] == (
+            "https://example.invalid/file"
+        )
+        return {"delivered": True, "kind": "approval"}
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
         "src.exchange_service._upload_attachments_to_lark",
-        new=AsyncMock(
-            return_value=SimpleNamespace(
-                tokens=("file-token-1",),
-                links=(
-                    {
-                        "name": "small.txt",
-                        "lark_file_url": "https://example.invalid/file",
-                    },
-                ),
-            )
-        ),
-    ), patch(
+        new=AsyncMock(side_effect=upload),
+    ) as upload_mock, patch(
         "src.exchange_service._ingest_to_qdrant",
         new_callable=AsyncMock,
     ), patch(
         "src.exchange_service._run_ai_pipeline",
-        new=AsyncMock(return_value=None),
-    ) as pipeline:
-        outcome = await _run_ai_path("mail-1", {"id": "mail-1"}, ctx, config)
+        new=AsyncMock(side_effect=run_pipeline),
+    ) as pipeline, patch(
+        "src.exchange_service._retain_cleanup_token",
+        new=AsyncMock(return_value=True),
+    ) as retain, patch(
+        "src.exchange_service._dispatch_notification",
+        new=AsyncMock(side_effect=dispatch),
+    ), patch(
+        "src.exchange_service._mark_email_read",
+        new_callable=AsyncMock,
+    ):
+        outcome = await _run_ai_path(
+            "mail-1",
+            {
+                "id": "mail-1",
+                "attachments": [{"name": "small.txt", "content": "c21hbGw="}],
+            },
+            ctx,
+            config,
+        )
 
-    assert outcome is ProcessingOutcome.FAILED
+    assert outcome is ProcessingOutcome.PROCESSED
+    assert events == ["pipeline", "upload", "dispatch"]
+    upload_mock.assert_awaited_once()
+    retain.assert_awaited_once_with("mail-1", ctx, "file-token-1")
     pipeline.assert_awaited_once_with(
         "mail-1",
         ctx,
         config,
-        attachment_tokens=["file-token-1"],
+        attachment_tokens=[],
         preserved_attachment_tokens=[],
         preserved_pdf_token=None,
-        attachment_links=[
-            {
-                "name": "small.txt",
-                "lark_file_url": "https://example.invalid/file",
-            }
-        ],
+        attachment_links=[],
     )
 
 
 @pytest.mark.asyncio
-async def test_ai_path_cleans_every_created_token_when_ingest_fails():
-    tokens = [f"file-token-{index}" for index in range(20)]
+async def test_ai_path_does_not_upload_when_ingest_fails():
     ctx = SimpleNamespace(
         db_manager=SimpleNamespace(
             get_content_ref=AsyncMock(return_value=_ref()),
@@ -882,10 +938,8 @@ async def test_ai_path_cleans_every_created_token_when_ingest_fails():
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
         "src.exchange_service._upload_attachments_to_lark",
-        new=AsyncMock(
-            return_value=SimpleNamespace(tokens=tuple(tokens), links=())
-        ),
-    ), patch(
+        new_callable=AsyncMock,
+    ) as upload, patch(
         "src.exchange_service._ingest_to_qdrant",
         new=AsyncMock(side_effect=failure),
     ), patch(
@@ -899,19 +953,15 @@ async def test_ai_path_cleans_every_created_token_when_ingest_fails():
             {"configurable": {"thread_id": "mail-1"}},
         )
 
-    assert {call.args[0] for call in delete.call_args_list} == set(tokens)
-    assert delete.call_count == 20
+    upload.assert_not_awaited()
+    delete.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ai_path_retains_failed_cleanup_handle_when_ingest_fails_before_graph_run():
+async def test_ai_path_seeds_slim_checkpoint_before_ingest_without_uploading():
     graph = _compiled_cleanup_graph()
     config = {"configurable": {"thread_id": "mail-crash-safe"}}
     snapshots: dict[str, dict] = {}
-
-    async def upload(_email, **_kwargs):
-        snapshots["before_upload"] = deepcopy((await graph.aget_state(config)).values)
-        return SimpleNamespace(tokens=("failed-delete-token",), links=())
 
     async def fail_ingest(*_args, **_kwargs):
         snapshots["before_ingest"] = deepcopy((await graph.aget_state(config)).values)
@@ -937,8 +987,8 @@ async def test_ai_path_retains_failed_cleanup_handle_when_ingest_fails_before_gr
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
         "src.exchange_service._upload_attachments_to_lark",
-        new=AsyncMock(side_effect=upload),
-    ), patch(
+        new_callable=AsyncMock,
+    ) as upload, patch(
         "src.exchange_service._ingest_to_qdrant",
         new=AsyncMock(side_effect=fail_ingest),
     ), patch(
@@ -948,12 +998,10 @@ async def test_ai_path_retains_failed_cleanup_handle_when_ingest_fails_before_gr
         await _run_ai_path("mail-crash-safe", email, ctx, config)
 
     final_state = await graph.aget_state(config)
-    assert snapshots["before_upload"]["email_id"] == "mail-crash-safe"
-    assert snapshots["before_upload"]["attachment_tokens"] == []
-    assert snapshots["before_ingest"]["attachment_tokens"] == [
-        "failed-delete-token"
-    ]
-    assert final_state.values["attachment_tokens"] == ["failed-delete-token"]
+    upload.assert_not_awaited()
+    assert snapshots["before_ingest"]["email_id"] == "mail-crash-safe"
+    assert snapshots["before_ingest"]["attachment_tokens"] == []
+    assert final_state.values["attachment_tokens"] == []
     assert "FULL-BODY-MUST-NOT-BE-CHECKPOINTED" not in str(final_state.values)
 
 
@@ -1013,7 +1061,17 @@ async def test_each_attachment_token_is_checkpointed_before_next_upload_on_cance
         ],
     }
 
+    async def complete_pipeline(*_args, **_kwargs):
+        await graph.ainvoke(None, config=config)
+        return {
+            "classification": {"need_reply": True},
+            "email": {"id": "mail-mid-batch-cancel", "attachments": []},
+        }
+
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._run_ai_pipeline",
+        new=AsyncMock(side_effect=complete_pipeline),
+    ), patch(
         "src.exchange_service.lark_app.upload_file_to_drive",
         side_effect=[
             {"file_token": "first-token", "url": "https://example.invalid/first"},
@@ -1030,7 +1088,7 @@ async def test_each_attachment_token_is_checkpointed_before_next_upload_on_cance
 
     state = await graph.aget_state(config)
     assert upload.call_count == 2
-    ingest.assert_not_awaited()
+    ingest.assert_awaited_once()
     assert state.values["attachment_tokens"] == ["first-token"]
     assert "BODY-MUST-STAY-LOCAL" not in str(state.values)
     assert "MQ==" not in str(state.values)
@@ -1071,7 +1129,17 @@ async def test_unconfirmed_token_ack_stops_upload_and_delete_failure_retains_han
         ],
     }
 
+    async def complete_pipeline(*_args, **_kwargs):
+        await compiled.ainvoke(None, config=config)
+        return {
+            "classification": {"need_reply": True},
+            "email": {"id": "mail-ack-failure", "attachments": []},
+        }
+
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._run_ai_pipeline",
+        new=AsyncMock(side_effect=complete_pipeline),
+    ), patch(
         "src.exchange_service.lark_app.upload_file_to_drive",
         side_effect=[
             {"file_token": "candidate-token", "url": "https://example.invalid/first"},
@@ -1083,12 +1151,12 @@ async def test_unconfirmed_token_ack_stops_upload_and_delete_failure_retains_han
     ), patch(
         "src.exchange_service._ingest_to_qdrant",
         new_callable=AsyncMock,
-    ) as ingest:
+    ) as ingest, pytest.raises(DatabaseOperationError):
         await _run_ai_path("mail-ack-failure", email, ctx, config)
 
     state = await compiled.aget_state(config)
     upload.assert_called_once()
-    ingest.assert_not_awaited()
+    ingest.assert_awaited_once()
     assert graph.update_count == 3
     assert state.values["attachment_tokens"] == ["candidate-token"]
 
@@ -1128,13 +1196,18 @@ async def test_token_ack_commit_then_raise_is_confirmed_by_readback():
             {"name": "second.txt", "content": "Mg=="},
         ],
     }
-    failure = DatabaseOperationError(
-        operation="update_status",
-        retryable=True,
-        message="ingest failed",
-    )
+
+    async def complete_pipeline(*_args, **_kwargs):
+        await compiled.ainvoke(None, config=config)
+        return {
+            "classification": {"need_reply": True},
+            "email": {"id": "mail-ack-readback", "attachments": []},
+        }
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._run_ai_pipeline",
+        new=AsyncMock(side_effect=complete_pipeline),
+    ), patch(
         "src.exchange_service.lark_app.upload_file_to_drive",
         side_effect=[
             {"file_token": "first-token", "url": "https://example.invalid/first"},
@@ -1145,8 +1218,11 @@ async def test_token_ack_commit_then_raise_is_confirmed_by_readback():
         return_value=True,
     ), patch(
         "src.exchange_service._ingest_to_qdrant",
-        new=AsyncMock(side_effect=failure),
-    ), pytest.raises(DatabaseOperationError):
+        new_callable=AsyncMock,
+    ), patch(
+        "src.exchange_service._dispatch_notification",
+        new=AsyncMock(return_value={"delivered": False, "kind": "approval"}),
+    ):
         await _run_ai_path("mail-ack-readback", email, ctx, config)
 
     assert upload.call_count == 2
@@ -1211,7 +1287,7 @@ async def test_cleanup_checkpoint_seed_does_not_double_run_graph_entry(preexisti
         await _run_ai_path(email_id, email, ctx, config)
 
     assert entry_calls == [
-        ("old-token", "new-token") if preexisting else ("new-token",)
+        ("old-token",) if preexisting else ()
     ]
     final_state = await graph.aget_state(config)
     assert "BODY-MUST-STAY-LOCAL" not in str(final_state.values)

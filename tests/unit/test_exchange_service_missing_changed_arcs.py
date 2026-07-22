@@ -120,6 +120,22 @@ async def test_unguarded_qdrant_error_remains_best_effort() -> None:
 
 
 @pytest.mark.asyncio
+async def test_successful_reingest_clears_a_prior_safe_error() -> None:
+    ctx = SimpleNamespace(
+        email_processor=SimpleNamespace(process_email=MagicMock(return_value=True)),
+        db_manager=SimpleNamespace(update_status=AsyncMock()),
+    )
+
+    await _ingest_to_qdrant("message-1", {"id": "message-1"}, ctx)
+
+    ctx.db_manager.update_status.assert_awaited_once_with(
+        "message-1",
+        "ingested",
+        error_message=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_guarded_pdf_state_write_error_stops_before_reconciliation() -> None:
     boundary, port = _boundary()
     state = SimpleNamespace(

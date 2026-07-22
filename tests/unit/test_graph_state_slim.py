@@ -6,6 +6,7 @@ import pytest
 
 from src.graph.state_factory import (
     MAX_CHECKPOINT_BYTES,
+    MAX_IMAGE_ANALYSIS_BYTES,
     MAX_LOGICAL_STATE_BYTES,
     build_initial_graph_state,
     cap_string_list,
@@ -183,6 +184,7 @@ def test_graph_delta_caps_model_values_and_rejects_oversized_human_values():
             "metadata": {
                 "review_count": 1,
                 "review_issues": "issue" * 1_000,
+                "image_analysis": "图" * 1_000,
                 "unknown": "drop-me",
             },
             "email": {"body": "BODY-MUST-NOT-ENTER"},
@@ -205,7 +207,15 @@ def test_graph_delta_caps_model_values_and_rejects_oversized_human_values():
     assert len(delta["routing_log"]) <= 8
     assert len(delta["active_skills"]) <= 16
     assert len(delta["draft_to"]) <= 10
-    assert set(delta["metadata"]) == {"review_count", "review_issues"}
+    assert set(delta["metadata"]) == {
+        "review_count",
+        "review_issues",
+        "image_analysis",
+    }
+    assert (
+        len(delta["metadata"]["image_analysis"].encode("utf-8"))
+        <= MAX_IMAGE_ANALYSIS_BYTES
+    )
     with pytest.raises(ValueError, match="invalid_draft_to"):
         sanitize_graph_delta(
             state,
