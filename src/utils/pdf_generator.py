@@ -5,9 +5,9 @@ from src.security.pdf import make_restricted_url_fetcher
 
 logger = logging.getLogger(__name__)
 
-# Suppress verbose fontTools logs
-# Suppress verbose fontTools and WeasyPrint logs
-# Suppress verbose fontTools and WeasyPrint logs
+# Keep standalone PDF scripts quiet too.  The application-wide handler filter
+# in logging_setup also protects against WeasyPrint temporarily lowering these
+# logger levels during font subsetting.
 logging.getLogger("fontTools").setLevel(logging.ERROR)
 logging.getLogger("weasyprint").setLevel(logging.ERROR)
 logging.getLogger("pypdf").setLevel(logging.ERROR)
