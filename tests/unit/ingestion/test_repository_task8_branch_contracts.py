@@ -19,9 +19,11 @@ from src.ingestion.models import (
     POSTGRES_BIGINT_MAX,
 )
 from src.ingestion.processing import (
+    GuardedExternalEffectFailed,
     ProcessingCompletion,
     ProcessingCompletionRejected,
     ProcessingReceiptConflict,
+    ReplaySafeExternalEffectFailed,
 )
 from src.ingestion.repository import (
     InboxRepository,
@@ -266,6 +268,74 @@ def _resolution(lease: InboxLease) -> _ProcessingResolution:
         attempts=lease.attempts,
         available_in_seconds=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("effect_started", "expected_status", "expected_code"),
+    [
+        (
+            False,
+            InboxStatus.RETRY_WAIT,
+            "inbox.transient_dependency",
+        ),
+        (
+            True,
+            InboxStatus.MANUAL_REVIEW,
+            "inbox.effect_outcome_unknown",
+        ),
+    ],
+    ids=["no-effect-marker", "effect-marker-remains-conservative"],
+)
+def test_failure_resolution_retries_safe_detail_only_without_effect_marker(
+    normalized_event: NormalizedIngressEvent,
+    effect_started: bool,
+    expected_status: InboxStatus,
+    expected_code: str,
+) -> None:
+    lease = _lease(normalized_event)
+    effect_started_at = datetime.now(UTC) if effect_started else None
+
+    resolution = InboxRepository._failure_resolution(
+        error=ReplaySafeExternalEffectFailed(),
+        lease=lease,
+        email=_email(
+            lease,
+            external_effects_started_at=effect_started_at,
+        ),
+        inbox=_inbox(
+            lease,
+            effect_started_at=effect_started_at,
+        ),
+        expected_email_version=4,
+    )
+
+    assert resolution.inbox_status is expected_status
+    assert resolution.email_status.value == expected_status.value
+    assert resolution.safe_code == expected_code
+
+
+def test_unknown_external_outcome_with_effect_marker_still_requires_review(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    lease = _lease(normalized_event)
+    effect_started_at = datetime.now(UTC)
+
+    resolution = InboxRepository._failure_resolution(
+        error=GuardedExternalEffectFailed(),
+        lease=lease,
+        email=_email(
+            lease,
+            external_effects_started_at=effect_started_at,
+        ),
+        inbox=_inbox(
+            lease,
+            effect_started_at=effect_started_at,
+        ),
+        expected_email_version=4,
+    )
+
+    assert resolution.inbox_status is InboxStatus.MANUAL_REVIEW
+    assert resolution.safe_code == "inbox.effect_outcome_unknown"
 
 
 def _repository_with_connection(
@@ -817,7 +887,10 @@ async def test_effect_start_fails_closed_when_locked_relation_disappears(
         AsyncMock(return_value=None),
     )
 
-    assert await repository.begin_processing_effect(lease, email.id, 4) is False
+    assert (
+        await repository.begin_processing_effect(lease, email.id, 4, "feishu")
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -855,9 +928,75 @@ async def test_effect_start_idempotency_still_requires_live_runtime_session(
     )
 
     assert (
-        await repository.begin_processing_effect(lease, email.id, 4)
+        await repository.begin_processing_effect(lease, email.id, 4, "feishu")
         is runtime_active
     )
+
+
+@pytest.mark.asyncio
+async def test_detail_authorization_checks_live_attempt_without_writing_effect_marker(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(normalized_event)
+    runtime_row = {"session_id": lease.lease_session_id}
+    repository, _connection = _repository_with_connection(
+        _Cursor(one=runtime_row)
+    )
+    _patch_transaction_setup(repository, monkeypatch)
+    email = _email(lease)
+    inbox = _inbox(lease)
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_email",
+        AsyncMock(return_value=email),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_inbox",
+        AsyncMock(return_value=inbox),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_require_authorized_processing_attempt",
+        AsyncMock(),
+    )
+
+    assert (
+        await repository.begin_processing_effect(
+            lease,
+            email.id,
+            4,
+            "detail",
+        )
+        is True
+    )
+    assert email.external_effects_started_at is None
+    assert inbox.effect_started_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effect_kind", [None, "unknown", "DETAIL"])
+async def test_processing_effect_rejects_invalid_kind_before_database_access(
+    normalized_event: NormalizedIngressEvent,
+    effect_kind: object,
+) -> None:
+    lease = _lease(normalized_event)
+    email_id = str(uuid4())
+    repository = InboxRepository(object())
+
+    with pytest.raises(ValueError, match="effect_kind"):
+        await repository.begin_processing_effect(
+            lease,
+            email_id,
+            4,
+            effect_kind,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio
@@ -910,9 +1049,17 @@ async def test_effect_start_rejects_when_atomic_marker_write_is_lost(
 
     if write_failure == "timestamp":
         with pytest.raises(DatabaseOperationError, match="timestamp is unavailable"):
-            await repository.begin_processing_effect(lease, email.id, 4)
+            await repository.begin_processing_effect(lease, email.id, 4, "feishu")
     else:
-        assert await repository.begin_processing_effect(lease, email.id, 4) is False
+        assert (
+            await repository.begin_processing_effect(
+                lease,
+                email.id,
+                4,
+                "feishu",
+            )
+            is False
+        )
 
 
 @pytest.mark.asyncio

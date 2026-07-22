@@ -119,6 +119,20 @@ class GuardedExternalEffectFailed(RuntimeError):
         return f"GuardedExternalEffectFailed(safe_code={self.safe_code!r})"
 
 
+class ReplaySafeExternalEffectFailed(RuntimeError):
+    """An authorized, replay-safe external call failed before later effects."""
+
+    kind = ErrorKind.TRANSIENT_DEPENDENCY
+    safe_code = "processing.replay_safe_effect_failed"
+    safe_summary = "Replay-safe external effect failed"
+
+    def __init__(self) -> None:
+        super().__init__(self.safe_summary)
+
+    def __repr__(self) -> str:
+        return f"ReplaySafeExternalEffectFailed(safe_code={self.safe_code!r})"
+
+
 class ProcessingCompletionRejected(RuntimeError):
     """A completion did not match the currently fenced processing attempt."""
 
@@ -458,4 +472,5 @@ __all__ = [
     "ProcessingFinishResult",
     "ProcessingPolicyRejected",
     "ProcessingReceiptConflict",
+    "ReplaySafeExternalEffectFailed",
 ]

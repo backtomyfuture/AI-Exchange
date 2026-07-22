@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
@@ -25,6 +26,7 @@ from src.ingestion.processing import (
     LegacyEffectScope,
     ProcessingCompletion,
     ProcessingPolicyRejected,
+    ReplaySafeExternalEffectFailed,
 )
 from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
 
@@ -44,6 +46,17 @@ _EXECUTABLE_DISPOSITIONS: Final = frozenset(
         EmailEventDisposition.PROCESSING_RESUMED,
     }
 )
+logger = logging.getLogger(__name__)
+
+
+def _log_stage_failure(stage: str, error: BaseException) -> None:
+    """Log only fixed stage metadata and an exception class, never its value."""
+
+    logger.error(
+        "Legacy processing stage failed: stage=%s error_type=%s",
+        stage,
+        type(error).__name__,
+    )
 
 
 class LegacyProcessingFailed(RuntimeError):
@@ -165,37 +178,70 @@ class LegacyProcessingAdapter:
         ExternalEffectBoundary(scope, before_external_effect)
         policy_port = _PolicyBoundEffectPort(before_external_effect, allowed)
         detail_boundary = ExternalEffectBoundary(scope, policy_port)
-        await detail_boundary.before(
-            ExternalEffectKind.DETAIL,
-            0,
-            {
-                "operation": "get_email",
-                "external_email_id": lease.event.external_email_id,
-                "source_version": lease.event.source_version,
-            },
-        )
-        details = await self._ctx.exchange_client.get_email(
-            lease.event.external_email_id
-        )
-        email_data = self._project_detail(lease, details)
+        try:
+            await detail_boundary.before(
+                ExternalEffectKind.DETAIL,
+                0,
+                {
+                    "operation": "get_email",
+                    "external_email_id": lease.event.external_email_id,
+                    "source_version": lease.event.source_version,
+                },
+            )
+        except Exception as error:
+            _log_stage_failure("detail_authorization", error)
+            raise
 
-        outcome = await self._guarded_processor(
-            email_data,
-            self._ctx,
-            skip_analysis=policy is ProcessingPolicy.ARCHIVE,
-            force_reprocess=(
-                application.disposition is EmailEventDisposition.PROCESSING_RESUMED
-            ),
-            before_external_effect=policy_port,
-            effect_scope=scope,
-        )
+        try:
+            details = await self._ctx.exchange_client.get_email(
+                lease.event.external_email_id
+            )
+        except Exception as error:
+            _log_stage_failure("detail_fetch", error)
+            raise ReplaySafeExternalEffectFailed() from None
+        if details is None:
+            error = ReplaySafeExternalEffectFailed()
+            _log_stage_failure("detail_fetch", error)
+            raise error
+
+        try:
+            email_data = self._project_detail(lease, details)
+        except Exception as error:
+            _log_stage_failure("detail_projection", error)
+            raise
+
+        try:
+            outcome = await self._guarded_processor(
+                email_data,
+                self._ctx,
+                skip_analysis=policy is ProcessingPolicy.ARCHIVE,
+                force_reprocess=(
+                    application.disposition
+                    is EmailEventDisposition.PROCESSING_RESUMED
+                ),
+                before_external_effect=policy_port,
+                effect_scope=scope,
+            )
+        except Exception as error:
+            _log_stage_failure("guarded_processing", error)
+            raise
         if type(outcome) is not ProcessingOutcome:
-            raise self._manual_review()
+            error = self._manual_review()
+            _log_stage_failure("completion_projection", error)
+            raise error
 
-        legacy_status = await self._ctx.db_manager.get_email_status(
-            lease.event.external_email_id
-        )
-        return self._map_completion(policy, outcome, legacy_status)
+        try:
+            legacy_status = await self._ctx.db_manager.get_email_status(
+                lease.event.external_email_id
+            )
+        except Exception as error:
+            _log_stage_failure("completion_readback", error)
+            raise
+        try:
+            return self._map_completion(policy, outcome, legacy_status)
+        except Exception as error:
+            _log_stage_failure("completion_projection", error)
+            raise
 
     @staticmethod
     def _validate_attempt(
@@ -234,6 +280,8 @@ class LegacyProcessingAdapter:
 
     @staticmethod
     def _project_detail(lease: InboxLease, details: object) -> dict[str, Any]:
+        if details is None:
+            raise ReplaySafeExternalEffectFailed()
         if not isinstance(details, Mapping):
             raise LegacyProcessingAdapter._manual_review()
         email_data = dict(details)
@@ -250,7 +298,11 @@ class LegacyProcessingAdapter:
             "received_at",
             email_data.get("received_time", ""),
         )
-        email_data["_parent_folder_id"] = lease.event.payload.get("parent_folder_id")
+        # NormalizedIngressEvent recursively freezes nested payload objects with
+        # MappingProxyType.  Never leak that immutable transport representation
+        # into the JSON-backed content envelope; ``folder`` is the already
+        # validated authoritative parent-folder ID.
+        email_data["_parent_folder_id"] = lease.event.folder
         email_data["_parent_folder_name"] = lease.event.folder
         email_data["_event_type"] = lease.event.raw_event_type
         return email_data

@@ -49,6 +49,7 @@ from src.ingestion.models import (
 )
 from src.ingestion.ownership import ownership_advisory_lock_key
 from src.ingestion.processing import (
+    ExternalEffectKind,
     ProcessingCompletion,
     ProcessingCompletionRejected,
     ProcessingFinishResult,
@@ -1977,10 +1978,19 @@ class InboxRepository:
         lease: InboxLease,
         email_id: str,
         expected_email_version: int,
+        effect_kind: str,
     ) -> bool:
         lease = self._require_lease(lease)
         email_id = _require_email_id(email_id)
         expected_email_version = _require_email_version(expected_email_version)
+        if type(effect_kind) is not str:
+            raise ValueError("effect_kind must be an exact ExternalEffectKind")
+        try:
+            resolved_effect_kind = ExternalEffectKind(effect_kind)
+        except ValueError:
+            raise ValueError(
+                "effect_kind must be an exact ExternalEffectKind"
+            ) from None
         try:
             async with self._pool.connection() as connection:
                 async with connection.transaction():
@@ -2043,6 +2053,11 @@ class InboxRepository:
                     inbox_marked = inbox.effect_started_at is not None
                     if email_marked is not inbox_marked:
                         raise ProcessingCompletionRejected()
+                    # DETAIL is a fenced read.  It must pass the exact same live
+                    # attempt/runtime checks, but it does not make this aggregate
+                    # unsafe to replay if the read itself times out or is absent.
+                    if resolved_effect_kind is ExternalEffectKind.DETAIL:
+                        return True
                     if email_marked:
                         return True
                     timestamp_cursor = await connection.execute(

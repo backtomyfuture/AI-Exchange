@@ -365,7 +365,7 @@ def _content_ctx(
 @pytest.mark.parametrize(
     ("put_error", "expected"),
     [
-        (RuntimeError("put failed"), GuardedExternalEffectFailed),
+        (RuntimeError("PRIVATE-CONTENT-PUT"), GuardedExternalEffectFailed),
         (asyncio.CancelledError(), asyncio.CancelledError),
     ],
     ids=["typed-remote-failure", "cancellation-propagates"],
@@ -374,6 +374,7 @@ def _content_ctx(
 async def test_guarded_content_put_never_enters_claim_after_remote_failure(
     put_error: BaseException,
     expected: type[BaseException],
+    caplog,
 ) -> None:
     boundary, port = _boundary()
     ctx = _content_ctx(put_error=put_error)
@@ -389,16 +390,21 @@ async def test_guarded_content_put_never_enters_claim_after_remote_failure(
 
     assert port.await_args.args[:2] == ("content", 0)
     ctx.db_manager.set_content_ref_if_absent.assert_not_awaited()
+    if isinstance(put_error, Exception):
+        assert "stage=content_put" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "PRIVATE-CONTENT-PUT" not in caplog.text
 
 
 @pytest.mark.parametrize(
     "claim_failure",
-    [asyncio.CancelledError(), RuntimeError("claim failed")],
+    [asyncio.CancelledError(), RuntimeError("PRIVATE-CONTENT-CAS")],
     ids=["cancelled", "raises"],
 )
 @pytest.mark.asyncio
 async def test_guarded_content_claim_propagates_without_unfenced_reconciliation(
     claim_failure: BaseException,
+    caplog,
 ) -> None:
     boundary, _port = _boundary()
     ctx = _content_ctx(claim_error=claim_failure)
@@ -414,16 +420,21 @@ async def test_guarded_content_claim_propagates_without_unfenced_reconciliation(
 
     ctx.db_manager.get_content_ref.assert_not_awaited()
     ctx.content_store.delete.assert_not_awaited()
+    if isinstance(claim_failure, Exception):
+        assert "stage=content_ref_cas" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "PRIVATE-CONTENT-CAS" not in caplog.text
 
 
 @pytest.mark.parametrize(
     "read_failure",
-    [asyncio.CancelledError(), RuntimeError("read failed")],
+    [asyncio.CancelledError(), RuntimeError("PRIVATE-CONTENT-READBACK")],
     ids=["cancelled", "raises"],
 )
 @pytest.mark.asyncio
 async def test_guarded_false_claim_propagates_failed_winner_read_without_cleanup(
     read_failure: BaseException,
+    caplog,
 ) -> None:
     boundary, _port = _boundary()
     ctx = _content_ctx(claim_result=False, read_error=read_failure)
@@ -438,6 +449,10 @@ async def test_guarded_false_claim_propagates_failed_winner_read_without_cleanup
         )
 
     ctx.content_store.delete.assert_not_awaited()
+    if isinstance(read_failure, Exception):
+        assert "stage=content_ref_readback" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "PRIVATE-CONTENT-READBACK" not in caplog.text
 
 
 @pytest.mark.parametrize(

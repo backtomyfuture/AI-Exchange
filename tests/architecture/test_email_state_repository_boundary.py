@@ -322,7 +322,7 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/exchange_service.py": (
-        "f74f8ad30a08d10006a9dc7d8212451eaccaf9a3f2e36215256ae3164ea88e20"
+        "156221ad005fc2f640a8587ece7aa14f4956c38e7a9e3caaa8d386062d4e36d9"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
@@ -428,19 +428,19 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "40da8178c318277c1d20a94c5496c93c86e3d2029f6e798c201af37ee6aa6311"
     ),
     "src/ingestion/legacy_adapter.py": (
-        "44b21f0853d8699e749ddf6524c552c86dc2dbadd4b018a092816d78d1e83514"
+        "4dce2a3b3d9456ef24ee938b2de144015d28c0566ede56a8aa5c0569f64f124c"
     ),
     "src/ingestion/processing.py": (
-        "eac0bf67b02c6d5519bba6863e5bede9e901110cc902c1c10a5e3efe173b99ee"
+        "2784e9b00e6f34ae68b348c513868077ed5bad9fd85b21136244fd3726cc4f4f"
     ),
     "src/ingestion/repository.py": (
-        "eaa83ce98dfb808b6551d6cf71b22753f57aa2c1818851dcf8ae2213bba734b0"
+        "4487935cb2f493952e1d00ca3015dfe6b8e002bba6ec55fd9aaadcd59d0cfee0"
     ),
     "src/ingestion/runtime.py": (
         "082bbcc655b60d7a2b9429bff0acdf1e0fade059943292cc22fa5b204a3c758d"
     ),
     "src/ingestion/worker.py": (
-        "b84ffc0a600252db9925045843e51ef0b19e076b986e345677590654780f31c9"
+        "75ed0dfeda6d6010d4b91741ee2679f2658b82afec8b1a8d303a8eecf0b066f0"
     ),
     "src/init_app.py": (
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
