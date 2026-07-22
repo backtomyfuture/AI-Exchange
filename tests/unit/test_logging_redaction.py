@@ -53,7 +53,7 @@ def test_safe_log_metadata_allows_only_bounded_explicit_values():
 def test_security_logging_hardens_url_bearing_third_party_loggers():
     from src.utils.logging_setup import harden_third_party_loggers
 
-    logger_names = ("httpx", "httpcore", "Lark")
+    logger_names = ("httpx", "httpcore", "fontTools", "weasyprint", "Lark")
     original_levels = {
         logger_name: logging.getLogger(logger_name).level
         for logger_name in logger_names
@@ -63,10 +63,46 @@ def test_security_logging_hardens_url_bearing_third_party_loggers():
 
         assert logging.getLogger("httpx").level >= logging.WARNING
         assert logging.getLogger("httpcore").level >= logging.WARNING
+        assert logging.getLogger("fontTools").level >= logging.ERROR
+        assert logging.getLogger("weasyprint").level >= logging.ERROR
         assert logging.getLogger("Lark").level > logging.CRITICAL
     finally:
         for logger_name, level in original_levels.items():
             logging.getLogger(logger_name).setLevel(level)
+
+
+def test_console_logging_is_plain_readable_and_filters_fonttools_noise(capsys):
+    from src.utils.logging_setup import setup_logging
+
+    root = logging.getLogger()
+    fonttools = logging.getLogger("fontTools")
+    fonttools_subset = logging.getLogger("fontTools.subset")
+    original_handlers = root.handlers[:]
+    original_root_level = root.level
+    original_fonttools_level = fonttools.level
+    original_subset_level = fonttools_subset.level
+    try:
+        setup_logging("INFO")
+
+        # Simulate WeasyPrint's capture_logs(), which temporarily changes the
+        # fontTools parent logger to DEBUG during every PDF render.
+        fonttools.setLevel(logging.DEBUG)
+        fonttools_subset.info("Glyph IDs: [1, 2, 3]")
+        fonttools_subset.error("Font subset failed")
+        logging.getLogger("test.readability").info("Email processing completed")
+
+        rendered = capsys.readouterr().err
+        assert "Glyph IDs" not in rendered
+        assert "Font subset failed" in rendered
+        assert "Email processing completed" in rendered
+        assert "test.readability" in rendered
+        assert "[info" in rendered
+        assert "\x1b[" not in rendered
+    finally:
+        root.handlers[:] = original_handlers
+        root.setLevel(original_root_level)
+        fonttools.setLevel(original_fonttools_level)
+        fonttools_subset.setLevel(original_subset_level)
 
 
 def test_lark_api_and_websocket_clients_never_enable_verbose_sdk_logs(monkeypatch):
