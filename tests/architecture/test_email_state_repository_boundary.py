@@ -322,7 +322,7 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/exchange_service.py": (
-        "474978e3799c23d125f1691167cd4fae8b64fdb327b1bb471c99ee16972ed299"
+        "2a278b19c307ab4e75fac4a3c977c1ac1de6d2be44fa91768d9ed0e12a4f8170"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"

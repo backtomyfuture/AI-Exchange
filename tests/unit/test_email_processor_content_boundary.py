@@ -812,6 +812,40 @@ async def test_attachment_upload_returns_only_tokens_without_mutating_email():
 
 
 @pytest.mark.asyncio
+async def test_non_inline_pdf_with_content_id_is_uploaded_as_business_attachment():
+    email = {
+        "body": "Please review the attached reports.",
+        "attachments": [
+            {
+                "name": "report.pdf",
+                "content": "UERG",
+                "content_type": "application/pdf",
+                "content_id": "normal-attachment-id",
+                "is_inline": False,
+            }
+        ],
+    }
+
+    with patch(
+        "src.exchange_service.lark_app.upload_file_to_drive",
+        return_value={
+            "file_token": "pdf-token",
+            "url": "https://example.invalid/report",
+        },
+    ) as upload:
+        uploads = await _upload_attachments_to_lark(email)
+
+    assert uploads.tokens == ("pdf-token",)
+    assert uploads.links == (
+        {
+            "name": "report.pdf",
+            "lark_file_url": "https://example.invalid/report",
+        },
+    )
+    upload.assert_called_once_with("report.pdf", b"PDF", 3)
+
+
+@pytest.mark.asyncio
 async def test_attachment_upload_respects_remaining_cleanup_handle_capacity():
     email = {
         "attachments": [

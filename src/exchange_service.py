@@ -30,6 +30,7 @@ from src.safety.manual_review import (
 )
 from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
+from src.utils.email_attachments import select_business_attachments
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.utils.notification_policy import decide_notification_kind
 from src.storage import ContentRef
@@ -161,13 +162,7 @@ async def _upload_attachments_to_lark(
     attachments = email_data.get("attachments", [])
     if not attachments or max_uploads == 0:
         return AttachmentUploadProjection(tokens=(), links=())
-    business_attachments = [
-        attachment
-        for attachment in attachments
-        if isinstance(attachment, dict)
-        and not attachment.get("content_id")
-        and attachment.get("is_inline") is not True
-    ]
+    business_attachments = select_business_attachments(email_data)
     if not business_attachments:
         return AttachmentUploadProjection(tokens=(), links=())
     logger.info(
