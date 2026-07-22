@@ -9,7 +9,24 @@ from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-_CHINESE_NAME_RE = re.compile(r"[\u4e00-\u9fff]{2,4}")
+# A bare ``[\u4e00-\u9fff]{2,4}`` match is not a name detector: it splits
+# ordinary Chinese prose into short chunks and turns nearly every draft into a
+# false positive.  Only treat text as a claimed addressee when it appears in a
+# conventional greeting at the beginning of a line.  The addressee may be a
+# person or a team; either way, it must already occur in the source email.
+_CHINESE_ADDRESSEE_PATTERNS = (
+    re.compile(
+        r"(?m)^[^\S\r\n]*尊敬的[^\S\r\n]*"
+        r"(?P<name>[\u4e00-\u9fff]{2,8}?)"
+        r"(?:先生|女士|老师|经理|总监|总)?[^\S\r\n]*[：:,，]"
+    ),
+    re.compile(
+        r"(?m)^[^\S\r\n]*(?!尊敬的)(?P<name>[\u4e00-\u9fff]{2,8}?)"
+        r"(?:先生|女士|老师|经理|总监|总)?[^\S\r\n]*[，,:：]"
+        r"[^\S\r\n]*"
+        r"(?:您好|你好)(?:[！!，,。.]|\s|$)"
+    ),
+)
 _DATE_RE = re.compile(
     r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日号]?"
     r"|\d{1,2}[-/月]\d{1,2}[日号]?"
@@ -55,6 +72,14 @@ class ContentGuard:
                 })
         return issues
 
+    @staticmethod
+    def _extract_chinese_addressees(text: str) -> set[str]:
+        return {
+            match.group("name")
+            for pattern in _CHINESE_ADDRESSEE_PATTERNS
+            for match in pattern.finditer(text)
+        }
+
     async def check_hallucination(self, draft: str, original_email: dict) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
         ref_text = " ".join([
@@ -70,13 +95,15 @@ class ContentGuard:
             if token not in ref_text:
                 issues.append({"type": "unverified_date", "claim": m.group(), "severity": "warning"})
 
-        draft_names = set(_CHINESE_NAME_RE.findall(draft))
-        ref_names = set(_CHINESE_NAME_RE.findall(ref_text))
-        common_words = {"您好", "你好", "谢谢", "感谢", "请问", "回复", "邮件", "附件", "发送",
-                        "通知", "会议", "报告", "方案", "内容", "情况", "确认", "处理", "收到",
-                        "了解", "安排", "尽快", "相关", "公司", "部门", "项目"}
-        for name in draft_names - ref_names - common_words:
-            issues.append({"type": "unverified_name", "claim": name, "severity": "warning"})
+        for name in sorted(self._extract_chinese_addressees(draft)):
+            if name.lower() not in ref_text:
+                issues.append(
+                    {
+                        "type": "unverified_name",
+                        "claim": name,
+                        "severity": "warning",
+                    }
+                )
 
         draft_nums = set(_NUMBER_RE.findall(draft))
         trivial = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "100"}
