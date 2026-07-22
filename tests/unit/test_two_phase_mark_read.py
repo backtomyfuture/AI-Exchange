@@ -3,7 +3,7 @@ C1: Two-phase mark_as_read tests.
 
 Verify that an email is only marked as read on Exchange AFTER the user-facing
 delivery (Lark card / explicit skip) succeeds. Card delivery failure must
-leave the email unread on the server so SelfHealer / human can retry.
+leave the email unread on the server so durable recovery or a human can retry.
 """
 
 import asyncio
@@ -1098,10 +1098,3 @@ async def test_process_email_marks_read_only_after_successful_dispatch(ctx):
         await process_and_archive_email({"id": "msg-ok"}, ctx)
 
     ctx.exchange_client.mark_as_read.assert_called_once_with("msg-ok", is_read=True)
-
-
-@pytest.mark.asyncio
-async def test_self_healer_picks_up_delivery_failed():
-    """SelfHealer's stuck list query must include delivery_failed status."""
-    from src.utils import self_healing
-    assert "delivery_failed" in self_healing.STUCK_STATUSES

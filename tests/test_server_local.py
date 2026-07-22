@@ -14,7 +14,7 @@ client = TestClient(app)
 
 def test_production_email_preview_returns_404_before_any_context_lookup():
     with patch(
-        "src.server.get_app_context",
+        "src.server.initialize_app_context",
         side_effect=AssertionError("production_preview_must_not_load_context"),
     ), patch(
         "src.server.get_settings",
@@ -41,7 +41,7 @@ def test_production_debug_misconfiguration_cannot_read_seeded_preview_state():
 
     store = TrackingStore({email_id: MagicMock()})
     with patch.object(lark_app, "_mock_store", store), patch(
-        "src.server.get_app_context",
+        "src.server.initialize_app_context",
         side_effect=AssertionError("production_preview_must_not_load_context"),
     ), patch(
         "src.server.get_settings",
@@ -61,7 +61,7 @@ def test_debug_false_seeded_mock_returns_404_without_production_fallback():
     lark_app._mock_store[email_id] = MagicMock()
     try:
         with patch(
-            "src.server.get_app_context",
+            "src.server.initialize_app_context",
             side_effect=AssertionError("disabled_preview_must_not_load_context"),
         ), patch(
             "src.server.get_settings",
@@ -76,7 +76,7 @@ def test_debug_false_seeded_mock_returns_404_without_production_fallback():
 
 def test_debug_non_test_or_unseeded_id_returns_404_without_context():
     with patch(
-        "src.server.get_app_context",
+        "src.server.initialize_app_context",
         side_effect=AssertionError("debug_preview_must_not_fall_through"),
     ), patch(
         "src.server.get_settings",
@@ -106,7 +106,7 @@ def test_explicit_seeded_debug_preview_never_initializes_production_context():
     lark_app._mock_store[email_id] = state
     try:
         with patch(
-            "src.server.get_app_context",
+            "src.server.initialize_app_context",
             side_effect=AssertionError("debug_preview_must_not_load_context"),
         ), patch(
             "src.server.get_settings",

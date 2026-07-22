@@ -26,7 +26,7 @@ def with_llm_retry(
     行为:
     1. 调用前检查熔断器，若 OPEN 则直接抛出 ``CircuitOpenError``，避免无谓重试。
     2. 重试结束后仍失败：上报 ``circuit_breaker.report_failure`` 累计失败次数。
-    3. 自愈/恢复由 SelfHealer 调用 ``report_success`` 关闭熔断器。
+    3. 调用失败时向共享熔断器报告失败。
     """
 
     def decorator(func):
@@ -88,42 +88,6 @@ def with_llm_retry(
             wait=wait_random_exponential(multiplier=base_wait, max=max_wait),
             stop=stop_after_attempt(max_attempts),
             retry=retry_if_exception_type(Exception),
-            reraise=True,
-        )
-        @wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-
-        import asyncio
-
-        if asyncio.iscoroutinefunction(func):
-            return async_wrapper
-        return sync_wrapper
-
-    return decorator
-
-
-def with_simple_retry(
-    max_attempts: int = 3,
-    max_wait: int = 30,
-):
-    """
-    简化版重试装饰器，不含速率限制。
-    """
-
-    def decorator(func):
-        @retry(
-            wait=wait_random_exponential(multiplier=1, max=max_wait),
-            stop=stop_after_attempt(max_attempts),
-            reraise=True,
-        )
-        @wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            return await func(*args, **kwargs)
-
-        @retry(
-            wait=wait_random_exponential(multiplier=1, max=max_wait),
-            stop=stop_after_attempt(max_attempts),
             reraise=True,
         )
         @wraps(func)

@@ -22,9 +22,7 @@ async def test_drafter_uses_system_prompt_modifier(graph_node_harness):
         system_prompt_modifier="【语气指令】使用 BLUF 原则，结论先行。",
     )
 
-    with patch("src.utils.llm_factory.LLMFactory") as mock_factory:
-        mock_factory.create_llm.return_value = mock_llm
-
+    with patch("src.providers.factory.get_llm_for_role", return_value=mock_llm):
         with patch("src.nodes.drafter.ChatPromptTemplate") as mock_prompt_cls:
             mock_chain = MagicMock()
             mock_chain.ainvoke = AsyncMock(return_value=mock_response)
@@ -66,8 +64,7 @@ async def test_drafter_works_without_modifier(graph_node_harness):
         system_prompt_modifier=None,
     )
 
-    with patch("src.utils.llm_factory.LLMFactory") as mock_factory:
-        mock_factory.create_llm.return_value = mock_llm
+    with patch("src.providers.factory.get_llm_for_role", return_value=mock_llm):
         with patch("src.nodes.drafter.ChatPromptTemplate") as mock_prompt_cls:
             mock_template = MagicMock()
             mock_template.__or__ = MagicMock(return_value=mock_chain)

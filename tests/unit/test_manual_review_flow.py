@@ -314,28 +314,6 @@ async def test_process_email_returns_typed_manual_review_outcome(mock_env):
     assert outcome is ProcessingOutcome.MANUAL_REVIEW
 
 
-@pytest.mark.asyncio
-async def test_self_healer_does_not_report_manual_review_as_recovered():
-    from src.utils import self_healing
-
-    ctx = MagicMock()
-    ctx.exchange_client.get_email = AsyncMock(
-        return_value={"id": "manual-healer", "attachments": []}
-    )
-    ctx.db_manager.claim_self_healing = AsyncMock(return_value=True)
-    ctx.db_manager.compare_and_set_status = AsyncMock(return_value=True)
-    with patch(
-        "src.utils.self_healing.process_and_archive_email",
-        new=AsyncMock(return_value=ProcessingOutcome.MANUAL_REVIEW),
-    ):
-        recovered = await self_healing.SelfHealer(ctx, 60).reprocess_single(
-            "manual-healer"
-        )
-
-    assert recovered is False
-
-
-@pytest.mark.asyncio
 async def test_run_ai_path_normalizes_untrusted_manual_review_code():
     email_id = "manual-code-boundary"
     ref = ContentRef(

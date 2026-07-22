@@ -30,7 +30,6 @@ EMAIL_STATUS_CAS_TRANSITIONS = frozenset(
         ("approved", "sending"),
         ("sending", "sent"),
         ("saving_draft", "draft_saved"),
-        ("recovering", "error"),
     }
 )
 
@@ -468,63 +467,6 @@ class AsyncDatabaseManager:
                 message="email status compare-and-set failed",
             ) from None
 
-    async def claim_self_healing(
-        self,
-        email_id: str,
-        *,
-        immediate: frozenset[str],
-        stale: frozenset[str],
-        stale_after_seconds: int,
-    ) -> bool:
-        """Atomically claim eligible recovery work without stealing live work."""
-        if (
-            not isinstance(email_id, str)
-            or not email_id.strip()
-            or not immediate
-            or not stale
-            or any(not isinstance(status, str) or not status for status in immediate | stale)
-            or bool((immediate | stale) & CAS_ONLY_EMAIL_STATUSES)
-            or isinstance(stale_after_seconds, bool)
-            or not isinstance(stale_after_seconds, int)
-            or stale_after_seconds <= 0
-        ):
-            raise ValueError("invalid_self_healing_claim")
-        try:
-            async with self.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        UPDATE emails_log
-                        SET status = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s AND (
-                            status = ANY(%s)
-                            OR (
-                                status = ANY(%s)
-                                AND updated_at < CURRENT_TIMESTAMP
-                                    - (%s * INTERVAL '1 second')
-                            )
-                        )
-                        """,
-                        (
-                            "recovering",
-                            email_id,
-                            sorted(immediate),
-                            sorted(stale),
-                            stale_after_seconds,
-                        ),
-                    )
-                    return cur.rowcount == 1
-        except psycopg.Error as exc:
-            logger.error(
-                "Self-healing claim failed: error_type=%s",
-                type(exc).__name__,
-            )
-            raise DatabaseOperationError(
-                operation="claim_self_healing",
-                retryable=isinstance(exc, psycopg.OperationalError),
-                message="self-healing claim failed",
-            ) from None
-
     async def compare_and_set_manual_review(
         self,
         email_id: str,
@@ -693,23 +635,6 @@ class AsyncDatabaseManager:
     async def mark_as_processed(self, email_id: str):
         """Quick shortcut for dedup, sets status to 'ingested'."""
         await self.update_status(email_id, "ingested")
-
-    async def get_records_by_date(self, target_date) -> list:
-        """Query email records processed on a specific date."""
-        try:
-            async with self.get_connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT * FROM emails_log WHERE DATE(processed_at) = %s ORDER BY processed_at DESC",
-                        (target_date,)
-                    )
-                    return await cur.fetchall()
-        except Exception as exc:
-            logger.error(
-                "Failed to get records by date: error_type=%s",
-                type(exc).__name__,
-            )
-            return []
 
     async def close(self):
         if self._pool:

@@ -637,10 +637,6 @@ def test_request_boundary_never_calls_legacy_or_external_effects_across_outcomes
             ),
         ),
         patch(
-            "src.exchange_service.enqueue_webhook_event",
-            new_callable=AsyncMock,
-        ) as legacy_enqueue,
-        patch(
             "src.exchange_service.process_and_archive_email",
             new_callable=AsyncMock,
         ) as legacy_processor,
@@ -691,7 +687,6 @@ def test_request_boundary_never_calls_legacy_or_external_effects_across_outcomes
         assert response.status_code == 400
 
     for external_spy in (
-        legacy_enqueue,
         legacy_processor,
         exchange_detail,
         exchange_list,
@@ -715,18 +710,12 @@ def test_missing_durable_service_returns_503_without_legacy_fallback(monkeypatch
     body, signature = _build_signed_body(payload, "test-secret")
     monkeypatch.delattr(app.state, "webhook_ingress_service", raising=False)
 
-    with (
-        patch(
-            "src.server.get_settings",
-            return_value=SimpleNamespace(
-                EXCHANGE_WEBHOOK_SECRET="test-secret",
-                WEBHOOK_MAX_BYTES=1_048_576,
-            ),
+    with patch(
+        "src.server.get_settings",
+        return_value=SimpleNamespace(
+            EXCHANGE_WEBHOOK_SECRET="test-secret",
+            WEBHOOK_MAX_BYTES=1_048_576,
         ),
-        patch(
-            "src.exchange_service.enqueue_webhook_event",
-            new_callable=AsyncMock,
-        ) as legacy_enqueue,
     ):
         response = client.post(
             "/webhooks/exchange",
@@ -740,7 +729,6 @@ def test_missing_durable_service_returns_503_without_legacy_fallback(monkeypatch
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Webhook ingress unavailable"}
-    legacy_enqueue.assert_not_called()
 
 
 def test_exchange_webhook_invalid_json_with_valid_signature_is_redacted(caplog):

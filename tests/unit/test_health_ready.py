@@ -23,7 +23,7 @@ def test_health_returns_only_liveness_metadata_without_app_context():
     client = TestClient(app)
 
     with patch(
-        "src.server.get_app_context",
+        "src.server.initialize_app_context",
         side_effect=AssertionError("health_must_not_initialize_app_context"),
     ):
         response = client.get("/health")

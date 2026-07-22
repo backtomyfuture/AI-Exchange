@@ -120,20 +120,6 @@ def _sync_transport_item(**overrides: object) -> dict[str, object]:
     return item
 
 
-def test_ingestion_boundary_exports_normalizers() -> None:
-    import src.ingestion as ingestion
-
-    assert ingestion.normalize_webhook_event is normalize_webhook_event
-    assert ingestion.normalize_sync_change is normalize_sync_change
-    assert ingestion.validate_sync_change_contract is validate_sync_change_contract
-
-
-def test_ingestion_boundary_exports_sync_contract_validator() -> None:
-    import src.ingestion as ingestion
-
-    assert callable(getattr(ingestion, "validate_sync_change_contract", None))
-
-
 def test_normalizers_require_keyword_only_explicit_policy() -> None:
     webhook_signature = inspect.signature(normalize_webhook_event)
     sync_signature = inspect.signature(normalize_sync_change)

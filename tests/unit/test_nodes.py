@@ -59,7 +59,7 @@ async def test_generate_forward_draft_uses_store_not_feedback_state(
         classification={"action": "forward"},
     )
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm"):
+    with patch("src.providers.factory.get_llm_for_role"):
         result = await drafter.generate_draft(
             state,
             graph_node_harness.dependencies,
@@ -85,7 +85,7 @@ async def test_generate_draft_no_feedback(mock_env, graph_node_harness):
     )
 
     with (
-        patch("src.utils.llm_factory.LLMFactory.create_llm") as mock_create,
+        patch("src.providers.factory.get_llm_for_role") as mock_create,
         patch(
             "src.nodes.drafter.with_llm_retry", side_effect=lambda **_: lambda fn: fn
         ),

@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import email as email_lib
 import email.policy
 import email.utils
@@ -691,7 +690,9 @@ def _get_exchange_mail_folders() -> list[tuple[str, str]]:
     3. Name not a GUID (system internal folders)
     """
     from src.config import get_settings, resolve_secret
-    import httpx, re
+    import re
+
+    import httpx
 
     settings = get_settings()
     api_url = settings.EXCHANGE_API_URL.rstrip("/")

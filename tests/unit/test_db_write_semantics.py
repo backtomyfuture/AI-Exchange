@@ -149,7 +149,6 @@ async def test_database_failure_is_not_duplicate(db_manager, failing_connection)
     assert caught.value.operation == "log_initial_email"
     assert caught.value.retryable is True
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stored_row", "expected"),
@@ -307,53 +306,4 @@ async def test_compare_and_set_status_wraps_database_failure(
         )
 
     assert caught.value.operation == "compare_and_set_status"
-    assert caught.value.retryable is True
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("rowcount", "expected_result"), [(1, True), (0, False)])
-async def test_claim_self_healing_is_atomic_and_reclaims_only_stale_claims(
-    db_manager, rowcount, expected_result
-):
-    cursor = FakeCursor(rowcount=rowcount)
-    db_manager.get_connection = connection_factory(cursor)
-
-    result = await db_manager.claim_self_healing(
-        "mail-heal",
-        immediate=frozenset({"error", "delivery_failed"}),
-        stale=frozenset({"analyzed", "ingested", "pending"}),
-        stale_after_seconds=1800,
-    )
-
-    assert result is expected_result
-    query, params = cursor.executions[-1]
-    normalized_query = " ".join(query.split())
-    assert "SET status = %s" in normalized_query
-    assert normalized_query.count("status = ANY(%s)") == 2
-    assert "status = %s AND updated_at <" not in normalized_query
-    assert params == (
-        "recovering",
-        "mail-heal",
-        ["delivery_failed", "error"],
-        ["analyzed", "ingested", "pending"],
-        1800,
-    )
-
-
-@pytest.mark.asyncio
-async def test_claim_self_healing_wraps_database_failure(
-    db_manager, failing_connection
-):
-    failing_connection.side_effect = psycopg.OperationalError("database unavailable")
-    db_manager.get_connection = failing_connection
-
-    with pytest.raises(DatabaseOperationError) as caught:
-        await db_manager.claim_self_healing(
-            "mail-heal",
-            immediate=frozenset({"error"}),
-            stale=frozenset({"ingested"}),
-            stale_after_seconds=1800,
-        )
-
-    assert caught.value.operation == "claim_self_healing"
     assert caught.value.retryable is True

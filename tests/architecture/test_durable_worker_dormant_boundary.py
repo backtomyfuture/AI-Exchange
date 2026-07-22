@@ -16,8 +16,6 @@ LIVE_ROOTS = (
     ROOT / "src" / "init_app.py",
     ROOT / "src" / "config.py",
     ROOT / "src" / "exchange_service.py",
-    ROOT / "src" / "scheduler",
-    ROOT / "src" / "utils" / "self_healing.py",
 )
 TASK8_PRODUCTION = (
     ROOT / "src" / "exchange_service.py",
