@@ -236,7 +236,7 @@ def test_runtime_settings_model_never_contains_admin_or_migration_secrets():
     }
 
     assert forbidden.isdisjoint(Settings.model_fields)
-    assert Settings.model_config["env_file"] == ".env.runtime"
+    assert Settings.model_config["env_file"] == ".env"
     assert Settings(_env_file=None).LEADER_SENDERS == ""
 
 
