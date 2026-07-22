@@ -61,32 +61,29 @@ jobs:
           uv pip install --dry-run --no-cache --python-version 3.12.13 --python-platform aarch64-unknown-linux-gnu --only-binary=:all: --require-hashes --target /tmp/wheel-check-aarch64 -r /tmp/requirements.lock
       - name: Validate production Compose
         shell: bash
+        env:
+          AI_EXCHANGE_IMAGE: ai-exchange:phase2-ci
+          EXTERNAL_URL: https://phase2-ci.invalid
+          EXCHANGE_API_URL: https://exchange.phase2-ci.invalid/api/v1/exchange/emails
+          EXCHANGE_API_KEY: phase2-ci-exchange-key
+          EXCHANGE_ACCOUNT_ID: "8"
+          EXCHANGE_ACCOUNT_EMAIL: phase2-ci@example.invalid
+          EXCHANGE_WEBHOOK_SECRET: phase2-ci-webhook-secret
+          LARK_APP_ID: phase2-ci-lark-app
+          LARK_APP_SECRET: phase2-ci-lark-secret
+          LARK_ENCRYPT_KEY: phase2-ci-lark-encrypt
+          LARK_CHAT_ID: phase2-ci-lark-chat
+          LARK_ALLOWED_OPEN_IDS: phase2-ci-open-id
+          OPENAI_API_KEY: phase2-ci-model-key
+          OPENAI_API_BASE: https://models.phase2-ci.invalid/v1
+          LLM_MODEL: phase2-ci-model
+          EMBEDDING_API_KEY: phase2-ci-embedding-key
+          EMBEDDING_BASE_URL: https://embeddings.phase2-ci.invalid/v1
+          EMBEDDING_MODEL: phase2-ci-embedding-model
         run: |
           set -euo pipefail
-          env \
-            AI_EXCHANGE_IMAGE=ai-exchange:phase2-ci \
-            POSTGRES_ADMIN_USER=phase2_ci_admin \
-            POSTGRES_ADMIN_PASSWORD=phase2-ci-placeholder \
-            POSTGRES_DB=email_agent \
-            POSTGRES_MIGRATION_OWNER_ROLE=phase2_ci_migration_owner \
-            POSTGRES_RUNTIME_USER=phase2_ci_runtime \
-            POSTGRES_RUNTIME_PASSWORD=phase2-ci-placeholder \
-            POSTGRES_MAINTENANCE_ROLE=phase2_ci_maintenance \
-            POSTGRES_CHECKPOINT_AUDITOR_ROLE=phase2_ci_auditor \
-            EXTERNAL_URL=https://phase2-ci.invalid \
-            docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --quiet
-          services="$(env \
-            AI_EXCHANGE_IMAGE=ai-exchange:phase2-ci \
-            POSTGRES_ADMIN_USER=phase2_ci_admin \
-            POSTGRES_ADMIN_PASSWORD=phase2-ci-placeholder \
-            POSTGRES_DB=email_agent \
-            POSTGRES_MIGRATION_OWNER_ROLE=phase2_ci_migration_owner \
-            POSTGRES_RUNTIME_USER=phase2_ci_runtime \
-            POSTGRES_RUNTIME_PASSWORD=phase2-ci-placeholder \
-            POSTGRES_MAINTENANCE_ROLE=phase2_ci_maintenance \
-            POSTGRES_CHECKPOINT_AUDITOR_ROLE=phase2_ci_auditor \
-            EXTERNAL_URL=https://phase2-ci.invalid \
-            docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --services)"
+          docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --quiet
+          services="$(docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --services)"
           for required_service in database-bootstrap checkpoint-maintenance checkpoint-maintenance-execute; do
             grep -Fqx "$required_service" <<<"$services"
           done
