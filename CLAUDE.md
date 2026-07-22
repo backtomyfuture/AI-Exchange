@@ -334,7 +334,7 @@ docker-compose logs -f ai-assistant-service
 |:----|:-----|:--------|
 | 收件人头像不显示 (zhang-xia) | `extract_email_address()` 不支持纯邮箱格式 | 新增纯邮箱格式支持 |
 | 内嵌图片被上传到云盘 | 未过滤 `content_id` 附件 | 跳过有 `content_id` 的内嵌图片 |
-| 低优先级邮件附件被上传 | 附件上传在分类前执行 | 移到 `need_reply=True` 后执行 |
+| 不发送飞书卡片的邮件附件被上传 | 附件上传在投递策略判断前执行 | 仅 `approval` / `read_only` 投递时上传 |
 
 ---
 
@@ -357,11 +357,12 @@ if '@' in raw_str and ' ' not in raw_str:
 
 #### 附件上传逻辑 (`exchange_service.py`)
 
-**变更**: 附件上传移到 AI 分类后，仅在 `need_reply=True` 时执行
+**变更**: 附件上传移到 AI 分类和飞书投递策略判断后；回复草稿与只读通知均上传业务附件，完全跳过飞书投递时不上传
 
 ```python
-if classification.get("need_reply"):
-    # 只有需要回复时才上传附件
+delivery_kind = decide_notification_kind(classification, email_data)
+if delivery_kind in {"approval", "read_only"}:
+    # 只要会发送飞书卡片，就上传业务附件
     for att in email_data['attachments']:
         # 跳过内嵌图片
         if att.get('content_id'):
@@ -372,6 +373,7 @@ if classification.get("need_reply"):
 
 > [!IMPORTANT]
 > `content_id` 是识别内嵌图片的关键字段。有此字段表示图片嵌入在邮件正文中（如签名图片），不应作为附件处理。
+> `need_reply` 只控制视觉分析和拟稿；附件上传由飞书投递类型控制。
 
 ---
 
@@ -539,24 +541,30 @@ td, th {
 
 ### 10.1 架构变更
 
-图片 Vision API 分析从"数据摄入阶段"延迟到 LangGraph 内的"检索/准备阶段"。仅在 `need_reply=True` 路径时触发，大幅减少不必要的 LLM 开销。
+图片 Vision API 分析从"数据摄入阶段"延迟到 LangGraph 内的"检索/准备阶段"。仅在 `need_reply=True` 路径时触发，大幅减少不必要的 LLM 开销。业务附件上传是独立的投递边界：只读通知和回复草稿都会上传，完全不发送飞书卡片时不上传。
 
 **数据流**：
 ```
-process_batch[仅元数据] → categorizer(纯文本) → need_reply?
-                                                  ├─ No → END (零图片处理)
-                                                  └─ Yes → retriever[图片分析] → drafter
+正文投影/Qdrant[无图片字节] → categorizer(纯文本) → need_reply?
+                                                    ├─ No → 飞书投递策略
+                                                    └─ Yes → retriever[图片短摘要] → drafter
+
+飞书投递策略 → approval/read_only：上传业务附件并发送卡片
+             → skipped：不上传附件、不发送卡片
 ```
 
 ### 10.2 关键代码变更
 
 | 文件 | 变更 |
 |:----|:----|
-| `src/utils/email_processor.py` | 移除摄入阶段的 `_describe_image()` 调用，图片数据暂存到 `email["_image_attachments"]` |
+| `src/utils/email_body_projection.py` | 将内嵌图片替换为占位符，确保 data URI / Base64 不进入模型提示词或向量索引 |
+| `src/utils/email_processor.py` | Qdrant 仅写入正文投影与附件元数据，不保存图片字节或视觉摘要 |
 | `src/utils/image_analyzer.py` | **新增**: 独立模块，提供批量分析 + 图片压缩（512px）+ 智能采样（最多6张）|
-| `src/nodes/retriever_node.py` | 在上下文检索后、拟稿前按需调用 `analyze_images()`，结果写入 `email["image_analysis"]` |
-| `src/nodes/categorizer.py` | 仅传递图片数量提示（不传描述），保持兼容旧 `image_analysis` 字段 |
-| `src/nodes/drafter.py` | 将 `image_analysis`（如有）追加到 body 末尾供 LLM 参考 |
+| `src/nodes/retriever_node.py` | 仅在 `need_reply=True` 时从 Content Store 临时加载图片、调用 `analyze_images()`，短摘要写入有界 `metadata.image_analysis` |
+| `src/nodes/categorizer.py` | 只使用正文投影和图片数量提示，不读取视觉摘要 |
+| `src/nodes/drafter.py` | 将有界视觉摘要作为不可信邮件内容交给拟稿模型参考 |
+| `src/nodes/reviewer.py` | 复用正文投影和视觉摘要审核草稿，并供规则校验图片中的日期、数字等事实 |
+| `src/exchange_service.py` | 根据 `approval` / `read_only` / `skipped` 决定是否上传业务附件；内嵌图片只保留在安全 PDF 中 |
 
 ### 10.3 图片分析优化策略
 
@@ -965,4 +973,3 @@ curl http://localhost:8000/health
 
 ### 0.8 本轮关键提交
 - `2b18708`：收件人编辑增强（累计搜索、历史候选扩展、外部邮箱支持等）。
-

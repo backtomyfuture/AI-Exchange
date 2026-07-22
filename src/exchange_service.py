@@ -30,6 +30,7 @@ from src.safety.manual_review import (
 )
 from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
+from src.utils.email_attachments import select_business_attachments
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 from src.utils.notification_policy import decide_notification_kind
 from src.storage import ContentRef
@@ -63,6 +64,28 @@ MANUAL_REVIEW_SOURCE_STATUSES = frozenset(
 class AttachmentUploadProjection:
     tokens: tuple[str, ...]
     links: tuple[dict[str, str], ...]
+
+
+def _apply_attachment_upload_links(
+    email_data: object,
+    links: tuple[dict[str, str], ...] | list[dict[str, str]],
+) -> None:
+    """Decorate a transient email projection with uploaded business attachments."""
+    if not isinstance(email_data, dict):
+        return
+    attachments = email_data.get("attachments")
+    if not isinstance(attachments, list):
+        return
+
+    remaining_links = [dict(link) for link in links]
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        for index, link in enumerate(remaining_links):
+            if link.get("name") == str(attachment.get("name", "unknown")):
+                attachment["lark_file_url"] = link.get("lark_file_url", "")
+                remaining_links.pop(index)
+                break
 
 
 @dataclass(frozen=True)
@@ -139,12 +162,19 @@ async def _upload_attachments_to_lark(
     attachments = email_data.get("attachments", [])
     if not attachments or max_uploads == 0:
         return AttachmentUploadProjection(tokens=(), links=())
-    logger.info("Email has %d attachments", len(attachments))
+    business_attachments = select_business_attachments(email_data)
+    if not business_attachments:
+        return AttachmentUploadProjection(tokens=(), links=())
+    logger.info(
+        "Email attachment projection: total=%d business=%d",
+        len(attachments),
+        len(business_attachments),
+    )
     tokens: list[str] = []
     links: list[dict[str, str]] = []
     import base64
 
-    for ordinal, att in enumerate(attachments[:max_uploads]):
+    for ordinal, att in enumerate(business_attachments[:max_uploads]):
         if att.get("content"):
             try:
                 content_bytes = base64.b64decode(att["content"], validate=True)
@@ -222,7 +252,11 @@ async def _ingest_to_qdrant(
             "Email ingested to Qdrant: email=%s",
             fingerprint_identifier(email_id, namespace="email"),
         )
-        await ctx.db_manager.update_status(email_id, "ingested")
+        await ctx.db_manager.update_status(
+            email_id,
+            "ingested",
+            error_message=None,
+        )
     except DatabaseOperationError:
         raise
     except Exception as exc:
@@ -354,16 +388,8 @@ async def _run_ai_pipeline(
         projection_email = deepcopy(dict(email_data))
         projection_email["draft_to"] = list(state_values.get("draft_to") or [])
         projection_email["draft_cc"] = list(state_values.get("draft_cc") or [])
-        if attachment_links and isinstance(projection_email.get("attachments"), list):
-            remaining_links = [dict(link) for link in attachment_links]
-            for attachment in projection_email["attachments"]:
-                if not isinstance(attachment, dict):
-                    continue
-                for index, link in enumerate(remaining_links):
-                    if link.get("name") == str(attachment.get("name", "unknown")):
-                        attachment["lark_file_url"] = link.get("lark_file_url", "")
-                        remaining_links.pop(index)
-                        break
+        if attachment_links:
+            _apply_attachment_upload_links(projection_email, attachment_links)
         return {
             "classification": state_values.get("classification", {}),
             "draft": draft,
@@ -1105,7 +1131,7 @@ async def process_and_archive_email(
     """
     Process a single email based on route decision.
 
-    - skip_analysis=False: upload -> ingest -> AI -> notify -> mark_read
+    - skip_analysis=False: ingest -> AI -> conditional upload -> notify -> mark_read
     - skip_analysis=True: ingest only -> mark archived (no upload/AI/notify/mark_read)
     - force_reprocess=True: proceed even if email already exists in DB
     """
@@ -1827,7 +1853,7 @@ async def _run_ai_path(
     _effect_boundary: ExternalEffectBoundary | None = None,
 ) -> ProcessingOutcome:
     """
-    Inbox route: upload -> ingest -> AI -> notify, with two-phase mark_as_read.
+    Inbox route: ingest -> AI -> conditional attachment upload -> notify.
 
     Mark-as-read is only fired AFTER user-facing delivery (Lark card or explicit
     skip) is confirmed. On dispatch failure the email stays unread on Exchange
@@ -1849,31 +1875,6 @@ async def _run_ai_path(
             pdf_token=baseline.pdf_token,
         )
 
-        async def acknowledge_attachment_token(token: str) -> None:
-            if token not in attachment_tokens:
-                attachment_tokens.append(token)
-            await _checkpoint_ai_path_resources(
-                thread_id,
-                email_data,
-                ref,
-                ctx,
-                config,
-                attachment_tokens=[
-                    *baseline.attachment_tokens,
-                    *attachment_tokens,
-                ],
-                pdf_token=baseline.pdf_token,
-            )
-
-        attachment_uploads = await _upload_attachments_to_lark(
-            email_data,
-            max_uploads=MAX_TOKENS - len(baseline.attachment_tokens),
-            acknowledge_token=acknowledge_attachment_token,
-            **_effect_boundary_kwargs(_effect_boundary),
-        )
-        for token in attachment_uploads.tokens:
-            if token not in attachment_tokens:
-                await acknowledge_attachment_token(token)
         await _ingest_to_qdrant(
             thread_id,
             email_data,
@@ -1884,10 +1885,10 @@ async def _run_ai_path(
             thread_id,
             ctx,
             config,
-            attachment_tokens=attachment_tokens,
+            attachment_tokens=[],
             preserved_attachment_tokens=list(baseline.attachment_tokens),
             preserved_pdf_token=baseline.pdf_token,
-            attachment_links=[dict(link) for link in attachment_uploads.links],
+            attachment_links=[],
             **_effect_boundary_kwargs(_effect_boundary),
         )
         if pipeline_result is None:
@@ -1957,6 +1958,36 @@ async def _run_ai_path(
                     type(exc).__name__,
                 )
             return ProcessingOutcome.MANUAL_REVIEW
+
+        delivery_kind = decide_notification_kind(
+            pipeline_result.get("classification") or {},
+            pipeline_result.get("email") or {},
+        )
+        if delivery_kind in {"approval", "read_only"}:
+            async def acknowledge_attachment_token(token: str) -> None:
+                if token not in attachment_tokens:
+                    attachment_tokens.append(token)
+                retained = await _retain_cleanup_token(thread_id, ctx, token)
+                if not retained:
+                    raise DatabaseOperationError(
+                        operation="track_attachment_upload",
+                        retryable=True,
+                        message="attachment cleanup handle not confirmed",
+                    )
+
+            attachment_uploads = await _upload_attachments_to_lark(
+                email_data,
+                max_uploads=MAX_TOKENS - len(baseline.attachment_tokens),
+                acknowledge_token=acknowledge_attachment_token,
+                **_effect_boundary_kwargs(_effect_boundary),
+            )
+            for token in attachment_uploads.tokens:
+                if token not in attachment_tokens:
+                    await acknowledge_attachment_token(token)
+            _apply_attachment_upload_links(
+                pipeline_result.get("email"),
+                attachment_uploads.links,
+            )
 
         dispatch_result = await _dispatch_notification(
             thread_id,

@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from src.config import get_settings
 from src.security.redaction import fingerprint_identifier
+from src.utils.email_attachments import select_business_attachments
 
 logger = logging.getLogger(__name__)
 
@@ -708,9 +709,8 @@ class LarkCardBuilder:
             "text": {"tag": "lark_md", "content": summary_content}
         })
 
-        # Attachments - Filter out inline images (content_id indicates embedded image in body)
-        attachments = email_data.get("attachments", [])
-        real_attachments = [att for att in attachments if not att.get('content_id')]
+        # Attachments - show only standalone business files.
+        real_attachments = select_business_attachments(email_data)
         
         if real_attachments:
             att_lines = []
@@ -937,9 +937,9 @@ class LarkCardBuilder:
             "text": {"tag": "lark_md", "content": summary_content}
         })
 
-        # Attachments - Filter out inline images (content_id indicates embedded image in body)
+        # Attachments - show only standalone business files.
         attachments = email_data.get("attachments", [])
-        real_attachments = [att for att in attachments if not att.get('content_id')]
+        real_attachments = select_business_attachments(email_data)
         
         if real_attachments:
             att_lines = []

@@ -94,3 +94,33 @@ async def test_second_failed_review_moves_to_manual(graph_node_harness):
     assert result["review_result"]["passed"] is False
     assert result["next_step"] == "manual_review"
     assert result["safe_error_summary"] == "reviewer_rewrite_limit"
+
+
+@pytest.mark.asyncio
+async def test_visual_summary_supports_content_guard_fact_validation(
+    graph_node_harness,
+):
+    state = graph_node_harness.state(
+        {
+            "id": "review-visual-fact",
+            "subject": "图表确认",
+            "body": '<p>请确认图中结果</p><img src="cid:chart.png">',
+        },
+        draft="收到，确认图中增长为 12%。",
+        metadata={"image_analysis": "图表显示增长为 12%。"},
+    )
+
+    async def provider(_value):
+        return MagicMock(content='{"pass": true, "issues": ""}')
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(provider),
+    ), patch(
+        "src.nodes.reviewer.with_llm_retry",
+        side_effect=_passthrough_retry,
+    ):
+        result = await review_draft(state, graph_node_harness.dependencies)
+
+    assert result["review_result"]["passed"] is True
+    assert result["next_step"] == "approval"

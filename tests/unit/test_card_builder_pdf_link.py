@@ -1,3 +1,5 @@
+import json
+
 from src.utils.card_builder import LarkCardBuilder
 
 
@@ -27,3 +29,58 @@ def test_build_approval_card_uses_pdf_url_from_dict():
 
     assert any("https://www.feishu.cn/file/abc" in c for c in contents)
     assert urls == []
+
+
+def test_read_only_card_links_non_inline_pdf_even_when_content_id_is_present():
+    builder = LarkCardBuilder(lark_api_client=None, exchange_client=None)
+
+    card = builder.build_read_only_card(
+        email_id="e1",
+        context=[],
+        email_data={
+            "subject": "s",
+            "sender": "Unknown",
+            "to": [],
+            "cc": [],
+            "body": "Please review the attached report.",
+            "attachments": [
+                {
+                    "name": "report.pdf",
+                    "content_id": "normal-attachment-id",
+                    "is_inline": False,
+                    "lark_file_url": "https://example.invalid/report",
+                }
+            ],
+        },
+        classification={"priority": "P1"},
+    )
+
+    assert "https://example.invalid/report" in json.dumps(card)
+
+
+def test_approval_card_links_non_inline_pdf_even_when_content_id_is_present():
+    builder = LarkCardBuilder(lark_api_client=None, exchange_client=None)
+
+    card = builder.build_approval_card(
+        email_id="e1",
+        draft="Approved reply",
+        context=[],
+        email_data={
+            "subject": "s",
+            "sender": "Unknown",
+            "to": [],
+            "cc": [],
+            "body": "Please review the attached report.",
+            "attachments": [
+                {
+                    "name": "report.pdf",
+                    "content_id": "normal-attachment-id",
+                    "is_inline": False,
+                    "lark_file_url": "https://example.invalid/report",
+                }
+            ],
+        },
+        classification={},
+    )
+
+    assert "https://example.invalid/report" in json.dumps(card)

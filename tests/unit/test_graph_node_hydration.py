@@ -198,8 +198,18 @@ async def test_categorizer_persists_fixed_forward_draft_and_recipients():
 
 @pytest.mark.asyncio
 async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries():
-    dependencies = _dependencies()
-    state = _state()
+    email = {
+        "id": "mail-1",
+        "subject": "subject",
+        "sender": "sender@example.com",
+        "body": (
+            "<p>CURRENT-BODY-SENTINEL</p>"
+            '<img src="data:image/png;base64,UkFXLUlNQUdFLUJZVEVT">'
+        ),
+    }
+    dependencies = _dependencies(email)
+    state = _state(email)
+    state["classification"] = {"need_reply": False}
     complete_hit = "COMPLETE-HIT-SENTINEL-" + "x" * 5_000
     retriever = MagicMock()
     retriever.search.return_value = [
@@ -231,12 +241,89 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
         result = await retrieve_context(state, dependencies)
 
     assert "CURRENT-BODY-SENTINEL" in retriever.search.call_args.kwargs["query_text"]
+    assert "[内嵌图片]" in retriever.search.call_args.kwargs["query_text"]
+    assert "data:image" not in retriever.search.call_args.kwargs["query_text"]
+    routed_email = router.apply_tier2_hits.await_args.args[0]["email"]
+    assert routed_email["body"] == "CURRENT-BODY-SENTINEL\n[内嵌图片]"
     encoded = json.dumps(result, ensure_ascii=False)
     assert "context" not in result
     assert len(result["context_summaries"]) == 2
     assert complete_hit not in encoded
     assert "COMPLETE-HIT-SENTINEL" in encoded
     assert result["metadata"]["thread_summary"] == "small thread summary"
+    assert dependencies.content_store.loads == [(_ref(), False)]
+
+
+@pytest.mark.asyncio
+async def test_reply_required_retrieval_projects_visual_summary_without_image_bytes():
+    email = {
+        "id": "mail-vision",
+        "subject": "请结合图片回复",
+        "sender": "sender@example.com",
+        "body": '<p>正文</p><img src="cid:chart.png">',
+        "attachments": [
+            {
+                "name": "chart.png",
+                "content_type": "image/png",
+                "content_id": "chart.png",
+                "is_inline": True,
+                "content": "SU1BR0UtQllURVM=",
+            },
+            {
+                "name": "terms.pdf",
+                "content_type": "application/pdf",
+                "content": "UERG",
+            },
+        ],
+    }
+    dependencies = _dependencies(email)
+    state = _state(email)
+    state["classification"] = {
+        "priority": "P1",
+        "need_reply": True,
+        "intent": "咨询",
+    }
+    retriever = MagicMock()
+    retriever.search.return_value = []
+    router = MagicMock()
+    router.apply_tier2_hits = AsyncMock(return_value={})
+
+    with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
+        "src.nodes.retriever_node.get_routing_engine", return_value=router
+    ), patch(
+        "src.nodes.retriever_node._retrieve_experience",
+        new_callable=AsyncMock,
+        return_value=[],
+    ), patch(
+        "src.nodes.retriever_node._retrieve_style_guidance",
+        new_callable=AsyncMock,
+        return_value="",
+    ), patch(
+        "src.nodes.retriever_node._retrieve_user_preferences",
+        new_callable=AsyncMock,
+        return_value=[],
+    ), patch(
+        "src.utils.image_analyzer.analyze_images",
+        new_callable=AsyncMock,
+        return_value="图表显示本月成本下降 12%。",
+    ) as analyze:
+        result = await retrieve_context(state, dependencies)
+
+    analyze.assert_awaited_once_with(
+        [
+            {
+                "name": "chart.png",
+                "content": "SU1BR0UtQllURVM=",
+                "mime_type": "image/png",
+            }
+        ]
+    )
+    assert dependencies.content_store.loads == [(_ref(), False), (_ref(), True)]
+    assert result["metadata"]["image_analysis"] == "图表显示本月成本下降 12%。"
+    encoded = json.dumps(result, ensure_ascii=False)
+    assert "SU1BR0UtQllURVM=" not in encoded
+    assert "attachments" not in result
+    assert "email" not in result
 
 
 @pytest.mark.asyncio
