@@ -8,7 +8,9 @@ from src.config import get_settings
 def is_direct_recipient(email: dict, me: str | None = None) -> bool:
     """配置邮箱是否出现在邮件 To 收件人中（子串、大小写不敏感）。
 
-    `me` 为空时从 EXCHANGE_ACCOUNT_EMAIL 读取；仍为空则兜底返回 True。
+    同时兼容标准化后的 ``to`` 和 Exchange 详情原始字段
+    ``to_recipients``。`me` 为空时从 EXCHANGE_ACCOUNT_EMAIL 读取；
+    仍为空则兜底返回 True。
     """
     if me is None:
         me = get_settings().EXCHANGE_ACCOUNT_EMAIL or ""
@@ -16,7 +18,7 @@ def is_direct_recipient(email: dict, me: str | None = None) -> bool:
     if not me:
         return True
 
-    to_list = email.get("to") or []
+    to_list = email.get("to") or email.get("to_recipients") or []
     if isinstance(to_list, str):
         to_list = [to_list]
     return any(me in str(t).lower() for t in to_list)

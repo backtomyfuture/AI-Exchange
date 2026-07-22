@@ -72,3 +72,21 @@ def test_decide_notification_kind(classification, email, expected):
     with patch("src.utils.notification_policy.get_settings",
                return_value=_settings(me="me@example.com", leaders="vp@corp.com")):
         assert np.decide_notification_kind(classification, email) == expected
+
+
+def test_exchange_to_recipients_direct_recipient_gets_read_notification():
+    email = {
+        "to_recipients": [
+            "Mailbox(name='同名用户3', email_address='me@example.com', "
+            "routing_type='SMTP', mailbox_type='Mailbox')"
+        ],
+        "cc_recipients": [],
+        "sender": "sender@example.com",
+    }
+    classification = _cls(need_reply=False, intent="通知", priority="P2")
+
+    with patch(
+        "src.utils.notification_policy.get_settings",
+        return_value=_settings(me="me@example.com"),
+    ):
+        assert np.decide_notification_kind(classification, email) == "read_only"

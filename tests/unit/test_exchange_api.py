@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
@@ -228,6 +230,38 @@ async def test_get_email_returns_none_for_non_object_data(mock_settings):
         email = await client.get_email("email-id")
 
     assert email is None
+
+
+@pytest.mark.asyncio
+async def test_get_email_adds_canonical_recipient_fields(mock_settings):
+    raw_email = {
+        "id": "email-id",
+        "to_recipients": [
+            "Mailbox(name='同名用户3', email_address='me@example.com')"
+        ],
+        "cc_recipients": [
+            "Mailbox(name='抄送用户', email_address='cc@example.com')"
+        ],
+    }
+    response_body = json.dumps({"data": raw_email}, ensure_ascii=False).encode()
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = StreamingHTTPClient(
+        [StreamingResponse(200, [response_body])]
+    )
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        email = await client.get_email("email-id")
+
+    assert email == {
+        **raw_email,
+        "to": raw_email["to_recipients"],
+        "cc": raw_email["cc_recipients"],
+    }
 
 
 @pytest.mark.asyncio
