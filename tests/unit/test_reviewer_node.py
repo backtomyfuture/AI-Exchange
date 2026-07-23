@@ -29,7 +29,7 @@ async def test_review_pass(graph_node_harness):
     mock_prompt = MagicMock()
     mock_prompt.__or__ = MagicMock(return_value=mock_chain)
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm", return_value=mock_llm), \
+    with patch("src.providers.factory.get_llm_for_role", return_value=mock_llm), \
          patch("src.nodes.reviewer.with_llm_retry", side_effect=_passthrough_retry), \
          patch("src.nodes.reviewer.ChatPromptTemplate") as mock_ct:
         mock_ct.from_messages.return_value = mock_prompt
@@ -59,7 +59,7 @@ async def test_review_fail_triggers_rewrite(graph_node_harness):
     mock_prompt = MagicMock()
     mock_prompt.__or__ = MagicMock(return_value=mock_chain)
 
-    with patch("src.utils.llm_factory.LLMFactory.create_llm", return_value=mock_llm), \
+    with patch("src.providers.factory.get_llm_for_role", return_value=mock_llm), \
          patch("src.nodes.reviewer.with_llm_retry", side_effect=_passthrough_retry), \
          patch("src.nodes.reviewer.ChatPromptTemplate") as mock_ct:
         mock_ct.from_messages.return_value = mock_prompt

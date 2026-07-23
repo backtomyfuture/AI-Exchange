@@ -29,13 +29,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("skill_discovery")
 
-from src.skills_discovery.analyzer import (
+from src.skills_discovery.analyzer import (  # noqa: E402
     DiscoveredPattern,
     EmailHistoryCollector,
     EmailRecord,
     PatternAnalyzer,
 )
-from src.skills_discovery.generator import write_skill
+from src.skills_discovery.generator import write_skill  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

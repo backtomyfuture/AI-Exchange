@@ -15,7 +15,6 @@ import pytest
 from psycopg.errors import UniqueViolation
 from psycopg.pq import TransactionStatus
 
-import src.ingestion as ingestion_boundary
 import src.ingestion.cold_start as cold_start_module
 from src.domain.errors import (
     DatabaseOperationError,
@@ -1007,22 +1006,6 @@ def test_cold_start_origin_port_has_the_frozen_async_signature() -> None:
         "limit": int,
         "return": SyncBatch,
     }
-
-
-def test_cold_start_public_boundary_exports_are_complete() -> None:
-    names = (
-        "ColdStartOriginPort",
-        "ColdStartPlanNotFoundError",
-        "ColdStartPlanState",
-        "ColdStartPlanView",
-        "ColdStartRunResult",
-        "ColdStartRunStatus",
-        "ColdStartSample",
-        "ColdStartService",
-        "ColdStartStateConflictError",
-    )
-
-    assert all(getattr(ingestion_boundary, name) is globals()[name] for name in names)
 
 
 @pytest.mark.asyncio

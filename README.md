@@ -1,12 +1,12 @@
 # AI Email Assistant (Enterprise Edition)
 
-这是一个为企业环境设计的高级 AI 邮件处理系统。它利用 Gemini 3 Flash 进行智能推理，Qdrant 作为向量数据库（RAG），并使用 LangGraph 编排复杂的 Agent 工作流。系统通过飞书 (Lark) 与用户进行审批互动。
+这是一个为企业环境设计的 AI 邮件处理系统。它通过可配置 Provider 调用模型，使用 Qdrant 提供历史检索，并由 LangGraph 编排可持久化的 Agent 工作流。系统通过飞书 (Lark) 与用户进行审批互动。
 
 ## 核心功能
 
 1.  **可靠收件**: 以 Exchange Webhook 为主通道，先写入 PostgreSQL Durable Inbox，再异步处理；当前不启用轮询。
 2.  **智能分类**: 使用 LLM 识别邮件意图，判断是否需要回复及其紧急程度。
-3.  **多模态 RAG**: 支持提取邮件文本和图片描述，并存储在 Qdrant 中作为历史背景。
+3.  **历史检索**: 将经过内容投影的邮件文本写入 Qdrant；图片只按需分析，Base64、data URI 和附件字节不会进入向量库。
 4.  **人机协作 (Human-in-the-Loop)**:
     -   系统生成回复草稿并通过飞书交互式卡片推送给用户。
     -   用户可以点击“通过”、“拒绝”或“修改”建议。
@@ -16,7 +16,7 @@
 
 -   **编排层**: `LangGraph` (基于 Postgres 的状态持久化)。
 -   **向量数据库**: `Qdrant` (存储邮件嵌入向量，支持语义搜索)。
--   **推理引擎**: `Gemini 3 Flash` (通过 OpenAI Adapter 调用)。
+-   **推理引擎**: 通过 `src/providers/` 为不同角色选择模型和 Adapter。
 -   **集成端口**:
     -   `Exchange API`: 自定义适配器，处理邮件收发和状态更新。
     -   `Lark (飞书)`: 采用 WebSocket (长连接) 监听回调，HTTP API 发送交互卡片。
@@ -297,14 +297,16 @@ cutover/production-ready 声明，而是面向可清空测试数据、单账户�
 
 -   `src/graph`: 定义 LangGraph 状态机和工作流逻辑。
 -   `src/nodes`: 工作流中的各个功能节点（分类、检索、草稿、发送）。
--   `src/utils`: 核心组件（Exchange 客户端、飞书应用、数据库管理器、RAG 引擎）。
--   `src/scripts`: 辅助脚本（模型检查、Exchange API 测试等）。
+-   `src/ingestion`: Durable Inbox、租约、策略和唯一运行时。
+-   `src/router` 与 `skills_registry`: Tiered Router 和生产 Skill。
+-   `src/utils`: Exchange、飞书、数据库与检索实现。
+-   `scripts`: 部署、维护、PST 导入和 Skill Discovery 入口。
 
 ## 运维建议
 
 -   **监控日志**: 核心日志输出在控制台，可通过 Docker logs 查看。
 -   **数据库管理**: Postgres 存储了所有的 LangGraph checkpoints，支持在服务重启后恢复处理中的任务。
--   **模型切换**: 推荐使用 Gemini 3 Flash 以获得最佳的性价比平衡。
+-   **模型切换**: 在 Provider 配置中按角色选择模型，不让供应商细节进入业务 module。
 
 ---
-**Last Updated**: 2026-07-17
+**Last Updated**: 2026-07-22

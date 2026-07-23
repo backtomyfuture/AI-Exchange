@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,17 +54,10 @@ _RUNTIME_EXACT_FILENAMES = frozenset({"exchange_service.py", "main.py", "server.
 _RUNTIME_PATH_MARKERS = ("scheduler", "startup", "worker")
 _RUNTIME_SCAN_EXEMPT_PATHS = frozenset(
     {
-        "src/ingestion/__init__.py",
         "src/ingestion/cold_start.py",
         "src/ingestion/sync.py",
     }
 )
-_REVIEWED_EXPORT_ONLY_EXEMPT_AST_SHA256 = {
-    "src/ingestion/__init__.py": (
-        "66d3fdb92975bce8a13df703b1a4e7dcec28463c691224832b950cadaeaf86bd"
-    ),
-}
-_EXPORT_ONLY_IMPORT_PREFIX = "src.ingestion."
 _RUNTIME_SERVICE_KEYS = frozenset(
     {
         "cold_start",
@@ -2585,130 +2577,6 @@ def _static_local_import_paths(path: Path, *, project_root: Path) -> list[Path]:
     return list(dict.fromkeys(imports))
 
 
-def _normalized_module_ast_sha256(tree: ast.Module) -> str:
-    payload = ast.dump(tree, include_attributes=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _export_only_exemption_violations(
-    tree: ast.Module,
-    *,
-    filename: str,
-) -> list[_Violation]:
-    violations: list[_Violation] = []
-    imported_bindings: set[str] = set()
-    exported_names: tuple[str, ...] | None = None
-    export_node: ast.AST = tree
-
-    def reject(node: ast.AST, detail: str) -> None:
-        violations.append(
-            _Violation(
-                filename=filename,
-                lineno=int(getattr(node, "lineno", 1)),
-                col_offset=int(getattr(node, "col_offset", 0)),
-                code="runtime_exemption_effect",
-                detail=detail,
-            )
-        )
-
-    for index, statement in enumerate(tree.body):
-        if (
-            index == 0
-            and isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        ):
-            continue
-        if isinstance(statement, ast.ImportFrom):
-            module = statement.module or ""
-            if (
-                statement.level != 0
-                or not module.startswith(_EXPORT_ONLY_IMPORT_PREFIX)
-                or any(alias.name == "*" for alias in statement.names)
-            ):
-                reject(
-                    statement,
-                    "runtime export exemption contains a non-domain or wildcard import",
-                )
-                continue
-            imported_bindings.update(
-                alias.asname or alias.name for alias in statement.names
-            )
-            continue
-        if (
-            isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and isinstance(statement.targets[0], ast.Name)
-            and statement.targets[0].id == "__all__"
-            and exported_names is None
-            and isinstance(statement.value, (ast.List, ast.Tuple))
-            and all(
-                isinstance(element, ast.Constant) and isinstance(element.value, str)
-                for element in statement.value.elts
-            )
-        ):
-            export_node = statement
-            exported_names = tuple(
-                element.value
-                for element in statement.value.elts
-                if isinstance(element, ast.Constant) and isinstance(element.value, str)
-            )
-            continue
-        reject(
-            statement,
-            "runtime export exemption may contain only static re-exports and __all__",
-        )
-
-    if exported_names is None:
-        reject(tree, "runtime export exemption must declare a constant __all__")
-    elif (
-        len(exported_names) != len(set(exported_names))
-        or set(exported_names) != imported_bindings
-    ):
-        reject(
-            export_node,
-            "runtime export exemption __all__ must exactly match imported bindings",
-        )
-    return violations
-
-
-def _scan_export_only_runtime_exemption_path(
-    path: Path,
-    *,
-    project_root: Path,
-    enforce_reviewed_hash: bool = False,
-) -> list[_Violation]:
-    filename = path.relative_to(project_root).as_posix()
-    try:
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=filename)
-    except (OSError, UnicodeError, SyntaxError, ValueError) as error:
-        return [
-            _Violation(
-                filename=filename,
-                lineno=int(getattr(error, "lineno", 1) or 1),
-                col_offset=int(getattr(error, "offset", 0) or 0),
-                code="runtime_exemption_effect",
-                detail="runtime export exemption cannot be parsed and reviewed",
-            )
-        ]
-    violations = _export_only_exemption_violations(tree, filename=filename)
-    expected_hash = _REVIEWED_EXPORT_ONLY_EXEMPT_AST_SHA256.get(filename)
-    if enforce_reviewed_hash and (
-        expected_hash is None or _normalized_module_ast_sha256(tree) != expected_hash
-    ):
-        violations.append(
-            _Violation(
-                filename=filename,
-                lineno=1,
-                col_offset=0,
-                code="runtime_exemption_drift",
-                detail="runtime export exemption differs from the reviewed AST",
-            )
-        )
-    return sorted(set(violations))
-
-
 def _production_runtime_entrypoints(project_root: Path) -> list[Path]:
     src_root = project_root / "src"
     roots = sorted(
@@ -3003,7 +2871,6 @@ def test_runtime_entrypoint_path_classifier_is_fail_closed(
 def test_production_runtime_entrypoints_keep_sync_services_dormant() -> None:
     project_root = Path(__file__).resolve().parents[2]
     candidates = _production_runtime_entrypoints(project_root)
-    export_only_exemption = project_root / "src/ingestion/__init__.py"
     relative_candidates = {
         path.relative_to(project_root).as_posix() for path in candidates
     }
@@ -3011,9 +2878,6 @@ def test_production_runtime_entrypoints_keep_sync_services_dormant() -> None:
         "src/main.py",
         "src/server.py",
         "src/exchange_service.py",
-        "src/scheduler/__init__.py",
-        "src/scheduler/daily_summary.py",
-        "src/scheduler/polling.py",
     } <= relative_candidates
 
     violations = [
@@ -3021,14 +2885,6 @@ def test_production_runtime_entrypoints_keep_sync_services_dormant() -> None:
         for path in candidates
         for violation in _scan_runtime_path(path, project_root=project_root)
     ]
-    violations.extend(
-        _scan_export_only_runtime_exemption_path(
-            export_only_exemption,
-            project_root=project_root,
-            enforce_reviewed_hash=True,
-        )
-    )
-
     assert violations == [], (
         "SyncCoordinator and ColdStartService must remain dormant in every runtime "
         f"entrypoint: {violations}"
@@ -4627,70 +4483,3 @@ def configure(cache, payload):
 )
 def test_detector_allows_v5_safe_unbound_and_mutation_patterns(source: str) -> None:
     assert _scan_runtime_source(source, filename="src/main.py") == []
-
-
-@pytest.mark.parametrize(
-    "runtime_effect",
-    (
-        pytest.param(
-            "service = ColdStartService()\n",
-            id="constructor",
-        ),
-        pytest.param(
-            'registry["sync"] = ColdStartService\n',
-            id="registry-assignment",
-        ),
-        pytest.param(
-            'service.run_folder(8, "INBOX")\n',
-            id="run-folder-call",
-        ),
-        pytest.param(
-            'service.apply("plan-1")\n',
-            id="apply-call",
-        ),
-    ),
-)
-def test_export_only_runtime_exemption_rejects_appended_effects(
-    tmp_path: Path,
-    runtime_effect: str,
-) -> None:
-    path = tmp_path / "src/ingestion/__init__.py"
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        '"""Dormant ingestion exports."""\n\n'
-        "from src.ingestion.cold_start import ColdStartService\n"
-        "from src.ingestion.sync import SyncCoordinator\n\n"
-        '__all__ = ["ColdStartService", "SyncCoordinator"]\n\n' + runtime_effect,
-        encoding="utf-8",
-    )
-
-    violations = _scan_export_only_runtime_exemption_path(
-        path,
-        project_root=tmp_path,
-    )
-
-    assert "runtime_exemption_effect" in {violation.code for violation in violations}, (
-        violations
-    )
-
-
-def test_export_only_runtime_exemption_allows_exact_static_reexports(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "src/ingestion/__init__.py"
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        '"""Dormant ingestion exports."""\n\n'
-        "from src.ingestion.cold_start import ColdStartService\n"
-        "from src.ingestion.sync import SyncCoordinator\n\n"
-        '__all__ = ["ColdStartService", "SyncCoordinator"]\n',
-        encoding="utf-8",
-    )
-
-    assert (
-        _scan_export_only_runtime_exemption_path(
-            path,
-            project_root=tmp_path,
-        )
-        == []
-    )

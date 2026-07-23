@@ -3,6 +3,31 @@ from unittest.mock import patch, AsyncMock, MagicMock
 from langchain_core.runnables import RunnableLambda
 
 
+def _forward_skill():
+    skill = MagicMock()
+    skill.manifest.name = "Test forward"
+    skill.manifest.depends_on = None
+
+    async def execute(state):
+        classification = dict(state.get("classification") or {})
+        classification.update(
+            {
+                "priority": "P0",
+                "need_reply": True,
+                "intent": "转发",
+                "action": "forward",
+                "reasoning": "test forward skill",
+            }
+        )
+        email = dict(state.get("email") or {})
+        email["draft_to"] = ["forward-target@example.com"]
+        email["draft_cc"] = []
+        return {"classification": classification, "email": email, "draft": "test forward"}
+
+    skill.execute = AsyncMock(side_effect=execute)
+    return skill
+
+
 def _fixed_classification(result):
     def retry_factory(**_kwargs):
         def decorator(_function):
@@ -124,25 +149,21 @@ async def test_real_forward_skill_projects_safe_recipients_and_draft(
     graph_node_harness,
     tier,
 ):
-    from skills_registry.skill_forward_boss.handler import Skill as ForwardBossSkill
     from src.nodes.categorizer import categorize_email
     from src.router.engine import RoutingEngine
 
-    manifest = MagicMock()
-    manifest.name = "Forward to Boss Verification"
-    manifest.depends_on = None
-    forward_skill = ForwardBossSkill(manifest)
+    forward_skill = _forward_skill()
     engine = RoutingEngine()
     engine.skill_manager.get_all_skills = MagicMock(
-        return_value={"skill_forward_boss": forward_skill}
+        return_value={"test_forward": forward_skill}
     )
     engine.skill_manager.get_skill = MagicMock(return_value=forward_skill)
 
     if tier == "tier1":
-        engine.t1_router.route = MagicMock(return_value=["skill_forward_boss"])
+        engine.t1_router.route = MagicMock(return_value=["test_forward"])
     else:
         engine.t1_router.route = MagicMock(return_value=[])
-        engine._tier3_llm_route = AsyncMock(return_value=["skill_forward_boss"])
+        engine._tier3_llm_route = AsyncMock(return_value=["test_forward"])
 
     state = graph_node_harness.state(
         {
@@ -158,9 +179,9 @@ async def test_real_forward_skill_projects_safe_recipients_and_draft(
         result = await categorize_email(state, graph_node_harness.dependencies)
 
     assert result["classification"]["action"] == "forward"
-    assert result["draft_to"] == ["boss@company.com"]
+    assert result["draft_to"] == ["forward-target@example.com"]
     assert result["draft_cc"] == []
     assert result["draft_id"] == f"forward-{tier}"
-    assert graph_node_harness.draft_saves == [(f"forward-{tier}", "呈阅")]
+    assert graph_node_harness.draft_saves == [(f"forward-{tier}", "test forward")]
     assert "email" not in result
     assert "draft" not in result

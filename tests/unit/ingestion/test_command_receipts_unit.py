@@ -276,16 +276,6 @@ def test_datetime_normalizer_rejects_hostile_nonexact_normalized_result() -> Non
         command_receipts._normalize_database_datetime(value)
 
 
-def test_public_ingestion_api_exports_receipt_contract() -> None:
-    from src import ingestion
-
-    assert ingestion.CommandReceipt is command_receipts.CommandReceipt
-    assert (
-        ingestion.CommandReceiptRepository is command_receipts.CommandReceiptRepository
-    )
-    assert ingestion.IdempotencyConflict is command_receipts.IdempotencyConflict
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),

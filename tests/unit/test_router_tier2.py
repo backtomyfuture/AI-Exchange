@@ -27,6 +27,31 @@ def _hit(email_id, skills):
     return {"id": email_id, "active_skills": skills}
 
 
+def _forward_skill():
+    skill = MagicMock()
+    skill.manifest.name = "Test forward"
+    skill.manifest.depends_on = None
+
+    async def execute(state):
+        classification = dict(state.get("classification") or {})
+        classification.update(
+            {
+                "priority": "P0",
+                "need_reply": True,
+                "intent": "转发",
+                "action": "forward",
+                "reasoning": "test forward skill",
+            }
+        )
+        email = dict(state.get("email") or {})
+        email["draft_to"] = ["forward-target@example.com"]
+        email["draft_cc"] = []
+        return {"classification": classification, "email": email, "draft": "test forward"}
+
+    skill.execute = AsyncMock(side_effect=execute)
+    return skill
+
+
 def test_tier2_activates_when_skill_majority_hits(engine_with_skill_pool):
     engine, pool = engine_with_skill_pool
     hits = [
@@ -205,30 +230,26 @@ async def test_real_mutating_forward_skill_projects_recipients_and_draft_store(
     monkeypatch,
     graph_node_harness,
 ):
-    from skills_registry.skill_forward_boss.handler import Skill as ForwardBossSkill
     from src.nodes import retriever_node
 
     engine = RoutingEngine()
-    manifest = MagicMock()
-    manifest.name = "Forward to Boss Verification"
-    manifest.depends_on = None
-    forward_skill = ForwardBossSkill(manifest)
+    forward_skill = _forward_skill()
     monkeypatch.setattr(
         engine.skill_manager,
         "get_all_skills",
-        lambda: {"skill_forward_boss": forward_skill},
+        lambda: {"test_forward": forward_skill},
     )
     monkeypatch.setattr(
         engine.skill_manager,
         "get_skill",
-        lambda skill_id: forward_skill if skill_id == "skill_forward_boss" else None,
+        lambda skill_id: forward_skill if skill_id == "test_forward" else None,
     )
     monkeypatch.setattr(retriever_node, "get_routing_engine", lambda: engine)
 
     fake_retriever = MagicMock()
     fake_retriever.search.return_value = [
-        _hit("old-1", ["skill_forward_boss"]),
-        _hit("old-2", ["skill_forward_boss"]),
+        _hit("old-1", ["test_forward"]),
+        _hit("old-2", ["test_forward"]),
     ]
     monkeypatch.setattr(retriever_node, "get_retriever", lambda: fake_retriever)
     monkeypatch.setattr(
@@ -274,11 +295,11 @@ async def test_real_mutating_forward_skill_projects_recipients_and_draft_store(
     updates = await retrieve_context(state, graph_node_harness.dependencies)
 
     assert updates["classification"]["action"] == "forward"
-    assert updates["draft_to"] == ["boss@company.com"]
+    assert updates["draft_to"] == ["forward-target@example.com"]
     assert updates["draft_cc"] == []
     assert updates["draft_id"] == "forward-tier-two"
-    assert graph_node_harness.draft_saves == [("forward-tier-two", "呈阅")]
-    assert updates["active_skills"] == ["skill_existing", "skill_forward_boss"]
+    assert graph_node_harness.draft_saves == [("forward-tier-two", "test forward")]
+    assert updates["active_skills"] == ["skill_existing", "test_forward"]
     assert "draft" not in updates
     assert "email" not in updates
     assert state == before

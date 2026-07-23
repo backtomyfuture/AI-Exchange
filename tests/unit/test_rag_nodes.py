@@ -43,7 +43,7 @@ async def test_retrieve_context(
     mock_instance.search.assert_called()
 
 @pytest.mark.asyncio
-@patch("src.utils.llm_factory.LLMFactory.create_llm")
+@patch("src.providers.factory.get_llm_for_role")
 @patch("src.nodes.drafter.ChatPromptTemplate")
 async def test_generate_draft(
     mock_prompt_class,

@@ -4,10 +4,7 @@ import ast
 import inspect
 from pathlib import Path
 
-from src.exchange_service import (
-    WebhookWorker,
-    process_and_archive_email_guarded,
-)
+from src.exchange_service import process_and_archive_email_guarded
 from src.ingestion.legacy_adapter import LegacyProcessingAdapter
 from src.ingestion.processing import ExternalEffectKind
 
@@ -21,7 +18,6 @@ LIVE_ROOTS = (
     ROOT / "src" / "server.py",
     ROOT / "src" / "init_app.py",
     ROOT / "src" / "exchange_service.py",
-    ROOT / "src" / "scheduler",
 )
 DIRECT_EFFECT_FUNCTIONS = frozenset(
     {
@@ -48,17 +44,6 @@ def _python_files(path: Path):
 
 def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
-
-def _method_node(tree: ast.Module, class_name: str, method_name: str):
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == class_name:
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-                    item.name == method_name
-                ):
-                    return item
-    raise AssertionError(f"missing {class_name}.{method_name}")
 
 
 def test_guarded_entry_and_adapter_require_injected_async_effect_port() -> None:
@@ -117,19 +102,6 @@ def test_legacy_adapter_has_exactly_one_runtime_factory_wiring() -> None:
         and node.func.id == "LegacyProcessingAdapter"
     ]
     assert len(constructors) == 1
-
-
-def test_webhook_worker_remains_on_unchanged_unguarded_live_entry() -> None:
-    tree = _tree(EXCHANGE_SERVICE)
-    process_one = _method_node(tree, WebhookWorker.__name__, "_process_one")
-    called_names = {
-        node.func.id
-        for node in ast.walk(process_one)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-
-    assert "process_and_archive_email" in called_names
-    assert "process_and_archive_email_guarded" not in called_names
 
 
 def test_every_legacy_external_call_owner_has_an_effect_authorization_gate() -> None:

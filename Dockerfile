@@ -38,13 +38,9 @@ RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple --only-binary=:all: --require-hashes -r /tmp/requirements.lock && \
     rm -f /tmp/requirements.lock
 
-# 复制字体文件
-COPY fonts /usr/share/fonts/truetype/custom
-RUN fc-cache -fv
-
 # 只复制生产运行时所需内容，避免测试夹具、文档和本地工件进入镜像。
 COPY src ./src
-COPY scripts ./scripts
+COPY scripts/manage_ingestion.py scripts/checkpoint_cleanup.py ./scripts/
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY skills_registry ./skills_registry

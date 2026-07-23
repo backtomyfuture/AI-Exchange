@@ -31,12 +31,7 @@ except (ImportError, OSError) as e:
         def __init__(self, *args, **kwargs): pass
 
 
-# Font Path Configuration
-# In Docker, we put fonts in /usr/share/fonts/truetype/custom
-# WeasyPrint relies on FontConfig/Pango to find fonts.
-# We don't need to manually load the file if the system finds it.
-# We just need to make sure the CSS font-family matches the font name.
-# "Arial Unicode MS" is usually the family name for "Arial Unicode.ttf".
+# WeasyPrint relies on FontConfig/Pango to find the system Noto CJK fonts.
 
 def convert_html_to_pdf(html_content: str) -> bytes:
     """
@@ -61,9 +56,6 @@ def convert_html_to_pdf(html_content: str) -> bytes:
         return b""
 
     try:
-        # Define CSS to force usage of Chinese-capable font
-        # Assuming the font file 'Arial Unicode.ttf' installs 'Arial Unicode MS'
-        
         # Suppress "Ignored `border-*:solid windowtext 1.0pt` at ... invalid value" warnings
         # by replacing the MS Word specific 'windowtext' color with standard 'black'
         assets = getattr(html_content, "assets", {})

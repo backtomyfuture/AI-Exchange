@@ -555,22 +555,6 @@ async def hide_production_only_surfaces(request: Request, call_next):
     ):
         return JSONResponse(status_code=404, content={"detail": "Not found"})
     return await call_next(request)
-
-
-def _get_app_context():
-    """
-    Lazy import to avoid loading heavy graph dependencies during lightweight API tests.
-    """
-    from src.init_app import get_app_context
-
-    return get_app_context()
-
-
-def get_app_context():
-    """Backward-compatible alias for tests and legacy imports."""
-    return _get_app_context()
-
-
 @app.get("/health")
 async def health_check():
     """Dependency-free liveness endpoint used by Docker and supervisors."""

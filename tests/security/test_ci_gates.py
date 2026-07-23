@@ -130,6 +130,21 @@ def test_ruff_is_an_exact_dev_dependency_excluded_from_production_export() -> No
     assert "uv export --frozen --no-dev --no-emit-project" in workflow
 
 
+def test_test_frameworks_are_dev_dependencies_excluded_from_production() -> None:
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    production = set(pyproject["project"]["dependencies"])
+    development = set(pyproject["dependency-groups"]["dev"])
+
+    expected = {
+        "pytest>=9.0.0",
+        "pytest-asyncio>=0.25.0",
+        "pytest-cov>=6.0.0",
+        "pytest-mock>=3.14.0",
+    }
+    assert expected <= development
+    assert production.isdisjoint(expected)
+
+
 def test_phase2_ci_proves_hashed_runtime_wheels_exist_for_linux_architectures() -> None:
     workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
     normalized_workflow = " ".join(workflow.split())

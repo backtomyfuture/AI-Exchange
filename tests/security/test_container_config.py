@@ -642,11 +642,13 @@ def test_dockerfile_copies_only_the_explicit_runtime_allowlist():
     assert "COPY . ." not in dockerfile_lines
     assert {
         "COPY src ./src",
-        "COPY scripts ./scripts",
+        "COPY scripts/manage_ingestion.py scripts/checkpoint_cleanup.py ./scripts/",
         "COPY alembic ./alembic",
         "COPY alembic.ini ./alembic.ini",
         "COPY skills_registry ./skills_registry",
     } <= dockerfile_lines
+    assert "COPY scripts ./scripts" not in dockerfile_lines
+    assert not any(line.startswith("COPY fonts") for line in dockerfile_lines)
 
 
 def test_vcs_ignores_coverage_artifacts_and_keeps_bootstrap_lockfile():

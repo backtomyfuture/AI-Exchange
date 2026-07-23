@@ -281,33 +281,6 @@ def _email_database_row(**overrides: object) -> dict[str, object]:
     return values
 
 
-def test_ingestion_boundary_exports_only_the_production_repository() -> None:
-    import src.ingestion as ingestion
-
-    assert ingestion.InboxRepository is InboxRepository
-    public_methods = {
-        name for name in InboxRepository.__dict__ if not name.startswith("_")
-    }
-    assert {
-        "insert",
-        "claim_batch",
-        "renew",
-        "begin_effect",
-        "recover_expired_leases",
-        "complete",
-        "fail",
-        "stats",
-    }.issubset(public_methods)
-    assert {
-        "get",
-        "status",
-        "audit_count",
-        "seed_lease",
-        "expire_for_test",
-        "seed_pending_policy",
-    }.isdisjoint(public_methods)
-
-
 def test_invalid_schema_text_is_rejected_without_database_access() -> None:
     with pytest.raises(ValueError, match="valid UTF-8"):
         InboxRepository(_NeverPool(), target_schema="\ud800")

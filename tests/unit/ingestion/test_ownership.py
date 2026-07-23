@@ -202,15 +202,6 @@ def test_phase2_exposes_no_public_generation_switch() -> None:
     }.intersection(transaction_methods)
 
 
-def test_ingestion_boundary_exports_ownership_contract() -> None:
-    import src.ingestion as ingestion
-
-    assert ingestion.PipelineOwnershipRepository is PipelineOwnershipRepository
-    assert ingestion.PipelineRetirementBlocked is PipelineRetirementBlocked
-    assert ingestion.RetirementBlockCode is RetirementBlockCode
-    assert not hasattr(ingestion, "PipelineOwnershipTransaction")
-
-
 @pytest.mark.asyncio
 async def test_can_execute_returns_false_only_for_a_stale_fence(monkeypatch) -> None:
     ownership = PipelineOwnershipRepository(_NeverPool())

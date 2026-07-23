@@ -6,19 +6,6 @@ import inspect
 import re
 from pathlib import Path
 
-import src.ingestion as ingestion
-from src.ingestion.email_events import (
-    EMAIL_STATUS_TRANSITIONS,
-    EmailEventApplication,
-    EmailEventDecision,
-    EmailEventDisposition,
-    EmailEventReason,
-    EmailStatus,
-    decide_email_event,
-)
-from src.ingestion.repository import EmailEventTransaction, InboxRepository
-
-
 _SQL_EXECUTION_METHODS = frozenset(
     {"copy", "copy_expert", "execute", "executemany", "exec_driver_sql"}
 )
@@ -42,11 +29,6 @@ _TRUSTED_TABLE_PREFIX = "__task5_trusted_schema__"
 _TRUSTED_TABLE_MARKER_ATTRIBUTE = "_task5_trusted_table_marker"
 _NON_SQL_EXECUTION_CALLS = frozenset(
     {
-        (
-            "scripts/manual_exchange_test.py",
-            "test_search",
-            "headers.copy",
-        ),
         (
             "src/router/engine.py",
             "RoutingEngine._apply_skills",
@@ -322,7 +304,7 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/exchange_service.py": (
-        "2a278b19c307ab4e75fac4a3c977c1ac1de6d2be44fa91768d9ed0e12a4f8170"
+        "60d2fdc3ae5f60ad9e2e76ee79218f725669fb69a884f698ac0bed7249f9b39e"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
@@ -446,7 +428,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "97f3b9269f9193fda02bfeffdd0ee20007015abb0d216e81409fd8f4a5ea08c9"
+        "3ace800944a20e292dc5c48e09d837bcc4d883e9caeb54aacc9f2194fd22923a"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
@@ -473,9 +455,6 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     ],
 }
 _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
-    "scripts/manual_exchange_test.py": (
-        "df77d3f8aca82be9cb4ec9af74ed87682c9dfa4e555c8e55157a09dd66ab7b86"
-    ),
     "src/router/engine.py": (
         "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
     ),
@@ -2342,19 +2321,3 @@ def test_non_sql_exception_files_require_explicit_structural_review() -> None:
         "Non-SQL exception structural review required before updating the "
         f"approved normalized AST SHA-256: expected {expected}, got {actual}"
     )
-
-
-def test_public_ingestion_boundary_exports_email_event_contract() -> None:
-    expected = {
-        "EMAIL_STATUS_TRANSITIONS": EMAIL_STATUS_TRANSITIONS,
-        "EmailEventApplication": EmailEventApplication,
-        "EmailEventDecision": EmailEventDecision,
-        "EmailEventDisposition": EmailEventDisposition,
-        "EmailEventReason": EmailEventReason,
-        "EmailEventTransaction": EmailEventTransaction,
-        "EmailStatus": EmailStatus,
-        "InboxRepository": InboxRepository,
-        "decide_email_event": decide_email_event,
-    }
-
-    assert {name: getattr(ingestion, name, None) for name in expected} == expected
