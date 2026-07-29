@@ -102,7 +102,6 @@ class _Runtime:
     def __init__(self, events: list[str], *, start_error: Exception | None = None):
         self.events = events
         self.start_error = start_error
-        self.webhook_ingress_service = object()
 
     async def start(self) -> None:
         self.events.append("runtime.start")
@@ -129,7 +128,7 @@ class _Context:
 
 
 @pytest.mark.asyncio
-async def test_single_lifespan_publishes_after_start_and_unpublishes_before_stop():
+async def test_single_lifespan_publishes_only_runtime_after_start():
     events: list[str] = []
     settings = SimpleNamespace()
     runtime = _Runtime(events)
@@ -156,13 +155,10 @@ async def test_single_lifespan_publishes_after_start_and_unpublishes_before_stop
     ):
         async with server_module.application_lifespan(application):
             assert application.state.ingestion_runtime is runtime
-            assert (
-                application.state.webhook_ingress_service
-                is runtime.webhook_ingress_service
-            )
+            assert not hasattr(application.state, "webhook_ingress_service")
             events.append("serving")
 
-    assert application.state.webhook_ingress_service is None
+    assert not hasattr(application.state, "webhook_ingress_service")
     assert application.state.ingestion_runtime is None
     assert events == [
         "security",
@@ -220,7 +216,7 @@ async def test_runtime_start_failure_is_stopped_released_and_never_published():
             async with server_module.application_lifespan(application):
                 raise AssertionError("lifespan must not yield")
 
-    assert application.state.webhook_ingress_service is None
+    assert not hasattr(application.state, "webhook_ingress_service")
     assert application.state.ingestion_runtime is None
     assert events == [
         "context.create",
@@ -401,7 +397,7 @@ async def test_processing_lifespan_starts_before_publish_and_closes_fence_last()
     ):
         async with server_module.application_lifespan(application):
             assert application.state.ingestion_runtime is runtime
-            assert application.state.webhook_ingress_service is runtime.webhook_ingress_service
+            assert not hasattr(application.state, "webhook_ingress_service")
             events.append("serving")
 
     fence_factory.assert_called_once_with(
@@ -409,7 +405,7 @@ async def test_processing_lifespan_starts_before_publish_and_closes_fence_last()
         fail_stop=server_module._fail_stop_after_checkpoint_fence_loss,
     )
     assert application.state.ingestion_runtime is None
-    assert application.state.webhook_ingress_service is None
+    assert not hasattr(application.state, "webhook_ingress_service")
     assert events == [
         "security",
         "database.preflight",
@@ -445,7 +441,6 @@ async def test_lark_ws_startup_timeout_never_starts_worker_and_cleans_owned_reso
     runtime = SimpleNamespace(
         start=AsyncMock(),
         stop=AsyncMock(),
-        webhook_ingress_service=object(),
     )
     context = SimpleNamespace(
         create_ingestion_runtime=MagicMock(return_value=runtime),
@@ -584,7 +579,6 @@ async def test_primary_startup_failure_is_not_replaced_by_cleanup_failure() -> N
     application = SimpleNamespace(state=SimpleNamespace())
     settings = SimpleNamespace(DURABLE_INBOX_ENABLED=False)
     runtime = SimpleNamespace(
-        webhook_ingress_service=object(),
         start=AsyncMock(side_effect=RuntimeError("registration_failed")),
         stop=AsyncMock(side_effect=RuntimeError("stop_failed")),
     )

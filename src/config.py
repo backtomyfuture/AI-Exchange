@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     DURABLE_INBOX_ENABLED: bool = False
     INGESTION_SHADOW_ENABLED: bool = False
     SYNC_RECONCILIATION_ENABLED: bool = False
+    POLLING_ENABLED: bool = False
+    POLLING_INTERVAL_SECONDS: PositiveInt = 60
     INGESTION_INSTANCE_ID: str = "ai-exchange-web"
     INGESTION_LEASE_SECONDS: PositiveInt = 30
     INGESTION_HEARTBEAT_SECONDS: PositiveInt = 10

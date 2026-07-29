@@ -1,11 +1,8 @@
 import asyncio
 import hashlib
-import hmac
-import json
 import logging
 import math
 import os
-import re
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -16,17 +13,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
-from src.config import get_settings, resolve_secret
+from src.config import get_settings
 from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
 from src.db.schema import require_runtime_database
 from src.db.runtime_boundary import require_runtime_database_boundary
-from src.domain.errors import DatabaseOperationError, IngressValidationError, StaleFence
-from src.ingestion.models import IngressReceipt
-from src.ingestion.policy import PolicySnapshotUnavailableError
-from src.ingestion.webhook import TestWebhookReceipt, WebhookIngressUnavailable
 from src.init_app import get_app_context as initialize_app_context
 from src.init_app import get_runtime_app_context
-from src.safety.input_limits import input_limits_from_settings
 from src.security.auth import require_metrics_auth, validate_runtime_security
 from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
@@ -37,7 +29,6 @@ _READINESS_SUCCESS_TTL_SECONDS = 5.0
 _READINESS_FAILURE_TTL_SECONDS = 1.0
 _READINESS_DATABASE_TIMEOUT_SECONDS = 5.0
 _READINESS_FAILURE_LOG_TTL_SECONDS = 5.0
-_WEBHOOK_SIGNATURE_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _LARK_INTAKE_DRAIN_SECONDS = 30.0
 _LARK_INTAKE_STOP_SECONDS = 32.0
 _LARK_WS_JOIN_SECONDS = 5.0
@@ -298,7 +289,6 @@ async def _shutdown_application_components(
     """Attempt every owned shutdown stage before releasing the fence."""
 
     failures: list[tuple[str, BaseException]] = []
-    application.state.webhook_ingress_service = None
     application.state.ingestion_runtime = None
 
     def attempt_sync(stage: str, operation) -> bool:
@@ -448,7 +438,6 @@ async def application_lifespan(application: FastAPI):
         fail_stop=_fail_stop_after_processing_control_loss,
     )
     application.state.ingestion_runtime = None
-    application.state.webhook_ingress_service = None
     fence: RuntimeCheckpointMaintenanceFence | None = None
     context_initialize_attempted = False
     lark_initialize_attempted = False
@@ -495,11 +484,7 @@ async def application_lifespan(application: FastAPI):
                 name="lark-websocket-connection-monitor",
             )
             lark_app.enable_lark_intake()
-        service = runtime.webhook_ingress_service
-        if service is None:
-            raise RuntimeError("webhook_ingress_service_unavailable")
         application.state.ingestion_runtime = runtime
-        application.state.webhook_ingress_service = service
         yield
     except BaseException as primary_exc:
         try:
@@ -658,130 +643,6 @@ async def queue_status(request: Request):
             "oldest_pending_seconds": stats.oldest_pending_seconds,
         },
     }
-
-
-@app.post("/webhooks/exchange")
-async def exchange_webhook(request: Request):
-    """
-    Exchange NewMail Webhook endpoint with HMAC-SHA256 signature verification.
-    """
-    settings = get_settings()
-    signature = request.headers.get("X-Webhook-Signature") or request.headers.get(
-        "X-Exchange-Signature"
-    )
-    if not signature:
-        logger.warning("Missing X-Webhook-Signature in webhook request")
-        raise HTTPException(status_code=400, detail="Missing signature")
-
-    # Strip the 'sha256=' prefix if present (sent by Exchange server)
-    if signature.startswith("sha256="):
-        signature = signature[len("sha256=") :]
-
-    webhook_secret = resolve_secret(settings.EXCHANGE_WEBHOOK_SECRET)
-    if not webhook_secret:
-        raise HTTPException(status_code=503, detail="Webhook secret not configured")
-    if _WEBHOOK_SIGNATURE_PATTERN.fullmatch(signature) is None:
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    media_type = request.headers.get("Content-Type", "").partition(";")[0]
-    if media_type.strip().casefold() != "application/json":
-        raise HTTPException(
-            status_code=415,
-            detail="Content-Type must be application/json",
-        )
-
-    max_bytes = input_limits_from_settings(settings).webhook_bytes
-    body_parts: list[bytes] = []
-    body_size = 0
-    async for chunk in request.stream():
-        body_size += len(chunk)
-        if body_size > max_bytes:
-            raise HTTPException(status_code=413, detail="Webhook payload too large")
-        body_parts.append(chunk)
-    body_bytes = b"".join(body_parts)
-    header_event = request.headers.get("X-Exchange-Event")
-
-    expected_signature = hmac.new(
-        webhook_secret.encode("utf-8"),
-        body_bytes,
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature, expected_signature):
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    try:
-        payload = json.loads(body_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
-        logger.warning("Exchange webhook payload is not valid JSON")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload") from None
-
-    if not isinstance(payload, dict):
-        logger.warning("Exchange webhook payload root is not an object")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    service = getattr(request.app.state, "webhook_ingress_service", None)
-    accept = getattr(service, "accept", None)
-    if not callable(accept):
-        logger.warning("Durable Exchange webhook ingress is unavailable")
-        raise HTTPException(
-            status_code=503,
-            detail="Webhook ingress unavailable",
-        )
-    try:
-        result = await accept(
-            raw_body=body_bytes,
-            payload=payload,
-            header_event=header_event,
-        )
-    except IngressValidationError as exc:
-        logger.warning(
-            "Rejected invalid Exchange webhook event: error_type=%s safe_code=%s",
-            type(exc).__name__,
-            exc.safe_code.value,
-        )
-        raise HTTPException(status_code=400, detail="Invalid webhook event") from None
-    except (
-        DatabaseOperationError,
-        PolicySnapshotUnavailableError,
-        StaleFence,
-        WebhookIngressUnavailable,
-    ) as exc:
-        logger.warning(
-            "Durable Exchange webhook ingress is unavailable: error_type=%s",
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Webhook ingress unavailable",
-        ) from None
-    except Exception as exc:
-        logger.error(
-            "Durable Exchange webhook intake failed: error_type=%s",
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Webhook ingress unavailable",
-        ) from None
-
-    if type(result) is TestWebhookReceipt:
-        logger.info("Exchange webhook test event verified")
-        return {"status": "ok", "test": True}
-    if type(result) is IngressReceipt:
-        logger.info(
-            "Exchange webhook durably accepted: duplicate=%s",
-            result.duplicate,
-        )
-        return JSONResponse(
-            status_code=202,
-            content={"status": "accepted"},
-        )
-    logger.error("Durable Exchange webhook intake returned an invalid receipt")
-    raise HTTPException(
-        status_code=503,
-        detail="Webhook ingress unavailable",
-    )
 
 
 class MockEmailData(BaseModel):

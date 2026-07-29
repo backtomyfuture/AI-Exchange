@@ -83,19 +83,20 @@ printf 'HEAD=%s\nimage=%s\n' "$HEAD_REVISION" "$IMAGE_ID"
 本页所有 Compose 命令必须沿用同一个 `PROJECT_NAME`。如果 Exchange 需要私网 TLS
 覆盖，则每条命令同时使用自动生成的 `secrets/deployment.env` 和
 `docker-compose.exchange-tls.yml`。常规重部署优先使用 `scripts/deploy_system.py`，避免
-遗漏内部配置；用户 `.env` 始终只保留 17 项。
+遗漏内部配置；用户 `.env` 始终只保留 16 项。
 
 ## 2. 生成并本地校验
 
-`--webhook-inbox-id` 必须是 Exchange Webhook 实际发送的 Inbox opaque ID，不能填写
-`INBOX` 或占位符。输出目录必须尚不存在，生成后目录权限为 `0700`、两个文件权限为
-`0600`，重复执行不会覆盖已有文件。
+`--webhook-inbox-id` 是冻结 policy schema 的兼容性元数据：传入本账户真实的 Inbox
+opaque ID，不能填写 `INBOX` 或占位符。它不会创建 Webhook 订阅或 HTTP 路由；当前
+邮件入口只会轮询 Gateway `INBOX`。输出目录必须尚不存在，生成后目录权限为 `0700`、
+两个文件权限为 `0600`，重复执行不会覆盖已有文件。
 
 ```bash
 .venv/bin/python scripts/prepare_ingestion_manifests.py \
   --account-id <ACCOUNT_ID> \
   --webhook-inbox-id <REAL_OPAQUE_INBOX_ID> \
-  --sync-folder Inbox \
+  --sync-folder INBOX \
   --build-id <BUILD_ID> \
   --release-evidence-file deploy/release-metadata-<BUILD_ID>.json \
   --output-dir deploy/generated-<BUILD_ID>
@@ -140,8 +141,9 @@ docker compose -p "$PROJECT_NAME" --profile ingestion-maintenance run --rm \
   --idempotency-key <UNIQUE_KEY>
 ```
 
-`POLICY.json` 固定为一个 `INBOX` scope 和严格七项事件策略；Sync 的三项仅用于满足
-统一策略契约，当前固定配置仍然关闭主动轮询与 Sync reconciliation。
+`POLICY.json` 固定为一个 `INBOX` scope 和严格七项事件策略；运行时只使用其中三项
+Sync 策略，通过 `sync_state` 把邮件变化写入现有 Durable Inbox。Webhook 策略条目仅为
+冻结 schema 兼容性保留，不会暴露入口；Sync reconciliation 仍保持关闭。
 
 ## 4. 隔离运行验收
 
@@ -153,16 +155,18 @@ overlay。所有命令固定同一组 `--env-file`、`-p` 和 `-f` 参数，所�
 返回 `status=ready` 与 `processing=active`。随后比较运行容器的 `.Image` 和第 1 节记录的
 `IMAGE_ID`，二者必须相同。
 
-安全的 Worker 冒烟不使用未知 folder 的 `NewMailEvent`：该路径会在 intake 本地完成，
-无法证明 Worker 领取。应使用真实 Inbox opaque ID、唯一虚构邮件 ID 和
-`ModifiedEvent`，对完全相同的原始 JSON bytes 计算 HMAC，并向本机端口发送两次；两次都
-必须返回 `202 {"status":"accepted"}`。通过 auditor DSN 做只读聚合验证：恰好一条
-`event_inbox`，policy 为 `metadata_only`、状态为 `completed`、
-`processing_started_at` 非空、`effect_started_at` 为空、lease 字段全部为空；对应
-`emails` 只有一个 `ingested` metadata shell，且没有任何外部 effect 时间戳。这样覆盖
-Webhook → Durable Inbox → Worker → 本地完成，同时不会读取 Exchange 详情、调用模型、
-Qdrant 或发送飞书卡片。
+`/ready` 首次返回 `processing=active` 表示新库已完成历史基线、游标已激活；在此之后
+发送一封真实且可识别的测试邮件。等待最多两个轮询周期后，以 auditor DSN 只读确认该
+邮件对应的 `event_inbox` 来源为 `sync`，并确认现有 Worker 已认领处理；随后按正常业务
+链路检查飞书卡片和审批结果。该验收覆盖 `sync_state` → Durable Inbox → 既有 Worker →
+既有邮件详情/图片按需处理/LLM/飞书，而不需要 HMAC、TestEvent 或 Webhook 订阅。
 
-本机签名请求不能证明公网回调。正式入口就绪后仍须按主 README 以 inactive 订阅完成
-TestEvent 的嵌套目标状态/响应体验收，再启用订阅并发送真实邮件完成审批点击闭环。测试
-结束只对隔离 project 使用同一参数执行 `down -v`，不得停止或删除旧项目。
+首次历史基线在后台执行：容器会先存活，`/ready` 在游标激活前保持未就绪。Gateway 会先
+完成其内部 Exchange 分页，再返回这一轮的最终游标；部署工具和 Compose 健康检查为这个
+过程预留 15 分钟。超过该时间应先检查 Gateway 连通性和基线进度，不要重置游标或反复
+重建数据卷。
+
+同一 Exchange 账户不能让旧、新两个应用同时处于活跃轮询状态。全新数据库的首次
+`sync_state=null` 会建立并丢弃历史基线，因此切换前必须明确接受边界窗口的策略：先完成
+新基线再停止旧实例会有短暂重复风险；先停止旧实例再建新基线则有遗漏风险。测试结束只对
+隔离 project 使用同一参数执行 `down -v`，不得停止或删除旧项目。

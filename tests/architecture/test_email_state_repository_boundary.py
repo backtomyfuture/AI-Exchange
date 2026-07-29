@@ -352,7 +352,7 @@ _TASK10G_TASK9G_SUCCESSOR_PATHS = frozenset(
 )
 _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/bootstrap.py": (
-        "27160b8d55a27a147a97b96e82a116e5d249acfd8bc51b87ce2b8945e3adc3f9"
+        "4cf3eb4fc7f47581c24a80021faf461c57df49f3aadc402494c05ef8dce9984a"
     ),
     "src/db/roles.py": (
         "95ab9de4b7ba0f33b364c960ebbcf0497db820a6cb779324159f38d194df6849"
@@ -404,10 +404,10 @@ _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS = frozenset(
 )
 _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/access_contract.py": (
-        "ae750156e6e0ab5156066fd15e36c06efad66d105f3d3292713744ca7e7cf4a3"
+        "2d930679f8ab1ca121b0485e101ea0dab72e6a04e18665045ad87956cd277ff2"
     ),
     "src/db/roles.py": (
-        "40da8178c318277c1d20a94c5496c93c86e3d2029f6e798c201af37ee6aa6311"
+        "1f37d4f16ae6f4b5422d7b71e0955ea3740017933fdb257c6276224dcfffc94a"
     ),
     "src/ingestion/legacy_adapter.py": (
         "4dce2a3b3d9456ef24ee938b2de144015d28c0566ede56a8aa5c0569f64f124c"
@@ -419,7 +419,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "4487935cb2f493952e1d00ca3015dfe6b8e002bba6ec55fd9aaadcd59d0cfee0"
     ),
     "src/ingestion/runtime.py": (
-        "082bbcc655b60d7a2b9429bff0acdf1e0fade059943292cc22fa5b204a3c758d"
+        "8a78bec0fe57571f9d7a262a656db85e93b9991d87d082986c9a84a8f110a915"
     ),
     "src/ingestion/worker.py": (
         "75ed0dfeda6d6010d4b91741ee2679f2658b82afec8b1a8d303a8eecf0b066f0"
@@ -428,7 +428,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "3ace800944a20e292dc5c48e09d837bcc4d883e9caeb54aacc9f2194fd22923a"
+        "315f162d2ffc7bb307ee8033df6cd6b55a18c59c661f6b4c5e0c1d77c1cbb3e7"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {

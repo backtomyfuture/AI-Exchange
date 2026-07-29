@@ -36,7 +36,11 @@ TASK7_MIGRATION_MANIFEST = frozenset(
     }
 )
 TASK10G_MIGRATION = "20260716_0006_greenfield_runtime_authority.py"
-TASK10G_MIGRATION_MANIFEST = TASK7_MIGRATION_MANIFEST | {TASK10G_MIGRATION}
+POLLING_ONLY_MIGRATION = "20260728_0007_polling_only_ingress.py"
+TASK10G_MIGRATION_MANIFEST = TASK7_MIGRATION_MANIFEST | {
+    TASK10G_MIGRATION,
+    POLLING_ONLY_MIGRATION,
+}
 TASK7_COMMAND_NAMES = frozenset(
     {
         "cold_start.preview",
@@ -195,10 +199,13 @@ def test_consumers_claim_and_process_inline_without_per_lease_processing_tasks()
     assert "create_task" not in consume_calls
 
 
-def test_task8_namespace_stays_frozen_while_task10g_adds_one_migration() -> None:
+def test_task8_namespace_stays_frozen_while_greenfield_adds_only_its_migrations() -> None:
     migration_manifest = frozenset(path.name for path in MIGRATIONS.glob("*.py"))
     assert migration_manifest == TASK10G_MIGRATION_MANIFEST
-    assert migration_manifest - TASK7_MIGRATION_MANIFEST == {TASK10G_MIGRATION}
+    assert migration_manifest - TASK7_MIGRATION_MANIFEST == {
+        TASK10G_MIGRATION,
+        POLLING_ONLY_MIGRATION,
+    }
     assert command_receipts._COMMAND_NAMES == TASK7_COMMAND_NAMES
 
     migration_source = SYNC_CONTROL_MIGRATION.read_text(encoding="utf-8")

@@ -24,7 +24,6 @@ USER_ENV_KEYS = (
     "EXCHANGE_API_KEY",
     "EXCHANGE_ACCOUNT_ID",
     "EXCHANGE_ACCOUNT_EMAIL",
-    "EXCHANGE_WEBHOOK_SECRET",
     "LARK_APP_ID",
     "LARK_APP_SECRET",
     "LARK_ENCRYPT_KEY",
@@ -40,10 +39,10 @@ USER_ENV_KEYS = (
 
 _USER_ENV_SECTIONS = (
     ("Service", USER_ENV_KEYS[0:1]),
-    ("Exchange", USER_ENV_KEYS[1:6]),
-    ("Lark", USER_ENV_KEYS[6:11]),
-    ("LLM", USER_ENV_KEYS[11:14]),
-    ("Embedding", USER_ENV_KEYS[14:17]),
+    ("Exchange", USER_ENV_KEYS[1:5]),
+    ("Lark", USER_ENV_KEYS[5:10]),
+    ("LLM", USER_ENV_KEYS[10:13]),
+    ("Embedding", USER_ENV_KEYS[13:16]),
 )
 
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
@@ -249,7 +248,7 @@ def _ensure_receipt_keypair(secrets_dir: Path) -> int:
 def _render_user_env(values: dict[str, str]) -> str:
     lines = [
         "# AI Exchange user configuration",
-        "# Keep only these 17 integration and model settings.",
+        "# Keep only these 16 integration and model settings.",
         "# Internal credentials and runtime controls are generated automatically.",
         "",
     ]

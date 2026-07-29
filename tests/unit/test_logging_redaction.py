@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
-import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi.testclient import TestClient
-
 from src.security.redaction import exception_type, fingerprint_identifier
-from src.server import app
 
 
 def test_identifier_fingerprint_is_stable_namespaced_and_single_line():
@@ -170,56 +165,6 @@ def test_exception_type_never_uses_exception_message():
 
     assert rendered == "RuntimeError"
     assert secret not in rendered
-
-
-def test_webhook_runtime_error_uses_fixed_public_error_and_safe_log(
-    caplog,
-    monkeypatch,
-):
-    client = TestClient(app)
-    secret = "webhook-secret-value"
-    private_error = "private-email-body-from-value-error"
-    payload = {
-        "event_type": "NewMailEvent",
-        "item_id": {"id": "private-email-id-sentinel"},
-    }
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-
-    service = SimpleNamespace(
-        accept=AsyncMock(side_effect=RuntimeError(private_error)),
-    )
-    monkeypatch.setattr(
-        app.state,
-        "webhook_ingress_service",
-        service,
-        raising=False,
-    )
-
-    with (
-        patch(
-            "src.server.get_settings",
-            return_value=SimpleNamespace(
-                EXCHANGE_WEBHOOK_SECRET=secret,
-                WEBHOOK_MAX_BYTES=1_048_576,
-            ),
-        ),
-        caplog.at_level(logging.WARNING, logger="WebServer"),
-    ):
-        response = client.post(
-            "/webhooks/exchange",
-            content=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Exchange-Signature": signature,
-            },
-        )
-
-    assert response.status_code == 503
-    assert response.json() == {"detail": "Webhook ingress unavailable"}
-    assert private_error not in response.text
-    assert private_error not in caplog.text
-    assert secret not in caplog.text
 
 
 def test_lark_message_success_log_omits_email_and_message_identifiers(caplog):

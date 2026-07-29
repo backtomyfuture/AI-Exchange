@@ -43,6 +43,7 @@ from src.ingestion.runtime_capability import (  # noqa: E402
 _MAX_JSON_BYTES: Final = 1_048_576
 _PROTOCOL_VERSION: Final = 1
 _CANONICAL_FOLDER_KEY: Final = "INBOX"
+_GATEWAY_POLLING_FOLDER: Final = "INBOX"
 _BUILD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}\Z", re.ASCII)
 _GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -408,6 +409,8 @@ def _prepare_payloads(
     exact_account_id = _require_account_id(account_id)
     exact_webhook_id = _require_webhook_id(webhook_inbox_id)
     exact_sync_folder = _require_text("sync_folder", sync_folder, maximum=512)
+    if exact_sync_folder != _GATEWAY_POLLING_FOLDER:
+        raise ManifestPreparationError("sync_folder_must_be_gateway_inbox")
     exact_build_id = _require_build_id(build_id)
     evidence = _load_release_evidence(
         release_evidence_file,
@@ -446,9 +449,9 @@ def _prepare_payloads(
         "features": {
             "durable_inbox_enabled": True,
             "ingestion_shadow_enabled": False,
-            "polling_enabled": False,
+            "polling_enabled": True,
             "sync_reconciliation_enabled": False,
-            "webhook_primary": True,
+            "webhook_primary": False,
         },
         "topology": {
             "exchange_accounts": 1,

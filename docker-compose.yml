@@ -264,11 +264,12 @@ services:
       POSTGRES_CHECKPOINT_AUDITOR_ROLE: ai_exchange_checkpoint_auditor
       DATABASE_ROLE_SEPARATION_REQUIRED: "true"
       DURABLE_INBOX_ENABLED: "true"
+      POLLING_ENABLED: "true"
+      POLLING_INTERVAL_SECONDS: "60"
       EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}
       EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
       EXCHANGE_ACCOUNT_EMAIL: ${EXCHANGE_ACCOUNT_EMAIL:?EXCHANGE_ACCOUNT_EMAIL is required}
-      EXCHANGE_WEBHOOK_SECRET: ${EXCHANGE_WEBHOOK_SECRET:?EXCHANGE_WEBHOOK_SECRET is required}
       EXCHANGE_FOLDERS_ARCHIVE: ${EXCHANGE_FOLDERS_ARCHIVE:-}
       LEADER_SENDERS: ${LEADER_SENDERS:-}
       LARK_APP_ID: ${LARK_APP_ID:?LARK_APP_ID is required}
@@ -307,7 +308,10 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      # A new data volume establishes its sync_state baseline before /ready
+      # succeeds.  Keep Docker from treating that bounded initialization as a
+      # crash while the deployment tool waits for the real readiness contract.
+      start_period: 900s
     stop_grace_period: 150s
     deploy:
       resources:

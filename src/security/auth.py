@@ -55,7 +55,6 @@ _BOUNDARY_SECRET_FIELDS = frozenset(
     {
         "POSTGRES_PASSWORD",
         "EXCHANGE_API_KEY",
-        "EXCHANGE_WEBHOOK_SECRET",
         "LARK_APP_SECRET",
         "LARK_ENCRYPT_KEY",
         "METRICS_TOKEN",
@@ -179,7 +178,6 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
         "EXCHANGE_API_KEY",
-        "EXCHANGE_WEBHOOK_SECRET",
         "LARK_APP_ID",
         "LARK_APP_SECRET",
         "LARK_ENCRYPT_KEY",
@@ -202,6 +200,8 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
         invalid.add("INGESTION_SHADOW_ENABLED")
     if _setting(settings, "SYNC_RECONCILIATION_ENABLED", False) is not False:
         invalid.add("SYNC_RECONCILIATION_ENABLED")
+    if _setting(settings, "POLLING_ENABLED", False) is not True:
+        invalid.add("POLLING_ENABLED")
     if _plain(settings, "INGESTION_INSTANCE_ID") != _PHASE4_LITE_INSTANCE_ID:
         invalid.add("INGESTION_INSTANCE_ID")
 

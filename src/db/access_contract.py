@@ -9,6 +9,9 @@ from typing import Final
 PHASE2_DATABASE_REVISION: Final = "20260713_0004"
 SYNC_RECONCILIATION_DATABASE_REVISION: Final = "20260713_0005"
 GREENFIELD_DATABASE_REVISION: Final = "20260716_0006"
+# This is the physical Alembic head.  ``GREENFIELD_DATABASE_REVISION`` remains
+# the immutable runtime-authority/capability contract used by the worker.
+POLLING_ONLY_DATABASE_REVISION: Final = "20260728_0007"
 PHASE2_RELATIONS: Final = (
     "audit_events",
     "emails",
@@ -2128,3 +2131,96 @@ TRIGGER_FUNCTIONS_BY_REVISION: Final[dict[str, tuple[str, ...]]] = {
     revision: tuple(sorted(functions))
     for revision, functions in TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION.items()
 }
+
+# Revision 0007 changes no relation shape, trigger, or constraint.  It adds one
+# migration-owned, session-fenced function which is the sole polling write
+# boundary.  Keep the copies explicit at the contract boundary so a physical
+# 0007 database can never be mistaken for the older 0006 ACL set.
+PHASE2_RELATIONS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    PHASE2_RELATIONS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+PHASE2_VIEW_SPECS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    PHASE2_VIEW_SPECS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+RUNTIME_RELATION_ACCESS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    RUNTIME_RELATION_ACCESS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+MAINTENANCE_RELATION_ACCESS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    MAINTENANCE_RELATION_ACCESS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+AUDITOR_RELATION_ACCESS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    AUDITOR_RELATION_ACCESS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+
+_POLLING_SYNC_PAGE_ROUTINE: Final = RoutineAccess(
+    "greenfield_commit_sync_page",
+    "p_account_id bigint, p_session_id uuid, "
+    "p_expected_lease_version bigint, p_folder_key text, "
+    "p_expected_cursor text, p_expected_cursor_version bigint, "
+    "p_next_cursor text, p_events jsonb, p_activation boolean",
+)
+RUNTIME_ROUTINE_EXECUTE_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    *(
+        routine
+        for routine in RUNTIME_ROUTINE_EXECUTE_BY_REVISION[
+            GREENFIELD_DATABASE_REVISION
+        ]
+        if routine.name != "greenfield_insert_webhook_event"
+    ),
+    _POLLING_SYNC_PAGE_ROUTINE,
+)
+MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+AUDITOR_ROUTINE_EXECUTE_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    AUDITOR_ROUTINE_EXECUTE_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+
+# Routine inventory is deliberately separate from per-role EXECUTE grants:
+# 0007 retains the historical webhook function for forward-only migration
+# compatibility, while the runtime role must no longer be able to invoke it.
+SECURITY_DEFINER_ROUTINES_BY_REVISION: Final[
+    dict[str, tuple[RoutineAccess, ...]]
+] = {
+    revision: tuple(
+        spec
+        for _identity, spec in sorted(
+            {
+                (spec.name, spec.identity_arguments): spec
+                for spec in (
+                    *RUNTIME_ROUTINE_EXECUTE_BY_REVISION[revision],
+                    *MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[revision],
+                )
+            }.items()
+        )
+    )
+    for revision in RUNTIME_ROUTINE_EXECUTE_BY_REVISION
+}
+SECURITY_DEFINER_ROUTINES_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = tuple(
+    spec
+    for _identity, spec in sorted(
+        {
+            (spec.name, spec.identity_arguments): spec
+            for spec in (
+                *SECURITY_DEFINER_ROUTINES_BY_REVISION[GREENFIELD_DATABASE_REVISION],
+                _POLLING_SYNC_PAGE_ROUTINE,
+            )
+        }.items()
+    )
+)
+
+FOREIGN_KEY_SPECS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    FOREIGN_KEY_SPECS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+TRIGGER_SPECS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    TRIGGER_SPECS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+TRIGGER_FUNCTIONS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    TRIGGER_FUNCTIONS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)

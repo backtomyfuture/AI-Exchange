@@ -43,10 +43,6 @@ _TLS_KEYS = (
     "EXCHANGE_TLS_IP",
     "EXCHANGE_CA_FILE_HOST",
 )
-_WEBHOOK_TLS_FILES = (
-    "webhook_tls_fullchain.pem",
-    "webhook_tls_key.pem",
-)
 
 
 class DeploymentError(RuntimeError):
@@ -70,26 +66,6 @@ def _private_file(path: Path) -> str:
         if mode not in {0o400, 0o600}:
             raise DeploymentError(f"private_file_mode_invalid:{path.name}")
         return _read_secret_file(str(path))
-    except DeploymentError:
-        raise
-    except Exception:
-        raise DeploymentError(f"private_file_invalid:{path.name}") from None
-
-
-def _private_material_file(path: Path) -> None:
-    """Validate private multiline material without parsing or exposing it."""
-
-    try:
-        details = path.lstat()
-        if not stat.S_ISREG(details.st_mode):
-            raise DeploymentError(f"private_file_invalid:{path.name}")
-        if stat.S_IMODE(details.st_mode) not in {0o400, 0o600}:
-            raise DeploymentError(f"private_file_mode_invalid:{path.name}")
-        if not 1 <= details.st_size <= 64 * 1024:
-            raise DeploymentError(f"private_file_invalid:{path.name}")
-        with path.open("rb") as stream:
-            if not stream.read(1):
-                raise DeploymentError(f"private_file_invalid:{path.name}")
     except DeploymentError:
         raise
     except Exception:
@@ -133,17 +109,9 @@ def _deployment_context(
             raise DeploymentError("exchange_ca_file_missing")
         compose_files.append(PROJECT_ROOT / "docker-compose.exchange-tls.yml")
 
-    webhook_tls_paths = tuple(
-        secrets_dir / filename for filename in _WEBHOOK_TLS_FILES
-    )
-    webhook_tls_presence = tuple(os.path.lexists(path) for path in webhook_tls_paths)
-    if any(webhook_tls_presence) and not all(webhook_tls_presence):
-        raise DeploymentError("webhook_tls_material_incomplete")
-    webhook_tls_enabled = all(webhook_tls_presence)
-    if webhook_tls_enabled:
-        for path in webhook_tls_paths:
-            _private_material_file(path)
-        compose_files.append(PROJECT_ROOT / "docker-compose.webhook-tls.yml")
+    # Webhook ingress is intentionally retired. Existing TLS material remains
+    # on disk for rollback/audit but must never alter the polling deployment.
+    webhook_tls_enabled = False
 
     project_name = project_override or _private_file(
         secrets_dir / "compose_project_name"
@@ -182,7 +150,7 @@ def _deployment_context(
     return compose, environment, project_name, port, webhook_tls_enabled
 
 
-def _wait_ready(port: int, timeout_seconds: int = 180) -> None:
+def _wait_ready(port: int, timeout_seconds: int = 900) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f"http://127.0.0.1:{port}/ready"
     last_status = "unreachable"
@@ -211,7 +179,7 @@ def check(
     _run([*compose, "config", "--quiet"], environment=environment)
     print(
         f"Deployment configuration valid: project={resolved_project} "
-        f"user_keys={len(USER_ENV_KEYS)} webhook_tls={webhook_tls_enabled}"
+        f"user_keys={len(USER_ENV_KEYS)} webhook_ingress=disabled"
     )
     return compose, environment, resolved_project, port, webhook_tls_enabled
 
@@ -238,7 +206,7 @@ def redeploy(project_name: str | None = None) -> None:
         [*compose, "up", "-d", "--no-build", "postgres", "qdrant"],
         environment=environment,
     )
-    print("Starting the rebuilt application and optional TLS ingress...")
+    print("Starting the rebuilt polling application...")
     _run(
         [
             *compose,

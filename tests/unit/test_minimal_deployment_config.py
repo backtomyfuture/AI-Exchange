@@ -29,7 +29,6 @@ def _minimal_user_values() -> dict[str, str]:
         "EXCHANGE_API_KEY": "exchange-api-key-value",
         "EXCHANGE_ACCOUNT_ID": "8",
         "EXCHANGE_ACCOUNT_EMAIL": "owner@example.test",
-        "EXCHANGE_WEBHOOK_SECRET": "exchange-webhook-value",
         "LARK_APP_ID": "lark-app-id",
         "LARK_APP_SECRET": "lark-app-secret-value",
         "LARK_ENCRYPT_KEY": "lark-encrypt-key-value",
@@ -59,7 +58,7 @@ def _isolated_deployment_script(
     )
 
 
-def test_user_environment_contract_is_exactly_the_recommended_seventeen_keys():
+def test_user_environment_contract_is_exactly_the_recommended_sixteen_keys():
     assert USER_ENV_KEYS == tuple(_minimal_user_values())
 
 
@@ -119,7 +118,7 @@ def test_legacy_environment_migrates_without_losing_advanced_behavior(
     migrated, _ = read_env_file(tmp_path / ".env")
     assert tuple(migrated) == USER_ENV_KEYS
     assert migrated == _minimal_user_values()
-    assert first.user_key_count == 17
+    assert first.user_key_count == 16
     assert second.generated_secret_count == 0
     assert first.project_name == "existing-project"
     assert stat.S_IMODE((tmp_path / ".env").stat().st_mode) == 0o600
@@ -146,8 +145,9 @@ def test_legacy_environment_migrates_without_losing_advanced_behavior(
     ).read_text(encoding="utf-8") == "metrics-token-secret-value"
 
 
-def test_polling_setting_is_not_part_of_runtime_configuration():
-    assert "POLLING_INTERVAL" not in Settings.model_fields
+def test_polling_settings_default_to_an_explicitly_disabled_bounded_schedule():
+    assert Settings.model_fields["POLLING_ENABLED"].default is False
+    assert Settings.model_fields["POLLING_INTERVAL_SECONDS"].default == 60
     assert Settings.model_config["env_file"] == ".env"
 
 
@@ -163,7 +163,7 @@ def test_python_dotenv_disabled_skips_local_env_file(tmp_path: Path, monkeypatch
     assert Settings().EXCHANGE_ACCOUNT_EMAIL == ""
 
 
-def test_deployment_automatically_adds_complete_webhook_tls_overlay(
+def test_deployment_ignores_legacy_webhook_tls_material(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -181,11 +181,11 @@ def test_deployment_automatically_adds_complete_webhook_tls_overlay(
         "test-project"
     )
 
-    assert webhook_tls_enabled is True
-    assert str(tmp_path / "docker-compose.webhook-tls.yml") in compose
+    assert webhook_tls_enabled is False
+    assert str(tmp_path / "docker-compose.webhook-tls.yml") not in compose
 
 
-def test_deployment_rejects_partial_webhook_tls_material(
+def test_deployment_ignores_partial_legacy_webhook_tls_material(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -195,20 +195,8 @@ def test_deployment_rejects_partial_webhook_tls_material(
         "certificate",
     )
 
-    with pytest.raises(
-        deploy_system.DeploymentError,
-        match="webhook_tls_material_incomplete",
-    ):
-        deploy_system._deployment_context("test-project")
+    _compose, _, _, _, webhook_tls_enabled = deploy_system._deployment_context(
+        "test-project"
+    )
 
-
-def test_deployment_rejects_symlinked_webhook_tls_material(tmp_path: Path):
-    target = _private(tmp_path / "private-key", "key")
-    link = tmp_path / "webhook_tls_key.pem"
-    link.symlink_to(target)
-
-    with pytest.raises(
-        deploy_system.DeploymentError,
-        match="private_file_invalid:webhook_tls_key.pem",
-    ):
-        deploy_system._private_material_file(link)
+    assert webhook_tls_enabled is False

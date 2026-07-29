@@ -63,6 +63,23 @@ def _wire_body(
     }
 
 
+def _polling_wire_body(
+    *,
+    cursor: object = "opaque-next-state",
+    items: object = None,
+) -> dict[str, object]:
+    """Current Gateway Sync contract used by the polling ingress."""
+
+    return {
+        "code": 200,
+        "msg": "OK",
+        "data": {
+            "sync_state": cursor,
+            "items": [] if items is None else items,
+        },
+    }
+
+
 def _json_response(
     status: int = 200,
     *,
@@ -306,6 +323,122 @@ async def test_sync_posts_exact_bounded_v2_request(
     assert batch.includes_last is True
     assert [(change.kind, change.external_email_id) for change in batch.changes] == [
         (ChangeKind.CREATE, "message-1")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_polling_sync_establishes_an_opaque_activation_cursor_from_null(
+    client_factory,
+) -> None:
+    """The real Gateway has no v2 response header or pagination marker."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://exchange.internal/api/v1/exchange/emails/sync"
+        assert request.method == "POST"
+        assert json.loads(request.content) == {
+            "account_id": 8,
+            "folder": "INBOX",
+            "sync_state": None,
+            "limit": 500,
+            "only_fields": ["id"],
+        }
+        return httpx.Response(200, json=_polling_wire_body())
+
+    batch = await client_factory(handler).sync_polling(8, "INBOX", None, 500)
+
+    assert batch.cursor == "opaque-next-state"
+    assert batch.changes == ()
+
+
+@pytest.mark.asyncio
+async def test_polling_sync_discards_untrusted_historical_items_during_activation(
+    client_factory,
+) -> None:
+    """The first null-cursor response is a boundary, never a mail payload."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_polling_wire_body(
+                items=[
+                    {
+                        "change_type": "create",
+                        "id": "historic-message",
+                        "untrusted_gateway_metadata": {"body": "not imported"},
+                    }
+                ]
+            ),
+        )
+
+    batch = await client_factory(handler).sync_polling(8, "INBOX", None, 500)
+
+    assert batch.cursor == "opaque-next-state"
+    assert batch.changes == ()
+
+
+@pytest.mark.asyncio
+async def test_polling_sync_treats_a_limit_sized_historical_delta_as_complete(
+    client_factory,
+) -> None:
+    """The Gateway returns its final cursor after exhausting EWS internally."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["sync_state"] == "history-cursor-1"
+        return httpx.Response(
+            200,
+            json=_polling_wire_body(
+                items=[
+                    {
+                        "change_type": "create",
+                        "id": "historic-message",
+                        "body": "must not be parsed during activation",
+                    }
+                ]
+            ),
+        )
+
+    batch = await client_factory(handler).sync_polling(
+        8,
+        "INBOX",
+        "history-cursor-1",
+        1,
+        discard_items=True,
+    )
+
+    assert batch.changes == ()
+    assert batch.includes_last is True
+
+
+@pytest.mark.asyncio
+async def test_polling_sync_projects_delta_to_notification_identity_only(
+    client_factory,
+) -> None:
+    """The existing Worker refetches detail; polling must not import it."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_polling_wire_body(
+                items=[
+                    {
+                        "change_type": "create",
+                        "id": "new-message",
+                        "item": {"subject": "must not enter the Inbox payload"},
+                        "gateway_metadata": {"attachment_bytes": "not imported"},
+                    }
+                ]
+            ),
+        )
+
+    batch = await client_factory(handler).sync_polling(
+        8,
+        "INBOX",
+        "active-cursor",
+        500,
+    )
+
+    assert [(change.kind, change.external_email_id, dict(change.item or {})) for change in batch.changes] == [
+        (ChangeKind.CREATE, "new-message", {})
     ]
 
 

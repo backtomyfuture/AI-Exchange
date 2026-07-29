@@ -381,6 +381,29 @@ class _ProcessingWorker:
             raise self.stop_error
 
 
+class _PollingRuntime:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.live = False
+        self.ready = False
+
+    async def start(self) -> None:
+        self.events.append("polling.start")
+        self.live = True
+        self.ready = True
+
+    async def stop(self) -> None:
+        self.events.append("polling.stop")
+        self.live = False
+        self.ready = False
+
+
+class _ActivatingPollingRuntime(_PollingRuntime):
+    async def start(self) -> None:
+        self.events.append("polling.start")
+        self.live = True
+
+
 class _AsyncContext:
     def __init__(self, value: object) -> None:
         self.value = value
@@ -435,6 +458,7 @@ def _runtime(
     pool: _Pool | None = None,
     processing_worker: _ProcessingWorker | None = None,
     recovery_repository: _RecoveryRepository | None = None,
+    polling_runtime_factory=None,
     fail_stop=None,
 ) -> tuple[IngestionRuntime, _InstanceRepository, _Writer]:
     instances = instance_repository or _InstanceRepository(events)
@@ -453,6 +477,7 @@ def _runtime(
         shutdown_seconds=1,
         processing_worker=processing_worker,
         inbox_recovery_repository=recovery_repository,
+        polling_runtime_factory=polling_runtime_factory,
         fail_stop=fail_stop,
     )
     return runtime, instances, sink
@@ -523,6 +548,55 @@ async def test_start_recovers_then_starts_one_processing_runtime_before_ready() 
     assert events.index("worker.start") < events.index("worker.stop:1.0")
     assert events.index("worker.stop:1.0") < events.index("instance.drain")
     assert events.index("instance.drain") < events.index("pool.close")
+
+
+@pytest.mark.asyncio
+async def test_start_and_stop_own_polling_before_runtime_readiness() -> None:
+    events: list[str] = []
+    poller = _PollingRuntime(events)
+    snapshots: list[PolicySnapshot] = []
+    runtime, _instances, _writer = _runtime(
+        events,
+        polling_runtime_factory=lambda snapshot: (
+            snapshots.append(snapshot) or poller
+        ),
+    )
+
+    await runtime.start()
+
+    assert snapshots == [_snapshot()]
+    assert runtime.polling_ready is True
+    assert runtime.ready is True
+    assert events.index("instance.register") < events.index("polling.start")
+
+    await runtime.stop()
+
+    assert runtime.polling_ready is False
+    assert events.index("polling.stop") < events.index("instance.drain")
+
+
+@pytest.mark.asyncio
+async def test_live_poller_can_finish_initial_activation_without_fail_stopping_runtime() -> None:
+    """Initial transient polling failure is not a lost scheduler."""
+
+    events: list[str] = []
+    poller = _ActivatingPollingRuntime(events)
+    runtime, _instances, _writer = _runtime(
+        events,
+        polling_runtime_factory=lambda _snapshot: poller,
+    )
+
+    await runtime.start()
+
+    assert runtime.polling_live is True
+    assert runtime.polling_ready is False
+    assert runtime.ready is False
+    await runtime.heartbeat_once()
+
+    poller.ready = True
+    assert runtime.ready is True
+
+    await runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -1575,6 +1649,20 @@ def test_runtime_factory_requires_context_before_allocating_processing_pool() ->
 
     with patch.object(runtime_module, "AsyncConnectionPool") as create:
         with pytest.raises(ValueError, match="processing_context is required"):
+            build_ingestion_runtime(settings)
+
+    create.assert_not_called()
+
+
+def test_runtime_factory_requires_durable_inbox_when_polling_is_enabled() -> None:
+    settings = SimpleNamespace(
+        database_url="postgresql://runtime@example.invalid/database",
+        EXCHANGE_ACCOUNT_ID=8,
+        POLLING_ENABLED=True,
+    )
+
+    with patch.object(runtime_module, "AsyncConnectionPool") as create:
+        with pytest.raises(ValueError, match="polling requires durable Inbox"):
             build_ingestion_runtime(settings)
 
     create.assert_not_called()

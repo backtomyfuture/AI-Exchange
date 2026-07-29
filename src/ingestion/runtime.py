@@ -1,9 +1,8 @@
-"""Single-process greenfield durable-ingestion runtime.
+"""Single-process durable-ingestion runtime.
 
-The Web session always owns the verified Webhook-to-Inbox commit path.  When
-durable processing is explicitly enabled, the same runtime and business pool
-also own one fixed-count Inbox worker and one bounded expired-lease recovery
-loop.  Sync remains a separate, inactive capability.
+The runtime owns the existing Durable Inbox worker and its bounded recovery
+loop. When enabled, its polling child is the only external mail ingress and
+commits ``sync_state`` deltas into that same Inbox.
 """
 
 from __future__ import annotations
@@ -152,6 +151,18 @@ class _ProcessingWorkerPort(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self, grace_seconds: float = 30.0) -> None: ...
+
+
+class _PollingRuntimePort(Protocol):
+    @property
+    def live(self) -> bool: ...
+
+    @property
+    def ready(self) -> bool: ...
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
 
 
 class _LeaseRenewerPort(Protocol):
@@ -445,8 +456,94 @@ class _SessionBoundWebhookInbox:
             return receipt
 
 
+class _SessionBoundPollingCommitter:
+    """Serialize polling-page commits with the Web session heartbeat.
+
+    The Gateway request happens before this object is entered.  Once a page is
+    ready to persist, it renews the same ``web`` lease and holds the shared
+    session lock until the database's fenced, one-page transaction returns.
+    """
+
+    def __init__(
+        self,
+        state: _SessionState,
+        renewer: _LeaseRenewerPort,
+        writer: Any,
+    ) -> None:
+        if type(state) is not _SessionState:
+            raise ValueError("session state is invalid")
+        if not callable(renewer) or not callable(getattr(writer, "commit_page", None)):
+            raise ValueError("polling commit dependency is invalid")
+        self._state = state
+        self._renewer = renewer
+        self._writer = writer
+
+    async def commit_page(
+        self,
+        checkpoint: Any,
+        next_cursor: str,
+        events: Sequence[NormalizedIngressEvent],
+        *,
+        activation: bool,
+    ) -> Any:
+        from src.ingestion.polling import PollingCursorUnavailable
+
+        exact_events = tuple(events)
+        async with self._state.lock:
+            lease = self._state.lease
+            if (
+                not self._state.accepting
+                or type(lease) is not RuntimeInstanceLease
+                or lease.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
+            ):
+                raise PollingCursorUnavailable()
+            try:
+                current = await self._renewer(
+                    lease,
+                    self._state.accepted_count,
+                    self._state.rejected_count,
+                )
+                if (
+                    type(current) is not RuntimeInstanceLease
+                    or current.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
+                    or current.session_id != lease.session_id
+                    or current.generation != lease.generation
+                    or current.fencing_token != lease.fencing_token
+                    or current.authority_epoch != lease.authority_epoch
+                    or current.capability_hash != lease.capability_hash
+                    or current.lease_version != lease.lease_version + 1
+                    or current.accepted_count != self._state.accepted_count
+                    or current.rejected_count != self._state.rejected_count
+                ):
+                    raise PollingCursorUnavailable()
+                self._state.lease = current
+                result = await self._writer.commit_page(
+                    current,
+                    checkpoint,
+                    next_cursor,
+                    exact_events,
+                    activation=activation,
+                )
+            except BaseException:
+                self._state.rejected_count += len(exact_events)
+                raise
+            inserted = getattr(result, "inserted_count", None)
+            duplicates = getattr(result, "duplicate_count", None)
+            if (
+                type(inserted) is not int
+                or type(duplicates) is not int
+                or inserted < 0
+                or duplicates < 0
+                or inserted + duplicates != len(exact_events)
+            ):
+                self._state.rejected_count += len(exact_events)
+                raise PollingCursorUnavailable()
+            self._state.accepted_count += len(exact_events)
+            return result
+
+
 class IngestionRuntime:
-    """Own one Web session and, optionally, its durable processing worker."""
+    """Own one session, its durable worker, and optional polling ingress."""
 
     def __init__(
         self,
@@ -464,6 +561,9 @@ class IngestionRuntime:
         shutdown_seconds: int,
         processing_worker: _ProcessingWorkerPort | None = None,
         inbox_recovery_repository: _InboxRecoveryPort | None = None,
+        polling_runtime_factory: Callable[[PolicySnapshot], _PollingRuntimePort]
+        | None = None,
+        session_state: _SessionState | None = None,
         fail_stop: Callable[[str], None] | None = None,
     ) -> None:
         if type(account_id) is not int or not 1 <= account_id < 2**63:
@@ -504,6 +604,10 @@ class IngestionRuntime:
             ):
                 if not callable(getattr(dependency, method, None)):
                     raise ValueError("processing dependency is invalid")
+        if polling_runtime_factory is not None and not callable(polling_runtime_factory):
+            raise ValueError("polling_runtime_factory must be callable")
+        if session_state is not None and type(session_state) is not _SessionState:
+            raise ValueError("session_state is invalid")
         if fail_stop is not None and not callable(fail_stop):
             raise ValueError("fail_stop must be callable")
         self._account_id = account_id
@@ -522,8 +626,10 @@ class IngestionRuntime:
         )
         self._processing_worker = processing_worker
         self._inbox_recovery_repository = inbox_recovery_repository
+        self._polling_runtime_factory = polling_runtime_factory
+        self._polling_runtime: _PollingRuntimePort | None = None
         self._fail_stop = fail_stop
-        self._state = _SessionState()
+        self._state = _SessionState() if session_state is None else session_state
         self._webhook_inbox = _SessionBoundWebhookInbox(
             self._state,
             webhook_writer,
@@ -546,9 +652,11 @@ class IngestionRuntime:
         lease = self._state.lease
         heartbeat = self._heartbeat_task
         processing_ready = self._processing_worker is None or self.processing_ready
+        polling_ready = self._polling_runtime is None or self.polling_ready
         return bool(
             self._ready
             and processing_ready
+            and polling_ready
             and self._state.accepting
             and heartbeat is not None
             and not heartbeat.done()
@@ -570,6 +678,20 @@ class IngestionRuntime:
             and recovery is not None
             and not recovery.done()
         )
+
+    @property
+    def polling_ready(self) -> bool:
+        """Whether polling has established its activation cursor."""
+
+        polling = self._polling_runtime
+        return bool(polling is not None and polling.ready is True)
+
+    @property
+    def polling_live(self) -> bool:
+        """Whether the configured polling scheduler is still running."""
+
+        polling = self._polling_runtime
+        return bool(polling is not None and polling.live is True)
 
     @property
     def lease(self) -> RuntimeInstanceLease | None:
@@ -628,6 +750,11 @@ class IngestionRuntime:
                 inbox_repository=self._webhook_inbox,
             )
             await self._start_processing()
+            # Polling uses the same session-bound intake gate as the retired
+            # Webhook adapter.  It must be open during the baseline cycle,
+            # while public readiness remains false until that cycle completes.
+            self._state.accepting = True
+            await self._start_polling(snapshot)
             if self._heartbeat_task is None or self._heartbeat_task.done():
                 raise RuntimeUnavailableError("startup_failed")
             self._started = True
@@ -675,6 +802,24 @@ class IngestionRuntime:
             name="durable-inbox-expired-lease-recovery",
         )
         self._processing_ready = True
+
+    async def _start_polling(self, snapshot: PolicySnapshot) -> None:
+        factory = self._polling_runtime_factory
+        if factory is None:
+            return
+        polling = factory(snapshot)
+        if (
+            polling is None
+            or not callable(getattr(polling, "start", None))
+            or not callable(getattr(polling, "stop", None))
+            or not isinstance(getattr(polling, "live", None), bool)
+            or not isinstance(getattr(polling, "ready", None), bool)
+        ):
+            raise RuntimeUnavailableError("startup_failed")
+        self._polling_runtime = polling
+        await polling.start()
+        if polling.live is not True:
+            raise RuntimeUnavailableError("startup_failed")
 
     async def _recovery_loop(self) -> None:
         repository = self._inbox_recovery_repository
@@ -727,6 +872,10 @@ class IngestionRuntime:
     ) -> None:
         cleanup_failures: list[BaseException] = []
         try:
+            await self._stop_polling()
+        except BaseException as error:
+            cleanup_failures.append(error)
+        try:
             await self._cancel_heartbeat()
         except BaseException as error:
             cleanup_failures.append(error)
@@ -773,6 +922,12 @@ class IngestionRuntime:
                 self._registered_lease = None
         self._service = None
 
+    async def _stop_polling(self) -> None:
+        polling = self._polling_runtime
+        if polling is None:
+            return
+        await polling.stop()
+
     async def _heartbeat_loop(self) -> None:
         try:
             while True:
@@ -786,7 +941,11 @@ class IngestionRuntime:
                 reason = (
                     "ingestion_runtime_processing_lost"
                     if str(error) == "processing_lost"
-                    else "ingestion_runtime_heartbeat_lost"
+                    else (
+                        "ingestion_runtime_polling_lost"
+                        if str(error) == "polling_lost"
+                        else "ingestion_runtime_heartbeat_lost"
+                    )
                 )
                 self._fail_stop(reason)
 
@@ -820,6 +979,13 @@ class IngestionRuntime:
                 and not self.processing_ready
             ):
                 raise RuntimeUnavailableError("processing_lost")
+            if (
+                self._started
+                and self._ready
+                and self._polling_runtime is not None
+                and not self.polling_live
+            ):
+                raise RuntimeUnavailableError("polling_lost")
             async with self._state.lock:
                 lease = self._state.lease
                 if (
@@ -934,6 +1100,12 @@ class IngestionRuntime:
                 error, _PROCESS_CONTROL_EXCEPTIONS
             ):
                 process_control = error
+
+        try:
+            await self._stop_polling()
+        except BaseException as exc:
+            _raise_if_current_task_cancelled(exc)
+            record_failure("polling_stop", exc)
 
         idle_waiter = asyncio.create_task(
             self._webhook_inbox.wait_idle(),
@@ -1052,6 +1224,9 @@ def build_ingestion_runtime(
     if bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)):
         raise ValueError("Phase4-Lite does not permit Sync reconciliation")
     processing_enabled = bool(getattr(settings, "DURABLE_INBOX_ENABLED", False))
+    polling_enabled = bool(getattr(settings, "POLLING_ENABLED", False))
+    if polling_enabled and not processing_enabled:
+        raise ValueError("polling requires durable Inbox processing")
     if processing_enabled and processing_context is None:
         raise ValueError(
             "processing_context is required when durable Inbox processing is enabled"
@@ -1064,9 +1239,14 @@ def build_ingestion_runtime(
         kwargs={"autocommit": True, "row_factory": dict_row},
     )
     authority_repository = RuntimeAuthorityRepository(pool)
+    instance_repository = RuntimeInstanceRepository(pool)
     session_id = str(uuid4())
+    session_state = _SessionState()
     processing_worker: _ProcessingWorkerPort | None = None
     inbox_recovery_repository: _InboxRecoveryPort | None = None
+    polling_runtime_factory: Callable[[PolicySnapshot], _PollingRuntimePort] | None = (
+        None
+    )
     if processing_enabled:
         # Local imports are required: ``init_app`` imports this runtime while
         # the compatibility adapter reaches ``exchange_service`` and then
@@ -1097,12 +1277,87 @@ def build_ingestion_runtime(
             ),
         )
         inbox_recovery_repository = inbox_repository
+    if polling_enabled:
+        if processing_context is None:
+            raise ValueError("polling requires an application processing context")
+
+        def build_polling_runtime(snapshot: PolicySnapshot) -> _PollingRuntimePort:
+            # Keep imports local: the polling adapter uses ExchangeClient while
+            # this module is imported during application-context construction.
+            from src.ingestion.polling import (
+                GreenfieldSyncPageWriter,
+                PollingIngress,
+                PollingRuntime,
+                PostgresPollingCursorStore,
+            )
+
+            page_client = getattr(processing_context, "exchange_client", None)
+            if not callable(getattr(page_client, "sync_polling", None)):
+                raise RuntimeUnavailableError("polling_client_unavailable")
+            scopes = ProcessingPolicyResolver().configured_scopes(snapshot)
+            inbox_scopes = tuple(
+                scope
+                for scope in scopes
+                if scope.canonical_key == "INBOX" and scope.sync_folder == "INBOX"
+            )
+            if len(inbox_scopes) != 1:
+                raise RuntimeUnavailableError("polling_scope_unavailable")
+            scope = inbox_scopes[0]
+
+            async def renew_polling_lease(
+                lease: RuntimeInstanceLease,
+                accepted_count: int,
+                rejected_count: int,
+            ) -> RuntimeInstanceLease:
+                from src.ingestion.polling import PollingCursorUnavailable
+
+                try:
+                    return await instance_repository.heartbeat(
+                        lease,
+                        accepted_count,
+                        rejected_count,
+                        int(getattr(settings, "INGESTION_LEASE_SECONDS", 30)),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    session_state.accepting = False
+                    raise PollingCursorUnavailable() from None
+
+            page_committer = _SessionBoundPollingCommitter(
+                session_state,
+                renew_polling_lease,
+                GreenfieldSyncPageWriter(pool),
+            )
+
+            cursor_store = PostgresPollingCursorStore(
+                pool,
+                page_committer,
+                account_id=settings.EXCHANGE_ACCOUNT_ID,
+                folder=scope.canonical_key,
+            )
+            return PollingRuntime(
+                (
+                    PollingIngress(
+                        account_id=settings.EXCHANGE_ACCOUNT_ID,
+                        scope=scope,
+                        snapshot=snapshot,
+                        page_client=page_client,
+                        cursor_store=cursor_store,
+                    ),
+                ),
+                interval_seconds=float(
+                    getattr(settings, "POLLING_INTERVAL_SECONDS", 60)
+                ),
+            )
+
+        polling_runtime_factory = build_polling_runtime
     return IngestionRuntime(
         account_id=settings.EXCHANGE_ACCOUNT_ID,
         pool=pool,
         authority_repository=authority_repository,
         manifest_repository=RuntimeManifestRepository(pool),
-        instance_repository=RuntimeInstanceRepository(pool),
+        instance_repository=instance_repository,
         webhook_writer=GreenfieldWebhookWriter(pool),
         instance_id=str(getattr(settings, "INGESTION_INSTANCE_ID", "ai-exchange-web")),
         session_id=session_id,
@@ -1111,6 +1366,8 @@ def build_ingestion_runtime(
         shutdown_seconds=int(getattr(settings, "INGESTION_SHUTDOWN_SECONDS", 30)),
         processing_worker=processing_worker,
         inbox_recovery_repository=inbox_recovery_repository,
+        polling_runtime_factory=polling_runtime_factory,
+        session_state=session_state,
         fail_stop=fail_stop,
     )
 

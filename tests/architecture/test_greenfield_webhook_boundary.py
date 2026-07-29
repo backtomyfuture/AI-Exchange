@@ -101,42 +101,16 @@ def test_typed_webhook_service_owns_no_pool_global_context_or_background_task() 
     assert "asyncio.Queue" not in source
 
 
-def test_exchange_http_route_cannot_reach_legacy_queue_or_business_effects() -> None:
+def test_exchange_http_route_is_absent_from_the_polling_only_server() -> None:
     tree = _tree(SERVER)
-    route = _function(tree, "exchange_webhook")
-    route_symbols = _referenced_symbols(route)
     source = SERVER.read_text(encoding="utf-8")
 
-    assert route_symbols.isdisjoint(_BANNED_RUNTIME_SYMBOLS)
+    assert "exchange_webhook" not in {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert '"/webhooks/exchange"' not in source
     assert "enqueue_webhook_event" not in source
     assert "_webhook_queue" not in source
     assert "queue_full" not in source
-
-
-def test_exchange_http_route_has_no_external_mail_model_graph_lark_or_qdrant_call() -> (
-    None
-):
-    route = _function(_tree(SERVER), "exchange_webhook")
-    called_names = {
-        node.func.id
-        for node in ast.walk(route)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    called_attributes = {
-        node.func.attr
-        for node in ast.walk(route)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-
-    assert (called_names | called_attributes).isdisjoint(
-        {
-            "get_email",
-            "list_emails",
-            "ainvoke",
-            "invoke",
-            "send_approval_card",
-            "upsert",
-            "mark_as_read",
-            "process_and_archive_email",
-        }
-    )
