@@ -43,6 +43,7 @@ _SYNC_ONLY_FIELDS = [
     "has_attachments",
 ]
 _POLLING_ONLY_FIELDS = ["id"]
+_POLLING_NON_INGRESS_CHANGE_TYPES = frozenset({"read_flag_change"})
 _SYNC_TIMEOUT = httpx.Timeout(
     connect=10.0,
     read=135.0,
@@ -284,7 +285,7 @@ def _sync_batch_from_payload(payload: object, *, limit: int) -> SyncBatch:
     )
 
 
-def _polling_sync_change_from_payload(value: object):
+def _polling_sync_change_from_payload(value: object) -> SyncChange | None:
     """Project a Gateway delta into an identity-only internal Sync DTO."""
 
     if not isinstance(value, dict):
@@ -294,6 +295,13 @@ def _polling_sync_change_from_payload(value: object):
     kind = value["change_type"]
     if type(kind) is not str:
         raise ValueError("invalid Exchange polling Sync item")
+    if kind in _POLLING_NON_INGRESS_CHANGE_TYPES:
+        if not _valid_exact_text(value["id"], max_length=1024):
+            raise ValueError("invalid Exchange polling Sync item")
+        # Exchange emits this after a client marks a message read.  It is a
+        # cursor-only state transition, not a mail event, and policy forbids
+        # it from entering the Durable Inbox.
+        return None
     # The existing Durable Inbox Worker obtains authoritative email detail only
     # after claiming the event.  Treat the polling response as an untrusted
     # notification: do not copy its body, attachment metadata, or mail fields
@@ -328,11 +336,10 @@ def _polling_sync_batch_from_payload(
     items = data["items"]
     if not isinstance(items, list) or len(items) > limit:
         raise ValueError("invalid Exchange polling Sync item count")
-    changes = (
-        ()
-        if discard_items
-        else tuple(_polling_sync_change_from_payload(item) for item in items)
-    )
+    changes: tuple[SyncChange, ...] = ()
+    if not discard_items:
+        projected = tuple(_polling_sync_change_from_payload(item) for item in items)
+        changes = tuple(change for change in projected if change is not None)
     return SyncBatch(
         contract_version=_SYNC_CONTRACT_VERSION,
         cursor=data["sync_state"],

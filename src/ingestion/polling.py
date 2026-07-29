@@ -660,6 +660,26 @@ class PollingRuntime:
             except PollingCursorConflict:
                 delay = self._interval_seconds
                 logger.info("Exchange polling cursor conflicted; retrying")
+            except Exception as error:
+                # The cursor only advances in the page commit, so retrying a
+                # rejected poll is safe.  Keep the scheduler alive and take
+                # readiness down instead of silently ending this task and
+                # forcing the whole application into a restart loop.
+                self._activated = False
+                delay = self._interval_seconds
+                candidate_code = getattr(type(error), "safe_code", None)
+                safe_code = (
+                    candidate_code
+                    if type(candidate_code) is str
+                    else "polling.unexpected_failure"
+                )
+                logger.error(
+                    "Exchange polling attempt failed safely; retrying in %ss: "
+                    "error_type=%s safe_code=%s",
+                    int(delay),
+                    type(error).__name__,
+                    safe_code,
+                )
             else:
                 self._activated = True
                 delay = self._interval_seconds

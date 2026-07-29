@@ -443,6 +443,59 @@ async def test_polling_sync_projects_delta_to_notification_identity_only(
 
 
 @pytest.mark.asyncio
+async def test_polling_sync_advances_past_read_flag_changes_without_enqueuing_them(
+    client_factory,
+) -> None:
+    """A read-state delta is not mail ingress, but must not poison its cursor."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_polling_wire_body(
+                cursor="next-cursor-after-read-state",
+                items=[
+                    {"change_type": "create", "id": "new-message"},
+                    {"change_type": "read_flag_change", "id": "read-message"},
+                ],
+            ),
+        )
+
+    batch = await client_factory(handler).sync_polling(
+        8,
+        "INBOX",
+        "active-cursor",
+        500,
+    )
+
+    assert batch.cursor == "next-cursor-after-read-state"
+    assert [(change.kind, change.external_email_id) for change in batch.changes] == [
+        (ChangeKind.CREATE, "new-message")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_id", [None, " invalid-id", "x" * 1025])
+async def test_polling_sync_rejects_invalid_ignored_read_flag_identity(
+    client_factory,
+    sync_error_types,
+    invalid_id: object,
+) -> None:
+    """A skipped state delta must still have a valid identity before advancing."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_polling_wire_body(
+                cursor="must-not-be-returned",
+                items=[{"change_type": "read_flag_change", "id": invalid_id}],
+            ),
+        )
+
+    with pytest.raises(sync_error_types.SyncContractError):
+        await client_factory(handler).sync_polling(8, "INBOX", "active-cursor", 500)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("account_id", "folder", "cursor", "limit"),
     [

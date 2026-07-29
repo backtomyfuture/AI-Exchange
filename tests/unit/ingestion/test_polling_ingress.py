@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 import pytest
 
-from src.domain.errors import SyncTransientError
+from src.domain.errors import SyncContractError, SyncTransientError
 from src.ingestion.models import (
     ChangeKind,
     IngressSource,
@@ -202,6 +203,44 @@ class _TransientThenCommitIngress:
         if self.calls == 1:
             raise SyncTransientError(retry_after_seconds=0)
         self.recovered.set()
+        return PollingIngressOutcome.COMMITTED
+
+
+class _ContractThenCommitIngress:
+    """One non-retryable gateway result followed by a healthy delta."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.recovered = asyncio.Event()
+
+    async def sync_once(self) -> PollingIngressOutcome:
+        self.calls += 1
+        if self.calls == 1:
+            raise SyncContractError()
+        self.recovered.set()
+        return PollingIngressOutcome.COMMITTED
+
+
+class _ReadyThenUnexpectedFailureIngress:
+    """Reach ready, fail once with private detail, then wait for a retry."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.failure_started = asyncio.Event()
+        self.release_failure = asyncio.Event()
+        self.retry_started = asyncio.Event()
+        self.release_retry = asyncio.Event()
+
+    async def sync_once(self) -> PollingIngressOutcome:
+        self.calls += 1
+        if self.calls == 1:
+            return PollingIngressOutcome.COMMITTED
+        if self.calls == 2:
+            self.failure_started.set()
+            await self.release_failure.wait()
+            raise RuntimeError("PRIVATE-POLLING-DETAIL")
+        self.retry_started.set()
+        await self.release_retry.wait()
         return PollingIngressOutcome.COMMITTED
 
 
@@ -550,3 +589,55 @@ async def test_polling_runtime_retries_a_transient_activation_failure_without_dy
     assert runtime.ready is True
 
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_polling_runtime_records_and_recovers_from_a_nontransient_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected Gateway response must not silently kill the polling scheduler."""
+
+    ingress = _ContractThenCommitIngress()
+    runtime = PollingRuntime((ingress,), interval_seconds=0.01)
+    caplog.set_level(logging.ERROR, logger="src.ingestion.polling")
+
+    await runtime.start()
+
+    await asyncio.wait_for(ingress.recovered.wait(), timeout=1)
+    assert ingress.calls == 2
+    assert runtime.live is True
+    assert runtime.ready is True
+    assert "error_type=SyncContractError" in caplog.text
+    assert "safe_code=exchange.sync.contract_invalid" in caplog.text
+
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_polling_runtime_degrades_readiness_without_leaking_unknown_failure_detail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected poll failure is retried safely without a restart signal."""
+
+    ingress = _ReadyThenUnexpectedFailureIngress()
+    runtime = PollingRuntime((ingress,), interval_seconds=0.01)
+    caplog.set_level(logging.ERROR, logger="src.ingestion.polling")
+
+    await runtime.start()
+    try:
+        await asyncio.wait_for(ingress.failure_started.wait(), timeout=1)
+        assert runtime.live is True
+        assert runtime.ready is True
+
+        ingress.release_failure.set()
+        await asyncio.wait_for(ingress.retry_started.wait(), timeout=1)
+
+        assert ingress.calls == 3
+        assert runtime.live is True
+        assert runtime.ready is False
+        assert "error_type=RuntimeError" in caplog.text
+        assert "safe_code=polling.unexpected_failure" in caplog.text
+        assert "PRIVATE-POLLING-DETAIL" not in caplog.text
+    finally:
+        ingress.release_retry.set()
+        await runtime.stop()
