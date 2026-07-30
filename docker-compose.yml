@@ -245,9 +245,16 @@ services:
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: always
     command: python -m src.main
+    user: "1000:1000"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     environment:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
       APP_ENV: production
       DEBUG: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -266,6 +273,7 @@ services:
       DURABLE_INBOX_ENABLED: "true"
       POLLING_ENABLED: "true"
       POLLING_INTERVAL_SECONDS: "60"
+      EXCHANGE_SSL_VERIFY: "true"
       EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}
       EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
@@ -318,6 +326,7 @@ services:
         limits:
           cpus: "2"
           memory: 2G
+          pids: 256
     networks:
       - backend
       - edge

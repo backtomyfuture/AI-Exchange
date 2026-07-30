@@ -11,6 +11,8 @@ from src.graph.state_factory import (
     sanitize_graph_delta,
 )
 from src.router.engine import get_routing_engine
+from src.safety.attachments import AttachmentPolicy
+from src.safety.input_limits import input_limits_from_settings
 from src.safety.model_budget import (
     ModelInputTooLarge,
     enforce_model_input_budget,
@@ -41,23 +43,30 @@ def _visual_analysis_inputs(email: object) -> list[dict[str, str]]:
     if not isinstance(attachments, list):
         return []
 
+    attachment_policy = AttachmentPolicy(
+        max_bytes=input_limits_from_settings(
+            get_settings()
+        ).attachment_single_bytes
+    )
     images: list[dict[str, str]] = []
     for attachment in attachments:
         if not isinstance(attachment, dict):
             continue
-        mime_type = attachment.get("content_type") or attachment.get("mime_type")
-        content = attachment.get("content")
-        if (
-            not isinstance(mime_type, str)
-            or not mime_type.casefold().startswith("image/")
-            or not isinstance(content, str)
-            or not content
-        ):
+        decision = attachment_policy.assess(attachment)
+        if not decision.allowed or not decision.is_image or decision.content is None:
             continue
+        suffix = decision.name.rsplit(".", 1)[-1].casefold()
+        mime_type = {
+            "gif": "image/gif",
+            "jpeg": "image/jpeg",
+            "jpg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+        }[suffix]
         images.append(
             {
-                "name": str(attachment.get("name") or "image"),
-                "content": content,
+                "name": decision.name,
+                "content": attachment["content"],
                 "mime_type": mime_type,
             }
         )
@@ -81,6 +90,7 @@ async def retrieve_context(
     body = email.get("body", "")
     sender = email.get("sender", "")
     thread_id = email.get("thread_id") or email.get("conversation_id")
+    email_id = state.get("email_id") or email.get("id")
 
     retriever = get_retriever()
     results = []
@@ -88,7 +98,10 @@ async def retrieve_context(
     # Priority 1: same-thread context
     if thread_id:
         thread_results = await asyncio.to_thread(
-            retriever.search_by_thread, thread_id=thread_id, limit=5
+            retriever.search_by_thread,
+            thread_id=thread_id,
+            limit=5,
+            exclude_email_id=email_id,
         )
         results.extend(thread_results)
 
@@ -97,7 +110,11 @@ async def retrieve_context(
     if remaining > 0:
         query_text = f"Subject: {subject}\nBody: {body[:500]}"
         semantic_results = await asyncio.to_thread(
-            retriever.search, query_text=query_text, sender=sender, limit=remaining
+            retriever.search,
+            query_text=query_text,
+            sender=sender,
+            limit=remaining,
+            exclude_email_id=email_id,
         )
         seen_ids = {r.get("id") for r in results}
         for r in semantic_results:
@@ -105,13 +122,36 @@ async def retrieve_context(
                 results.append(r)
 
     # Priority 2b: Tier 2 semantic routing - vote on past similar emails' labels.
-    tier2_delta: dict = {}
+    routing_delta: dict = {}
     try:
         engine = get_routing_engine()
-        tier2_delta = await engine.apply_tier2_hits(local_state, results)
+        routing_stage = state.get("routing_stage", "pending")
+        if routing_stage == "tier1":
+            routing_delta = {"routing_stage": "tier1"}
+        else:
+            tier2_delta = await engine.apply_tier2_hits(local_state, results)
+            if not isinstance(tier2_delta, dict):
+                raise RuntimeError("tier2_delta_invalid")
+            if tier2_delta.get("active_skills"):
+                routing_delta = dict(tier2_delta)
+                routing_delta.setdefault("routing_stage", "tier2")
+            else:
+                tier3_delta = await engine.apply_tier3_fallback(local_state)
+                if not isinstance(tier3_delta, dict):
+                    raise RuntimeError("tier3_delta_invalid")
+                if tier3_delta.get("next_step") == "manual_review":
+                    return build_manual_review_delta(
+                        state,
+                        tier3_delta.get("safe_error_summary"),
+                    )
+                routing_delta = dict(tier3_delta)
+                routing_delta.setdefault(
+                    "routing_stage",
+                    "tier3" if routing_delta.get("active_skills") else "none",
+                )
     except Exception as exc:
         logger.error(
-            "Tier 2 routing failed; manual review required: error_type=%s",
+            "Layered routing failed; manual review required: error_type=%s",
             type(exc).__name__,
         )
         return build_manual_review_delta(state, "router_skill_failed")
@@ -183,7 +223,7 @@ async def retrieve_context(
     if metadata:
         updates["metadata"] = metadata
 
-    fixed_draft = tier2_delta.pop("_draft_content", None)
+    fixed_draft = routing_delta.pop("_draft_content", None)
     if isinstance(fixed_draft, str):
         updates["draft_id"] = await dependencies.drafts.save_draft(
             state["email_id"],
@@ -192,7 +232,7 @@ async def retrieve_context(
 
     # List fields have replacement semantics. Merge and de-duplicate explicitly
     # before the common byte/item caps are applied.
-    for k, v in tier2_delta.items():
+    for k, v in routing_delta.items():
         if k == "metadata" and isinstance(v, dict):
             merged = dict(updates.get("metadata") or {})
             merged.update(v)

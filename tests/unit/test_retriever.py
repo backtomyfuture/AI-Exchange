@@ -86,6 +86,31 @@ class TestEmailRetriever:
         # 验证filter被传递
         call_args = mock_qdrant_client.query_points.call_args
         assert call_args[1]['query_filter'] is not None
+
+    def test_search_excludes_the_current_email_from_semantic_context(
+        self,
+        retriever,
+        mock_qdrant_client,
+        mock_openai_client,
+    ):
+        mock_embedding_response = Mock()
+        mock_embedding_response.data = [Mock(embedding=[0.1, 0.2])]
+        mock_openai_client.embeddings.create.return_value = mock_embedding_response
+        current = Mock(payload={"id": "mail-current", "subject": "current"})
+        old_one = Mock(payload={"id": "mail-old-1", "subject": "old one"})
+        old_two = Mock(payload={"id": "mail-old-2", "subject": "old two"})
+        mock_qdrant_client.query_points.return_value = Mock(
+            points=[current, old_one, old_two]
+        )
+
+        results = retriever.search(
+            "query",
+            limit=2,
+            exclude_email_id="mail-current",
+        )
+
+        assert [item["id"] for item in results] == ["mail-old-1", "mail-old-2"]
+        assert mock_qdrant_client.query_points.call_args.kwargs["limit"] == 7
     
     
     def test_search_embedding_failure(self, retriever, mock_openai_client):
@@ -132,6 +157,24 @@ class TestEmailRetriever:
         assert len(results) == 2
         assert results[0]["thread_id"] == "thread-123"
         mock_qdrant_client.scroll.assert_called_once()
+
+    def test_search_by_thread_excludes_the_current_email(
+        self,
+        retriever,
+        mock_qdrant_client,
+    ):
+        current = Mock(payload={"id": "mail-current", "thread_id": "thread-123"})
+        old = Mock(payload={"id": "mail-old", "thread_id": "thread-123"})
+        mock_qdrant_client.scroll.return_value = ([current, old], None)
+
+        results = retriever.search_by_thread(
+            "thread-123",
+            limit=2,
+            exclude_email_id="mail-current",
+        )
+
+        assert results == [{"id": "mail-old", "thread_id": "thread-123"}]
+        assert mock_qdrant_client.scroll.call_args.kwargs["limit"] == 7
     
     
     def test_search_by_thread_empty_thread_id(self, retriever):

@@ -150,6 +150,7 @@ async def test_real_forward_skill_projects_safe_recipients_and_draft(
     tier,
 ):
     from src.nodes.categorizer import categorize_email
+    from src.nodes.retriever_node import retrieve_context
     from src.router.engine import RoutingEngine
 
     forward_skill = _forward_skill()
@@ -172,11 +173,62 @@ async def test_real_forward_skill_projects_safe_recipients_and_draft(
             "body": "body",
             "sender": "sender@example.com",
             "draft_to": ["sender@example.com"],
+            "draft_cc": ["copy@example.com"],
         }
     )
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=engine):
-        result = await categorize_email(state, graph_node_harness.dependencies)
+    if tier == "tier1":
+        with patch("src.nodes.categorizer.get_routing_engine", return_value=engine):
+            result = await categorize_email(state, graph_node_harness.dependencies)
+    else:
+        classification = {
+            "priority": "P2",
+            "need_reply": True,
+            "intent": "咨询",
+            "summary": "需要继续检索路由",
+            "reasoning": "Tier 1 未命中",
+            "confidence": 1.0,
+        }
+        with patch(
+            "src.nodes.categorizer.get_routing_engine",
+            return_value=engine,
+        ), patch(
+            "src.providers.factory.get_llm_for_role",
+            return_value=RunnableLambda(lambda value: value),
+        ), patch(
+            "src.nodes.categorizer.with_llm_retry",
+            side_effect=_fixed_classification(classification),
+        ):
+            categorized = await categorize_email(
+                state,
+                graph_node_harness.dependencies,
+            )
+
+        assert categorized["routing_stage"] == "pending"
+        retriever = MagicMock()
+        retriever.search.return_value = []
+        with patch(
+            "src.nodes.retriever_node.get_routing_engine",
+            return_value=engine,
+        ), patch(
+            "src.nodes.retriever_node.get_retriever",
+            return_value=retriever,
+        ), patch(
+            "src.nodes.retriever_node._retrieve_experience",
+            new=AsyncMock(return_value=[]),
+        ), patch(
+            "src.nodes.retriever_node._retrieve_style_guidance",
+            new=AsyncMock(return_value=""),
+        ), patch(
+            "src.nodes.retriever_node._retrieve_user_preferences",
+            new=AsyncMock(return_value=[]),
+        ):
+            result = await retrieve_context(
+                {**state, **categorized},
+                graph_node_harness.dependencies,
+            )
+
+        engine._tier3_llm_route.assert_awaited_once()
 
     assert result["classification"]["action"] == "forward"
     assert result["draft_to"] == ["forward-target@example.com"]

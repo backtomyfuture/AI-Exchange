@@ -54,6 +54,44 @@ class ApplicationShutdownError(RuntimeError):
     """Fixed failure for an incomplete application-lifecycle shutdown."""
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeHealthSnapshot:
+    """Identifier-free projection used by the operator endpoints."""
+
+    processing_active: bool
+    polling_active: bool
+    polling_cursor_ready: bool
+
+
+def _runtime_health_snapshot(runtime: object) -> _RuntimeHealthSnapshot:
+    """Read the runtime seam with a safe fallback for test adapters."""
+
+    try:
+        snapshot_factory = getattr(runtime, "health_snapshot", None)
+        if callable(snapshot_factory):
+            snapshot = snapshot_factory()
+            return _RuntimeHealthSnapshot(
+                processing_active=bool(
+                    getattr(snapshot, "processing_active", False)
+                ),
+                polling_active=bool(getattr(snapshot, "polling_active", False)),
+                polling_cursor_ready=bool(
+                    getattr(snapshot, "polling_cursor_ready", False)
+                ),
+            )
+        return _RuntimeHealthSnapshot(
+            processing_active=bool(getattr(runtime, "processing_ready", False)),
+            polling_active=bool(getattr(runtime, "polling_live", False)),
+            polling_cursor_ready=bool(getattr(runtime, "polling_ready", False)),
+        )
+    except Exception:
+        return _RuntimeHealthSnapshot(
+            processing_active=False,
+            polling_active=False,
+            polling_cursor_ready=False,
+        )
+
+
 def _runtime_stop_timeout_seconds(settings: Any) -> float:
     """Cover both runtime drain phases plus a small bounded cleanup margin."""
 
@@ -600,7 +638,14 @@ async def metrics_endpoint(request: Request) -> Response:
         )
         ready = False
         stats = None
-    record_durable_ingestion(stats, ready=ready)
+    health = _runtime_health_snapshot(runtime)
+    record_durable_ingestion(
+        stats,
+        ready=ready,
+        processing_active=health.processing_active,
+        polling_active=health.polling_active,
+        polling_cursor_ready=health.polling_cursor_ready,
+    )
 
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
@@ -627,13 +672,13 @@ async def queue_status(request: Request):
             status_code=503,
             content={"status": "not_ready"},
         )
+    health = _runtime_health_snapshot(runtime)
     return {
         "status": "ready",
-        "ingress": "active",
+        "ingress": "active" if health.polling_active else "standby",
+        "cursor": "ready" if health.polling_cursor_ready else "activating",
         "session": "active",
-        "processing": (
-            "active" if bool(getattr(runtime, "processing_ready", False)) else "standby"
-        ),
+        "processing": "active" if health.processing_active else "standby",
         "queue": {
             "pending": stats.pending,
             "retry_wait": stats.retry_wait,

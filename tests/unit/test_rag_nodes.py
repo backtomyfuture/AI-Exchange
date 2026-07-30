@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from src.graph.state import AgentState
 from src.nodes.retriever_node import retrieve_context
@@ -34,8 +35,13 @@ async def test_retrieve_context(
     mock_instance.search.return_value = [
         {"sender": "boss@example.com", "subject": "上次会议纪要", "body": "这是上次会议的纪要..."}
     ]
+    router = SimpleNamespace(
+        apply_tier2_hits=AsyncMock(return_value={}),
+        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
+    )
 
-    new_state = await retrieve_context(mock_state, graph_node_harness.dependencies)
+    with patch("src.nodes.retriever_node.get_routing_engine", return_value=router):
+        new_state = await retrieve_context(mock_state, graph_node_harness.dependencies)
 
     assert len(new_state["context_summaries"]) == 1
     assert new_state["context_summaries"][0]["subject"] == "上次会议纪要"

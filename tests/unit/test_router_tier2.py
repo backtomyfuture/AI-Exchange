@@ -168,6 +168,103 @@ async def test_apply_tier2_hits_no_match_returns_empty(engine_with_skill_pool):
 
 
 @pytest.mark.asyncio
+async def test_tier1_miss_defers_tier3_until_retrieval(engine_with_skill_pool):
+    engine, _pool = engine_with_skill_pool
+    state = {
+        "email": {"id": "mail-1", "subject": "s", "body": "b"},
+        "active_skills": [],
+        "routing_log": [],
+    }
+
+    with (
+        patch.object(engine.t1_router, "route", return_value=[]),
+        patch.object(engine, "_tier3_llm_route", new_callable=AsyncMock) as tier3,
+    ):
+        result = await engine.execute_router(state)
+
+    tier3.assert_not_awaited()
+    assert result["routing_stage"] == "pending"
+    assert result["routing_log"] == ["Tier 1 No match, awaiting Tier 2"]
+
+
+@pytest.mark.asyncio
+async def test_retriever_uses_tier3_only_after_tier2_has_no_decision(
+    monkeypatch,
+    graph_node_harness,
+):
+    from src.nodes import retriever_node
+
+    call_order: list[str] = []
+    fake_retriever = MagicMock()
+    fake_retriever.search_by_thread.return_value = []
+    fake_retriever.search.return_value = []
+    monkeypatch.setattr(retriever_node, "get_retriever", lambda: fake_retriever)
+
+    async def tier2(*_args):
+        call_order.append("tier2")
+        return {}
+
+    async def tier3(*_args):
+        call_order.append("tier3")
+        return {
+            "active_skills": ["skill_project_tracker"],
+            "routing_log": ["Tier 3 LLM Match: ['skill_project_tracker']"],
+            "routing_stage": "tier3",
+        }
+
+    fake_engine = MagicMock()
+    fake_engine.apply_tier2_hits = AsyncMock(side_effect=tier2)
+    fake_engine.apply_tier3_fallback = AsyncMock(side_effect=tier3)
+    monkeypatch.setattr(retriever_node, "get_routing_engine", lambda: fake_engine)
+    monkeypatch.setattr(retriever_node, "_retrieve_experience", AsyncMock(return_value=[]))
+    monkeypatch.setattr(retriever_node, "_retrieve_style_guidance", AsyncMock(return_value=""))
+    monkeypatch.setattr(retriever_node, "_retrieve_user_preferences", AsyncMock(return_value=[]))
+
+    state = graph_node_harness.state(
+        {"id": "tier-order", "subject": "s", "body": "b", "sender": "u@x.com"},
+        classification={"need_reply": True},
+        routing_stage="pending",
+    )
+    updates = await retrieve_context(state, graph_node_harness.dependencies)
+
+    assert call_order == ["tier2", "tier3"]
+    assert updates["routing_stage"] == "tier3"
+    assert updates["active_skills"] == ["skill_project_tracker"]
+
+
+@pytest.mark.asyncio
+async def test_retriever_does_not_reopen_tier2_or_tier3_after_tier1(
+    monkeypatch,
+    graph_node_harness,
+):
+    from src.nodes import retriever_node
+
+    fake_retriever = MagicMock()
+    fake_retriever.search_by_thread.return_value = []
+    fake_retriever.search.return_value = []
+    monkeypatch.setattr(retriever_node, "get_retriever", lambda: fake_retriever)
+    fake_engine = MagicMock()
+    fake_engine.apply_tier2_hits = AsyncMock()
+    fake_engine.apply_tier3_fallback = AsyncMock()
+    monkeypatch.setattr(retriever_node, "get_routing_engine", lambda: fake_engine)
+    monkeypatch.setattr(retriever_node, "_retrieve_experience", AsyncMock(return_value=[]))
+    monkeypatch.setattr(retriever_node, "_retrieve_style_guidance", AsyncMock(return_value=""))
+    monkeypatch.setattr(retriever_node, "_retrieve_user_preferences", AsyncMock(return_value=[]))
+
+    state = graph_node_harness.state(
+        {"id": "tier-one", "subject": "s", "body": "b", "sender": "u@x.com"},
+        classification={"need_reply": True},
+        active_skills=["skill_vip_handling"],
+        routing_stage="tier1",
+    )
+    updates = await retrieve_context(state, graph_node_harness.dependencies)
+
+    fake_engine.apply_tier2_hits.assert_not_awaited()
+    fake_engine.apply_tier3_fallback.assert_not_awaited()
+    assert updates["routing_stage"] == "tier1"
+
+
+@pytest.mark.asyncio
 async def test_retriever_node_integrates_tier2(monkeypatch, graph_node_harness):
     """retrieve_context must surface Tier 2 deltas alongside context."""
     from src.nodes import retriever_node

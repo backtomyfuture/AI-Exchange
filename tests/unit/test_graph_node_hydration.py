@@ -218,6 +218,9 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
     ]
     router = MagicMock()
     router.apply_tier2_hits = AsyncMock(return_value={})
+    router.apply_tier3_fallback = AsyncMock(
+        return_value={"routing_stage": "none"}
+    )
 
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
         "src.nodes.retriever_node.get_routing_engine", return_value=router
@@ -243,6 +246,7 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
     assert "CURRENT-BODY-SENTINEL" in retriever.search.call_args.kwargs["query_text"]
     assert "[内嵌图片]" in retriever.search.call_args.kwargs["query_text"]
     assert "data:image" not in retriever.search.call_args.kwargs["query_text"]
+    assert retriever.search.call_args.kwargs["exclude_email_id"] == "mail-1"
     routed_email = router.apply_tier2_hits.await_args.args[0]["email"]
     assert routed_email["body"] == "CURRENT-BODY-SENTINEL\n[内嵌图片]"
     encoded = json.dumps(result, ensure_ascii=False)
@@ -267,12 +271,12 @@ async def test_reply_required_retrieval_projects_visual_summary_without_image_by
                 "content_type": "image/png",
                 "content_id": "chart.png",
                 "is_inline": True,
-                "content": "SU1BR0UtQllURVM=",
+                "content": "iVBORw0KGgo=",
             },
             {
                 "name": "terms.pdf",
                 "content_type": "application/pdf",
-                "content": "UERG",
+                "content": "JVBERi0xLjcK",
             },
         ],
     }
@@ -287,6 +291,9 @@ async def test_reply_required_retrieval_projects_visual_summary_without_image_by
     retriever.search.return_value = []
     router = MagicMock()
     router.apply_tier2_hits = AsyncMock(return_value={})
+    router.apply_tier3_fallback = AsyncMock(
+        return_value={"routing_stage": "none"}
+    )
 
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
         "src.nodes.retriever_node.get_routing_engine", return_value=router
@@ -313,7 +320,7 @@ async def test_reply_required_retrieval_projects_visual_summary_without_image_by
         [
             {
                 "name": "chart.png",
-                "content": "SU1BR0UtQllURVM=",
+                "content": "iVBORw0KGgo=",
                 "mime_type": "image/png",
             }
         ]
@@ -321,7 +328,7 @@ async def test_reply_required_retrieval_projects_visual_summary_without_image_by
     assert dependencies.content_store.loads == [(_ref(), False), (_ref(), True)]
     assert result["metadata"]["image_analysis"] == "图表显示本月成本下降 12%。"
     encoded = json.dumps(result, ensure_ascii=False)
-    assert "SU1BR0UtQllURVM=" not in encoded
+    assert "iVBORw0KGgo=" not in encoded
     assert "attachments" not in result
     assert "email" not in result
 

@@ -32,9 +32,10 @@ class RoutingEngine:
 
     async def execute_router(self, state: AgentState) -> AgentState:
         """
-        执行路由生命周期。
+        执行 Tier 1 路由生命周期。
 
-        返回值由调用节点投影为有界 Graph delta；列表字段不依赖 reducer。
+        Tier 2 必须等待检索结果，Tier 3 只能在 Tier 2 未形成结论后执行；
+        两者由 ``retrieve_context`` 通过 ``apply_tier3_fallback`` 串行调用。
         """
         email = state.get("email", {})
         routing_log: List[str] = list(state.get("routing_log") or [])
@@ -53,51 +54,13 @@ class RoutingEngine:
             state = await self._apply_skills(state, t1_matches)
             state["routing_log"] = routing_log
             state["active_skills"] = active_skills
+            state["routing_stage"] = "tier1"
             return state
 
-        # --- Stage 2: Tier 2 (Semantic Layer) ---
-        # Tier 2 通常集成在 retriever_node 中，因为它需要等待向量数据库的检索结果。
-        routing_log.append("Tier 1 No match, moving to Tier 2/3")
-
-        # --- Stage 3: Tier 3 (LLM Reasoning Layer) ---
-        # 仅在有可用 Skill 时才调用 LLM，避免无意义的 LLM 开销。
-        skills = self.skill_manager.get_all_skills()
-        if skills:
-            try:
-                t3_matches = await self._tier3_llm_route(state, skills)
-            except ModelInputTooLarge:
-                delta = build_manual_review_delta(
-                    {},
-                    "router_input_too_large",
-                    classification=manual_review_classification(
-                        "router_input_too_large"
-                    ),
-                )
-                return delta
-            except Exception as exc:
-                logger.error(
-                    "Tier 3 LLM routing unavailable: error_type=%s",
-                    type(exc).__name__,
-                )
-                delta = build_manual_review_delta(
-                    {},
-                    "router_model_failed",
-                    classification=manual_review_classification(
-                        "router_model_failed"
-                    ),
-                )
-                return delta
-            if t3_matches:
-                routing_log.append(f"Tier 3 LLM Match: {t3_matches}")
-                for sid in t3_matches:
-                    if sid not in existing_skills and sid not in active_skills:
-                        active_skills.append(sid)
-                state = await self._apply_skills(state, t3_matches)
-        else:
-            routing_log.append("Tier 3 Skipped: No skills registered")
-
+        routing_log.append("Tier 1 No match, awaiting Tier 2")
         state["routing_log"] = routing_log
         state["active_skills"] = active_skills
+        state["routing_stage"] = "pending"
         return state
 
     def _tier2_route(
@@ -180,9 +143,76 @@ class RoutingEngine:
             return {}
         before = deepcopy(dict(state))
         new_state = await self._apply_skills(before, chosen)
+        return self._project_skill_delta(
+            before,
+            new_state,
+            chosen,
+            routing_log=f"Tier 2 Match: {chosen}",
+            routing_stage="tier2",
+        )
+
+    async def apply_tier3_fallback(self, state: AgentState) -> AgentState:
+        """Run Tier 3 only after a completed Tier 2 miss.
+
+        This is the second public routing seam.  Keeping it separate from the
+        Tier-1 entry prevents a model call from racing ahead of historical
+        evidence and makes the call order observable in tests.
+        """
+
+        skills = self.skill_manager.get_all_skills()
+        if not skills:
+            return {
+                "routing_log": ["Tier 3 Skipped: No skills registered"],
+                "routing_stage": "none",
+            }
+        try:
+            chosen = await self._tier3_llm_route(state, skills)
+        except ModelInputTooLarge:
+            return build_manual_review_delta(
+                {},
+                "router_input_too_large",
+                classification=manual_review_classification("router_input_too_large"),
+            )
+        except Exception as exc:
+            logger.error(
+                "Tier 3 LLM routing unavailable: error_type=%s",
+                type(exc).__name__,
+            )
+            return build_manual_review_delta(
+                {},
+                "router_model_failed",
+                classification=manual_review_classification("router_model_failed"),
+            )
+        if not chosen:
+            return {
+                "routing_log": ["Tier 3 LLM No match"],
+                "routing_stage": "none",
+            }
+        before = deepcopy(dict(state))
+        new_state = await self._apply_skills(before, chosen)
+        return self._project_skill_delta(
+            before,
+            new_state,
+            chosen,
+            routing_log=f"Tier 3 LLM Match: {chosen}",
+            routing_stage="tier3",
+        )
+
+    @staticmethod
+    def _project_skill_delta(
+        before: AgentState,
+        new_state: AgentState,
+        chosen: List[str],
+        *,
+        routing_log: str,
+        routing_stage: str,
+    ) -> AgentState:
+        """Project skill mutations into the bounded state fields owned by routing."""
+
         delta: Dict[str, Any] = {
             "active_skills": chosen,
-            "routing_log": [f"Tier 2 Match: {chosen}"],
+            "routing_log": [routing_log],
+            "routing_stage": routing_stage,
         }
         for key in (
             "classification",

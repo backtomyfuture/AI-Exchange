@@ -23,6 +23,7 @@ from src.ingestion.policy import FolderScope, PolicySnapshot
 from src.ingestion.runtime import (
     GreenfieldWebhookWriter,
     IngestionRuntime,
+    RuntimeHealthSnapshot,
     RuntimeManifestRepository,
     RuntimeShutdownError,
     RuntimeUnavailableError,
@@ -567,11 +568,23 @@ async def test_start_and_stop_own_polling_before_runtime_readiness() -> None:
     assert snapshots == [_snapshot()]
     assert runtime.polling_ready is True
     assert runtime.ready is True
+    assert runtime.health_snapshot() == RuntimeHealthSnapshot(
+        ready=True,
+        processing_active=False,
+        polling_active=True,
+        polling_cursor_ready=True,
+    )
     assert events.index("instance.register") < events.index("polling.start")
 
     await runtime.stop()
 
     assert runtime.polling_ready is False
+    assert runtime.health_snapshot() == RuntimeHealthSnapshot(
+        ready=False,
+        processing_active=False,
+        polling_active=False,
+        polling_cursor_ready=False,
+    )
     assert events.index("polling.stop") < events.index("instance.drain")
 
 

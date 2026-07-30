@@ -94,6 +94,21 @@ class RuntimeShutdownError(RuntimeError):
     """The runtime could not prove a complete bounded shutdown."""
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeHealthSnapshot:
+    """One local, identifier-free view of the polling runtime's liveness.
+
+    This small read-only Interface lets HTTP endpoints expose the state of the
+    actual single polling worker without coupling to its internal tasks, lease
+    or cursor implementation.
+    """
+
+    ready: bool
+    processing_active: bool
+    polling_active: bool
+    polling_cursor_ready: bool
+
+
 class _PoolPort(Protocol):
     async def open(self) -> None: ...
 
@@ -692,6 +707,20 @@ class IngestionRuntime:
 
         polling = self._polling_runtime
         return bool(polling is not None and polling.live is True)
+
+    def health_snapshot(self) -> RuntimeHealthSnapshot:
+        """Return the bounded liveness fields exposed to operators.
+
+        It intentionally does not perform a database round trip.  Callers
+        requiring authority validation must still use :meth:`check_ready`.
+        """
+
+        return RuntimeHealthSnapshot(
+            ready=self.ready,
+            processing_active=self.processing_ready,
+            polling_active=self.polling_live,
+            polling_cursor_ready=self.polling_ready,
+        )
 
     @property
     def lease(self) -> RuntimeInstanceLease | None:
@@ -1375,6 +1404,7 @@ def build_ingestion_runtime(
 __all__ = [
     "GreenfieldWebhookWriter",
     "IngestionRuntime",
+    "RuntimeHealthSnapshot",
     "RuntimeManifestRepository",
     "RuntimeShutdownError",
     "RuntimeUnavailableError",

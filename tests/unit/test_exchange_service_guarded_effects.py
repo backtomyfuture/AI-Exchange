@@ -82,10 +82,13 @@ async def test_attachment_upload_rejects_ambiguous_capacity_before_remote_io(
 
 
 @pytest.mark.asyncio
-async def test_attachment_upload_skips_contentless_items_and_stops_on_bad_base64() -> (
+async def test_attachment_upload_skips_invalid_items_without_consuming_valid_capacity() -> (
     None
 ):
-    with patch("src.exchange_service.lark_app.upload_file_to_drive") as upload:
+    with patch(
+        "src.exchange_service.lark_app.upload_file_to_drive",
+        return_value={"file_token": "token-1", "url": "https://example.test/file"},
+    ) as upload:
         projection = await _upload_attachments_to_lark(
             {
                 "attachments": [
@@ -94,11 +97,13 @@ async def test_attachment_upload_skips_contentless_items_and_stops_on_bad_base64
                     {"name": "never.txt", "content": "YQ=="},
                 ]
             }
-        )
+    )
 
-    assert projection.tokens == ()
-    assert projection.links == ()
-    upload.assert_not_called()
+    assert projection.tokens == ("token-1",)
+    assert projection.links == (
+        {"name": "never.txt", "lark_file_url": "https://example.test/file"},
+    )
+    upload.assert_called_once_with("never.txt", b"a", 1)
 
 
 @pytest.mark.parametrize(

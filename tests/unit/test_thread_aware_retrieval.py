@@ -1,6 +1,14 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from src.nodes.retriever_node import retrieve_context
+
+
+def _router_without_matches() -> SimpleNamespace:
+    return SimpleNamespace(
+        apply_tier2_hits=AsyncMock(return_value={}),
+        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
+    )
 
 
 @pytest.mark.asyncio
@@ -30,12 +38,19 @@ async def test_thread_context_fetched_first(graph_node_harness):
         "src.nodes.retriever_node.get_retriever",
         return_value=mock_retriever,
     ), patch(
+        "src.nodes.retriever_node.get_routing_engine",
+        return_value=_router_without_matches(),
+    ), patch(
         "src.nodes.retriever_node._generate_thread_summary",
         new=AsyncMock(return_value="deterministic thread summary"),
     ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
-    mock_retriever.search_by_thread.assert_called_once_with(thread_id="conv-123", limit=5)
+    mock_retriever.search_by_thread.assert_called_once_with(
+        thread_id="conv-123",
+        limit=5,
+        exclude_email_id="thread-one",
+    )
     assert len(result["context_summaries"]) == 3
     assert result["context_summaries"][0]["id"] == "t1"
 
@@ -56,7 +71,13 @@ async def test_no_thread_id_falls_back_to_semantic(graph_node_harness):
         context=[],
     )
 
-    with patch("src.nodes.retriever_node.get_retriever", return_value=mock_retriever):
+    with patch(
+        "src.nodes.retriever_node.get_retriever",
+        return_value=mock_retriever,
+    ), patch(
+        "src.nodes.retriever_node.get_routing_engine",
+        return_value=_router_without_matches(),
+    ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
     mock_retriever.search_by_thread.assert_not_called()

@@ -303,8 +303,9 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
     }
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    # AttachmentPolicy is the shared admission boundary for Drive uploads.
     "src/exchange_service.py": (
-        "aff05daada2f6b4e2342d47eb292ab5bb1e5ec2be5e9861cc36518d68c04aa92"
+        "33eb53e00b17ed7d4870b7e9cab202d363c31599a1f87e6b5c9ed93f63530ed2"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
@@ -419,7 +420,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "f5805eb412d72782cf17e9ac967bebd3c1b1a2da6cb1d26a66643d61868fb1c3"
     ),
     "src/ingestion/runtime.py": (
-        "8a78bec0fe57571f9d7a262a656db85e93b9991d87d082986c9a84a8f110a915"
+        "879573e600d3eb8a1dd96be7f81ae4001e2434159ca697ac17c6b7be6ab944a1"
     ),
     "src/ingestion/worker.py": (
         "75ed0dfeda6d6010d4b91741ee2679f2658b82afec8b1a8d303a8eecf0b066f0"
@@ -428,7 +429,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "315f162d2ffc7bb307ee8033df6cd6b55a18c59c661f6b4c5e0c1d77c1cbb3e7"
+        "d838a61f841ca8af7b19117bc60214706d13310d7a7b401f58dc711af4241f1d"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
@@ -455,8 +456,9 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     ],
 }
 _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
+    # Tier 3 is now reachable only through the post-Tier-2 fallback seam.
     "src/router/engine.py": (
-        "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
+        "9a2336ce5b9eeace9c1c2b3a110422b5864e7e282100b4262325b9f0e2cf46e2"
     ),
     "src/server.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
     "src/utils/email_processor.py": (

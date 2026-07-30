@@ -30,6 +30,7 @@ MAX_ROUTING_LOGS = 8
 MAX_ROUTING_LOG_BYTES = 256
 MAX_ACTIVE_SKILLS = 16
 MAX_SKILL_BYTES = 128
+_ROUTING_STAGES = frozenset({"pending", "tier1", "tier2", "tier3", "none"})
 MAX_METADATA_TEXT_BYTES = 1_024
 # The visual summary is drafting context, not a transcript.  Keep enough room
 # for the rest of the LangGraph checkpoint (routing, context and review state).
@@ -495,6 +496,11 @@ def sanitize_graph_delta(
             max_items=MAX_ROUTING_LOGS,
             max_item_bytes=MAX_ROUTING_LOG_BYTES,
         )
+    if "routing_stage" in delta:
+        stage = delta["routing_stage"]
+        if type(stage) is not str or stage not in _ROUTING_STAGES:
+            raise ValueError("invalid_routing_stage")
+        result["routing_stage"] = stage
     if "priority_level" in delta and type(delta["priority_level"]) is int:
         result["priority_level"] = max(0, min(delta["priority_level"], 10))
     if "system_prompt_modifier" in delta:

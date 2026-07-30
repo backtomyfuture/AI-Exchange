@@ -87,12 +87,12 @@ card_dispatch_total = Counter(
 
 
 # ---------------------------------------------------------------------------
-# Webhook queue / circuit-breaker visibility
+# Polling queue / circuit-breaker visibility
 # ---------------------------------------------------------------------------
 
-webhook_queue_depth = Gauge(
-    "webhook_queue_depth",
-    "Current length of the Exchange webhook ingest queue.",
+polling_queue_depth = Gauge(
+    "polling_queue_depth",
+    "Current number of pending or retryable items from Exchange polling.",
 )
 
 durable_inbox_items = Gauge(
@@ -108,7 +108,7 @@ durable_inbox_oldest_pending_seconds = Gauge(
 
 durable_ingress_ready = Gauge(
     "durable_ingress_ready",
-    "Whether the schema, policy, authority and Web session are ready.",
+    "Whether the schema, policy, authority, session and polling cursor are ready.",
 )
 
 durable_ingestion_snapshot_ok = Gauge(
@@ -118,7 +118,17 @@ durable_ingestion_snapshot_ok = Gauge(
 
 durable_processing_active = Gauge(
     "durable_processing_active",
-    "Whether final durable processing is active; Phase 2 remains standby.",
+    "Whether the configured durable processing worker and recovery loop are active.",
+)
+
+polling_ingress_active = Gauge(
+    "polling_ingress_active",
+    "Whether the single Exchange polling scheduler is live.",
+)
+
+polling_cursor_ready_gauge = Gauge(
+    "polling_cursor_ready",
+    "Whether polling completed baseline activation and has a usable cursor.",
 )
 
 circuit_breaker_state = Gauge(
@@ -154,11 +164,20 @@ def record_email_status(status: str) -> None:
     emails_processed_total.labels(status=status).inc()
 
 
-def record_durable_ingestion(stats, *, ready: bool) -> None:
-    """Update the bounded Phase-2 queue and runtime health gauges."""
+def record_durable_ingestion(
+    stats,
+    *,
+    ready: bool,
+    processing_active: bool,
+    polling_active: bool,
+    polling_cursor_ready: bool,
+) -> None:
+    """Update the bounded polling queue and runtime health gauges."""
 
     durable_ingress_ready.set(1 if ready else 0)
-    durable_processing_active.set(0)
+    durable_processing_active.set(1 if processing_active else 0)
+    polling_ingress_active.set(1 if polling_active else 0)
+    polling_cursor_ready_gauge.set(1 if polling_cursor_ready else 0)
     if stats is None:
         durable_ingestion_snapshot_ok.set(0)
         return
@@ -175,7 +194,7 @@ def record_durable_ingestion(stats, *, ready: bool) -> None:
         durable_inbox_items.labels(status=status).set(max(0, count))
     oldest = float(getattr(stats, "oldest_pending_seconds", 0.0))
     durable_inbox_oldest_pending_seconds.set(max(0.0, oldest))
-    webhook_queue_depth.set(values["pending"] + values["retry_wait"])
+    polling_queue_depth.set(values["pending"] + values["retry_wait"])
 
 
 def render_metrics() -> tuple[bytes, str]:
@@ -189,12 +208,14 @@ __all__ = [
     "llm_calls_total",
     "llm_call_duration_seconds",
     "card_dispatch_total",
-    "webhook_queue_depth",
+    "polling_queue_depth",
     "durable_inbox_items",
     "durable_inbox_oldest_pending_seconds",
     "durable_ingress_ready",
     "durable_ingestion_snapshot_ok",
     "durable_processing_active",
+    "polling_ingress_active",
+    "polling_cursor_ready_gauge",
     "circuit_breaker_state",
     "record_card_dispatch",
     "record_circuit_breaker_state",

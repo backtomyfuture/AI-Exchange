@@ -21,6 +21,7 @@ from src.graph.state_factory import (
     sanitize_graph_delta,
 )
 from src.graph.resource_locks import get_graph_resource_lock
+from src.safety.attachments import AttachmentPolicy
 from src.safety.input_limits import input_limits_from_settings, validate_email_input
 from src.safety.manual_review import (
     build_manual_review_delta,
@@ -168,59 +169,66 @@ async def _upload_attachments_to_lark(
     )
     tokens: list[str] = []
     links: list[dict[str, str]] = []
-    import base64
+    attachment_policy = AttachmentPolicy(
+        max_bytes=input_limits_from_settings(
+            get_settings()
+        ).attachment_single_bytes
+    )
+    attempted_uploads = 0
 
-    for ordinal, att in enumerate(business_attachments[:max_uploads]):
-        if att.get("content"):
-            try:
-                content_bytes = base64.b64decode(att["content"], validate=True)
-            except Exception as exc:
-                logger.error(
-                    "Attachment upload failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                break
-            await _authorize_external_effect(
-                _effect_boundary,
-                ExternalEffectKind.FEISHU,
-                ordinal,
-                {
-                    "operation": "upload_attachment",
-                    "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
-                    "size": len(content_bytes),
-                },
+    for ordinal, att in enumerate(business_attachments):
+        if attempted_uploads >= max_uploads:
+            break
+        decision = attachment_policy.assess(att)
+        if not decision.allowed or decision.content is None:
+            logger.warning(
+                "Attachment withheld from Lark Drive: reason=%s",
+                decision.reason or "attachment_policy_rejected",
             )
-            try:
-                res = await asyncio.to_thread(
-                    lark_app.upload_file_to_drive,
-                    att.get("name", "unknown"),
-                    content_bytes,
-                    len(content_bytes),
+            continue
+        content_bytes = decision.content
+        attempted_uploads += 1
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            ordinal,
+            {
+                "operation": "upload_attachment",
+                "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+                "size": len(content_bytes),
+            },
+        )
+        try:
+            res = await asyncio.to_thread(
+                lark_app.upload_file_to_drive,
+                decision.name,
+                content_bytes,
+                len(content_bytes),
+            )
+        except Exception as exc:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            logger.error(
+                "Attachment upload failed: error_type=%s",
+                type(exc).__name__,
+            )
+            break
+        token = res.get("file_token") if res else None
+        if _effect_boundary is not None and not (isinstance(token, str) and token):
+            raise GuardedExternalEffectFailed()
+        if isinstance(token, str) and token:
+            tokens.append(token)
+            if acknowledge_token is not None:
+                await acknowledge_token(token)
+            url = res.get("url")
+            if isinstance(url, str) and url:
+                links.append(
+                    {
+                        "name": decision.name,
+                        "lark_file_url": url,
+                    }
                 )
-            except Exception as exc:
-                if _effect_boundary is not None:
-                    raise GuardedExternalEffectFailed() from None
-                logger.error(
-                    "Attachment upload failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                break
-            token = res.get("file_token") if res else None
-            if _effect_boundary is not None and not (isinstance(token, str) and token):
-                raise GuardedExternalEffectFailed()
-            if isinstance(token, str) and token:
-                tokens.append(token)
-                if acknowledge_token is not None:
-                    await acknowledge_token(token)
-                url = res.get("url")
-                if isinstance(url, str) and url:
-                    links.append(
-                        {
-                            "name": str(att.get("name", "unknown")),
-                            "lark_file_url": url,
-                        }
-                    )
-                logger.info("Attachment uploaded to Lark Drive")
+            logger.info("Attachment uploaded to Lark Drive")
     return AttachmentUploadProjection(tokens=tuple(tokens), links=tuple(links))
 
 

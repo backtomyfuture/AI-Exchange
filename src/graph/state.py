@@ -19,6 +19,7 @@ class AgentState(TypedDict, total=False):
     # --- 路由与 Skill 控制层 ---
     active_skills: list[str]
     routing_log: list[str]
+    routing_stage: str
     priority_level: int
     system_prompt_modifier: str | None
     tool_calls: list[dict[str, str]]

@@ -66,9 +66,10 @@ Metrics Token、ContentStore Key、迁移/维护 DSN、运行限额和部署状�
 - 非占位、无用户信息的真实 HTTPS `EXTERNAL_URL`。本机冒烟可以用 HTTP curl 访问
   `127.0.0.1`；它不再承担 Exchange 入站回调职责。
 
-Exchange 地址必须通过证书校验。若服务实际通过私网 IP 访问、证书却只覆盖 DNS
-名称，部署工具会复用已迁移的内部 DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书
-问题。新环境的特殊私网 TLS 初始化见 [`deploy/README.md`](deploy/README.md)。
+生产 Compose 会显式注入 `EXCHANGE_SSL_VERIFY=true`，Exchange 地址必须通过证书校验。
+若服务实际通过私网 IP 访问、证书却只覆盖 DNS 名称，部署工具会复用已迁移的内部
+DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书问题。新环境的特殊私网 TLS 初始化见
+[`deploy/README.md`](deploy/README.md)。
 
 Exchange 入站 Webhook 已退役：应用不公开 `/webhooks/exchange`，不需要
 `EXCHANGE_WEBHOOK_SECRET`，也不应创建或启用 Exchange Webhook 订阅。
@@ -89,6 +90,8 @@ from src.config import get_settings
 from src.utils.exchange_api import ExchangeClient
 async def main():
     settings = get_settings()
+    if settings.EXCHANGE_SSL_VERIFY is not True:
+        raise SystemExit("exchange_tls_verification_required")
     client = ExchangeClient(settings)
     try:
         folders = await client.get_all_folders(force_refresh=True)
@@ -288,6 +291,11 @@ docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance-execute run -
 ## 运维建议
 
 -   **监控日志**: 核心日志输出在控制台，可通过 Docker logs 查看。
+-   **轮询健康**: 使用受 `METRICS_TOKEN` 保护的 `/queue` 和 `/metrics`；`ingress`、
+    `cursor`、`processing` 分别反映轮询调度器、首轮基线游标和 Durable Inbox Worker。
+-   **不确定副作用**: 首次外部调用前会持久化副作用标记。进程在远端结果未知时会进入
+    `manual_review`，而不是自动重试或重复发送飞书卡片。先人工核对飞书和 Exchange
+    的实际结果；不要把该状态加入批量 `reprocess_email.py --all-stuck`。
 -   **数据库管理**: Postgres 存储了所有的 LangGraph checkpoints，支持在服务重启后恢复处理中的任务。
 -   **模型切换**: 在 Provider 配置中按角色选择模型，不让供应商细节进入业务 module。
 

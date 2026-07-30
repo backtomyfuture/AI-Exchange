@@ -819,7 +819,7 @@ async def test_non_inline_pdf_with_content_id_is_uploaded_as_business_attachment
         "attachments": [
             {
                 "name": "report.pdf",
-                "content": "UERG",
+                "content": "JVBERi0xLjcK",
                 "content_type": "application/pdf",
                 "content_id": "normal-attachment-id",
                 "is_inline": False,
@@ -843,7 +843,7 @@ async def test_non_inline_pdf_with_content_id_is_uploaded_as_business_attachment
             "lark_file_url": "https://example.invalid/report",
         },
     )
-    upload.assert_called_once_with("report.pdf", b"PDF", 3)
+    upload.assert_called_once_with("report.pdf", b"%PDF-1.7\n", 9)
 
 
 @pytest.mark.asyncio

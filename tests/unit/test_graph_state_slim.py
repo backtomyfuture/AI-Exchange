@@ -132,6 +132,23 @@ def test_draft_id_must_belong_to_the_current_email():
         sanitize_graph_delta(state, {"draft_id": "mail-B"})
 
 
+@pytest.mark.parametrize("stage", ("tier1", "tier2", "tier3", "pending", "none"))
+def test_routing_stage_is_bounded_to_the_known_lifecycle(stage: str):
+    state = build_initial_graph_state({"id": "mail-1"}, _content_ref())
+
+    assert sanitize_graph_delta(state, {"routing_stage": stage}) == {
+        "routing_stage": stage
+    }
+
+
+@pytest.mark.parametrize("stage", ("unknown", ["tier1"], 1, None))
+def test_routing_stage_rejects_invalid_or_unhashable_values(stage: object):
+    state = build_initial_graph_state({"id": "mail-1"}, _content_ref())
+
+    with pytest.raises(ValueError, match="invalid_routing_stage"):
+        sanitize_graph_delta(state, {"routing_stage": stage})
+
+
 def test_persistent_email_identifier_fails_closed_instead_of_being_truncated():
     with pytest.raises(ValueError, match="invalid_email_id"):
         build_initial_graph_state(

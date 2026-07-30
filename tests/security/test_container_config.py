@@ -351,6 +351,20 @@ def test_production_application_has_no_source_or_test_bind_mounts():
     assert all(not str(volume).startswith("./tests:") for volume in volumes)
 
 
+def test_production_application_uses_a_restricted_non_root_runtime_container():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["ai-assistant-service"]
+
+    assert service["user"] == "1000:1000"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["deploy"]["resources"]["limits"]["pids"] == 256
+    assert service["tmpfs"] == ["/tmp:size=64m,mode=1777"]
+    assert service["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert service["environment"]["EXCHANGE_SSL_VERIFY"] == "true"
+
+
 def test_production_database_credentials_use_three_distinct_planes():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     postgres_environment = compose["services"]["postgres"]["environment"]
