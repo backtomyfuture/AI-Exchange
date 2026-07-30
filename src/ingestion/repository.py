@@ -2196,6 +2196,15 @@ class InboxRepository:
                                 attempts=lease.attempts,
                                 available_in_seconds=0,
                             )
+                    elif completion.target_status is EmailStatus.MANUAL_REVIEW:
+                        resolution = _ProcessingResolution(
+                            email_status=EmailStatus.MANUAL_REVIEW,
+                            inbox_status=InboxStatus.MANUAL_REVIEW,
+                            safe_code=completion.safe_error_code,
+                            safe_summary=completion.safe_error_summary,
+                            attempts=lease.attempts,
+                            available_in_seconds=0,
+                        )
                     else:
                         resolution = _ProcessingResolution(
                             email_status=completion.target_status,

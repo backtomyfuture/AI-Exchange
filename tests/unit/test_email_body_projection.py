@@ -1,4 +1,7 @@
-from src.utils.email_body_projection import project_email_body_for_model
+from src.utils.email_body_projection import (
+    project_email_body_for_guard,
+    project_email_body_for_model,
+)
 
 
 def test_model_projection_keeps_visible_text_without_inline_image_bytes():
@@ -20,3 +23,11 @@ def test_model_projection_keeps_visible_text_without_inline_image_bytes():
     assert payload not in projection.text
     assert projection.inline_image_count == 2
     assert len(projection.text.encode("utf-8")) < 256
+
+
+def test_guard_projection_keeps_inline_text_in_a_single_reference_line():
+    projection = project_email_body_for_guard(
+        "<p><span>7</span><span>月</span><span>30</span><span>日</span></p>"
+    )
+
+    assert projection == "7 月 30 日"

@@ -315,6 +315,12 @@ class LegacyProcessingAdapter:
     ) -> ProcessingCompletion:
         if outcome is ProcessingOutcome.FAILED:
             raise LegacyProcessingFailed()
+        if (
+            outcome is ProcessingOutcome.MANUAL_REVIEW
+            and type(legacy_status) is str
+            and legacy_status == "manual_review"
+        ):
+            return ProcessingCompletion.manual_review()
         if policy is ProcessingPolicy.ARCHIVE:
             if (
                 outcome is ProcessingOutcome.ARCHIVED

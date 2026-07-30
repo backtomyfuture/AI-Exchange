@@ -23,8 +23,11 @@ class ModelBodyProjection:
     inline_image_count: int
 
 
-def project_email_body_for_model(body: object) -> ModelBodyProjection:
-    """Return visible email text without transporting inline image bytes."""
+def _visible_text_and_image_count(
+    body: object,
+    *,
+    separator: str,
+) -> tuple[str, int]:
     source = body if isinstance(body, str) else str(body or "")
     soup = BeautifulSoup(source, "html.parser")
 
@@ -36,12 +39,21 @@ def project_email_body_for_model(body: object) -> ModelBodyProjection:
         image.replace_with(f" {INLINE_IMAGE_PLACEHOLDER} ")
         inline_image_count += 1
 
-    visible_text = soup.get_text(separator="\n", strip=True)
+    visible_text = soup.get_text(separator=separator, strip=True)
     visible_text, plain_uri_count = _DATA_IMAGE_URI_RE.subn(
         INLINE_IMAGE_PLACEHOLDER,
         visible_text,
     )
     inline_image_count += plain_uri_count
+    return visible_text, inline_image_count
+
+
+def project_email_body_for_model(body: object) -> ModelBodyProjection:
+    """Return visible email text without transporting inline image bytes."""
+    visible_text, inline_image_count = _visible_text_and_image_count(
+        body,
+        separator="\n",
+    )
 
     lines = []
     for raw_line in visible_text.splitlines():
@@ -55,8 +67,15 @@ def project_email_body_for_model(body: object) -> ModelBodyProjection:
     )
 
 
+def project_email_body_for_guard(body: object) -> str:
+    """Return a compact visible-text reference for deterministic content checks."""
+    visible_text, _ = _visible_text_and_image_count(body, separator=" ")
+    return _HORIZONTAL_WHITESPACE_RE.sub(" ", visible_text).strip()
+
+
 __all__ = [
     "INLINE_IMAGE_PLACEHOLDER",
     "ModelBodyProjection",
+    "project_email_body_for_guard",
     "project_email_body_for_model",
 ]

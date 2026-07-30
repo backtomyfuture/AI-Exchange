@@ -34,6 +34,7 @@ from src.ingestion.models import (
 from src.ingestion.processing import (
     ExternalEffectAuthorizationError,
     ExternalEffectKind,
+    ProcessingCompletion,
     ProcessingPolicyRejected,
     ReplaySafeExternalEffectFailed,
 )
@@ -276,7 +277,6 @@ async def test_nested_folder_payload_is_materialized_for_content_storage() -> No
         (ProcessingOutcome.PROCESSED, "sent"),
         (ProcessingOutcome.ARCHIVED, "waiting_approval"),
         (ProcessingOutcome.DUPLICATE, "waiting_approval"),
-        (ProcessingOutcome.MANUAL_REVIEW, "manual_review"),
     ],
 )
 async def test_unknown_duplicate_or_manual_legacy_results_require_review(
@@ -296,6 +296,24 @@ async def test_unknown_duplicate_or_manual_legacy_results_require_review(
             _application(),
             before_external_effect=AsyncMock(return_value=None),
         )
+
+
+@pytest.mark.asyncio
+async def test_manual_legacy_result_maps_to_terminal_manual_completion() -> None:
+    ctx = _ctx(legacy_status="manual_review")
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=AsyncMock(return_value=ProcessingOutcome.MANUAL_REVIEW),
+    )
+
+    completion = await adapter.process(
+        _lease(),
+        _application(),
+        before_external_effect=AsyncMock(return_value=None),
+    )
+
+    assert completion == ProcessingCompletion.manual_review()
 
 
 @pytest.mark.asyncio

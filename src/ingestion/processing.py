@@ -39,6 +39,7 @@ _SUCCESS_PAIRS: Final = frozenset(
         (EmailStatus.NOTIFIED_READONLY, ProcessingOutcome.PROCESSED),
         (EmailStatus.NO_ACTION, ProcessingOutcome.PROCESSED),
         (EmailStatus.ARCHIVED, ProcessingOutcome.ARCHIVED),
+        (EmailStatus.MANUAL_REVIEW, ProcessingOutcome.MANUAL_REVIEW),
     }
 )
 _FINISH_PAIRS: Final = frozenset(
@@ -233,7 +234,26 @@ class ProcessingCompletion:
         outcome = self.legacy_outcome
         if (target, outcome) not in _SUCCESS_PAIRS:
             raise ValueError("processing completion has an invalid legacy mapping")
-        if self.safe_error_code is not None or self.safe_error_summary is not None:
+        if target is EmailStatus.MANUAL_REVIEW:
+            object.__setattr__(
+                self,
+                "safe_error_code",
+                _require_text(
+                    "safe_error_code",
+                    self.safe_error_code,
+                    max_length=128,
+                ),
+            )
+            object.__setattr__(
+                self,
+                "safe_error_summary",
+                _require_text(
+                    "safe_error_summary",
+                    self.safe_error_summary,
+                    max_length=256,
+                ),
+            )
+        elif self.safe_error_code is not None or self.safe_error_summary is not None:
             raise ValueError("successful processing completion cannot contain an error")
 
     @classmethod
@@ -251,6 +271,15 @@ class ProcessingCompletion:
     @classmethod
     def archived(cls) -> ProcessingCompletion:
         return cls(EmailStatus.ARCHIVED, ProcessingOutcome.ARCHIVED)
+
+    @classmethod
+    def manual_review(cls) -> ProcessingCompletion:
+        return cls(
+            EmailStatus.MANUAL_REVIEW,
+            ProcessingOutcome.MANUAL_REVIEW,
+            safe_error_code="processing.manual_review",
+            safe_error_summary="Processing requires manual review",
+        )
 
 
 @dataclass(frozen=True, slots=True)

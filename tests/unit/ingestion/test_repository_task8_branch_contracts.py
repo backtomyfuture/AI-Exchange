@@ -1152,6 +1152,58 @@ async def test_finish_rejects_exhausted_version_before_any_write(
 
 
 @pytest.mark.asyncio
+async def test_finish_manual_completion_preserves_an_atomic_manual_review_pair(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(normalized_event)
+    repository, _connection = _repository_with_connection(
+        _Cursor(one=(str(uuid4()),)),
+        _Cursor(one=(str(uuid4()),)),
+    )
+    _patch_transaction_setup(repository, monkeypatch)
+    email = _email(lease)
+    monkeypatch.setattr(
+        repository, "_lock_processing_email", AsyncMock(return_value=email)
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_inbox",
+        AsyncMock(return_value=_inbox(lease)),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_load_processing_result_receipt",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_require_authorized_processing_attempt",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_append_processing_result_receipt",
+        AsyncMock(),
+    )
+
+    result = await repository.finish_email_processing(
+        lease,
+        email.id,
+        email.version,
+        ProcessingCompletion.manual_review(),
+    )
+
+    assert result.email_status is EmailStatus.MANUAL_REVIEW
+    assert result.inbox_status is InboxStatus.MANUAL_REVIEW
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("write_failure", ["email", "inbox"])
 async def test_finish_rejects_when_aggregate_write_is_lost(
     normalized_event: NormalizedIngressEvent,

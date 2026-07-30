@@ -12,7 +12,10 @@ from src.safety.model_budget import (
     token_budget_from_settings,
 )
 from src.safety.manual_review import build_manual_review_delta
-from src.utils.email_body_projection import project_email_body_for_model
+from src.utils.email_body_projection import (
+    project_email_body_for_guard,
+    project_email_body_for_model,
+)
 from src.utils.retry_decorator import with_llm_retry
 
 logger = logging.getLogger(__name__)
@@ -27,7 +30,10 @@ async def review_draft(
     email, draft = await hydrate_graph_content(state, dependencies)
     metadata = state.get("metadata") or {}
     review_count = metadata.get("review_count", 0)
-    body_projection = project_email_body_for_model(email.get("body", ""))
+    original_body = email.get("body", "")
+    guard_email = dict(email)
+    guard_email["body"] = project_email_body_for_guard(original_body)
+    body_projection = project_email_body_for_model(original_body)
     email["body"] = body_projection.text
     image_analysis = metadata.get("image_analysis", "")
     visual_context = ""
@@ -38,6 +44,7 @@ async def review_draft(
         # ContentGuard must be able to validate dates and numbers that the draft
         # legitimately derived from the image summary.
         email["body"] += visual_context
+        guard_email["body"] += visual_context
 
     if not draft:
         return build_manual_review_delta(
@@ -105,7 +112,7 @@ async def review_draft(
 
         if result["pass"]:
             logger.info("Draft review: PASS")
-            return await _run_content_guard(state, draft, email)
+            return await _run_content_guard(state, draft, guard_email)
         issues = result.get("issues", "")
         logger.info(
             "Draft review failed: issues_present=%s issues_bytes=%d",
