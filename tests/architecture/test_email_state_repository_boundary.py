@@ -261,7 +261,8 @@ _TASK5_REPOSITORY_STRUCTURAL_AST_SHA256 = {
         "f6171bcd68eab46b13ce3590ada575780f93389bb0790092d669d8adca38e6a5"
     ),
     "src/domain/errors.py": (
-        "d7019263f9325f7628f382205c2f3ce9177b4d82187ec4f717ad1c4f328a6236"
+        # Reviewed after the replay-safe Exchange detail retry-hint boundary.
+        "7357c1746099ae16b71e2a5ad04866a8d1b8eeb4142e58002181163570d2877a"
     ),
     "src/ingestion/repository.py": (
         "a5b01672ba755da251a6fa6b54f7611e3e89555712ecba318e3f6dfc067fa969"
@@ -411,13 +412,14 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "1f37d4f16ae6f4b5422d7b71e0955ea3740017933fdb257c6276224dcfffc94a"
     ),
     "src/ingestion/legacy_adapter.py": (
-        "542aaf9657213542a18a2846edcb860c2ad665f122e4cac033cce80a0d5df442"
+        # Reviewed after propagating a validated Exchange Retry-After hint.
+        "523a6fc1028940a6b97dd66086fde8492648fb92621ab5f149569c6c42fbad17"
     ),
     "src/ingestion/processing.py": (
-        "4e34b1677fc7facd8c31413c324663a2552f4e2359e9b0da64d8aedde26da1f9"
+        "48a2531595f37502be2b07b592f211e53fff2df50f4e785b7c82c1d7a90bda77"
     ),
     "src/ingestion/repository.py": (
-        "f5805eb412d72782cf17e9ac967bebd3c1b1a2da6cb1d26a66643d61868fb1c3"
+        "b8e2544ab54bc0c87a72a8148567966b9cfa8df56382c5329d5bdc130a913830"
     ),
     "src/ingestion/runtime.py": (
         "879573e600d3eb8a1dd96be7f81ae4001e2434159ca697ac17c6b7be6ab944a1"
@@ -461,8 +463,11 @@ _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
         "9a2336ce5b9eeace9c1c2b3a110422b5864e7e282100b4262325b9f0e2cf46e2"
     ),
     "src/server.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
+    # Reviewed after splitting current-message embeddings from bounded quoted
+    # history and removing raw provider alternative bodies; the approved
+    # email.copy call remains the only non-SQL exception.
     "src/utils/email_processor.py": (
-        "b553db7c12a4fd0a078b88a12f8edcbd9f61dbe597b52c38fa52bbdbf8478711"
+        "6bca4ef1e07cbed5ab8188d12de451ca29ba01cccf2eff28c5cf7d17998905b7"
     ),
 }
 _EMAIL_MUTATION = re.compile(

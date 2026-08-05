@@ -111,7 +111,7 @@ def _utc_now() -> datetime:
 def _normalize_email_detail_recipients(
     email_data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Add canonical recipient fields without discarding gateway aliases."""
+    """Add canonical detail fields without discarding gateway aliases."""
     normalized = dict(email_data)
     for canonical, gateway_field in (
         ("to", "to_recipients"),
@@ -119,6 +119,35 @@ def _normalize_email_detail_recipients(
     ):
         if not normalized.get(canonical) and gateway_field in normalized:
             normalized[canonical] = normalized.get(gateway_field) or []
+
+    for canonical, gateway_fields in (
+        (
+            "conversation_id",
+            ("conversationId", "conversationID", "ConversationId", "ConversationID"),
+        ),
+        ("conversation_index", ("conversationIndex", "ConversationIndex")),
+        ("thread_id", ("threadId", "threadID", "ThreadId", "ThreadID")),
+        (
+            "internet_message_id",
+            ("internetMessageId", "InternetMessageId"),
+        ),
+        ("in_reply_to", ("inReplyTo", "InReplyTo")),
+        ("references", ("References",)),
+        ("unique_body", ("uniqueBody", "UniqueBody")),
+    ):
+        if normalized.get(canonical):
+            continue
+        for gateway_field in gateway_fields:
+            value = normalized.get(gateway_field)
+            if value:
+                normalized[canonical] = value
+                break
+
+    # Qdrant's same-thread index uses one canonical key.  Exchange's
+    # ConversationId is the authoritative value when the gateway does not
+    # provide an application-specific thread_id.
+    if not normalized.get("thread_id") and normalized.get("conversation_id"):
+        normalized["thread_id"] = normalized["conversation_id"]
     return normalized
 
 
