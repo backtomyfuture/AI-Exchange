@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from pydantic import SecretStr
 
 from src.config import Settings
+from src.domain.errors import ExchangeDetailTransientError
 from src.domain.send_result import ExchangeSendOutcome, ExchangeSendResult
 from src.utils.exchange_api import ExchangeClient
 
@@ -230,6 +231,36 @@ async def test_get_email_returns_none_for_non_object_data(mock_settings):
         email = await client.get_email("email-id")
 
     assert email is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [503, 504])
+async def test_get_email_surfaces_gateway_retry_hint_for_transient_detail_failure(
+    mock_settings,
+    status_code: int,
+) -> None:
+    client = ExchangeClient(settings=mock_settings)
+    response = StreamingResponse(
+        status_code,
+        [b'{"retryable":true}'],
+        headers=[("Retry-After", "1")],
+    )
+    mock_http = StreamingHTTPClient([response])
+
+    with (
+        patch.object(
+            type(client),
+            "http_client",
+            new_callable=PropertyMock,
+            return_value=mock_http,
+        ),
+        pytest.raises(ExchangeDetailTransientError) as caught,
+    ):
+        await client.get_email("email-id")
+
+    assert caught.value.retryable is True
+    assert caught.value.retry_after_seconds == 1
+    assert response.chunks_consumed == 0
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from src.domain.errors import (
+    ExchangeDetailTransientError,
     SyncAuthorizationError,
     SyncContractError,
     SyncCursorInvalidError,
@@ -1162,11 +1163,22 @@ class ExchangeClient:
                         if isinstance(email_data, dict) and email_data
                         else None
                     )
+                if response.status_code in {503, 504}:
+                    logger.warning(
+                        "Exchange email details temporarily unavailable: email=%s status=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
+                        response.status_code,
+                    )
+                    raise ExchangeDetailTransientError(
+                        retry_after_seconds=_retry_after_seconds(response)
+                    )
                 logger.error(
                     "Failed to get Exchange email details: email=%s status=%s",
                     fingerprint_identifier(email_id, namespace="email"),
                     response.status_code,
                 )
+        except ExchangeDetailTransientError:
+            raise
         except Exception as exc:
             logger.error(
                 "Exception getting Exchange email: email=%s error_type=%s",
