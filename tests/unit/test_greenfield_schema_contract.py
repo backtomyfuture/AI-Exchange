@@ -4,6 +4,7 @@ from src.db import schema_contract
 
 
 _REVISION = "20260716_0006"
+_POLLING_REVISION = "20260728_0007"
 
 
 def test_0006_manifest_covers_greenfield_relations_columns_and_expressions() -> None:
@@ -174,3 +175,27 @@ def test_0006_manifest_pins_guard_and_data_routine_structural_identity() -> None
         else:
             assert routine[2] == "trigger"
             assert routine[5] is False
+
+
+def test_0007_manifest_adds_only_the_fenced_sync_page_routine() -> None:
+    assert schema_contract._PHASE2_RELATION_KINDS_BY_REVISION[_POLLING_REVISION] == (
+        schema_contract._PHASE2_RELATION_KINDS_BY_REVISION[_REVISION]
+    )
+    assert schema_contract._PHASE2_COLUMN_TYPES_BY_REVISION[_POLLING_REVISION] == (
+        schema_contract._PHASE2_COLUMN_TYPES_BY_REVISION[_REVISION]
+    )
+    added = schema_contract._POLLING_ONLY_ROUTINES - schema_contract._GREENFIELD_ROUTINES
+    assert len(added) == 1
+    routine = next(iter(added))
+    assert routine[:3] == (
+        "greenfield_commit_sync_page",
+        "p_account_id bigint, p_session_id uuid, "
+        "p_expected_lease_version bigint, p_folder_key text, "
+        "p_expected_cursor text, p_expected_cursor_version bigint, "
+        "p_next_cursor text, p_events jsonb, p_activation boolean",
+        "TABLE(committed_cursor text, committed_version bigint, "
+        "inserted_count bigint, duplicate_count bigint)",
+    )
+    assert schema_contract._POLLING_ONLY_ROUTINE_SOURCE_SHA256[
+        (routine[0], routine[1])
+    ] == "acbc4d4e474cb38f2f929a9327c58a8928db4ebdf8709679b42d6a34bdab292a"

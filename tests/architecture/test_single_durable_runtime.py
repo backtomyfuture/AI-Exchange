@@ -110,13 +110,11 @@ def test_runtime_factory_has_one_worker_wiring_and_no_sync_constructor() -> None
     )
 
 
-def test_webhook_endpoint_has_one_production_sink_and_no_legacy_queue_fallback() -> (
-    None
-):
+def test_polling_only_server_exposes_no_webhook_sink_or_legacy_queue_fallback() -> None:
     source = _source("src/server.py")
 
-    assert source.count(".webhook_ingress_service") >= 3
-    assert source.count('getattr(request.app.state, "webhook_ingress_service"') == 1
+    assert '"/webhooks/exchange"' not in source
+    assert "exchange_webhook" not in source
     assert "enqueue_webhook_event" not in source
     assert "WebhookWorker" not in source
     assert "queue_full" not in source

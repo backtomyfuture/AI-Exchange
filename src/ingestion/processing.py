@@ -39,6 +39,7 @@ _SUCCESS_PAIRS: Final = frozenset(
         (EmailStatus.NOTIFIED_READONLY, ProcessingOutcome.PROCESSED),
         (EmailStatus.NO_ACTION, ProcessingOutcome.PROCESSED),
         (EmailStatus.ARCHIVED, ProcessingOutcome.ARCHIVED),
+        (EmailStatus.MANUAL_REVIEW, ProcessingOutcome.MANUAL_REVIEW),
     }
 )
 _FINISH_PAIRS: Final = frozenset(
@@ -126,11 +127,19 @@ class ReplaySafeExternalEffectFailed(RuntimeError):
     safe_code = "processing.replay_safe_effect_failed"
     safe_summary = "Replay-safe external effect failed"
 
-    def __init__(self) -> None:
+    def __init__(self, *, retry_after_seconds: int | None = None) -> None:
+        if retry_after_seconds is not None and (
+            type(retry_after_seconds) is not int or not 0 <= retry_after_seconds <= 3600
+        ):
+            raise TypeError("invalid retry_after_seconds")
         super().__init__(self.safe_summary)
+        self.retry_after_seconds = retry_after_seconds
 
     def __repr__(self) -> str:
-        return f"ReplaySafeExternalEffectFailed(safe_code={self.safe_code!r})"
+        return (
+            f"ReplaySafeExternalEffectFailed(safe_code={self.safe_code!r}, "
+            f"retry_after_seconds={self.retry_after_seconds!r})"
+        )
 
 
 class ProcessingCompletionRejected(RuntimeError):
@@ -233,7 +242,26 @@ class ProcessingCompletion:
         outcome = self.legacy_outcome
         if (target, outcome) not in _SUCCESS_PAIRS:
             raise ValueError("processing completion has an invalid legacy mapping")
-        if self.safe_error_code is not None or self.safe_error_summary is not None:
+        if target is EmailStatus.MANUAL_REVIEW:
+            object.__setattr__(
+                self,
+                "safe_error_code",
+                _require_text(
+                    "safe_error_code",
+                    self.safe_error_code,
+                    max_length=128,
+                ),
+            )
+            object.__setattr__(
+                self,
+                "safe_error_summary",
+                _require_text(
+                    "safe_error_summary",
+                    self.safe_error_summary,
+                    max_length=256,
+                ),
+            )
+        elif self.safe_error_code is not None or self.safe_error_summary is not None:
             raise ValueError("successful processing completion cannot contain an error")
 
     @classmethod
@@ -251,6 +279,15 @@ class ProcessingCompletion:
     @classmethod
     def archived(cls) -> ProcessingCompletion:
         return cls(EmailStatus.ARCHIVED, ProcessingOutcome.ARCHIVED)
+
+    @classmethod
+    def manual_review(cls) -> ProcessingCompletion:
+        return cls(
+            EmailStatus.MANUAL_REVIEW,
+            ProcessingOutcome.MANUAL_REVIEW,
+            safe_error_code="processing.manual_review",
+            safe_error_summary="Processing requires manual review",
+        )
 
 
 @dataclass(frozen=True, slots=True)

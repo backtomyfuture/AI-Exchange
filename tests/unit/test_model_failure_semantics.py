@@ -145,7 +145,7 @@ async def test_tier3_router_failure_requires_manual_review():
     with patch("src.router.engine.enforce_model_input_budget"), patch(
         "src.providers.factory.get_llm_for_role", return_value=model
     ):
-        result = await engine.execute_router(state)
+        result = await engine.apply_tier3_fallback(state)
 
     _assert_manual_review(result, raw_error)
 
@@ -161,7 +161,10 @@ async def test_thread_summary_failure_requires_manual_review(graph_node_harness)
         {"id": "old-1", "sender": "one@example.com", "subject": "Q", "body": "a"},
         {"id": "old-2", "sender": "two@example.com", "subject": "Q", "body": "b"},
     ]
-    router = SimpleNamespace(apply_tier2_hits=AsyncMock(return_value={}))
+    router = SimpleNamespace(
+        apply_tier2_hits=AsyncMock(return_value={}),
+        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
+    )
     model = SimpleNamespace(ainvoke=AsyncMock(side_effect=TimeoutError(raw_error)))
 
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
@@ -411,7 +414,7 @@ async def test_tier3_invalid_decision_requires_manual_review(content):
         "src.providers.factory.get_llm_for_role",
         return_value=model,
     ):
-        result = await engine.execute_router(state)
+        result = await engine.apply_tier3_fallback(state)
 
     _assert_manual_review(result)
 
@@ -432,7 +435,7 @@ async def test_large_router_failure_still_returns_bounded_manual_delta():
         "src.providers.factory.get_llm_for_role",
         return_value=model,
     ):
-        result = await engine.execute_router(state)
+        result = await engine.apply_tier3_fallback(state)
 
     _assert_manual_review(result, "private")
     assert "email" not in result
@@ -448,7 +451,10 @@ async def test_empty_thread_summary_requires_manual_review(graph_node_harness):
         {"id": "old-1", "sender": "one@example.com", "subject": "Q", "body": "a"},
         {"id": "old-2", "sender": "two@example.com", "subject": "Q", "body": "b"},
     ]
-    router = SimpleNamespace(apply_tier2_hits=AsyncMock(return_value={}))
+    router = SimpleNamespace(
+        apply_tier2_hits=AsyncMock(return_value={}),
+        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
+    )
     model = SimpleNamespace(
         ainvoke=AsyncMock(return_value=SimpleNamespace(content="  \n"))
     )

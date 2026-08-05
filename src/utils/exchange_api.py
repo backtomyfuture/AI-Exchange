@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from src.domain.errors import (
+    ExchangeDetailTransientError,
     SyncAuthorizationError,
     SyncContractError,
     SyncCursorInvalidError,
@@ -18,6 +19,7 @@ from src.ingestion.models import (
     MAX_SYNC_CHANGES_PER_BATCH,
     POSTGRES_BIGINT_MAX,
     SyncBatch,
+    SyncChange,
 )
 from src.ingestion.normalization import validate_sync_change_contract
 from src.safety.http_response import read_json_limited
@@ -41,6 +43,8 @@ _SYNC_ONLY_FIELDS = [
     "is_read",
     "has_attachments",
 ]
+_POLLING_ONLY_FIELDS = ["id"]
+_POLLING_NON_INGRESS_CHANGE_TYPES = frozenset({"read_flag_change"})
 _SYNC_TIMEOUT = httpx.Timeout(
     connect=10.0,
     read=135.0,
@@ -282,6 +286,73 @@ def _sync_batch_from_payload(payload: object, *, limit: int) -> SyncBatch:
     )
 
 
+def _polling_sync_change_from_payload(value: object) -> SyncChange | None:
+    """Project a Gateway delta into an identity-only internal Sync DTO."""
+
+    if not isinstance(value, dict):
+        raise ValueError("invalid Exchange polling Sync item")
+    if not {"change_type", "id"}.issubset(value):
+        raise ValueError("invalid Exchange polling Sync item")
+    kind = value["change_type"]
+    if type(kind) is not str:
+        raise ValueError("invalid Exchange polling Sync item")
+    if kind in _POLLING_NON_INGRESS_CHANGE_TYPES:
+        if not _valid_exact_text(value["id"], max_length=1024):
+            raise ValueError("invalid Exchange polling Sync item")
+        # Exchange emits this after a client marks a message read.  It is a
+        # cursor-only state transition, not a mail event, and policy forbids
+        # it from entering the Durable Inbox.
+        return None
+    # The existing Durable Inbox Worker obtains authoritative email detail only
+    # after claiming the event.  Treat the polling response as an untrusted
+    # notification: do not copy its body, attachment metadata, or mail fields
+    # into the durable payload.
+    item = {} if kind in {"create", "update"} else None
+    return validate_sync_change_contract(
+        SyncChange(
+            kind=kind,
+            external_email_id=value["id"],
+            item=item,
+        )
+    )
+
+
+def _polling_sync_batch_from_payload(
+    payload: object,
+    *,
+    limit: int,
+    discard_items: bool,
+) -> SyncBatch:
+    """Normalize the current complete-delta Gateway response for polling."""
+
+    if not isinstance(payload, dict) or set(payload) != {"code", "msg", "data"}:
+        raise ValueError("invalid Exchange polling Sync wrapper")
+    if type(payload["code"]) is not int or payload["code"] != 200:
+        raise ValueError("invalid Exchange polling Sync wrapper code")
+    if payload["msg"] != "OK" or type(payload["msg"]) is not str:
+        raise ValueError("invalid Exchange polling Sync wrapper message")
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != {"sync_state", "items"}:
+        raise ValueError("invalid Exchange polling Sync data")
+    items = data["items"]
+    if not isinstance(items, list) or len(items) > limit:
+        raise ValueError("invalid Exchange polling Sync item count")
+    changes: tuple[SyncChange, ...] = ()
+    if not discard_items:
+        projected = tuple(_polling_sync_change_from_payload(item) for item in items)
+        changes = tuple(change for change in projected if change is not None)
+    return SyncBatch(
+        contract_version=_SYNC_CONTRACT_VERSION,
+        cursor=data["sync_state"],
+        changes=changes,
+        # The deployed Gateway exhausts its internal ``sync_items`` generator
+        # before serializing the response.  Its returned state is therefore the
+        # completed delta boundary, even when the number of identities equals
+        # the requested Exchange page size.
+        includes_last=True,
+    )
+
+
 def _normalize_folder_name(name: str | None) -> str:
     return re.sub(r"[\s_-]+", "", (name or "").strip().casefold())
 
@@ -458,6 +529,114 @@ class ExchangeClient:
                             max_structure_tokens=32 + (21 * limit),
                         )
                         batch = _sync_batch_from_payload(response_payload, limit=limit)
+                    except httpx.DecodingError:
+                        failure = SyncContractError()
+                    except httpx.TimeoutException:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except httpx.TransportError:
+                        failure = SyncTransientError(
+                            retry_after_seconds=_retry_after_seconds(response)
+                        )
+                    except Exception:
+                        failure = SyncContractError()
+        except httpx.DecodingError:
+            failure = SyncContractError()
+        except httpx.TimeoutException:
+            failure = SyncTransientError()
+        except httpx.TransportError:
+            failure = SyncTransientError()
+        except Exception:
+            failure = SyncContractError()
+
+        if failure is not None:
+            raise failure
+        if batch is None:
+            raise SyncContractError()
+        return batch
+
+    async def sync_polling(
+        self,
+        account_id: int,
+        folder: str,
+        sync_state: str | None,
+        limit: int,
+        *,
+        discard_items: bool = False,
+    ) -> SyncBatch:
+        """Fetch one current-Gateway complete delta for the polling ingress.
+
+        Unlike the dormant v2 reconciliation endpoint, this deployed Gateway
+        accepts a null activation cursor and returns no pagination marker or
+        custom contract header.  The response is normalized before it reaches
+        the existing durable Inbox path.
+        """
+
+        endpoint: str | None = None
+        valid_cursor = sync_state is None or _valid_exact_text(
+            sync_state,
+            max_length=8192,
+        )
+        invalid_input = not (
+            type(account_id) is int
+            and 1 <= account_id <= POSTGRES_BIGINT_MAX
+            and _valid_exact_text(folder, max_length=512)
+            and valid_cursor
+            and type(limit) is int
+            and 1 <= limit <= MAX_SYNC_CHANGES_PER_BATCH
+            and type(discard_items) is bool
+        )
+        if not invalid_input:
+            try:
+                endpoint = self._sync_endpoint()
+            except Exception:
+                invalid_input = True
+        if invalid_input or endpoint is None:
+            raise SyncContractError()
+
+        payload = {
+            "account_id": account_id,
+            "folder": folder,
+            "sync_state": sync_state,
+            "limit": limit,
+            "only_fields": _POLLING_ONLY_FIELDS,
+        }
+        failure: Exception | None = None
+        batch: SyncBatch | None = None
+        try:
+            client = self.http_client
+            async with client.stream(
+                "POST",
+                endpoint,
+                json=payload,
+                headers={"Accept-Encoding": "identity"},
+                timeout=_SYNC_TIMEOUT,
+                follow_redirects=False,
+            ) as response:
+                status = response.status_code
+                if status in {401, 403}:
+                    failure = SyncAuthorizationError()
+                elif status in {400, 404, 422}:
+                    failure = SyncContractError()
+                elif status in {408, 429} or 500 <= status <= 599:
+                    failure = SyncTransientError(
+                        retry_after_seconds=_retry_after_seconds(response)
+                    )
+                elif status != 200 or not _content_encoding_is_safe(response):
+                    failure = SyncContractError()
+                else:
+                    try:
+                        response_payload = await read_json_limited(
+                            response,
+                            max_bytes=self._input_limits.exchange_response_bytes,
+                            max_structure_tokens=32 + (21 * limit),
+                        )
+                        batch = _polling_sync_batch_from_payload(
+                            response_payload,
+                            limit=limit,
+                            discard_items=discard_items or sync_state is None,
+                        )
                     except httpx.DecodingError:
                         failure = SyncContractError()
                     except httpx.TimeoutException:
@@ -984,11 +1163,22 @@ class ExchangeClient:
                         if isinstance(email_data, dict) and email_data
                         else None
                     )
+                if response.status_code in {503, 504}:
+                    logger.warning(
+                        "Exchange email details temporarily unavailable: email=%s status=%s",
+                        fingerprint_identifier(email_id, namespace="email"),
+                        response.status_code,
+                    )
+                    raise ExchangeDetailTransientError(
+                        retry_after_seconds=_retry_after_seconds(response)
+                    )
                 logger.error(
                     "Failed to get Exchange email details: email=%s status=%s",
                     fingerprint_identifier(email_id, namespace="email"),
                     response.status_code,
                 )
+        except ExchangeDetailTransientError:
+            raise
         except Exception as exc:
             logger.error(
                 "Exception getting Exchange email: email=%s error_type=%s",

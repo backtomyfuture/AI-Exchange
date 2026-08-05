@@ -9,6 +9,7 @@ from src.db import access_contract, bootstrap, roles, schema_contract
 
 
 REVISION = "20260716_0006"
+POLLING_REVISION = "20260728_0007"
 GOVERNED_RELATIONS = frozenset(
     {
         "audit_events",
@@ -185,7 +186,12 @@ def test_greenfield_relation_acl_limits_runtime_worker_to_exact_columns() -> Non
     assert GOVERNED_RELATIONS <= set(maintenance)
     assert "pipeline_shadow_comparisons" not in runtime
     assert "pipeline_shadow_comparisons" not in maintenance
-    for relation in GOVERNED_RELATIONS - {"audit_events", "emails", "event_inbox"}:
+    for relation in GOVERNED_RELATIONS - {
+        "audit_events",
+        "emails",
+        "event_inbox",
+        "sync_cursors",
+    }:
         _assert_select_only(runtime[relation])
     for relation in GOVERNED_RELATIONS:
         _assert_select_only(maintenance[relation])
@@ -283,7 +289,8 @@ def test_greenfield_relation_acl_limits_runtime_worker_to_exact_columns() -> Non
             "safe_metadata",
         ),
     )
-    for relation in ("audit_events", "emails", "event_inbox"):
+    _assert_select_only(runtime["sync_cursors"])
+    for relation in ("audit_events", "emails", "event_inbox", "sync_cursors"):
         assert set(runtime[relation].table_privileges) == {"SELECT"}
         assert runtime[relation].delete is False
 
@@ -435,6 +442,35 @@ def test_greenfield_routine_execute_manifests_are_exact_identity_pairs() -> None
         assert all("pending" not in spec.identity_arguments for spec in manifest)
         assert all("*" not in spec.name and "%" not in spec.name for spec in manifest)
         bootstrap._validate_routine_manifest(manifest)
+
+
+def test_polling_revision_grants_only_the_session_fenced_sync_page_writer() -> None:
+    runtime = access_contract.RUNTIME_ROUTINE_EXECUTE_BY_REVISION[POLLING_REVISION]
+    names = {spec.name for spec in runtime}
+
+    assert (
+        names
+        == (RUNTIME_ROUTINES - {"greenfield_insert_webhook_event"})
+        | {"greenfield_commit_sync_page"}
+    )
+    assert all(
+        access_contract.RUNTIME_RELATION_ACCESS_BY_REVISION[POLLING_REVISION][name]
+        == access_contract.RUNTIME_RELATION_ACCESS_BY_REVISION[REVISION][name]
+        for name in GOVERNED_RELATIONS
+    )
+    assert {spec.name for spec in access_contract.SECURITY_DEFINER_ROUTINES_BY_REVISION[
+        POLLING_REVISION
+    ]} >= {
+        "greenfield_insert_webhook_event",
+        "greenfield_commit_sync_page",
+    }
+    sync_page = next(spec for spec in runtime if spec.name == "greenfield_commit_sync_page")
+    assert sync_page.identity_arguments == (
+        "p_account_id bigint, p_session_id uuid, "
+        "p_expected_lease_version bigint, p_folder_key text, "
+        "p_expected_cursor text, p_expected_cursor_version bigint, "
+        "p_next_cursor text, p_events jsonb, p_activation boolean"
+    )
 
 
 def test_role_preflight_uses_exact_name_and_identity_argument_set_equality() -> None:

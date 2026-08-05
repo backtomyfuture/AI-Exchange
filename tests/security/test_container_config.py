@@ -264,10 +264,12 @@ def test_production_shutdown_budget_covers_bounded_ingestion_drain():
 
 def test_production_healthchecks_use_session_aware_readiness():
     compose = _load_yaml(PRODUCTION_COMPOSE)
-    service_check = compose["services"]["ai-assistant-service"]["healthcheck"]["test"]
+    healthcheck = compose["services"]["ai-assistant-service"]["healthcheck"]
+    service_check = healthcheck["test"]
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
     assert service_check == ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+    assert healthcheck["start_period"] == "900s"
     assert "CMD curl -f http://localhost:8000/ready || exit 1" in dockerfile
     assert "CMD curl -f http://localhost:8000/health || exit 1" not in dockerfile
 
@@ -335,7 +337,7 @@ def test_optional_webhook_tls_ingress_mounts_only_reviewed_config_and_secrets():
         {"source": "webhook_tls_fullchain", "target": "webhook_tls_fullchain.pem"},
         {"source": "webhook_tls_key", "target": "webhook_tls_key.pem"},
     ]
-    assert "location = /webhooks/exchange" in config
+    assert "location = /webhooks/exchange" not in config
     assert "location = /ready" in config
     assert "location /" in config and "return 404" in config
     assert "ssl_protocols TLSv1.2 TLSv1.3" in config
@@ -347,6 +349,20 @@ def test_production_application_has_no_source_or_test_bind_mounts():
 
     assert all(not str(volume).startswith("./src:") for volume in volumes)
     assert all(not str(volume).startswith("./tests:") for volume in volumes)
+
+
+def test_production_application_uses_a_restricted_non_root_runtime_container():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["ai-assistant-service"]
+
+    assert service["user"] == "1000:1000"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["deploy"]["resources"]["limits"]["pids"] == 256
+    assert service["tmpfs"] == ["/tmp:size=64m,mode=1777"]
+    assert service["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert service["environment"]["EXCHANGE_SSL_VERIFY"] == "true"
 
 
 def test_production_database_credentials_use_three_distinct_planes():

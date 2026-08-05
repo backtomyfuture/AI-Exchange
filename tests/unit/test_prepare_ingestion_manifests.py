@@ -52,7 +52,7 @@ def _args(evidence_file: Path, output_dir: Path, **overrides: object) -> Namespa
     values: dict[str, object] = {
         "account_id": 8,
         "webhook_inbox_id": _WEBHOOK_ID,
-        "sync_folder": "Inbox",
+        "sync_folder": "INBOX",
         "build_id": _BUILD_ID,
         "release_evidence_file": evidence_file,
         "output_dir": output_dir,
@@ -96,7 +96,7 @@ def test_prepares_exact_seven_item_policy_and_valid_runtime_contract(
     scope = policy["scopes"][0]
     assert scope["canonical_key"] == "INBOX"
     assert scope["webhook_ids"] == [_WEBHOOK_ID]
-    assert scope["sync_folder"] == "Inbox"
+    assert scope["sync_folder"] == "INBOX"
     assert len(scope["event_policy_matrix"]) == 7
     assert scope["event_policy_matrix"] == [
         {
@@ -394,7 +394,7 @@ def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
         preparer._prepare_payloads(
             account_id=8,
             webhook_inbox_id=_WEBHOOK_ID,
-            sync_folder="Inbox",
+            sync_folder="INBOX",
             build_id=_BUILD_ID,
             release_evidence_file=evidence_file,
         )
@@ -411,7 +411,7 @@ def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
         preparer._prepare_payloads(
             account_id=8,
             webhook_inbox_id="INBOX",
-            sync_folder="Inbox",
+            sync_folder="INBOX",
             build_id=_BUILD_ID,
             release_evidence_file=evidence_file,
         )
@@ -426,6 +426,31 @@ def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
             "--evidence-manifest-hash",
         }
     )
+
+
+def test_refuses_a_sync_folder_other_than_the_gateway_inbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    evidence_file = tmp_path / "evidence.json"
+    _write_json(evidence_file, _evidence())
+    monkeypatch.setattr(
+        preparer,
+        "_require_clean_git_tree",
+        lambda _root: {"revision": _REVISION, "tree": _TREE},
+    )
+
+    with pytest.raises(
+        preparer.ManifestPreparationError,
+        match="sync_folder_must_be_gateway_inbox",
+    ):
+        preparer._prepare_payloads(
+            account_id=8,
+            webhook_inbox_id=_WEBHOOK_ID,
+            sync_folder="Inbox",
+            build_id=_BUILD_ID,
+            release_evidence_file=evidence_file,
+        )
 
 
 def test_partial_output_write_is_fully_removed(

@@ -704,6 +704,8 @@ async def bootstrap_database(
         "20260710_0003",
         "20260713_0004",
         "20260713_0005",
+        "20260716_0006",
+        "20260728_0007",
     }
     await require_database_schema_contract(
         dsn,

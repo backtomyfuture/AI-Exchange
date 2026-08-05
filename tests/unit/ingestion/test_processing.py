@@ -144,6 +144,15 @@ def test_processing_completion_factories_are_exact_and_immutable(
         completion.target_status = EmailStatus.ARCHIVED  # type: ignore[misc]
 
 
+def test_manual_review_completion_is_an_explicit_terminal_outcome() -> None:
+    completion = ProcessingCompletion.manual_review()
+
+    assert completion.target_status is EmailStatus.MANUAL_REVIEW
+    assert completion.legacy_outcome is ProcessingOutcome.MANUAL_REVIEW
+    assert completion.safe_error_code == "processing.manual_review"
+    assert completion.safe_error_summary == "Processing requires manual review"
+
+
 @pytest.mark.parametrize(
     "values",
     [

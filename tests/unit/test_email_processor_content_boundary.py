@@ -10,6 +10,7 @@ from langgraph.graph import END, StateGraph
 from src.domain.email_state import InitialEmailWriteResult, ProcessingOutcome
 from src.domain.errors import DatabaseOperationError
 from src.exchange_service import (
+    CleanupHandleSnapshot,
     _cleanup_graph_drive_files,
     _ensure_durable_content_ref,
     _run_ai_path,
@@ -818,7 +819,7 @@ async def test_non_inline_pdf_with_content_id_is_uploaded_as_business_attachment
         "attachments": [
             {
                 "name": "report.pdf",
-                "content": "UERG",
+                "content": "JVBERi0xLjcK",
                 "content_type": "application/pdf",
                 "content_id": "normal-attachment-id",
                 "is_inline": False,
@@ -842,7 +843,7 @@ async def test_non_inline_pdf_with_content_id_is_uploaded_as_business_attachment
             "lark_file_url": "https://example.invalid/report",
         },
     )
-    upload.assert_called_once_with("report.pdf", b"PDF", 3)
+    upload.assert_called_once_with("report.pdf", b"%PDF-1.7\n", 9)
 
 
 @pytest.mark.asyncio
@@ -952,6 +953,139 @@ async def test_ai_path_uploads_and_decorates_business_attachments_after_ai():
         preserved_pdf_token=None,
         attachment_links=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_ai_path_sends_manual_review_card_without_marking_exchange_read():
+    """A fail-closed graph result must surface the email without consuming it."""
+    ctx = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            get_content_ref=AsyncMock(return_value=_ref()),
+            compare_and_set_manual_review=AsyncMock(return_value=True),
+            get_email_status=AsyncMock(return_value="manual_review"),
+            update_status=AsyncMock(),
+        ),
+        exchange_client=AsyncMock(),
+        graph=_stateful_graph(),
+    )
+    pipeline_result = {
+        "next_step": "manual_review",
+        "approval_status": "manual_review",
+        "safe_error_summary": "content_guard_rejected",
+        "classification": {"priority": "P1"},
+        "email": {
+            "id": "mail-manual-review",
+            "subject": "需人工处理",
+            "sender": "sender@example.test",
+            "body": "请在7月30日前完成。",
+        },
+    }
+    manual_card = AsyncMock(return_value=True)
+
+    with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._snapshot_cleanup_handles",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch(
+        "src.exchange_service._checkpoint_ai_path_resources",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch(
+        "src.exchange_service._ingest_to_qdrant",
+        new_callable=AsyncMock,
+    ), patch(
+        "src.exchange_service._run_ai_pipeline",
+        new=AsyncMock(return_value=pipeline_result),
+    ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=manual_card,
+    ), patch(
+        "src.exchange_service._cleanup_graph_drive_files",
+        new_callable=AsyncMock,
+    ), patch(
+        "src.exchange_service._mark_email_read",
+        new_callable=AsyncMock,
+    ) as mark_read:
+        outcome = await _run_ai_path(
+            "mail-manual-review",
+            {"id": "mail-manual-review"},
+            ctx,
+            {"configurable": {"thread_id": "mail-manual-review"}},
+        )
+
+    assert outcome is ProcessingOutcome.MANUAL_REVIEW
+    manual_card.assert_awaited_once_with(
+        "mail-manual-review",
+        pipeline_result,
+        _effect_boundary=None,
+    )
+    ctx.db_manager.compare_and_set_manual_review.assert_awaited_once()
+    assert (
+        ctx.db_manager.compare_and_set_manual_review.await_args.kwargs["error_code"]
+        == "content_guard_rejected"
+    )
+    mark_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ai_path_keeps_manual_review_email_unread_when_card_delivery_fails():
+    ctx = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            get_content_ref=AsyncMock(return_value=_ref()),
+            compare_and_set_manual_review=AsyncMock(return_value=True),
+            update_status=AsyncMock(),
+        ),
+        exchange_client=AsyncMock(),
+        graph=_stateful_graph(),
+    )
+    pipeline_result = {
+        "next_step": "manual_review",
+        "safe_error_summary": "content_guard_rejected",
+        "email": {"id": "mail-manual-card-failed", "body": "需要人工处理"},
+    }
+    manual_card = AsyncMock(return_value=False)
+
+    with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
+        "src.exchange_service._snapshot_cleanup_handles",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch(
+        "src.exchange_service._checkpoint_ai_path_resources",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch(
+        "src.exchange_service._ingest_to_qdrant",
+        new_callable=AsyncMock,
+    ), patch(
+        "src.exchange_service._run_ai_pipeline",
+        new=AsyncMock(return_value=pipeline_result),
+    ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=manual_card,
+    ), patch(
+        "src.exchange_service._cleanup_graph_drive_files",
+        new_callable=AsyncMock,
+    ) as cleanup, patch(
+        "src.exchange_service._mark_email_read",
+        new_callable=AsyncMock,
+    ) as mark_read:
+        outcome = await _run_ai_path(
+            "mail-manual-card-failed",
+            {"id": "mail-manual-card-failed"},
+            ctx,
+            {"configurable": {"thread_id": "mail-manual-card-failed"}},
+        )
+
+    assert outcome is ProcessingOutcome.FAILED
+    manual_card.assert_awaited_once_with(
+        "mail-manual-card-failed",
+        pipeline_result,
+        _effect_boundary=None,
+    )
+    ctx.db_manager.compare_and_set_manual_review.assert_not_awaited()
+    ctx.db_manager.update_status.assert_awaited_once_with(
+        "mail-manual-card-failed",
+        "delivery_failed",
+        error_message="manual_review_card_delivery_failed",
+    )
+    cleanup.assert_awaited_once()
+    mark_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio

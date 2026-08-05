@@ -197,7 +197,7 @@ async def test_compiled_reviewer_manual_route_never_reaches_sender(
 
 
 @pytest.mark.asyncio
-async def test_run_ai_path_persists_manual_review_without_dispatch_or_mark_read():
+async def test_run_ai_path_sends_manual_review_card_without_mark_read():
     email_id = "manual-service"
     ref = ContentRef(
         account_id=8,
@@ -234,6 +234,12 @@ async def test_run_ai_path_persists_manual_review_without_dispatch_or_mark_read(
         "next_step": "manual_review",
         "safe_error_summary": "categorizer_model_failed",
     }
+    manual_card = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: call_order.append(
+            "manual_card_delivered"
+        )
+        or True
+    )
 
     with patch(
         "src.exchange_service.get_settings",
@@ -257,6 +263,9 @@ async def test_run_ai_path_persists_manual_review_without_dispatch_or_mark_read(
         "src.exchange_service._cleanup_graph_drive_files",
         new=AsyncMock(side_effect=cleanup_resources),
     ) as cleanup, patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=manual_card,
+    ), patch(
         "src.exchange_service._dispatch_notification",
         new=AsyncMock(return_value={"delivered": True, "kind": "skipped"}),
     ) as dispatch, patch(
@@ -271,7 +280,16 @@ async def test_run_ai_path_persists_manual_review_without_dispatch_or_mark_read(
         )
 
     assert outcome is ProcessingOutcome.MANUAL_REVIEW
-    assert call_order == ["manual_review_persisted", "resources_cleaned"]
+    assert call_order == [
+        "manual_card_delivered",
+        "manual_review_persisted",
+        "resources_cleaned",
+    ]
+    manual_card.assert_awaited_once_with(
+        email_id,
+        projection,
+        _effect_boundary=None,
+    )
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_with(
         email_id,
         expected=frozenset(
@@ -337,6 +355,7 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
         "next_step": "approval",
         "safe_error_summary": "private-content-should-not-be-persisted",
     }
+    manual_card = AsyncMock(return_value=True)
 
     with patch(
         "src.exchange_service.get_settings",
@@ -360,6 +379,9 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
         "src.exchange_service._cleanup_graph_drive_files",
         new=AsyncMock(),
     ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=manual_card,
+    ), patch(
         "src.exchange_service._dispatch_notification",
         new=AsyncMock(),
     ) as dispatch:
@@ -371,6 +393,11 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
         )
 
     assert outcome is ProcessingOutcome.MANUAL_REVIEW
+    manual_card.assert_awaited_once_with(
+        email_id,
+        projection,
+        _effect_boundary=None,
+    )
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_with(
         email_id,
         expected=frozenset(
@@ -391,7 +418,7 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
 
 
 @pytest.mark.asyncio
-async def test_run_ai_path_cannot_overwrite_newer_terminal_with_manual_review():
+async def test_run_ai_path_escalates_card_delivery_when_manual_review_cas_loses():
     email_id = "manual-cas-loser"
     ref = ContentRef(
         account_id=8,
@@ -408,6 +435,7 @@ async def test_run_ai_path_cannot_overwrite_newer_terminal_with_manual_review():
         "next_step": "manual_review",
         "safe_error_summary": "reviewer_model_failed",
     }
+    manual_card = AsyncMock(return_value=True)
 
     with patch(
         "src.exchange_service.get_settings",
@@ -431,17 +459,25 @@ async def test_run_ai_path_cannot_overwrite_newer_terminal_with_manual_review():
         "src.exchange_service._cleanup_graph_drive_files",
         new=cleanup,
     ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=manual_card,
+    ), patch(
         "src.exchange_service._dispatch_notification",
         new=AsyncMock(),
-    ) as dispatch:
-        outcome = await _run_ai_path(
+    ) as dispatch, pytest.raises(DatabaseOperationError) as caught:
+        await _run_ai_path(
             email_id,
             {"id": email_id, "attachments": []},
             ctx,
             {"configurable": {"thread_id": email_id}},
         )
 
-    assert outcome is ProcessingOutcome.FAILED
+    assert caught.value.operation == "compare_and_set_manual_review"
+    manual_card.assert_awaited_once_with(
+        email_id,
+        projection,
+        _effect_boundary=None,
+    )
     cleanup.assert_not_awaited()
     dispatch.assert_not_awaited()
 
@@ -494,6 +530,9 @@ async def test_manual_review_commit_then_raise_is_confirmed_before_cleanup(caplo
     ), patch(
         "src.exchange_service._cleanup_graph_drive_files",
         new=cleanup,
+    ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=AsyncMock(return_value=True),
     ):
         outcome = await _run_ai_path(
             email_id,
@@ -548,6 +587,9 @@ async def test_manual_cleanup_cancellation_preserves_manual_and_cancellation_ide
     ), patch(
         "src.exchange_service._cleanup_graph_drive_files",
         new=cleanup,
+    ), patch(
+        "src.exchange_service._dispatch_manual_review_notification",
+        new=AsyncMock(return_value=True),
     ), pytest.raises(asyncio.CancelledError) as caught:
         await _run_ai_path(
             email_id,
@@ -558,4 +600,4 @@ async def test_manual_cleanup_cancellation_preserves_manual_and_cancellation_ide
 
     assert caught.value is cancellation
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_once()
-    assert cleanup.await_count == 2
+    assert cleanup.await_count == 1

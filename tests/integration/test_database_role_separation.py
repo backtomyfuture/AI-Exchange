@@ -6,7 +6,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from src.db.access_contract import GREENFIELD_DATABASE_REVISION
+from src.db.access_contract import POLLING_ONLY_DATABASE_REVISION
 from src.db.bootstrap import bootstrap_database
 from src.db.roles import (
     DatabaseRoleError,
@@ -1180,7 +1180,7 @@ async def test_bootstrap_resolves_builtin_types_before_target_domains(empty_sche
         **empty_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == GREENFIELD_DATABASE_REVISION
+    assert summary["alembic"] == POLLING_ONLY_DATABASE_REVISION
     shadowed_columns = empty_schema.scalar(
         "SELECT count(*) "
         "FROM pg_catalog.pg_attribute AS attribute "
@@ -1696,7 +1696,7 @@ async def test_bootstrap_accepts_inaccessible_legacy_processed_view(
         **separated_schema.bootstrap_identity,
     )
 
-    assert summary["alembic"] == GREENFIELD_DATABASE_REVISION
+    assert summary["alembic"] == POLLING_ONLY_DATABASE_REVISION
     await require_runtime_database_role(
         separated_schema.runtime_dsn,
         **separated_schema.runtime_identity,

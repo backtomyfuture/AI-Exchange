@@ -81,8 +81,8 @@ class TestRoutingEngineTier1:
 
 
     @pytest.mark.asyncio
-    async def test_tier1_no_match_proceed_to_tier3(self, sample_state, mock_settings):
-        """测试Tier 1无匹配时进入Tier 3"""
+    async def test_tier1_no_match_defers_tier3_until_retrieval(self, sample_state, mock_settings):
+        """Tier 1 无匹配必须先等待检索层的 Tier 2。"""
         engine = RoutingEngine()
         
         # Mock Tier1返回空列表(无匹配)
@@ -94,13 +94,10 @@ class TestRoutingEngineTier1:
                 with patch.object(engine, '_apply_skills', return_value=sample_state):
                     result = await engine.execute_router(sample_state)
                     
-                    # 验证进入Tier 3
-                    mock_t3.assert_called_once()
-                    
-                    # 验证routing_log记录流程
+                    mock_t3.assert_not_awaited()
                     log = result.get("routing_log", [])
                     assert any("Tier 1 No match" in str(entry) for entry in log)
-                    assert any("Tier 3" in str(entry) for entry in log)
+                    assert result["routing_stage"] == "pending"
 
 
 class TestRoutingEngineTier3:

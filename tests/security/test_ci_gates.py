@@ -40,7 +40,6 @@ COMPOSE_PLACEHOLDERS = {
     "EXCHANGE_API_KEY": "phase2-ci-exchange-key",
     "EXCHANGE_ACCOUNT_ID": "8",
     "EXCHANGE_ACCOUNT_EMAIL": "phase2-ci@example.invalid",
-    "EXCHANGE_WEBHOOK_SECRET": "phase2-ci-webhook-secret",
     "LARK_APP_ID": "phase2-ci-lark-app",
     "LARK_APP_SECRET": "phase2-ci-lark-secret",
     "LARK_ENCRYPT_KEY": "phase2-ci-lark-encrypt",

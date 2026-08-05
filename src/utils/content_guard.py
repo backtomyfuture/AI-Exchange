@@ -34,6 +34,20 @@ _DATE_RE = re.compile(
     r"|(?:今|明|后|昨|前)天"
     r"|(?:上|下|这|本)(?:周|个?月)"
 )
+_DATE_TOKEN_SEPARATOR_RE = re.compile(r"[\s\u200b\u200c\u200d\u2060\ufeff]+")
+_DATE_REFERENCE_RE = re.compile(
+    r"\d{4}[\s\u200b\u200c\u200d\u2060\ufeff]*[-/年]"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*\d{1,2}"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*[-/月]"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*\d{1,2}"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*[日号]?"
+    r"|\d{1,2}[\s\u200b\u200c\u200d\u2060\ufeff]*[-/月]"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*\d{1,2}"
+    r"[\s\u200b\u200c\u200d\u2060\ufeff]*[日号]?"
+    r"|(?:周|星期)[一二三四五六日天]"
+    r"|(?:今|明|后|昨|前)天"
+    r"|(?:上|下|这|本)(?:周|个?月)"
+)
 _NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?%?\b")
 
 
@@ -80,6 +94,10 @@ class ContentGuard:
             for match in pattern.finditer(text)
         }
 
+    @staticmethod
+    def _normalize_date_token(value: str) -> str:
+        return _DATE_TOKEN_SEPARATOR_RE.sub("", value).lower()
+
     async def check_hallucination(self, draft: str, original_email: dict) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
         ref_text = " ".join([
@@ -89,10 +107,14 @@ class ContentGuard:
             " ".join(str(r) for r in (original_email.get("to") or [])),
             " ".join(str(r) for r in (original_email.get("cc") or [])),
         ]).lower()
+        reference_dates = {
+            self._normalize_date_token(match.group())
+            for match in _DATE_REFERENCE_RE.finditer(ref_text)
+        }
 
         for m in _DATE_RE.finditer(draft):
-            token = m.group().lower()
-            if token not in ref_text:
+            token = self._normalize_date_token(m.group())
+            if not any(token in reference_date for reference_date in reference_dates):
                 issues.append({"type": "unverified_date", "claim": m.group(), "severity": "warning"})
 
         for name in sorted(self._extract_chinese_addressees(draft)):

@@ -312,6 +312,43 @@ def test_failure_resolution_retries_safe_detail_only_without_effect_marker(
     assert resolution.inbox_status is expected_status
     assert resolution.email_status.value == expected_status.value
     assert resolution.safe_code == expected_code
+    if not effect_started:
+        assert resolution.available_in_seconds == 10
+
+
+def test_failure_resolution_honors_replay_safe_gateway_retry_hint(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    lease = _lease(normalized_event)
+
+    resolution = InboxRepository._failure_resolution(
+        error=ReplaySafeExternalEffectFailed(retry_after_seconds=1),
+        lease=lease,
+        email=_email(lease),
+        inbox=_inbox(lease),
+        expected_email_version=4,
+    )
+
+    assert resolution.inbox_status is InboxStatus.RETRY_WAIT
+    assert resolution.available_in_seconds == 1
+
+
+def test_failure_resolution_keeps_effect_started_detail_hint_in_manual_review(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    lease = _lease(normalized_event)
+    effect_started_at = datetime.now(UTC)
+
+    resolution = InboxRepository._failure_resolution(
+        error=ReplaySafeExternalEffectFailed(retry_after_seconds=1),
+        lease=lease,
+        email=_email(lease, external_effects_started_at=effect_started_at),
+        inbox=_inbox(lease, effect_started_at=effect_started_at),
+        expected_email_version=4,
+    )
+
+    assert resolution.inbox_status is InboxStatus.MANUAL_REVIEW
+    assert resolution.available_in_seconds == 0
 
 
 def test_unknown_external_outcome_with_effect_marker_still_requires_review(
@@ -1149,6 +1186,58 @@ async def test_finish_rejects_exhausted_version_before_any_write(
             POSTGRES_BIGINT_MAX,
             ProcessingCompletion.no_action(),
         )
+
+
+@pytest.mark.asyncio
+async def test_finish_manual_completion_preserves_an_atomic_manual_review_pair(
+    normalized_event: NormalizedIngressEvent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _lease(normalized_event)
+    repository, _connection = _repository_with_connection(
+        _Cursor(one=(str(uuid4()),)),
+        _Cursor(one=(str(uuid4()),)),
+    )
+    _patch_transaction_setup(repository, monkeypatch)
+    email = _email(lease)
+    monkeypatch.setattr(
+        repository, "_lock_processing_email", AsyncMock(return_value=email)
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_ownership",
+        AsyncMock(return_value=PipelineGenerationState.CURRENT_INGRESS),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_lock_processing_inbox",
+        AsyncMock(return_value=_inbox(lease)),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_load_processing_result_receipt",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_require_authorized_processing_attempt",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_append_processing_result_receipt",
+        AsyncMock(),
+    )
+
+    result = await repository.finish_email_processing(
+        lease,
+        email.id,
+        email.version,
+        ProcessingCompletion.manual_review(),
+    )
+
+    assert result.email_status is EmailStatus.MANUAL_REVIEW
+    assert result.inbox_status is InboxStatus.MANUAL_REVIEW
 
 
 @pytest.mark.asyncio

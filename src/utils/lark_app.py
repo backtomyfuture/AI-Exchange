@@ -641,6 +641,18 @@ def send_system_notification(title: str, content: str, template: str = "red"):
     return _impl(title, content, template, lark_api_client=lark_api_client)
 
 
+def send_manual_review_card(email_id: str, email_data: dict, reason: str):
+    """Send a manual-review alert card. Delegates to lark_messaging."""
+    from src.utils.lark_messaging import send_manual_review_card as _impl
+
+    return _impl(
+        email_id,
+        email_data,
+        reason,
+        lark_api_client=lark_api_client,
+    )
+
+
 
 
 # Event Handlers

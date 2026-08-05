@@ -865,6 +865,7 @@ async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
         "20260713_0004",
         "20260713_0005",
         "20260716_0006",
+        "20260728_0007",
     }:
         raise AssertionError("unsupported test revision")
     alembic_runner.upgrade(schema, revision)
@@ -1224,7 +1225,11 @@ async def test_0006_governed_relations_expose_only_bounded_runtime_worker_column
             ),
         ).fetchall()
     assert len(rows) == 2 * len(_GREENFIELD_SELECT_ONLY_RELATIONS)
-    expected_runtime_column_insert = {"audit_events", "emails", "event_inbox"}
+    expected_runtime_column_insert = {
+        "audit_events",
+        "emails",
+        "event_inbox",
+    }
     expected_runtime_column_update = {"emails", "event_inbox"}
     for row in rows:
         role_name, relation_name = row[:2]
@@ -1278,6 +1283,45 @@ async def test_0006_governed_relations_expose_only_bounded_runtime_worker_column
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 with connection.cursor().copy("COPY audit_events FROM STDIN"):
                     pass
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_0007_runtime_role_can_execute_only_the_fenced_polling_writer(
+    postgres_database_factory,
+    alembic_runner,
+):
+    """The 0007 function, not direct DML, is the sole polling mutation path."""
+
+    schema = postgres_database_factory()
+    await _prepare_revision(schema, alembic_runner, "20260728_0007")
+
+    with psycopg.connect(schema.runtime_dsn, autocommit=True) as connection:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "INSERT INTO public.sync_cursors ("
+                "account_id, folder_key, cursor, status, blocked_reason_code"
+                ") VALUES (8, 'INBOX', NULL, 'cold_start_pending', "
+                "'sync.cold_start_required')"
+            )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "UPDATE public.sync_cursors SET cursor = 'forbidden' WHERE false"
+            )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "SELECT public.greenfield_insert_webhook_event("
+                "8, '00000000-0000-4000-8000-000000000001', 1, 'mail', "
+                "'INBOX', 'NewMailEvent', 'create', repeat('a', 64), NULL, "
+                "NULL, '{}'::jsonb, 'full')"
+            )
+        assert connection.execute(
+            "SELECT pg_catalog.has_function_privilege("
+            "current_user, "
+            "'public.greenfield_commit_sync_page(bigint, uuid, bigint, text, "
+            "text, bigint, text, jsonb, boolean)'::pg_catalog.regprocedure, "
+            "'EXECUTE')"
+        ).fetchone() == (True,)
 
 
 @pytest.mark.integration
@@ -1635,7 +1679,7 @@ async def test_legacy_runtime_revisions_fail_closed(
 
     with pytest.raises(
         DatabaseRevisionError,
-        match=r"expected one of \[20260716_0006\]",
+        match=r"expected one of \[20260728_0007\]",
     ):
         await require_runtime_database(
             schema.runtime_dsn,

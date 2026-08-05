@@ -3,7 +3,7 @@
 import hmac
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -61,7 +61,13 @@ def test_record_durable_ingestion_uses_only_bounded_queue_labels():
         oldest_pending_seconds=12.5,
     )
 
-    m.record_durable_ingestion(stats, ready=True)
+    m.record_durable_ingestion(
+        stats,
+        ready=True,
+        processing_active=True,
+        polling_active=True,
+        polling_cursor_ready=True,
+    )
 
     body = _scrape()
     for status, value in {
@@ -75,8 +81,11 @@ def test_record_durable_ingestion_uses_only_bounded_queue_labels():
     assert "durable_inbox_oldest_pending_seconds 12.5" in body
     assert "durable_ingress_ready 1.0" in body
     assert "durable_ingestion_snapshot_ok 1.0" in body
-    assert "durable_processing_active 0.0" in body
-    assert "webhook_queue_depth 5.0" in body
+    assert "durable_processing_active 1.0" in body
+    assert "polling_ingress_active 1.0" in body
+    assert "polling_cursor_ready 1.0" in body
+    assert "polling_queue_depth 5.0" in body
+    assert "webhook_queue_depth" not in body
 
 
 def test_failed_queue_snapshot_preserves_backlog_and_marks_snapshot_unknown():
@@ -88,17 +97,32 @@ def test_failed_queue_snapshot_preserves_backlog_and_marks_snapshot_unknown():
         manual_review=4,
         oldest_pending_seconds=18.0,
     )
-    m.record_durable_ingestion(stats, ready=True)
+    m.record_durable_ingestion(
+        stats,
+        ready=True,
+        processing_active=True,
+        polling_active=True,
+        polling_cursor_ready=True,
+    )
 
-    m.record_durable_ingestion(None, ready=False)
+    m.record_durable_ingestion(
+        None,
+        ready=False,
+        processing_active=False,
+        polling_active=False,
+        polling_cursor_ready=False,
+    )
 
     body = _scrape()
     assert 'durable_inbox_items{status="pending"} 7.0' in body
     assert 'durable_inbox_items{status="dead_letter"} 5.0' in body
     assert "durable_inbox_oldest_pending_seconds 18.0" in body
-    assert "webhook_queue_depth 10.0" in body
+    assert "polling_queue_depth 10.0" in body
     assert "durable_ingress_ready 0.0" in body
     assert "durable_ingestion_snapshot_ok 0.0" in body
+    assert "durable_processing_active 0.0" in body
+    assert "polling_ingress_active 0.0" in body
+    assert "polling_cursor_ready 0.0" in body
 
 
 def test_metrics_endpoint_returns_prometheus_payload():
@@ -121,9 +145,31 @@ def test_metrics_endpoint_returns_prometheus_payload():
             "emails_processed_total",
             "card_dispatch_total",
             "circuit_breaker_state",
-            "webhook_queue_depth",
+            "polling_queue_depth",
         )
     )
+
+
+def test_metrics_endpoint_tolerates_a_failed_local_runtime_health_projection():
+    client = TestClient(app)
+    settings = SimpleNamespace(METRICS_TOKEN=SecretStr("metrics-secret"))
+    runtime = SimpleNamespace(
+        check_ready=AsyncMock(return_value=True),
+        queue_stats=AsyncMock(return_value=None),
+        health_snapshot=Mock(side_effect=RuntimeError("projection_unavailable")),
+    )
+
+    with (
+        patch("src.server.get_settings", return_value=settings),
+        patch.object(app.state, "ingestion_runtime", runtime, create=True),
+    ):
+        response = client.get(
+            "/metrics",
+            headers={"Authorization": "Bearer metrics-secret"},
+        )
+
+    assert response.status_code == 200
+    runtime.health_snapshot.assert_called_once_with()
 
 
 def test_queue_endpoint_returns_one_identifier_free_runtime_snapshot():
@@ -140,6 +186,9 @@ def test_queue_endpoint_returns_one_identifier_free_runtime_snapshot():
     runtime = SimpleNamespace(
         check_ready=AsyncMock(return_value=True),
         queue_stats=AsyncMock(return_value=stats),
+        processing_ready=False,
+        polling_live=True,
+        polling_ready=True,
     )
 
     with (
@@ -155,6 +204,7 @@ def test_queue_endpoint_returns_one_identifier_free_runtime_snapshot():
     assert response.json() == {
         "status": "ready",
         "ingress": "active",
+        "cursor": "ready",
         "session": "active",
         "processing": "standby",
         "queue": {

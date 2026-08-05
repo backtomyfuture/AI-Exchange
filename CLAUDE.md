@@ -18,7 +18,8 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 
 生产只有一个 FastAPI 应用进程：
 
-1. `POST /webhooks/exchange` 验证请求并写入 PostgreSQL Durable Inbox；
+1. `PollingRuntime` 使用 Exchange `sync_state` 拉取增量，并先写入 PostgreSQL
+   Durable Inbox；
 2. 同进程的 `DurableInboxWorker` 领取持久化事件；
 3. `LegacyProcessingAdapter` 调用当前邮件处理实现；
 4. LangGraph 执行分类、检索、草稿、审核和发送；
@@ -27,6 +28,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 当前生产路径没有以下后台入口：
 
 - 旧的内存 Webhook Queue/Worker；
+- Exchange Webhook HTTP 入口或订阅；
 - 无游标的 recent-mail polling；
 - Daily Summary scheduler；
 - SelfHealer 扫描循环。
@@ -40,7 +42,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 
 主要路径：
 
-- `src/ingestion/webhook.py`：纯请求规范化与 receipt；
+- `src/ingestion/polling.py`：唯一 Exchange 增量入口、cursor 和 `sync_state` 提交；
 - `src/ingestion/repository.py`：Inbox 持久化和租约；
 - `src/ingestion/worker.py`：领取、续租、重试和完成；
 - `src/ingestion/runtime.py`：唯一运行时装配；
@@ -49,8 +51,8 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 `src/ingestion/__init__.py` 不再做重型再导出。调用者必须从拥有类型或行为的 module
 直接导入，避免导入 models 时加载 cold-start、sync 和 repository 实现。
 
-Webhook 返回 202 只表示事件已进入 Inbox，不表示 Qdrant、草稿、飞书卡片或发送已经
-成功。排障必须逐阶段验证。
+轮询完成一页 `sync_state` 的提交只表示变化已进入 Inbox，不表示 Qdrant、草稿、飞书
+卡片或发送已经成功。排障必须逐阶段验证。
 
 ### 3.2 Router 与 Skill
 
@@ -61,12 +63,11 @@ Webhook 返回 202 只表示事件已进入 Inbox，不表示 Qdrant、草稿、
 3. Tier 3：只有 Tier 1/2 放弃或低置信度时才由 LLM 兜底；
 4. 三层只能产生一个权威 `RouteDecision`，后续节点不得覆盖。
 
-当前实现尚未完全达到这个目标：`RoutingEngine.execute_router()` 在 Tier 1 未命中后
-会先执行 Tier 3；Tier 2 位于 Retriever，且只有 Categorizer 已判定
-`need_reply=True` 后才能执行。修改路由时必须先修复这一执行顺序，并增加以下不变量
-测试：
+当前实现以两个公开 seam 固化顺序：`RoutingEngine.execute_router()` 只执行 Tier 1；
+Retriever 完成 Tier 2 后，才在未命中时调用 `apply_tier3_fallback()`。检索会排除当前
+邮件，避免把自己当作历史证据。修改路由时必须保持以下不变量测试：
 
-- Tier 1 命中时不调用 Embedding 或 LLM；
+- Tier 1 命中时不再调用 Tier 2 或 Tier 3；
 - Tier 2 高置信度时不调用 Tier 3；
 - Tier 2 放弃时 Tier 3 只调用一次；
 - 后续节点不得覆盖最终路由决策。
@@ -131,12 +132,16 @@ Provider interface，不得重新增加 `src.utils.llm_factory` 兼容壳。OAut
   或普通模型输入；
 - 图片分析只在 `need_reply` 等业务条件满足后按需执行；
 - 附件上传、审批卡片和发送必须经过显式授权；
+- `AttachmentPolicy` 是附件上传与视觉模型输入共用的准入 Module；它校验文件名、大小、
+  Base64、扩展名和魔数，不可信附件保留在原邮件但不得上传或送入模型；
+- Durable Inbox 会在首次非只读外部调用前写入副作用标记；若进程在远端结果未知时退出，
+  恢复路径必须转 `manual_review`，不得自动重试可能已经发生的卡片或发送；
 - 日志不得包含密钥、邮件正文、真实标识符或异常原文，只记录有界
   `safe_code`、`stage` 和 `error_type`。
 
 ## 5. 配置与部署
 
-本地和 Compose 共用最小 `.env`。复制 `.env.example` 后只填写其中的 17 个集成及
+本地和 Compose 共用最小 `.env`。复制 `.env.example` 后只填写其中的 16 个集成及
 模型值：
 
 ```bash
@@ -147,6 +152,10 @@ cp .env.example .env
 
 数据库角色、DSN、令牌、ContentStore key、运行限额和部署状态生成到忽略版本控制的
 `secrets/`。测试需要隔离本地部署配置时使用 `PYTHON_DOTENV_DISABLED=1`。
+
+生产 Compose 强制 `EXCHANGE_SSL_VERIFY=true`。私网 Exchange 证书只覆盖 DNS 名称时，
+使用 `docker-compose.exchange-tls.yml` 提供 DNS、SNI 和只读 CA 文件；不能以
+`verify=false` 作为替代。
 
 常用命令：
 

@@ -75,6 +75,7 @@ async def categorize_email(
     routing_updates = {}
     for key in (
         "routing_log",
+        "routing_stage",
         "active_skills",
         "system_prompt_modifier",
         "priority_level",

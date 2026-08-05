@@ -4,7 +4,7 @@
 
 ## 核心功能
 
-1.  **可靠收件**: 以 Exchange Webhook 为主通道，先写入 PostgreSQL Durable Inbox，再异步处理；当前不启用轮询。
+1.  **可靠收件**: 仅通过 Exchange `sync_state` 轮询发现邮件变化，先写入 PostgreSQL Durable Inbox，再异步处理。
 2.  **智能分类**: 使用 LLM 识别邮件意图，判断是否需要回复及其紧急程度。
 3.  **历史检索**: 将经过内容投影的邮件文本写入 Qdrant；图片只按需分析，Base64、data URI 和附件字节不会进入向量库。
 4.  **人机协作 (Human-in-the-Loop)**:
@@ -23,11 +23,11 @@
 
 ## 单进程服务
 
-当前精简上线形态只有一个 **`ai-assistant-service`**：FastAPI 接收 Exchange
-Webhook，同一进程内的单消费者 Durable Inbox Worker 复用现有 LangGraph、
-ContentStore 和飞书 WebSocket 完成处理与审批。Webhook 请求只负责可靠落库，业务
-处理失败不会丢失已接收事件。该形态面向单 Exchange 账户、单飞书账户和全新初始化；
-不包含 Shadow、Sync 轮询、历史数据迁移、多账户或多实例滚动切换。
+当前精简上线形态只有一个 **`ai-assistant-service`**：同一进程内的 `sync_state`
+轮询入口和单消费者 Durable Inbox Worker 复用现有 LangGraph、ContentStore 和飞书
+WebSocket 完成处理与审批。轮询仅把变化通知可靠写入 Inbox；Worker 仍按既有流程获取
+邮件详情、按需处理图片、调用模型并发送飞书卡片。该形态面向单 Exchange 账户、单飞书
+账户和全新初始化；不包含 Shadow、Webhook、历史回填、多账户或多实例滚动切换。
 
 ## 快速开始
 
@@ -42,7 +42,7 @@ uv sync --frozen
 
 ### 2. 配置环境变量
 
-复制模板并只填写其中列出的 17 项：
+复制模板并只填写其中列出的 16 项：
 
 ```bash
 cp .env.example .env
@@ -59,46 +59,24 @@ Metrics Token、ContentStore Key、迁移/维护 DSN、运行限额和部署状�
 
 生产 preflight 仍会检查：
 
-- Exchange HTTPS URL、API key、账户 ID，以及与服务端完全一致且至少 16 字节的
-  Webhook secret；
+- Exchange HTTPS URL、API key 和账户 ID；
 - 飞书 `LARK_APP_ID`、至少 16 字节的 `LARK_APP_SECRET`/`LARK_ENCRYPT_KEY`、
   `LARK_CHAT_ID`，以及至少一个真实且非 `*` 的 `LARK_ALLOWED_OPEN_IDS`；
 - 真实模型及 Embedding 凭据、地址和模型名；
 - 非占位、无用户信息的真实 HTTPS `EXTERNAL_URL`。本机冒烟可以用 HTTP curl 访问
-  `127.0.0.1`，但 Compose 内这个生产配置仍必须是未来受控的 HTTPS 回调 origin；尚未
-  配置反向代理时，不能宣称外部 Webhook 已经上线。
+  `127.0.0.1`；它不再承担 Exchange 入站回调职责。
 
-Exchange 地址必须通过证书校验。若服务实际通过私网 IP 访问、证书却只覆盖 DNS
-名称，部署工具会复用已迁移的内部 DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书
-问题。新环境的特殊私网 TLS 初始化见 [`deploy/README.md`](deploy/README.md)。
+生产 Compose 会显式注入 `EXCHANGE_SSL_VERIFY=true`，Exchange 地址必须通过证书校验。
+若服务实际通过私网 IP 访问、证书却只覆盖 DNS 名称，部署工具会复用已迁移的内部
+DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书问题。新环境的特殊私网 TLS 初始化见
+[`deploy/README.md`](deploy/README.md)。
 
-反方向的 Exchange Webhook 入口同样有外部前置：本 Compose 只提供容器内 HTTP，
-不包含公网 TLS 终止。正式环境必须由现有反向代理/入口提供真实可达的 HTTPS
-`EXTERNAL_URL`，并把 `/webhooks/exchange` 路由到应用端口；本机直接访问 HTTP 只用于
-隔离冒烟。当前项目验证完成后，再在 Exchange 扩展中以 `is_active=false` 创建/更新
-单账户、仅 `NewMailEvent` 的订阅。两端必须使用完全相同、至少 16 字节的高熵
-`EXCHANGE_WEBHOOK_SECRET`；先触发扩展的 TestEvent，不能只看扩展接口外层 HTTP 200，
-还必须确认返回的目标 `data.status_code=200`，且 `data.response_body` 可解析为精确的
-`{"status":"ok","test":true}`。这些条件全部满足后才把订阅设为 active，再用一封
-真实测试邮件验证“Webhook 202 → Durable Inbox → 飞书卡片 → 用户点击 → 数据库状态变化”。
+Exchange 入站 Webhook 已退役：应用不公开 `/webhooks/exchange`，不需要
+`EXCHANGE_WEBHOOK_SECRET`，也不应创建或启用 Exchange Webhook 订阅。
+`docker-compose.webhook-tls.yml` 仅作为旧部署回滚资料保留，轮询部署不会加载它。
 
-没有公网 DNS、但已有覆盖公司子域名的证书时，可启用
-`docker-compose.webhook-tls.yml`。证书覆盖的内部主机名只需在 Exchange Gateway 的
-`extra_hosts` 中固定解析到本机私网 IP，不必关闭证书校验。把完整证书链和私钥分别保存为
-忽略版本控制且权限为 `0400` 或 `0600` 的 `secrets/webhook_tls_fullchain.pem` 与
-`secrets/webhook_tls_key.pem`。部署工具会在两者同时存在时自动追加 TLS 覆盖并沿用同一
-Compose project；只存在其中一个、文件为空、过大、权限过宽或为符号链接都会拒绝部署：
-
-```bash
-.venv/bin/python scripts/deploy_system.py check
-.venv/bin/python scripts/deploy_system.py redeploy
-```
-
-默认入口是 `8443`，只暴露 `/webhooks/exchange`、`/ready` 和自身健康检查；正式验收必须
-使用证书覆盖的主机名完成 TLS 校验，不能使用 `curl -k`。
-
-真实 Inbox opaque ID 从 Exchange 的 `emails/folders/all` 接口读取，并写入本次 policy
-manifest；不能用显示名 `INBOX` 代替。私网 TLS 场景可在镜像构建后，使用同一个
+`sync_state` 仍会访问 Gateway，因此保留 `docker-compose.exchange-tls.yml` 作为**出站**
+证书、SNI 和私网 DNS/IP 映射。私网 TLS 场景可在镜像构建后，使用同一个
 Compose project、TLS overlay 和应用镜像执行一个不传 `--build` 的 `--no-deps` one-shot；它从
 容器环境读取 API key，不把密钥放入命令行，并利用 overlay 的 SNI/DNS/CA 配置：
 
@@ -112,6 +90,8 @@ from src.config import get_settings
 from src.utils.exchange_api import ExchangeClient
 async def main():
     settings = get_settings()
+    if settings.EXCHANGE_SSL_VERIFY is not True:
+        raise SystemExit("exchange_tls_verification_required")
     client = ExchangeClient(settings)
     try:
         folders = await client.get_all_folders(force_refresh=True)
@@ -131,8 +111,10 @@ test -s "/tmp/ai-exchange-inbox-$PROJECT_NAME"
 ```
 
 输出文件只用于随后生成本次 manifest，不能提交。若 Exchange 域名本身正常解析且证书链
-完整，则去掉 TLS overlay 参数。TestEvent 只证明签名和可达性，不会写 Durable Inbox，
-因此不能替代后两项验收。
+完整，则去掉 TLS overlay 参数。生成 manifest 时仍需传入这个 opaque ID，以满足冻结的
+策略 schema；它只是兼容性元数据，不会创建 Webhook 路由或订阅。实际轮询 scope 固定为
+`INBOX`，首次新库启动会丢弃 Gateway 返回的完整历史同步结果并建立游标，之后才把增量
+写入 Durable Inbox。
 
 ### 3. 运行系统
 
@@ -142,8 +124,8 @@ test -s "/tmp/ai-exchange-inbox-$PROJECT_NAME"
 .venv/bin/python scripts/deploy_system.py redeploy
 ```
 
-命令会校验 17 项用户配置与所有内部 secret，构建一个新的统一应用镜像，在不删除
-PostgreSQL、Qdrant 和 ContentStore 数据卷的前提下重建应用及可选 HTTPS 入口，并等待
+命令会校验 16 项用户配置与所有内部 secret，构建一个新的统一应用镜像，在不删除
+PostgreSQL、Qdrant 和 ContentStore 数据卷的前提下重建应用，并等待
 `/ready` 同时返回 `status=ready` 与 `processing=active`。
 
 以下内容仅适用于全新数据库的首次生产初始化；数据库 provisioning、migration 与
@@ -170,14 +152,16 @@ docker compose -p "$PROJECT_NAME" --profile database-provision run --rm database
 docker compose -p "$PROJECT_NAME" --profile migration run --rm database-bootstrap
 ```
 
-从 Exchange 读取本账户真实 Inbox opaque folder ID 后，按
+从 Exchange 读取本账户真实 Inbox opaque folder ID（仅作冻结策略 schema 的兼容性
+元数据）后，按
 [`deploy/README.md`](deploy/README.md) 第 2–3 节生成
 `deploy/generated-<BUILD_ID>/POLICY.json` 与 `CONTRACT.json`，先 dry-run，再把该
 精确子目录只读挂载给 `ingestion-maintenance initialize`。不要挂载整个 `deploy/`，
 不要手写 hash，也不要引用仓库中不存在的根级 `deploy/POLICY.json`。
 
-初始化成功并配置真实 Exchange、飞书和模型凭据后，运行时会固定启用 Durable Inbox，
-并保持 Shadow 与 Sync 关闭；不得对应用服务执行 `--scale`。启动和就绪验证由
+初始化成功并配置真实 Exchange、飞书和模型凭据后，运行时会固定启用 Durable Inbox 和
+`sync_state` 轮询，并保持 Shadow 与 Sync reconciliation 关闭；不得对应用服务执行
+`--scale`。启动和就绪验证由
 `scripts/deploy_system.py redeploy` 完成。
 
 常规 `docker compose -p "$PROJECT_NAME" up -d` 不会启动带 profile 的 bootstrap 或维护容器，也不会
@@ -287,11 +271,13 @@ docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance-execute run -
 ```
 
 这些命令仅描述手工 checkpoint 维护入口。精简上线只允许显式打开
-`DURABLE_INBOX_ENABLED=true`；`INGESTION_SHADOW_ENABLED` 与
-`SYNC_RECONCILIATION_ENABLED` 必须保持 `false`。这不是原六阶段方案中的完整
-cutover/production-ready 声明，而是面向可清空测试数据、单账户、单进程的新系统启动。
+`DURABLE_INBOX_ENABLED=true` 与 `POLLING_ENABLED=true`；
+`INGESTION_SHADOW_ENABLED` 与 `SYNC_RECONCILIATION_ENABLED` 必须保持 `false`。
+这不是原六阶段方案中的完整 cutover/production-ready 声明，而是面向可清空测试数据、
+单账户、单进程的新系统启动。
 
-本地启动同一个应用：`python -m src.main`。旧的轮询/分进程入口不是当前部署拓扑。
+本地启动同一个应用：`python -m src.main`。`sync_state` 轮询是当前部署拓扑中的唯一
+邮件入口。
 
 ## 目录结构说明
 
@@ -305,6 +291,11 @@ cutover/production-ready 声明，而是面向可清空测试数据、单账户�
 ## 运维建议
 
 -   **监控日志**: 核心日志输出在控制台，可通过 Docker logs 查看。
+-   **轮询健康**: 使用受 `METRICS_TOKEN` 保护的 `/queue` 和 `/metrics`；`ingress`、
+    `cursor`、`processing` 分别反映轮询调度器、首轮基线游标和 Durable Inbox Worker。
+-   **不确定副作用**: 首次外部调用前会持久化副作用标记。进程在远端结果未知时会进入
+    `manual_review`，而不是自动重试或重复发送飞书卡片。先人工核对飞书和 Exchange
+    的实际结果；不要把该状态加入批量 `reprocess_email.py --all-stuck`。
 -   **数据库管理**: Postgres 存储了所有的 LangGraph checkpoints，支持在服务重启后恢复处理中的任务。
 -   **模型切换**: 在 Provider 配置中按角色选择模型，不让供应商细节进入业务 module。
 

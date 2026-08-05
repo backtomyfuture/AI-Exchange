@@ -54,6 +54,7 @@ from src.ingestion.processing import (
     ProcessingCompletionRejected,
     ProcessingFinishResult,
     ProcessingReceiptConflict,
+    ReplaySafeExternalEffectFailed,
 )
 from src.ingestion.runtime_authority import (
     RuntimeInstanceLease,
@@ -921,6 +922,20 @@ def _failure_decision(error: BaseException) -> _FailureDecision:
     return _UNKNOWN_FAILURE
 
 
+def _trusted_replay_safe_retry_hint(error: BaseException) -> int | None:
+    """Read a validated retry hint only from the exact replay-safe error type."""
+
+    if type(error) is not ReplaySafeExternalEffectFailed:
+        return None
+    fields = object.__getattribute__(error, "__dict__")
+    if type(fields) is not dict:
+        return None
+    raw_hint = dict.get(fields, "retry_after_seconds")
+    if type(raw_hint) is int and 0 <= raw_hint <= 3600:
+        return raw_hint
+    return None
+
+
 def _terminal_action(decision: _FailureDecision) -> str:
     if decision.safe_code == _EFFECT_UNKNOWN.safe_code:
         return "ingress.effect_unknown"
@@ -1571,6 +1586,7 @@ class InboxRepository:
         decision: _FailureDecision,
         lease: _LeaseToken,
         expected_email_version: int,
+        retry_after_seconds: int | None = None,
     ) -> _ProcessingResolution:
         attempts = _next_attempts(lease.attempts)
         retry_has_capacity = (
@@ -1593,7 +1609,11 @@ class InboxRepository:
             safe_summary=decision.safe_summary,
             attempts=attempts,
             available_in_seconds=(
-                min(5 * (2**lease.attempts), _MAX_BACKOFF_SECONDS)
+                (
+                    retry_after_seconds
+                    if retry_after_seconds is not None
+                    else min(5 * (2**lease.attempts), _MAX_BACKOFF_SECONDS)
+                )
                 if decision.status is InboxDispositionStatus.RETRY_WAIT
                 else 0
             ),
@@ -1618,6 +1638,9 @@ class InboxRepository:
             decision=decision,
             lease=lease,
             expected_email_version=expected_email_version,
+            retry_after_seconds=(
+                None if effect_started else _trusted_replay_safe_retry_hint(error)
+            ),
         )
 
     async def _require_authorized_processing_attempt(
@@ -2196,6 +2219,15 @@ class InboxRepository:
                                 attempts=lease.attempts,
                                 available_in_seconds=0,
                             )
+                    elif completion.target_status is EmailStatus.MANUAL_REVIEW:
+                        resolution = _ProcessingResolution(
+                            email_status=EmailStatus.MANUAL_REVIEW,
+                            inbox_status=InboxStatus.MANUAL_REVIEW,
+                            safe_code=completion.safe_error_code,
+                            safe_summary=completion.safe_error_summary,
+                            attempts=lease.attempts,
+                            available_in_seconds=0,
+                        )
                     else:
                         resolution = _ProcessingResolution(
                             email_status=completion.target_status,

@@ -33,8 +33,8 @@ _ROLE_BOUNDARY = {
 }
 
 
-def test_runtime_revision_is_exact_greenfield_0006_head() -> None:
-    assert EXPECTED_DATABASE_REVISION == "20260716_0006"
+def test_runtime_revision_is_exact_polling_only_0007_head() -> None:
+    assert EXPECTED_DATABASE_REVISION == "20260728_0007"
     assert database_schema.RUNTIME_COMPATIBLE_DATABASE_REVISIONS == frozenset(
         {EXPECTED_DATABASE_REVISION}
     )
@@ -135,7 +135,7 @@ async def test_require_current_database_rejects_missing_or_stale_revision(
 
 
 @pytest.mark.asyncio
-async def test_runtime_gate_accepts_only_0006_when_flags_are_disabled() -> None:
+async def test_runtime_gate_accepts_only_0007_when_flags_are_disabled() -> None:
     schema_contract = AsyncMock()
     with (
         patch.object(
@@ -146,7 +146,7 @@ async def test_runtime_gate_accepts_only_0006_when_flags_are_disabled() -> None:
         patch.object(
             database_schema,
             "get_current_database_revision",
-            new=AsyncMock(return_value="20260716_0006"),
+            new=AsyncMock(return_value=EXPECTED_DATABASE_REVISION),
         ),
         patch.object(
             database_schema,
@@ -164,7 +164,7 @@ async def test_runtime_gate_accepts_only_0006_when_flags_are_disabled() -> None:
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
-        expected_revision="20260716_0006",
+        expected_revision=EXPECTED_DATABASE_REVISION,
     )
 
 
@@ -176,6 +176,7 @@ async def test_runtime_gate_accepts_only_0006_when_flags_are_disabled() -> None:
         "20260710_0003",
         "20260713_0004",
         "20260713_0005",
+        "20260716_0006",
     ],
 )
 async def test_runtime_gate_rejects_every_legacy_revision(
@@ -192,7 +193,7 @@ async def test_runtime_gate_rejects_every_legacy_revision(
             "get_current_database_revision",
             new=AsyncMock(return_value=legacy_revision),
         ),
-        pytest.raises(DatabaseRevisionError, match="20260716_0006"),
+        pytest.raises(DatabaseRevisionError, match=EXPECTED_DATABASE_REVISION),
     ):
         await database_schema.require_runtime_database(
             "postgresql://test/test",
@@ -223,7 +224,7 @@ async def test_runtime_flags_do_not_select_a_different_revision(
         ),
         patch(
             "src.db.schema.get_current_database_revision",
-            new=AsyncMock(return_value="20260716_0006"),
+            new=AsyncMock(return_value=EXPECTED_DATABASE_REVISION),
         ),
         patch.object(
             database_schema,
@@ -240,7 +241,7 @@ async def test_runtime_flags_do_not_select_a_different_revision(
         "postgresql://test/test",
         target_schema="public",
         require_complete=True,
-        expected_revision="20260716_0006",
+        expected_revision=EXPECTED_DATABASE_REVISION,
     )
 
     with (
@@ -374,7 +375,7 @@ async def test_runtime_gate_rejects_unversioned_unknown_and_multiple_heads(
 
 @pytest.mark.asyncio
 async def test_runtime_gate_requires_role_separation_even_when_flags_are_disabled():
-    revision_reader = AsyncMock(return_value="20260716_0006")
+    revision_reader = AsyncMock(return_value=EXPECTED_DATABASE_REVISION)
 
     with (
         patch.object(

@@ -237,7 +237,11 @@ class _InboxRepository:
             return self.finish_result
         return ProcessingFinishResult(
             email_status=completion.target_status,
-            inbox_status=InboxStatus.COMPLETED,
+            inbox_status=(
+                InboxStatus.MANUAL_REVIEW
+                if completion.target_status is EmailStatus.MANUAL_REVIEW
+                else InboxStatus.COMPLETED
+            ),
             replayed=False,
         )
 
@@ -631,6 +635,20 @@ async def test_non_effect_policy_finishes_elected_aggregate_locally(
     assert not ownership.calls
     assert not router.calls
     assert not adapter.calls
+
+
+async def test_manual_completion_finishes_as_an_atomic_manual_review_pair() -> None:
+    lease = _lease()
+    worker, inbox, _ownership, _router, adapter = _worker(lease, _application())
+    adapter.completion = ProcessingCompletion.manual_review()
+
+    result = await worker.process_lease(lease)
+
+    assert result is not None
+    assert result.email_status is EmailStatus.MANUAL_REVIEW
+    assert result.inbox_status is InboxStatus.MANUAL_REVIEW
+    assert inbox.finish_calls[0][3] == ProcessingCompletion.manual_review()
+    assert not inbox.failure_calls
 
 
 async def test_full_policy_version_exhaustion_finishes_before_adapter_or_effect() -> (

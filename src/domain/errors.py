@@ -142,6 +142,29 @@ class SyncTransientError(_ExchangeSyncError):
         )
 
 
+class ExchangeDetailTransientError(RuntimeError):
+    """Fixed-shape temporary failure at the Exchange email-detail boundary."""
+
+    kind = ErrorKind.TRANSIENT_DEPENDENCY
+    safe_code = "exchange.detail.transient_failure"
+    safe_summary = "Exchange email detail is temporarily unavailable"
+    retryable = True
+
+    def __init__(self, *, retry_after_seconds: int | None = None) -> None:
+        if retry_after_seconds is not None and (
+            type(retry_after_seconds) is not int or not 0 <= retry_after_seconds <= 3600
+        ):
+            raise TypeError("invalid retry_after_seconds")
+        super().__init__(self.safe_summary)
+        self.retry_after_seconds = retry_after_seconds
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(safe_code={self.safe_code!r}, "
+            f"retry_after_seconds={self.retry_after_seconds!r})"
+        )
+
+
 class SyncContractError(_ExchangeSyncError):
     safe_code = "exchange.sync.contract_invalid"
     safe_summary = "Exchange sync contract is invalid"

@@ -8,7 +8,7 @@ from src.db.roles import DatabaseRoleError, require_runtime_database_role
 from src.db.schema_contract import require_database_schema_contract
 
 
-EXPECTED_DATABASE_REVISION = "20260716_0006"
+EXPECTED_DATABASE_REVISION = "20260728_0007"
 RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset({EXPECTED_DATABASE_REVISION})
 
 

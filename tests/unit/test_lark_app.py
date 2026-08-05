@@ -1,7 +1,10 @@
+import json
+
 import pytest
 from typing import get_args, get_type_hints
 from unittest.mock import MagicMock, patch, AsyncMock
 from src.utils import lark_app
+from src.utils import lark_messaging
 
 @pytest.fixture
 def mock_lark_deps():
@@ -75,6 +78,38 @@ def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
     
     # Check calls
     mock_instance.im.v1.message.create.assert_called_once()
+
+
+def test_manual_review_card_surfaces_email_content_without_an_acknowledge_action():
+    client = MagicMock()
+    response = MagicMock()
+    response.success.return_value = True
+    response.data.message_id = "message-1"
+    client.im.v1.message.create.return_value = response
+    settings = MagicMock(LARK_CHAT_ID="chat-1")
+
+    with patch("src.utils.lark_messaging.get_settings", return_value=settings):
+        delivered = lark_messaging.send_manual_review_card(
+            "mail-1",
+            {
+                "subject": "需要人工处理",
+                "sender": "sender@example.test",
+                "body": "<p>需要人工处理的正文</p>",
+            },
+            "content_guard_rejected",
+            lark_api_client=client,
+        )
+
+    request = client.im.v1.message.create.call_args.args[0]
+    card = json.loads(request.request_body.content)
+    assert delivered is True
+    assert card["header"]["template"] == "red"
+    assert "需要人工处理" in card["header"]["title"]["content"]
+    assert any(
+        "需要人工处理的正文" in element.get("text", {}).get("content", "")
+        for element in card["elements"]
+    )
+    assert all(element["tag"] != "action" for element in card["elements"])
 
 
 @patch("lark_oapi.Client")

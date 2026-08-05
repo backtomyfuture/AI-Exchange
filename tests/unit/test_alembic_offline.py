@@ -40,6 +40,19 @@ def test_0006_downgrade_is_explicitly_forward_only() -> None:
         revision.downgrade()
 
 
+def test_0007_downgrade_is_explicitly_forward_only() -> None:
+    path = PROJECT_ROOT / "alembic/versions/20260728_0007_polling_only_ingress.py"
+    spec = spec_from_file_location("polling_only_forward_only_revision", path)
+    assert spec is not None and spec.loader is not None
+    revision = module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    assert revision.revision == "20260728_0007"
+    assert revision.down_revision == "20260716_0006"
+    with pytest.raises(RuntimeError, match="Forward-only production migration"):
+        revision.downgrade()
+
+
 def test_offline_upgrade_emits_fail_closed_0004_policy_migration_sql() -> None:
     output = StringIO()
     config = Config(str(PROJECT_ROOT / "alembic.ini"), output_buffer=output)
@@ -118,7 +131,10 @@ def test_offline_upgrade_emits_atomic_greenfield_0006_authority_sql() -> None:
     command.upgrade(config, "head", sql=True)
 
     rendered = output.getvalue()
-    revision_sql = rendered.split("20260713_0005 -> 20260716_0006", 1)[1]
+    revision_sql = rendered.split("20260713_0005 -> 20260716_0006", 1)[1].split(
+        "20260716_0006 -> 20260728_0007",
+        1,
+    )[0]
     normalized = " ".join(revision_sql.split())
     lock_position = revision_sql.index("LOCK TABLE")
     reject_position = revision_sql.index("greenfield_reinitialize_required")
@@ -199,3 +215,28 @@ def test_offline_upgrade_emits_atomic_greenfield_0006_authority_sql() -> None:
     assert "CREATE OR REPLACE" not in revision_sql
     assert "legacy_compat" not in revision_sql
     assert "CREATE TABLE pipeline_shadow" not in revision_sql
+
+
+def test_offline_upgrade_emits_only_the_session_fenced_0007_polling_boundary() -> None:
+    output = StringIO()
+    config = Config(str(PROJECT_ROOT / "alembic.ini"), output_buffer=output)
+    config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql://offline:offline@localhost/offline",
+    )
+
+    command.upgrade(config, "head", sql=True)
+
+    rendered = output.getvalue()
+    revision_sql = rendered.split("20260716_0006 -> 20260728_0007", 1)[1]
+    normalized = " ".join(revision_sql.split())
+
+    assert "CREATE FUNCTION public.greenfield_commit_sync_page(" in revision_sql
+    assert "SECURITY DEFINER" in revision_sql
+    assert "SET search_path = pg_catalog" in revision_sql
+    assert "REVOKE ALL ON FUNCTION public.greenfield_commit_sync_page" in normalized
+    assert "p_events pg_catalog.jsonb" in normalized
+    assert "p_activation pg_catalog.bool" in normalized
+    assert "greenfield_sync_policy_unavailable" in revision_sql
+    assert "greenfield_insert_webhook_event" not in revision_sql
+    assert "CREATE TABLE" not in revision_sql

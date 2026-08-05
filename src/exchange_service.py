@@ -21,6 +21,7 @@ from src.graph.state_factory import (
     sanitize_graph_delta,
 )
 from src.graph.resource_locks import get_graph_resource_lock
+from src.safety.attachments import AttachmentPolicy
 from src.safety.input_limits import input_limits_from_settings, validate_email_input
 from src.safety.manual_review import (
     build_manual_review_delta,
@@ -168,59 +169,66 @@ async def _upload_attachments_to_lark(
     )
     tokens: list[str] = []
     links: list[dict[str, str]] = []
-    import base64
+    attachment_policy = AttachmentPolicy(
+        max_bytes=input_limits_from_settings(
+            get_settings()
+        ).attachment_single_bytes
+    )
+    attempted_uploads = 0
 
-    for ordinal, att in enumerate(business_attachments[:max_uploads]):
-        if att.get("content"):
-            try:
-                content_bytes = base64.b64decode(att["content"], validate=True)
-            except Exception as exc:
-                logger.error(
-                    "Attachment upload failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                break
-            await _authorize_external_effect(
-                _effect_boundary,
-                ExternalEffectKind.FEISHU,
-                ordinal,
-                {
-                    "operation": "upload_attachment",
-                    "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
-                    "size": len(content_bytes),
-                },
+    for ordinal, att in enumerate(business_attachments):
+        if attempted_uploads >= max_uploads:
+            break
+        decision = attachment_policy.assess(att)
+        if not decision.allowed or decision.content is None:
+            logger.warning(
+                "Attachment withheld from Lark Drive: reason=%s",
+                decision.reason or "attachment_policy_rejected",
             )
-            try:
-                res = await asyncio.to_thread(
-                    lark_app.upload_file_to_drive,
-                    att.get("name", "unknown"),
-                    content_bytes,
-                    len(content_bytes),
+            continue
+        content_bytes = decision.content
+        attempted_uploads += 1
+        await _authorize_external_effect(
+            _effect_boundary,
+            ExternalEffectKind.FEISHU,
+            ordinal,
+            {
+                "operation": "upload_attachment",
+                "content_sha256": hashlib.sha256(content_bytes).hexdigest(),
+                "size": len(content_bytes),
+            },
+        )
+        try:
+            res = await asyncio.to_thread(
+                lark_app.upload_file_to_drive,
+                decision.name,
+                content_bytes,
+                len(content_bytes),
+            )
+        except Exception as exc:
+            if _effect_boundary is not None:
+                raise GuardedExternalEffectFailed() from None
+            logger.error(
+                "Attachment upload failed: error_type=%s",
+                type(exc).__name__,
+            )
+            break
+        token = res.get("file_token") if res else None
+        if _effect_boundary is not None and not (isinstance(token, str) and token):
+            raise GuardedExternalEffectFailed()
+        if isinstance(token, str) and token:
+            tokens.append(token)
+            if acknowledge_token is not None:
+                await acknowledge_token(token)
+            url = res.get("url")
+            if isinstance(url, str) and url:
+                links.append(
+                    {
+                        "name": decision.name,
+                        "lark_file_url": url,
+                    }
                 )
-            except Exception as exc:
-                if _effect_boundary is not None:
-                    raise GuardedExternalEffectFailed() from None
-                logger.error(
-                    "Attachment upload failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                break
-            token = res.get("file_token") if res else None
-            if _effect_boundary is not None and not (isinstance(token, str) and token):
-                raise GuardedExternalEffectFailed()
-            if isinstance(token, str) and token:
-                tokens.append(token)
-                if acknowledge_token is not None:
-                    await acknowledge_token(token)
-                url = res.get("url")
-                if isinstance(url, str) and url:
-                    links.append(
-                        {
-                            "name": str(att.get("name", "unknown")),
-                            "lark_file_url": url,
-                        }
-                    )
-                logger.info("Attachment uploaded to Lark Drive")
+            logger.info("Attachment uploaded to Lark Drive")
     return AttachmentUploadProjection(tokens=tuple(tokens), links=tuple(links))
 
 
@@ -794,6 +802,62 @@ async def _delete_replaced_pdf(
     if not reconciled:
         logger.error("Replaced PDF cleanup handle is untracked")
     return reconciled
+
+
+async def _dispatch_manual_review_notification(
+    email_id: str,
+    pipeline_result: dict,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None = None,
+) -> bool:
+    """Surface a fail-closed result without acknowledging the Exchange email."""
+    safe_code = normalize_manual_review_code(
+        pipeline_result.get("safe_error_summary")
+    )
+    email_data = pipeline_result.get("email")
+    if not isinstance(email_data, dict):
+        email_data = {}
+    logger.info(
+        "Sending Lark manual-review request: email=%s reason=%s",
+        fingerprint_identifier(email_id, namespace="email"),
+        safe_code,
+    )
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.FEISHU,
+        31,
+        {
+            "operation": "send_manual_review_card",
+            "email_id": email_id,
+            "reason": safe_code,
+        },
+    )
+    try:
+        delivery_result = await asyncio.to_thread(
+            lark_app.send_manual_review_card,
+            email_id=email_id,
+            email_data=email_data,
+            reason=safe_code,
+        )
+    except Exception:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
+        raise
+    if _effect_boundary is not None and delivery_result is not True:
+        raise GuardedExternalEffectFailed()
+    delivered = bool(delivery_result)
+    if not delivered:
+        logger.error(
+            "Manual-review card delivery failed; leaving Exchange unread: email=%s",
+            fingerprint_identifier(email_id, namespace="email"),
+        )
+    try:
+        from src.observability.metrics import record_card_dispatch
+
+        record_card_dispatch("manual_review", delivered)
+    except Exception:
+        pass
+    return delivered
 
 
 async def _dispatch_notification(
@@ -1908,6 +1972,27 @@ async def _run_ai_path(
             safe_code = normalize_manual_review_code(
                 pipeline_result.get("safe_error_summary")
             )
+            manual_delivered = await _dispatch_manual_review_notification(
+                thread_id,
+                pipeline_result,
+                _effect_boundary=_effect_boundary,
+            )
+            if not manual_delivered:
+                await _cleanup_graph_drive_files(
+                    thread_id,
+                    ctx,
+                    fallback_attachment_tokens=attachment_tokens,
+                    preserve_attachment_tokens=list(baseline.attachment_tokens),
+                    preserve_pdf_token=baseline.pdf_token,
+                    **_effect_boundary_kwargs(_effect_boundary),
+                )
+                await ctx.db_manager.update_status(
+                    thread_id,
+                    "delivery_failed",
+                    error_message="manual_review_card_delivery_failed",
+                )
+                return ProcessingOutcome.FAILED
+            notification_committed = True
             try:
                 manual_persisted = await ctx.db_manager.compare_and_set_manual_review(
                     thread_id,
@@ -1929,12 +2014,25 @@ async def _run_ai_path(
                         "Manual-review readback failed: error_type=%s",
                         type(read_exc).__name__,
                     )
-                    return ProcessingOutcome.FAILED
-            if not manual_persisted:
-                logger.warning(
-                    "Manual-review CAS lost; preserving newer state and resources"
+                    raise NotificationSideEffectCommittedError(
+                        kind="manual_review",
+                        cause=read_exc,
+                    ) from None
+                if not manual_persisted:
+                    raise NotificationSideEffectCommittedError(
+                        kind="manual_review",
+                        cause=claim_exc,
+                    ) from None
+            if manual_persisted is not True:
+                failure = DatabaseOperationError(
+                    operation="compare_and_set_manual_review",
+                    retryable=False,
+                    message="manual-review transition was not confirmed",
                 )
-                return ProcessingOutcome.FAILED
+                raise NotificationSideEffectCommittedError(
+                    kind="manual_review",
+                    cause=failure,
+                )
             try:
                 await _cleanup_graph_drive_files(
                     thread_id,
@@ -1947,8 +2045,6 @@ async def _run_ai_path(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if _effect_boundary is not None:
-                    raise
                 logger.error(
                     "Manual-review cleanup failed: error_type=%s",
                     type(exc).__name__,

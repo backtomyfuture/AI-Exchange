@@ -7,6 +7,7 @@ from src.db.schema_contract import (
     DatabaseSchemaContractError,
     _GREENFIELD_ROUTINE_PENDING_SOURCE_IDENTITIES,
     _GREENFIELD_ROUTINE_SOURCE_SHA256 as PRODUCTION_ROUTINE_SOURCE_SHA256,
+    _POLLING_ONLY_ROUTINE_SOURCE_SHA256,
     require_database_schema_contract,
 )
 
@@ -138,6 +139,38 @@ async def test_fresh_0006_passes_exact_greenfield_schema_contract(
         require_complete=False,
         require_business_complete=True,
         expected_revision="20260716_0006",
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fresh_0007_passes_the_extended_polling_schema_contract(
+    alembic_runner,
+    empty_schema,
+) -> None:
+    alembic_runner.upgrade(empty_schema, "20260728_0007")
+
+    await require_database_schema_contract(
+        empty_schema.dsn,
+        target_schema="public",
+        require_complete=False,
+        require_business_complete=True,
+        expected_revision="20260728_0007",
+    )
+    polling_identity = (
+        "greenfield_commit_sync_page",
+        "p_account_id bigint, p_session_id uuid, "
+        "p_expected_lease_version bigint, p_folder_key text, "
+        "p_expected_cursor text, p_expected_cursor_version bigint, "
+        "p_next_cursor text, p_events jsonb, p_activation boolean",
+    )
+    assert set(_POLLING_ONLY_ROUTINE_SOURCE_SHA256) == {
+        *PRODUCTION_ROUTINE_SOURCE_SHA256,
+        polling_identity,
+    }
+    assert (
+        _POLLING_ONLY_ROUTINE_SOURCE_SHA256[polling_identity]
+        == "acbc4d4e474cb38f2f929a9327c58a8928db4ebdf8709679b42d6a34bdab292a"
     )
 
 

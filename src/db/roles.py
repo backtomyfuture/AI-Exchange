@@ -21,11 +21,13 @@ from src.db.access_contract import (
     PHASE2_RELATIONS,
     PHASE2_RELATIONS_BY_REVISION,
     PHASE2_VIEW_SPECS_BY_REVISION,
+    POLLING_ONLY_DATABASE_REVISION,
     RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
     RUNTIME_RELATION_ACCESS,
     RUNTIME_RELATION_ACCESS_BY_REVISION,
     RelationAccess,
     RoutineAccess,
+    SECURITY_DEFINER_ROUTINES_BY_REVISION,
     TRIGGER_FUNCTIONS_BY_REVISION,
     TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION,
     TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION,
@@ -562,6 +564,40 @@ def _phase2_profile_matches_sql(schema_oid: str, revision: str) -> str:
     )"""
 
 
+_POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS: Final = (
+    "p_account_id bigint, p_session_id uuid, "
+    "p_expected_lease_version bigint, p_folder_key text, "
+    "p_expected_cursor text, p_expected_cursor_version bigint, "
+    "p_next_cursor text, p_events jsonb, p_activation boolean"
+)
+
+
+def _polling_only_sync_function_exists_sql(schema_oid: str) -> str:
+    """Prove the physical 0007 marker without trusting runtime settings."""
+
+    return f"""EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc AS routine
+        WHERE routine.pronamespace = {schema_oid}
+          AND routine.proname = 'greenfield_commit_sync_page'
+          AND routine.prokind = 'f'
+          AND pg_catalog.pg_get_function_identity_arguments(routine.oid)
+              = {_sql_text_literal(_POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS)}
+    )"""
+
+
+def _reviewed_profile_matches_sql(schema_oid: str, revision: str) -> str:
+    """Match a physical profile, including the function-only 0007 boundary."""
+
+    relation_profile = _phase2_profile_matches_sql(schema_oid, revision)
+    if revision == POLLING_ONLY_DATABASE_REVISION:
+        return (
+            "(" + relation_profile + " AND "
+            + _polling_only_sync_function_exists_sql(schema_oid) + ")"
+        )
+    return relation_profile
+
+
 def _relation_access_contract_sql(
     schema_oid: str,
     role_oid: str,
@@ -818,7 +854,7 @@ def _selected_access_revision_sql(
 
     clauses = "\n".join(
         "WHEN "
-        + _phase2_profile_matches_sql(schema_oid, revision)
+        + _reviewed_profile_matches_sql(schema_oid, revision)
         + " THEN "
         + _sql_text_literal(revision)
         + "::pg_catalog.text"
@@ -939,16 +975,7 @@ def _security_definer_contract_sql(
 ) -> str:
     """Allow only the revision's fixed migration-owned greenfield routines."""
 
-    manifests: dict[str, tuple[RoutineAccess, ...]] = {}
-    for revision in RUNTIME_ROUTINE_EXECUTE_BY_REVISION:
-        identities = {
-            (spec.name, spec.identity_arguments): spec
-            for spec in (
-                *RUNTIME_ROUTINE_EXECUTE_BY_REVISION[revision],
-                *MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[revision],
-            )
-        }
-        manifests[revision] = tuple(identities[key] for key in sorted(identities))
+    manifests = SECURITY_DEFINER_ROUTINES_BY_REVISION
 
     return f"""(
         WITH selected_revision(revision) AS (

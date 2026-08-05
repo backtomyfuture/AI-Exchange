@@ -124,3 +124,37 @@ async def test_visual_summary_supports_content_guard_fact_validation(
 
     assert result["review_result"]["passed"] is True
     assert result["next_step"] == "approval"
+
+
+@pytest.mark.asyncio
+async def test_review_accepts_date_split_across_inline_html_nodes(
+    graph_node_harness,
+):
+    """ContentGuard must validate the visible date, not HTML node boundaries."""
+    state = graph_node_harness.state(
+        {
+            "id": "review-inline-date",
+            "subject": "培训问卷",
+            "body": (
+                "<p>请在<span>7</span><span>月</span>"
+                "<span>30</span><span>日</span>前完成问卷。</p>"
+            ),
+        },
+        draft="您好！我会在7月30日前完成问卷。",
+        metadata={},
+    )
+
+    async def provider(_value):
+        return MagicMock(content='{"pass": true, "issues": ""}')
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(provider),
+    ), patch(
+        "src.nodes.reviewer.with_llm_retry",
+        side_effect=_passthrough_retry,
+    ):
+        result = await review_draft(state, graph_node_harness.dependencies)
+
+    assert result["review_result"]["passed"] is True
+    assert result["next_step"] == "approval"

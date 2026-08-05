@@ -282,6 +282,9 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
     router = MagicMock()
     router.execute_router = AsyncMock(side_effect=lambda state: state)
     router.apply_tier2_hits = AsyncMock(return_value={})
+    router.apply_tier3_fallback = AsyncMock(
+        return_value={"routing_stage": "none"}
+    )
     retriever = MagicMock()
     retriever.search.return_value = [
         {

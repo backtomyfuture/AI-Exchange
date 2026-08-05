@@ -9,7 +9,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 
 from src.domain.email_state import ProcessingOutcome
-from src.domain.errors import ErrorKind, ManualReviewRequired
+from src.domain.errors import (
+    ErrorKind,
+    ExchangeDetailTransientError,
+    ManualReviewRequired,
+)
 from src.exchange_service import process_and_archive_email_guarded
 from src.ingestion.email_events import (
     EmailEventApplication,
@@ -196,6 +200,11 @@ class LegacyProcessingAdapter:
             details = await self._ctx.exchange_client.get_email(
                 lease.event.external_email_id
             )
+        except ExchangeDetailTransientError as error:
+            _log_stage_failure("detail_fetch", error)
+            raise ReplaySafeExternalEffectFailed(
+                retry_after_seconds=error.retry_after_seconds
+            ) from None
         except Exception as error:
             _log_stage_failure("detail_fetch", error)
             raise ReplaySafeExternalEffectFailed() from None
@@ -315,6 +324,12 @@ class LegacyProcessingAdapter:
     ) -> ProcessingCompletion:
         if outcome is ProcessingOutcome.FAILED:
             raise LegacyProcessingFailed()
+        if (
+            outcome is ProcessingOutcome.MANUAL_REVIEW
+            and type(legacy_status) is str
+            and legacy_status == "manual_review"
+        ):
+            return ProcessingCompletion.manual_review()
         if policy is ProcessingPolicy.ARCHIVE:
             if (
                 outcome is ProcessingOutcome.ARCHIVED

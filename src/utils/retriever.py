@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterable
 from typing import List, Optional, Any
 from openai import OpenAI, APIError, APIConnectionError
 
@@ -10,6 +11,27 @@ logger = logging.getLogger(__name__)
 # Keep patchable symbols for tests while retaining lazy import behavior.
 QdrantClient = None
 models = None
+
+
+def _exclude_current_email(
+    payloads: Iterable[object],
+    *,
+    exclude_email_id: str | None,
+    limit: int,
+) -> list[dict]:
+    """Filter the in-flight mail after a vector query without trusting Qdrant IDs."""
+
+    results: list[dict] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        payload_email_id = payload.get("id") or payload.get("email_id")
+        if exclude_email_id and payload_email_id == exclude_email_id:
+            continue
+        results.append(payload)
+        if len(results) >= limit:
+            break
+    return results
 
 class EmailRetriever:
     """
@@ -69,7 +91,9 @@ class EmailRetriever:
         self,
         query_text: str,
         sender: Optional[str] = None,
-        limit: int = 5
+        limit: int = 5,
+        *,
+        exclude_email_id: str | None = None,
     ) -> List[dict]:
         """
         Hybrid search based on text content and sender.
@@ -103,10 +127,14 @@ class EmailRetriever:
                 collection_name=self.collection_name,
                 query=query_vector,
                 query_filter=query_filter,
-                limit=limit,
+                limit=limit + 5 if exclude_email_id else limit,
                 with_payload=True
             )
-            return [hit.payload for hit in search_result.points]
+            return _exclude_current_email(
+                (hit.payload for hit in search_result.points),
+                exclude_email_id=exclude_email_id,
+                limit=limit,
+            )
         except Exception as exc:
             # Keep broad handling to avoid hard dependency on qdrant exception classes.
             if exc.__class__.__name__ == "UnexpectedResponse":
@@ -118,7 +146,13 @@ class EmailRetriever:
             logger.error("Qdrant search failed: error_type=%s", type(exc).__name__)
             return []
 
-    def search_by_thread(self, thread_id: str, limit: int = 20) -> List[dict]:
+    def search_by_thread(
+        self,
+        thread_id: str,
+        limit: int = 20,
+        *,
+        exclude_email_id: str | None = None,
+    ) -> List[dict]:
         """Search all emails in the same conversation thread."""
         if not thread_id:
             return []
@@ -143,10 +177,14 @@ class EmailRetriever:
             points, _ = client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=query_filter,
-                limit=limit,
+                limit=limit + 5 if exclude_email_id else limit,
                 with_payload=True,
             )
-            return [point.payload for point in points]
+            return _exclude_current_email(
+                (point.payload for point in points),
+                exclude_email_id=exclude_email_id,
+                limit=limit,
+            )
         except Exception as exc:
             logger.error(
                 "Thread search failed: thread=%s error_type=%s",

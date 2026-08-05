@@ -104,3 +104,22 @@ async def test_unverified_dates_remain_blocked():
         "claim": "明天",
         "severity": "warning",
     } in issues
+
+
+@pytest.mark.asyncio
+async def test_source_full_date_with_inline_spacing_allows_short_draft_date():
+    guard = ContentGuard()
+    original = {
+        "subject": "培训问卷",
+        "body": "请在 2026 年 7 月 30 日 前完成。",
+        "sender": "sender@example.com",
+        "to": ["recipient@example.com"],
+        "cc": [],
+    }
+
+    issues = await guard.check_hallucination(
+        "您好！我会在7月30日前完成。",
+        original,
+    )
+
+    assert not [issue for issue in issues if issue["type"] == "unverified_date"]

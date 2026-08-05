@@ -9,7 +9,11 @@ from uuid import uuid4
 import pytest
 
 from src.domain.email_state import ProcessingOutcome
-from src.domain.errors import ErrorKind, ManualReviewRequired
+from src.domain.errors import (
+    ErrorKind,
+    ExchangeDetailTransientError,
+    ManualReviewRequired,
+)
 from src.ingestion.email_events import (
     EmailEventApplication,
     EmailEventDecision,
@@ -34,6 +38,7 @@ from src.ingestion.models import (
 from src.ingestion.processing import (
     ExternalEffectAuthorizationError,
     ExternalEffectKind,
+    ProcessingCompletion,
     ProcessingPolicyRejected,
     ReplaySafeExternalEffectFailed,
 )
@@ -276,7 +281,6 @@ async def test_nested_folder_payload_is_materialized_for_content_storage() -> No
         (ProcessingOutcome.PROCESSED, "sent"),
         (ProcessingOutcome.ARCHIVED, "waiting_approval"),
         (ProcessingOutcome.DUPLICATE, "waiting_approval"),
-        (ProcessingOutcome.MANUAL_REVIEW, "manual_review"),
     ],
 )
 async def test_unknown_duplicate_or_manual_legacy_results_require_review(
@@ -296,6 +300,24 @@ async def test_unknown_duplicate_or_manual_legacy_results_require_review(
             _application(),
             before_external_effect=AsyncMock(return_value=None),
         )
+
+
+@pytest.mark.asyncio
+async def test_manual_legacy_result_maps_to_terminal_manual_completion() -> None:
+    ctx = _ctx(legacy_status="manual_review")
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=AsyncMock(return_value=ProcessingOutcome.MANUAL_REVIEW),
+    )
+
+    completion = await adapter.process(
+        _lease(),
+        _application(),
+        before_external_effect=AsyncMock(return_value=None),
+    )
+
+    assert completion == ProcessingCompletion.manual_review()
 
 
 @pytest.mark.asyncio
@@ -523,6 +545,31 @@ async def test_detail_exception_is_redacted_and_wrapped_as_replay_safe(caplog) -
     assert "stage=detail_fetch" in caplog.text
     assert "error_type=RuntimeError" in caplog.text
     assert "PRIVATE-EXCHANGE-DETAIL" not in caplog.text
+    processor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retryable_detail_exception_preserves_gateway_retry_hint() -> None:
+    ctx = _ctx(legacy_status="skipped")
+    ctx.exchange_client.get_email.side_effect = ExchangeDetailTransientError(
+        retry_after_seconds=1
+    )
+    processor = AsyncMock(return_value=ProcessingOutcome.PROCESSED)
+    adapter = LegacyProcessingAdapter(
+        ctx,
+        legacy_account_id=8,
+        guarded_processor=processor,
+    )
+
+    with pytest.raises(ReplaySafeExternalEffectFailed) as caught:
+        await adapter.process(
+            _lease(),
+            _application(),
+            before_external_effect=AsyncMock(return_value=None),
+        )
+
+    assert caught.value.retry_after_seconds == 1
+    assert caught.value.__cause__ is None
     processor.assert_not_awaited()
 
 

@@ -303,8 +303,9 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
     }
 )
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
+    # AttachmentPolicy is the shared admission boundary for Drive uploads.
     "src/exchange_service.py": (
-        "60d2fdc3ae5f60ad9e2e76ee79218f725669fb69a884f698ac0bed7249f9b39e"
+        "33eb53e00b17ed7d4870b7e9cab202d363c31599a1f87e6b5c9ed93f63530ed2"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
@@ -352,7 +353,7 @@ _TASK10G_TASK9G_SUCCESSOR_PATHS = frozenset(
 )
 _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/bootstrap.py": (
-        "27160b8d55a27a147a97b96e82a116e5d249acfd8bc51b87ce2b8945e3adc3f9"
+        "4cf3eb4fc7f47581c24a80021faf461c57df49f3aadc402494c05ef8dce9984a"
     ),
     "src/db/roles.py": (
         "95ab9de4b7ba0f33b364c960ebbcf0497db820a6cb779324159f38d194df6849"
@@ -404,22 +405,22 @@ _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS = frozenset(
 )
 _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/access_contract.py": (
-        "ae750156e6e0ab5156066fd15e36c06efad66d105f3d3292713744ca7e7cf4a3"
+        "2d930679f8ab1ca121b0485e101ea0dab72e6a04e18665045ad87956cd277ff2"
     ),
     "src/db/roles.py": (
-        "40da8178c318277c1d20a94c5496c93c86e3d2029f6e798c201af37ee6aa6311"
+        "1f37d4f16ae6f4b5422d7b71e0955ea3740017933fdb257c6276224dcfffc94a"
     ),
     "src/ingestion/legacy_adapter.py": (
-        "4dce2a3b3d9456ef24ee938b2de144015d28c0566ede56a8aa5c0569f64f124c"
+        "542aaf9657213542a18a2846edcb860c2ad665f122e4cac033cce80a0d5df442"
     ),
     "src/ingestion/processing.py": (
-        "2784e9b00e6f34ae68b348c513868077ed5bad9fd85b21136244fd3726cc4f4f"
+        "4e34b1677fc7facd8c31413c324663a2552f4e2359e9b0da64d8aedde26da1f9"
     ),
     "src/ingestion/repository.py": (
-        "4487935cb2f493952e1d00ca3015dfe6b8e002bba6ec55fd9aaadcd59d0cfee0"
+        "f5805eb412d72782cf17e9ac967bebd3c1b1a2da6cb1d26a66643d61868fb1c3"
     ),
     "src/ingestion/runtime.py": (
-        "082bbcc655b60d7a2b9429bff0acdf1e0fade059943292cc22fa5b204a3c758d"
+        "879573e600d3eb8a1dd96be7f81ae4001e2434159ca697ac17c6b7be6ab944a1"
     ),
     "src/ingestion/worker.py": (
         "75ed0dfeda6d6010d4b91741ee2679f2658b82afec8b1a8d303a8eecf0b066f0"
@@ -428,7 +429,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "3ace800944a20e292dc5c48e09d837bcc4d883e9caeb54aacc9f2194fd22923a"
+        "d838a61f841ca8af7b19117bc60214706d13310d7a7b401f58dc711af4241f1d"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
@@ -455,8 +456,9 @@ _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {
     ],
 }
 _NON_SQL_EXCEPTION_FILE_STRUCTURAL_AST_SHA256 = {
+    # Tier 3 is now reachable only through the post-Tier-2 fallback seam.
     "src/router/engine.py": (
-        "594148219dadfe5c8aec192cb5a452e2521d8a04ae7609cb3b7f2e18831f33e6"
+        "9a2336ce5b9eeace9c1c2b3a110422b5864e7e282100b4262325b9f0e2cf46e2"
     ),
     "src/server.py": _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256["src/server.py"],
     "src/utils/email_processor.py": (

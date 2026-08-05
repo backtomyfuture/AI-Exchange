@@ -54,6 +54,7 @@ def _secure_production_settings(**overrides: Any) -> Settings:
         "DURABLE_INBOX_ENABLED": True,
         "INGESTION_SHADOW_ENABLED": False,
         "SYNC_RECONCILIATION_ENABLED": False,
+        "POLLING_ENABLED": True,
         "INGESTION_INSTANCE_ID": "ai-exchange-web",
         "EXCHANGE_API_URL": "https://exchange.internal.company/api/v1/exchange/emails",
         "EXCHANGE_API_KEY": SecretStr(_SAFE_SECRET_VALUES["EXCHANGE_API_KEY"]),
@@ -87,6 +88,13 @@ def test_exchange_tls_verification_defaults_to_true(monkeypatch: pytest.MonkeyPa
     assert settings.EXCHANGE_SSL_VERIFY is True
 
 
+def test_production_polling_does_not_require_a_retired_webhook_secret():
+    validate_runtime_security = _load_runtime_validator()
+    settings = _secure_production_settings(EXCHANGE_WEBHOOK_SECRET=SecretStr(""))
+
+    validate_runtime_security(settings)
+
+
 def test_phase_2_ingestion_flags_default_to_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -94,6 +102,7 @@ def test_phase_2_ingestion_flags_default_to_disabled(
         "DURABLE_INBOX_ENABLED",
         "INGESTION_SHADOW_ENABLED",
         "SYNC_RECONCILIATION_ENABLED",
+        "POLLING_ENABLED",
     ):
         monkeypatch.delenv(field_name, raising=False)
 
@@ -102,6 +111,7 @@ def test_phase_2_ingestion_flags_default_to_disabled(
     assert settings.DURABLE_INBOX_ENABLED is False
     assert settings.INGESTION_SHADOW_ENABLED is False
     assert settings.SYNC_RECONCILIATION_ENABLED is False
+    assert settings.POLLING_ENABLED is False
 
 
 def test_secure_production_baseline_is_accepted():
@@ -119,6 +129,7 @@ def test_secure_production_baseline_is_accepted():
         ("DURABLE_INBOX_ENABLED", False),
         ("INGESTION_SHADOW_ENABLED", True),
         ("SYNC_RECONCILIATION_ENABLED", True),
+        ("POLLING_ENABLED", False),
     ],
 )
 def test_production_accepts_only_the_phase4_lite_runtime_mode(
@@ -181,7 +192,6 @@ def test_production_rejects_unsafe_database_role_boundary(
         ("POSTGRES_USER", "user"),
         ("POSTGRES_PASSWORD", SecretStr("password")),
         ("EXCHANGE_API_KEY", SecretStr("your_api_key")),
-        ("EXCHANGE_WEBHOOK_SECRET", SecretStr("")),
         ("LARK_APP_SECRET", SecretStr("y5...")),
         ("LARK_ENCRYPT_KEY", SecretStr("your_encrypt_key")),
         ("CONTENT_STORE_KEY", SecretStr("")),
@@ -257,7 +267,6 @@ def test_production_rejects_structured_placeholder_values(
     [
         "POSTGRES_PASSWORD",
         "EXCHANGE_API_KEY",
-        "EXCHANGE_WEBHOOK_SECRET",
         "LARK_APP_SECRET",
         "LARK_ENCRYPT_KEY",
         "METRICS_TOKEN",
@@ -313,7 +322,6 @@ def test_production_validation_reports_all_invalid_field_names_at_once():
     validate_runtime_security = _load_runtime_validator()
     settings = _secure_production_settings(
         POSTGRES_PASSWORD=SecretStr("password"),
-        EXCHANGE_WEBHOOK_SECRET=SecretStr(""),
         EXCHANGE_SSL_VERIFY=False,
         LARK_ALLOWED_OPEN_IDS="",
     )
@@ -323,7 +331,6 @@ def test_production_validation_reports_all_invalid_field_names_at_once():
 
     message = str(caught.value)
     assert "POSTGRES_PASSWORD" in message
-    assert "EXCHANGE_WEBHOOK_SECRET" in message
     assert "EXCHANGE_SSL_VERIFY" in message
     assert "LARK_ALLOWED_OPEN_IDS" in message
     assert "password" not in message

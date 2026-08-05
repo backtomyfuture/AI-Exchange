@@ -9,6 +9,7 @@ import psycopg
 
 from src.db.access_contract import (
     GREENFIELD_DATABASE_REVISION,
+    POLLING_ONLY_DATABASE_REVISION,
     PHASE2_CHECK_CONSTRAINT_SHA256,  # noqa: F401 - compatibility export
     PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION,
     PHASE2_CHECK_CONSTRAINT_SHA256_OVERRIDES_BY_REVISION,  # noqa: F401
@@ -29,6 +30,10 @@ from src.db.access_contract import (
 class DatabaseSchemaContractError(RuntimeError):
     """Raised when deployed columns do not match the trusted type contract."""
 
+
+_GREENFIELD_PHYSICAL_REVISIONS: Final = frozenset(
+    {GREENFIELD_DATABASE_REVISION, POLLING_ONLY_DATABASE_REVISION}
+)
 
 _CHECKPOINT_RELATIONS: Final = frozenset(
     {
@@ -351,6 +356,9 @@ _PHASE2_COLUMN_TYPES_BY_REVISION[GREENFIELD_DATABASE_REVISION] = {
     }.items()
     if column[0] in PHASE2_RELATIONS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
 }
+_PHASE2_COLUMN_TYPES_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    _PHASE2_COLUMN_TYPES_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
 
 _PHASE2_NULLABLE_COLUMNS: Final = frozenset(
     {
@@ -527,13 +535,21 @@ _PHASE2_NULLABLE_COLUMNS_BY_REVISION[GREENFIELD_DATABASE_REVISION] = (
 _PHASE2_DEFAULTED_COLUMNS_BY_REVISION[GREENFIELD_DATABASE_REVISION] = frozenset(
     _GREENFIELD_DEFAULT_EXPRESSIONS
 )
+_PHASE2_NULLABLE_COLUMNS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    _PHASE2_NULLABLE_COLUMNS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
+_PHASE2_DEFAULTED_COLUMNS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
+    _PHASE2_DEFAULTED_COLUMNS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
+)
 _DEFAULT_EXPRESSIONS_BY_REVISION: Final = {
     **PHASE2_DEFAULT_EXPRESSIONS_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_DEFAULT_EXPRESSIONS,
+    POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_DEFAULT_EXPRESSIONS,
 }
 _GENERATED_EXPRESSION_SHA256_BY_REVISION: Final = {
     **PHASE2_GENERATED_EXPRESSION_SHA256_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_GENERATED_EXPRESSION_SHA256,
+    POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_GENERATED_EXPRESSION_SHA256,
 }
 _GREENFIELD_CHECK_CONSTRAINT_SHA256: Final = {
     **{
@@ -652,6 +668,7 @@ _GREENFIELD_CHECK_CONSTRAINT_SHA256: Final = {
 _CHECK_CONSTRAINT_SHA256_BY_REVISION: Final = {
     **PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_CHECK_CONSTRAINT_SHA256,
+    POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_CHECK_CONSTRAINT_SHA256,
 }
 
 
@@ -1881,6 +1898,31 @@ _GREENFIELD_ROUTINE_PENDING_SOURCE_IDENTITIES: Final = (
     _GREENFIELD_ROUTINE_DIGEST_IDENTITIES - frozenset(_GREENFIELD_ROUTINE_SOURCE_SHA256)
 )
 
+_POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS: Final = (
+    "p_account_id bigint, p_session_id uuid, "
+    "p_expected_lease_version bigint, p_folder_key text, "
+    "p_expected_cursor text, p_expected_cursor_version bigint, "
+    "p_next_cursor text, p_events jsonb, p_activation boolean"
+)
+_POLLING_ONLY_ROUTINES: Final = frozenset(
+    {
+        *_GREENFIELD_ROUTINES,
+        _routine_contract(
+            "greenfield_commit_sync_page",
+            _POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS,
+            "TABLE(committed_cursor text, committed_version bigint, "
+            "inserted_count bigint, duplicate_count bigint)",
+        ),
+    }
+)
+_POLLING_ONLY_ROUTINE_SOURCE_SHA256: Final = {
+    **_GREENFIELD_ROUTINE_SOURCE_SHA256,
+    (
+        "greenfield_commit_sync_page",
+        _POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS,
+    ): "acbc4d4e474cb38f2f929a9327c58a8928db4ebdf8709679b42d6a34bdab292a",
+}
+
 _BASE_RELATION_KINDS: Final = {
     "alembic_version": "r",
     "emails_log": "r",
@@ -2467,11 +2509,21 @@ async def require_database_schema_contract(
         for relation_name, relation_kind, *_rest in relation_kind_rows
         if relation_name in all_phase2_relations or relation_name in all_phase2_views
     }
+    has_polling_sync_page = any(
+        row[0] == "greenfield_commit_sync_page"
+        and row[1] == _POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS
+        for row in routine_rows
+    )
     if expected_revision is None:
         revision_candidates = tuple(
             revision
             for revision, relation_kinds in (_PHASE2_RELATION_KINDS_BY_REVISION.items())
             if deployed_phase2_relation_kinds == relation_kinds
+            and (
+                revision not in _GREENFIELD_PHYSICAL_REVISIONS
+                or (revision == POLLING_ONLY_DATABASE_REVISION)
+                == has_polling_sync_page
+            )
         )
     elif expected_revision in PHASE2_RELATIONS_BY_REVISION:
         revision_candidates = (expected_revision,)
@@ -2693,7 +2745,7 @@ async def require_database_schema_contract(
     if actual_views != expected_views:
         raise _invalid_contract()
 
-    if selected_revision == GREENFIELD_DATABASE_REVISION:
+    if selected_revision in _GREENFIELD_PHYSICAL_REVISIONS:
         expected_unique = _GREENFIELD_UNIQUE_CONSTRAINTS
     else:
         expected_unique = {
@@ -2767,7 +2819,7 @@ async def require_database_schema_contract(
     if actual_unique != expected_unique:
         raise _invalid_contract()
 
-    if selected_revision == GREENFIELD_DATABASE_REVISION:
+    if selected_revision in _GREENFIELD_PHYSICAL_REVISIONS:
         expected_indexes = _GREENFIELD_INDEXES
     else:
         expected_indexes = {
@@ -2823,7 +2875,7 @@ async def require_database_schema_contract(
     if actual_indexes != expected_indexes:
         raise _invalid_contract()
 
-    if selected_revision != GREENFIELD_DATABASE_REVISION:
+    if selected_revision not in _GREENFIELD_PHYSICAL_REVISIONS:
         return
 
     actual_foreign_keys = {
@@ -2897,12 +2949,22 @@ async def require_database_schema_contract(
             _source_sha256,
         ) in routine_rows
     }
-    if actual_routines != _GREENFIELD_ROUTINES:
+    expected_routines = (
+        _POLLING_ONLY_ROUTINES
+        if selected_revision == POLLING_ONLY_DATABASE_REVISION
+        else _GREENFIELD_ROUTINES
+    )
+    if actual_routines != expected_routines:
         raise _invalid_contract()
 
     actual_routine_digests = {(row[0], row[1]): row[-1] for row in routine_rows}
+    expected_routine_digests = (
+        _POLLING_ONLY_ROUTINE_SOURCE_SHA256
+        if selected_revision == POLLING_ONLY_DATABASE_REVISION
+        else _GREENFIELD_ROUTINE_SOURCE_SHA256
+    )
     if any(
         actual_routine_digests.get(identity) != expected_digest
-        for identity, expected_digest in _GREENFIELD_ROUTINE_SOURCE_SHA256.items()
+        for identity, expected_digest in expected_routine_digests.items()
     ):
         raise _invalid_contract()
