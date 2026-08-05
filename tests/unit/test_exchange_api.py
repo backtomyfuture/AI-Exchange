@@ -296,6 +296,43 @@ async def test_get_email_adds_canonical_recipient_fields(mock_settings):
 
 
 @pytest.mark.asyncio
+async def test_get_email_adds_canonical_conversation_fields(mock_settings):
+    raw_email = {
+        "id": "email-id",
+        "conversationId": "conversation-1",
+        "conversationIndex": "AQHk7K8=",
+        "internetMessageId": "<current@example.com>",
+        "inReplyTo": "<parent@example.com>",
+        "References": ["<root@example.com>", "<parent@example.com>"],
+        "uniqueBody": "<p>本轮新增正文</p>",
+    }
+    response_body = json.dumps({"data": raw_email}).encode()
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = StreamingHTTPClient(
+        [StreamingResponse(200, [response_body])]
+    )
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        email = await client.get_email("email-id")
+
+    assert email == {
+        **raw_email,
+        "conversation_id": "conversation-1",
+        "conversation_index": "AQHk7K8=",
+        "thread_id": "conversation-1",
+        "internet_message_id": "<current@example.com>",
+        "in_reply_to": "<parent@example.com>",
+        "references": ["<root@example.com>", "<parent@example.com>"],
+        "unique_body": "<p>本轮新增正文</p>",
+    }
+
+
+@pytest.mark.asyncio
 async def test_send_email_success(mock_settings):
     """Test sending an email successfully."""
     client = ExchangeClient(settings=mock_settings)

@@ -16,6 +16,11 @@ from src.security.redaction import fingerprint_identifier
 
 logger = logging.getLogger(__name__)
 
+MAX_INDEX_BODY_CHARS = 50_000
+MAX_QUOTED_HISTORY_FALLBACK_CHARS = 4_000
+MAX_QUOTED_HISTORY_PREVIEW_CHARS = 2_000
+
+
 class EmailProcessor:
     def __init__(
         self, 
@@ -155,12 +160,37 @@ class EmailProcessor:
             if attachment_summaries:
                 parts.append("【包含的附件列表】:\n" + "\n".join(attachment_summaries))
                 
-            body_projection = project_email_body_for_model(email.get("body", ""))
-            projected_body = body_projection.text
-            if len(projected_body) > 50000:
-                projected_body = projected_body[:50000] + "\n...[truncated]"
-                    
-            parts.append("【邮件正文】:\n" + projected_body)
+            body_projection = project_email_body_for_model(
+                email.get("body", ""),
+                unique_body=email.get("unique_body"),
+            )
+            projected_body = body_projection.current_text
+            if len(projected_body) > MAX_INDEX_BODY_CHARS:
+                projected_body = (
+                    projected_body[:MAX_INDEX_BODY_CHARS] + "\n...[truncated]"
+                )
+
+            if projected_body:
+                parts.append("【本轮新增正文】:\n" + projected_body)
+                body_source = "current_message"
+            elif body_projection.has_quoted_history:
+                # A bare forward/reply has no delta to embed.  Retain a bounded
+                # fallback so it remains semantically searchable, without
+                # re-embedding an arbitrarily deep nested thread.
+                history_fallback = body_projection.quoted_text[
+                    :MAX_QUOTED_HISTORY_FALLBACK_CHARS
+                ]
+                parts.append(
+                    "【引用历史（本轮无新增正文）】:\n" + history_fallback
+                )
+                body_source = "quoted_history_fallback"
+            else:
+                parts.append("【本轮新增正文】:\n")
+                body_source = "current_message"
+
+            quoted_history_preview = body_projection.quoted_text[
+                :MAX_QUOTED_HISTORY_PREVIEW_CHARS
+            ]
             
             full_text = "\n\n".join(parts)
             
@@ -192,7 +222,25 @@ class EmailProcessor:
                     # dictionary untouched.
                     payload.pop("_image_attachments", None)
                     payload.pop("image_analysis", None)
+                    # Never retain provider-supplied raw alternative bodies in
+                    # Qdrant: both canonical and Gateway aliases may contain
+                    # HTML/data URIs.  ``body`` below is the bounded, safe
+                    # current-message projection.
+                    payload.pop("unique_body", None)
+                    payload.pop("uniqueBody", None)
+                    payload.pop("UniqueBody", None)
+                    thread_id = payload.get("thread_id") or payload.get(
+                        "conversation_id"
+                    )
+                    if thread_id:
+                        payload["thread_id"] = thread_id
                     payload["body"] = projected_body
+                    payload["body_source"] = body_source
+                    payload["has_quoted_history"] = (
+                        body_projection.has_quoted_history
+                    )
+                    if quoted_history_preview:
+                        payload["quoted_history_preview"] = quoted_history_preview
                     payload["attachments_metadata"] = valid_attachments_metadata
                     
                     if "attachments" in payload:

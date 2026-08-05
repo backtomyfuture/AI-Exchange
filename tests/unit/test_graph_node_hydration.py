@@ -165,6 +165,103 @@ async def test_categorizer_hydrates_body_locally_and_returns_only_bounded_delta(
 
 
 @pytest.mark.asyncio
+async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
+    email = {
+        "id": "mail-evolution",
+        "subject": "答复: 外部信息单据待处理提醒",
+        "sender": "sender@example.com",
+        "to": [],
+        "cc": [],
+        "body": """
+            <p>呈阅</p>
+            <div style="border:none;border-top:solid #E1E1E1 1.0pt">
+              <p><b>发件人:</b> 数字化安全管理平台信箱</p>
+              <p><b>发送时间:</b> 2026年7月28日 23:12</p>
+              <p><b>收件人:</b> 信息技术部</p>
+              <p><b>主题:</b> 外部信息单据待处理提醒</p>
+              <p>请及时填写信息评估结论。</p>
+            </div>
+        """,
+    }
+    dependencies = _dependencies(email)
+    state = _state(email)
+    captured = {}
+
+    def fake_model(prompt_value):
+        captured["prompt"] = prompt_value.to_string()
+        return json.dumps(
+            {
+                "priority": "P3",
+                "need_reply": False,
+                "intent": "通知",
+                "summary": "转呈历史通知供阅知。",
+                "reasoning": "本轮新增内容只有呈阅，没有要求回复。",
+                "confidence": 1.0,
+            },
+            ensure_ascii=False,
+        )
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(fake_model),
+    ):
+        result = await categorize_email(state, dependencies)
+
+    assert "<current_message>\n呈阅\n</current_message>" in captured["prompt"]
+    assert "<quoted_history>" in captured["prompt"]
+    assert "请及时填写信息评估结论。" in captured["prompt"]
+    current_section = captured["prompt"].split("<current_message>", 1)[1].split(
+        "</current_message>",
+        1,
+    )[0]
+    assert "请及时填写信息评估结论。" not in current_section
+    assert result["classification"]["need_reply"] is False
+    assert "skill_auto_1446" in result["active_skills"]
+
+
+@pytest.mark.asyncio
+async def test_categorizer_does_not_route_on_keyword_found_only_in_history():
+    email = {
+        "id": "mail-history-keyword",
+        "subject": "答复: 项目材料",
+        "sender": "sender@example.com",
+        "to": [],
+        "cc": [],
+        "body": """
+            <p>请继续修改本轮材料，完成后回复。</p>
+            <div class="gmail_quote">
+              <p>呈阅，请知悉。</p>
+            </div>
+        """,
+    }
+    dependencies = _dependencies(email)
+    state = _state(email)
+
+    def fake_model(_prompt_value):
+        return json.dumps(
+            {
+                "priority": "P1",
+                "need_reply": True,
+                "intent": "审批",
+                "summary": "要求继续修改并回复。",
+                "reasoning": "本轮新增内容提出了明确任务。",
+                "confidence": 1.0,
+            },
+            ensure_ascii=False,
+        )
+
+    with patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(fake_model),
+    ):
+        result = await categorize_email(state, dependencies)
+
+    assert "skill_auto_1446" not in result["active_skills"]
+    assert result["classification"]["need_reply"] is True
+    assert result["next_step"] == "rag_search"
+
+
+@pytest.mark.asyncio
 async def test_categorizer_persists_fixed_forward_draft_and_recipients():
     dependencies = _dependencies()
     state = _state()
@@ -205,6 +302,7 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
         "body": (
             "<p>CURRENT-BODY-SENTINEL</p>"
             '<img src="data:image/png;base64,UkFXLUlNQUdFLUJZVEVT">'
+            '<div class="gmail_quote"><p>QUOTED-OLD-TASK-SENTINEL</p></div>'
         ),
     }
     dependencies = _dependencies(email)
@@ -245,6 +343,9 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
 
     assert "CURRENT-BODY-SENTINEL" in retriever.search.call_args.kwargs["query_text"]
     assert "[内嵌图片]" in retriever.search.call_args.kwargs["query_text"]
+    assert "QUOTED-OLD-TASK-SENTINEL" not in retriever.search.call_args.kwargs[
+        "query_text"
+    ]
     assert "data:image" not in retriever.search.call_args.kwargs["query_text"]
     assert retriever.search.call_args.kwargs["exclude_email_id"] == "mail-1"
     routed_email = router.apply_tier2_hits.await_args.args[0]["email"]
@@ -367,6 +468,49 @@ async def test_drafter_saves_complete_draft_and_returns_only_draft_id():
 
 
 @pytest.mark.asyncio
+async def test_drafter_distinguishes_current_request_from_quoted_history():
+    email = {
+        "id": "mail-draft-evolution",
+        "subject": "答复: 项目材料",
+        "sender": "sender@example.com",
+        "body": """
+            <p>本轮请仅确认收到。</p>
+            <div class="gmail_quote">
+              <p>旧请求：请重新编制预算并提交说明。</p>
+            </div>
+        """,
+    }
+    dependencies = _dependencies(email)
+    state = _state(email)
+    captured = {}
+
+    def capture_budget(_role, value, *, budget):
+        captured["prompt"] = value
+
+    with patch(
+        "src.nodes.drafter.with_llm_retry",
+        side_effect=_draft_retry("收到，谢谢。"),
+    ), patch(
+        "src.nodes.drafter.enforce_model_input_budget",
+        side_effect=capture_budget,
+    ), patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(lambda value: value),
+    ):
+        await generate_draft(state, dependencies)
+
+    assert "<current_message>\n本轮请仅确认收到。\n</current_message>" in captured[
+        "prompt"
+    ]
+    assert "<quoted_history>" in captured["prompt"]
+    current_section = captured["prompt"].split("<current_message>", 1)[1].split(
+        "</current_message>",
+        1,
+    )[0]
+    assert "旧请求：请重新编制预算并提交说明。" not in current_section
+
+
+@pytest.mark.asyncio
 async def test_drafter_rewrite_uses_bounded_review_issues_and_replaces_store_value():
     dependencies = _dependencies()
     dependencies.drafts.values["mail-1"] = "FIRST-DRAFT-SENTINEL"
@@ -427,6 +571,51 @@ async def test_reviewer_loads_draft_and_email_locally_without_returning_either()
     assert "email" not in result
     assert "draft" not in result
     assert result["review_result"]["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_reviewer_checks_current_request_separately_from_quoted_history():
+    email = {
+        "id": "mail-review-evolution",
+        "subject": "答复: 项目材料",
+        "sender": "sender@example.com",
+        "body": """
+            <p>本轮请仅确认收到。</p>
+            <div class="gmail_quote">
+              <p>旧请求：请重新编制预算并提交说明。</p>
+            </div>
+        """,
+    }
+    dependencies = _dependencies(email)
+    dependencies.drafts.values[email["id"]] = "已收到，谢谢。"
+    state = _state(email)
+    state["draft_id"] = email["id"]
+    captured = {}
+
+    def capture_budget(_role, value, *, budget):
+        captured["prompt"] = value
+
+    with patch(
+        "src.nodes.reviewer.with_llm_retry",
+        side_effect=_draft_retry('{"pass": true, "issues": ""}'),
+    ), patch(
+        "src.nodes.reviewer.enforce_model_input_budget",
+        side_effect=capture_budget,
+    ), patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(lambda value: value),
+    ):
+        await review_draft(state, dependencies)
+
+    assert "<current_message>\n本轮请仅确认收到。\n</current_message>" in captured[
+        "prompt"
+    ]
+    assert "<quoted_history>" in captured["prompt"]
+    current_section = captured["prompt"].split("<current_message>", 1)[1].split(
+        "</current_message>",
+        1,
+    )[0]
+    assert "旧请求：请重新编制预算并提交说明。" not in current_section
 
 
 @pytest.mark.asyncio
