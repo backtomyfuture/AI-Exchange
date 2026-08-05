@@ -41,7 +41,10 @@ async def run_notification_smoke() -> list[dict[str, object]]:
                 "intent": "通知",
                 "need_reply": False,
             },
-            "email": {"subject": "General Notification"},
+            "email": {
+                "subject": "General Notification",
+                "to": ["notification-smoke@example.test"],
+            },
         },
         {
             "classification": {
@@ -54,6 +57,12 @@ async def run_notification_smoke() -> list[dict[str, object]]:
     ]
 
     with patch(
+        "src.utils.notification_policy.get_settings",
+        return_value=SimpleNamespace(
+            EXCHANGE_ACCOUNT_EMAIL="notification-smoke@example.test",
+            LEADER_SENDERS="",
+        ),
+    ), patch(
         "src.exchange_service.lark_app.generate_and_upload_pdf",
         new=AsyncMock(return_value=None),
     ), patch(
