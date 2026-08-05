@@ -21,7 +21,13 @@ async def get_current_database_revision(dsn: str) -> str | None:
     try:
         async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT version_num FROM alembic_version")
+                await cur.execute(
+                    "SELECT pg_catalog.to_regclass('public.alembic_version')"
+                )
+                relation = await cur.fetchone()
+                if relation is None or relation[0] is None:
+                    return None
+                await cur.execute("SELECT version_num FROM public.alembic_version")
                 rows = await cur.fetchall()
     except psycopg.errors.UndefinedTable:
         return None

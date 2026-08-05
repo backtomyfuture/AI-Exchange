@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import psycopg
 
 from src.db import schema as database_schema
 from src.db.schema import (
@@ -41,8 +40,9 @@ def test_runtime_revision_is_exact_polling_only_0007_head() -> None:
 
 
 class _RevisionCursor:
-    def __init__(self, row):
+    def __init__(self, row, *, relation: tuple[str | None] | None = None):
         self.row = row
+        self.relation = relation
         self.statements: list[str] = []
 
     async def execute(self, statement: str) -> None:
@@ -50,6 +50,9 @@ class _RevisionCursor:
 
     async def fetchall(self):
         return self.row
+
+    async def fetchone(self):
+        return self.relation
 
     async def __aenter__(self):
         return self
@@ -75,6 +78,7 @@ class _RevisionConnection:
 @pytest.mark.asyncio
 async def test_get_current_database_revision_is_read_only():
     connection = _RevisionConnection([(EXPECTED_DATABASE_REVISION,)])
+    connection.cursor_obj.relation = ("public.alembic_version",)
 
     async def connect(*_args, **kwargs):
         assert kwargs["autocommit"] is True
@@ -85,18 +89,15 @@ async def test_get_current_database_revision_is_read_only():
 
     assert revision == EXPECTED_DATABASE_REVISION
     assert connection.cursor_obj.statements == [
-        "SELECT version_num FROM alembic_version"
+        "SELECT pg_catalog.to_regclass('public.alembic_version')",
+        "SELECT version_num FROM public.alembic_version",
     ]
 
 
 @pytest.mark.asyncio
-async def test_get_current_database_revision_treats_missing_table_as_unversioned():
-    connection = _RevisionConnection([])
-
-    async def missing_table(_statement: str) -> None:
-        raise psycopg.errors.UndefinedTable("alembic_version does not exist")
-
-    connection.cursor_obj.execute = missing_table
+async def test_get_current_database_revision_skips_missing_table_without_querying_it():
+    connection = _RevisionConnection([],)
+    connection.cursor_obj.relation = (None,)
 
     async def connect(*_args, **_kwargs):
         return connection
@@ -105,6 +106,9 @@ async def test_get_current_database_revision_treats_missing_table_as_unversioned
         revision = await get_current_database_revision("postgresql://test/test")
 
     assert revision is None
+    assert connection.cursor_obj.statements == [
+        "SELECT pg_catalog.to_regclass('public.alembic_version')"
+    ]
 
 
 @pytest.mark.asyncio
