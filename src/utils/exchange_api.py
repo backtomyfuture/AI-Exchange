@@ -1105,7 +1105,11 @@ class ExchangeClient:
 
         client = self.http_client
         try:
-            response = await client.put(endpoint, params=params, timeout=10.0)
+            response = await client.put(
+                endpoint,
+                params=params,
+                timeout=_EXCHANGE_DETAIL_TIMEOUT_SECONDS,
+            )
             if response.status_code == 200:
                 data = response.json()
                 return data.get('code') == 200

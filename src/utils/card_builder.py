@@ -202,16 +202,17 @@ class LarkCardBuilder:
             for email in unresolved_emails:
                 try:
                     # Run async resolve_contact in sync context
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
+                    try:
+                        asyncio.get_running_loop()
+                    except RuntimeError:
+                        name = asyncio.run(self.exchange_client.resolve_contact(email))
+                    else:
                         import concurrent.futures
                         with concurrent.futures.ThreadPoolExecutor() as pool:
                             name = pool.submit(
                                 asyncio.run,
                                 self.exchange_client.resolve_contact(email)
                             ).result(timeout=10)
-                    else:
-                        name = asyncio.run(self.exchange_client.resolve_contact(email))
                     
                     if name:
                         logger.info(
