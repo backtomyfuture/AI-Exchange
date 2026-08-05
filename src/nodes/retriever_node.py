@@ -82,8 +82,14 @@ async def retrieve_context(
     全程使用 ``asyncio.to_thread`` 避免阻塞事件循环。
     """
     email = await hydrate_email_from_state(state, dependencies)
-    body_projection = project_email_body_for_model(email.get("body", ""))
-    email["body"] = body_projection.text
+    body_projection = project_email_body_for_model(
+        email.get("body", ""),
+        unique_body=email.get("unique_body"),
+    )
+    # Semantic matching and fallback routing describe the current turn.  Using
+    # recursively quoted history here would vote on an older task instead of
+    # the sender's latest update.
+    email["body"] = body_projection.current_text
     local_state = deepcopy(dict(state))
     local_state["email"] = email
     subject = email.get("subject", "")

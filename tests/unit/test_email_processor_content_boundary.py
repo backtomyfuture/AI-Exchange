@@ -779,6 +779,59 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
     assert "LEGACY-BASE64-IMAGE-SENTINEL" not in str(point.payload)
 
 
+def test_email_processor_indexes_reply_delta_without_reembedding_quoted_history():
+    processor = EmailProcessor.__new__(EmailProcessor)
+    processor.collection_name = "emails"
+    processor.init_collection = MagicMock()
+    captured = {}
+
+    def split_text(value):
+        captured["indexed_text"] = value
+        return ["small chunk"]
+
+    processor.text_splitter = SimpleNamespace(split_text=split_text)
+    processor.openai_client = SimpleNamespace(
+        embeddings=SimpleNamespace(
+            create=lambda **_kwargs: SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.1, 0.2])]
+            )
+        )
+    )
+    processor.embedding_model = "test"
+    processor.qdrant_client = MagicMock()
+    email = {
+        "id": "mail-evolution",
+        "subject": "答复: 项目材料",
+        "conversation_id": "conversation-1",
+        "unique_body": "<p>本轮增量：材料已完成，请查收。</p>",
+        "uniqueBody": (
+            "<img src=\"data:image/png;base64,UNIQUE-BODY-RAW-SENTINEL\">"
+        ),
+        "body": """
+            <p>完整正文中的旧请求：请重新编制预算。</p>
+            <div class="gmail_quote">
+              <p>旧任务：请在今天前修改材料并回复。</p>
+            </div>
+        """,
+        "attachments": [],
+    }
+    before = deepcopy(email)
+
+    assert processor.process_batch([email]) == 1
+
+    assert email == before
+    assert "本轮增量：材料已完成，请查收。" in captured["indexed_text"]
+    assert "完整正文中的旧请求：请重新编制预算。" not in captured["indexed_text"]
+    assert "旧任务：请在今天前修改材料并回复。" not in captured["indexed_text"]
+    point = processor.qdrant_client.upsert.call_args.kwargs["points"][0]
+    assert point.payload["body"] == "本轮增量：材料已完成，请查收。"
+    assert point.payload["thread_id"] == "conversation-1"
+    assert point.payload["has_quoted_history"] is False
+    assert "unique_body" not in point.payload
+    assert "uniqueBody" not in point.payload
+    assert "UNIQUE-BODY-RAW-SENTINEL" not in str(point.payload)
+
+
 @pytest.mark.asyncio
 async def test_attachment_upload_returns_only_tokens_without_mutating_email():
     email = {
