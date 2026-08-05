@@ -8,7 +8,7 @@ from pydantic import SecretStr
 from src.config import Settings
 from src.domain.errors import ExchangeDetailTransientError
 from src.domain.send_result import ExchangeSendOutcome, ExchangeSendResult
-from src.utils.exchange_api import ExchangeClient
+from src.utils.exchange_api import ExchangeClient, _EXCHANGE_DETAIL_TIMEOUT_SECONDS
 
 
 class StreamingResponse:
@@ -456,6 +456,25 @@ async def test_existing_email_send_exception_is_unknown_without_retry(mock_setti
 
     assert result == ExchangeSendResult.unknown()
     mock_http.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mark_as_read_uses_gateway_compatible_timeout(mock_settings):
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = AsyncMock()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"code": 200}
+    mock_http.put.return_value = response
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        assert await client.mark_as_read("mail-1") is True
+
+    assert mock_http.put.await_args.kwargs["timeout"] == _EXCHANGE_DETAIL_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
