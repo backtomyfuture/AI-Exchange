@@ -73,6 +73,58 @@ async def test_queue_command_reports_durable_inbox_counts(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pending_command_formats_serialized_mailbox_sender(monkeypatch) -> None:
+    raw_sender = (
+        "Mailbox(name='武珉（Annie）', email_address='m.wu@tianjin-air.com', "
+        "routing_type='SMTP', mailbox_type='Mailbox')"
+    )
+    rows = [
+        {
+            "id": "mail-one",
+            "subject": "中秋、国庆双节福利实物礼包论坛票选活动",
+            "sender": raw_sender,
+        },
+        {"id": "mail-two", "subject": None, "sender": ""},
+    ]
+    cursor = AsyncMock()
+    cursor.fetchall.return_value = rows
+
+    class _CursorContext:
+        async def __aenter__(self):
+            return cursor
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _Connection:
+        def cursor(self):
+            return _CursorContext()
+
+    class _ConnectionContext:
+        async def __aenter__(self):
+            return _Connection()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class _Database:
+        def get_connection(self):
+            return _ConnectionContext()
+
+    monkeypatch.setattr(handlers, "_db_manager", _Database())
+    router = CommandRouter()
+    router.register("/pending", handlers.handle_pending)
+
+    reply = await router.dispatch("/pending")
+
+    assert reply == (
+        "⏳ 待审批邮件 (2 封):\n\n"
+        "  · [中秋、国庆双节福利实物礼包论坛票选活动] from 武珉（Annie） <m.wu@tianjin-air.com>\n"
+        "  · [无主题] from 未知"
+    )
+
+
+@pytest.mark.asyncio
 async def test_search_command_deduplicates_chunks_and_formats_sender(monkeypatch) -> None:
     raw_sender = (
         "Mailbox(name='武珉（Annie）', email_address='m.wu@tianjin-air.com', "

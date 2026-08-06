@@ -28,6 +28,7 @@ from src.utils.lark_messaging import (
     find_daily_digest_headers,
     send_daily_digest_text,
 )
+from src.utils.mailbox_text import parse_serialized_mailbox
 
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,17 @@ def _status_display(status: object) -> tuple[str, str]:
         "expired": ("已过期", "已处理"),
     }
     return mapping.get(normalized, ("状态待确认", "请人工检查"))
+
+
+def _display_sender(value: object) -> str:
+    """Render a stored sender as a readable name, falling back to the address."""
+
+    parsed = parse_serialized_mailbox(value)
+    if parsed is not None:
+        return parsed.name or parsed.address
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 
 def _safe_text(value: object, max_bytes: int) -> str:
@@ -885,7 +897,7 @@ def _email_item_from_row(row: Mapping[str, object]) -> DigestEmailItem:
         raise RuntimeError("daily_digest_source_timestamp_invalid")
     return DigestEmailItem(
         received_at=_as_utc(timestamp),
-        sender=_safe_text(row.get("sender"), 96),
+        sender=_safe_text(_display_sender(row.get("sender")), 96),
         subject=_safe_text(row.get("subject"), 192),
         status=_normal_status(row.get("status")),
     )

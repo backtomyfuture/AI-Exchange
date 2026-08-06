@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from src.security.html import bound_email_html, sanitize_email_html
 from src.security.pdf import PdfAsset, pdf_asset_url, register_pdf_asset
+from src.utils.mailbox_text import parse_serialized_mailbox
 
 
 logger = logging.getLogger(__name__)
@@ -71,16 +72,12 @@ def _format_address_str(value: object) -> str:
         return ""
     raw = str(value).strip()
 
-    mailbox = re.search(
-        r"name=['\"]([^'\"]*)['\"].*?email_address=['\"]([^'\"]+)['\"]",
-        raw,
-    )
-    if mailbox:
-        name, address = mailbox.groups()
+    parsed = parse_serialized_mailbox(raw)
+    if parsed is not None and parsed.address:
         return (
-            f"{html.escape(name)} &lt;{html.escape(address)}&gt;"
-            if name
-            else html.escape(address)
+            f"{html.escape(parsed.name)} &lt;{html.escape(parsed.address)}&gt;"
+            if parsed.name
+            else html.escape(parsed.address)
         )
 
     display = re.search(r"(.*?)\s*<(.+?)>", raw)

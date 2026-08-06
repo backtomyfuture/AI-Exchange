@@ -14,6 +14,7 @@ from src.daily_digest import (
     DailyDigestSnapshot,
     DailyDigestWindow,
     DigestEmailItem,
+    _email_item_from_row,
     delivery_scope_hash,
     render_daily_digest,
 )
@@ -92,6 +93,92 @@ def test_digest_lists_metadata_and_next_action_but_not_an_email_body() -> None:
     assert "待审批" in text
     assert "请在飞书完成审批" in text
     assert "邮件正文不应出现" not in text
+
+
+def _item_from_row(*, sender: str, subject: str, status: str) -> DigestEmailItem:
+    return _email_item_from_row(
+        {
+            "received_at": datetime(2026, 8, 5, 4, 23, tzinfo=UTC),
+            "sender": sender,
+            "subject": subject,
+            "status": status,
+        }
+    )
+
+
+def test_serialized_mailbox_sender_is_rendered_as_a_readable_name() -> None:
+    item = _item_from_row(
+        sender=(
+            "Mailbox(name='武珉（Annie）', email_address='m.wu@tianjin-air.com', "
+            "routing_type='SMTP', mailbox_type='Mailbox')"
+        ),
+        subject="FW: 请阅处：关于组织开展中秋、国庆双节福利实物礼包论坛票选活动的通知",
+        status="manual_review",
+    )
+    text = render_daily_digest(
+        _snapshot(emails=(item,)),
+        is_backfill=False,
+        max_bytes=12_000,
+    )[0][1]
+
+    assert "武珉（Annie）" in text
+    assert "Mailbox(" not in text
+    assert "email_address" not in text
+    assert "routing_type" not in text
+
+
+def test_long_mailbox_name_is_parsed_before_sender_truncation() -> None:
+    long_name = "天津航空有限责任公司市场营销委员会收益管理中心党总支书记"
+    item = _item_from_row(
+        sender=(
+            f"Mailbox(name='{long_name}', email_address='m.wu@tianjin-air.com', "
+            "routing_type='SMTP', mailbox_type='Mailbox')"
+        ),
+        subject="长名字发件人",
+        status="manual_review",
+    )
+    text = render_daily_digest(
+        _snapshot(emails=(item,)),
+        is_backfill=False,
+        max_bytes=12_000,
+    )[0][1]
+
+    assert long_name in text
+    assert "Mailbox(" not in text
+
+
+def test_serialized_mailbox_sender_falls_back_to_address_when_name_is_empty() -> None:
+    item = _item_from_row(
+        sender=(
+            "Mailbox(name='', email_address='zhang-xia@tianjin-air.com', "
+            "routing_type='SMTP', mailbox_type='Mailbox')"
+        ),
+        subject="转发: 呈阅知：关于基地园区西侧车位封控施工的通知",
+        status="no_action",
+    )
+    text = render_daily_digest(
+        _snapshot(emails=(item,)),
+        is_backfill=False,
+        max_bytes=12_000,
+    )[0][1]
+
+    assert "zhang-xia@tianjin-air.com" in text
+    assert "Mailbox(" not in text
+
+
+def test_plain_sender_text_is_rendered_unchanged() -> None:
+    item = _item_from_row(
+        sender="sender@example.test",
+        subject="普通发件人",
+        status="no_action",
+    )
+    text = render_daily_digest(
+        _snapshot(emails=(item,)),
+        is_backfill=False,
+        max_bytes=12_000,
+    )[0][1]
+
+    assert "sender@example.test" in text
 
 
 def test_draft_saved_is_not_an_attention_item_and_backlog_is_labelled() -> None:
