@@ -232,7 +232,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
     assert [candidate.thread_id for candidate in snapshot.candidates] == ["old-sent"]
     assert snapshot.candidates[0].updated_at.tzinfo is not None
-    assert snapshot.alembic_revision == "20260728_0007"
+    assert snapshot.alembic_revision == "20260805_0008"
     assert snapshot.checkpoint_revision == len(AsyncPostgresSaver.MIGRATIONS) - 1
     assert len(snapshot.database_fingerprint) == 64
     assert snapshot.database_timezone

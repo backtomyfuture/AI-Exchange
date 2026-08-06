@@ -354,7 +354,7 @@ _TASK10G_TASK9G_SUCCESSOR_PATHS = frozenset(
 )
 _TASK10G_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/bootstrap.py": (
-        "4cf3eb4fc7f47581c24a80021faf461c57df49f3aadc402494c05ef8dce9984a"
+        "f1c9663163f5395d49e662a2865d2b7aeb3ede43b0023f8bbcb699e438421a7c"
     ),
     "src/db/roles.py": (
         "95ab9de4b7ba0f33b364c960ebbcf0497db820a6cb779324159f38d194df6849"
@@ -406,10 +406,10 @@ _PHASE4_LITE_TASK11G_SUCCESSOR_PATHS = frozenset(
 )
 _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
     "src/db/access_contract.py": (
-        "2d930679f8ab1ca121b0485e101ea0dab72e6a04e18665045ad87956cd277ff2"
+        "4e9a8a884775ce897b3f61c644ca9c867bbe24e053fdd20621f95380870f09d5"
     ),
     "src/db/roles.py": (
-        "1f37d4f16ae6f4b5422d7b71e0955ea3740017933fdb257c6276224dcfffc94a"
+        "1df2478032680114afef0ee503b082a840f5ee4ddc90d325c2aa41c1df2d4acd"
     ),
     "src/ingestion/legacy_adapter.py": (
         # Reviewed after propagating a validated Exchange Retry-After hint.
@@ -431,7 +431,7 @@ _PHASE4_LITE_REVIEWED_STRUCTURAL_AST_SHA256 = {
         "43af96b3596113d0745e1b6bb6c13fa7acbd0aca0f089d4bec7eec13d3bfce0a"
     ),
     "src/server.py": (
-        "d838a61f841ca8af7b19117bc60214706d13310d7a7b401f58dc711af4241f1d"
+        "25c376a73b2bd38a96aa58021dbc54756369c638a1feafa9cc4c08dc0ecd772b"
     ),
 }
 _TRUSTED_DYNAMIC_SQL_FILE_STRUCTURAL_AST_SHA256 = {

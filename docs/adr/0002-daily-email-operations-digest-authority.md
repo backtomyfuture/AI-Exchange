@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# Derive daily email operations digests from durable state
+
+A Daily Email Operations Digest is sent at 18:00 Asia/Shanghai time to the configured Lark chat, including on zero-volume days, for the immediately preceding Daily Digest Reporting Window: the previous 18:00 inclusive through the current 18:00 exclusive. Its processed-volume, pending-approval, failure-or-backlog, and health facts come exclusively from PostgreSQL Durable Inbox state and the runtime health snapshot; it is delivered as a concise Feishu text message, or when necessary an ordered Daily Digest Delivery Bundle. Its plain-text layout has three sections: 今日概况 contains the precomputed aggregates, 需关注事项 directly lists unresolved Digest Attention Items rather than a thematic summary, and 邮件清单 contains one compact Digest Email Item for every Inbound Email in the window. Historical Backlog appears in 需关注事项 with that label but is not repeated in 邮件清单. An explicitly saved draft is handled and appears only in 邮件清单. Each item shows the received or sent time, sender, subject, current status, and processing outcome or next action, but not the email body or attachments; an LLM may at most render precomputed aggregates and must never receive raw email subjects or bodies for this digest. This deliberately replaces the legacy message-level LLM summary so that the digest remains auditable, concise, and correct even when individual email content is unavailable.

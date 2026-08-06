@@ -866,6 +866,7 @@ async def _prepare_revision(schema, alembic_runner, revision: str) -> None:
         "20260713_0005",
         "20260716_0006",
         "20260728_0007",
+        "20260805_0008",
     }:
         raise AssertionError("unsupported test revision")
     alembic_runner.upgrade(schema, revision)
@@ -1679,7 +1680,7 @@ async def test_legacy_runtime_revisions_fail_closed(
 
     with pytest.raises(
         DatabaseRevisionError,
-        match=r"expected one of \[20260728_0007\]",
+        match=r"expected one of \[20260805_0008\]",
     ):
         await require_runtime_database(
             schema.runtime_dsn,

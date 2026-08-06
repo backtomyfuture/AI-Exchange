@@ -10,6 +10,7 @@ from src.db import access_contract, bootstrap, roles, schema_contract
 
 REVISION = "20260716_0006"
 POLLING_REVISION = "20260728_0007"
+DAILY_DIGEST_REVISION = "20260805_0008"
 GOVERNED_RELATIONS = frozenset(
     {
         "audit_events",
@@ -471,6 +472,41 @@ def test_polling_revision_grants_only_the_session_fenced_sync_page_writer() -> N
         "p_expected_cursor text, p_expected_cursor_version bigint, "
         "p_next_cursor text, p_events jsonb, p_activation boolean"
     )
+
+
+def test_daily_digest_revision_grants_only_its_durable_execution_record() -> None:
+    runtime = access_contract.RUNTIME_RELATION_ACCESS_BY_REVISION[
+        DAILY_DIGEST_REVISION
+    ]
+    digest = runtime["daily_digest_executions"]
+
+    assert digest.table_privileges == ("SELECT",)
+    assert digest.insert_columns == (
+        "account_id",
+        "delivery_scope_hash",
+        "window_start",
+        "window_end",
+        "state",
+        "is_backfill",
+        "delivery_parts",
+    )
+    assert set(digest.update_columns) == {
+        "state",
+        "delivery_parts",
+        "attempt_count",
+        "last_attempt_at",
+        "last_error_code",
+        "confirmed_at",
+        "missed_at",
+        "missed_reported_at",
+        "updated_at",
+    }
+    assert access_contract.MAINTENANCE_RELATION_ACCESS_BY_REVISION[
+        DAILY_DIGEST_REVISION
+    ] == access_contract.MAINTENANCE_RELATION_ACCESS_BY_REVISION[POLLING_REVISION]
+    assert access_contract.AUDITOR_RELATION_ACCESS_BY_REVISION[
+        DAILY_DIGEST_REVISION
+    ] == access_contract.AUDITOR_RELATION_ACCESS_BY_REVISION[POLLING_REVISION]
 
 
 def test_role_preflight_uses_exact_name_and_identity_argument_set_equality() -> None:
