@@ -1,8 +1,9 @@
 import asyncio
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any
+
+from src.utils.mailbox_text import parse_serialized_mailbox
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,10 @@ async def handle_pending(args: str) -> str:
             return "✅ 暂无待审批邮件"
         lines = [f"⏳ 待审批邮件 ({len(rows)} 封):\n"]
         for row in rows:
-            lines.append(f"  · [{(row.get('subject') or '无主题')[:30]}] from {row.get('sender', '未知')}")
+            lines.append(
+                f"  · [{(row.get('subject') or '无主题')[:30]}] "
+                f"from {_format_command_sender(row.get('sender'))}"
+            )
         return "\n".join(lines)
     except Exception as exc:
         logger.error("handle_pending failed: error_type=%s", type(exc).__name__)
@@ -171,20 +175,13 @@ def _deduplicate_search_results(rows: list[dict[str, Any]]) -> list[dict[str, An
 def _format_command_sender(value: object) -> str:
     """Render Exchange's serialized Mailbox value as readable plain text."""
 
+    parsed = parse_serialized_mailbox(value)
+    if parsed is not None:
+        if parsed.name and parsed.address:
+            return f"{parsed.name} <{parsed.address}>"
+        return parsed.name or parsed.address or "未知"
     raw = str(value or "").strip()
-    if not raw:
-        return "未知"
-    mailbox = re.search(
-        r"name=['\"]([^'\"]*)['\"].*?email_address=['\"]([^'\"]+)['\"]",
-        raw,
-    )
-    if mailbox:
-        name, address = (part.strip() for part in mailbox.groups())
-        return f"{name} <{address}>" if name else address
-    address = re.search(r"email_address=['\"]([^'\"]+)['\"]", raw)
-    if address:
-        return address.group(1).strip()
-    return raw
+    return raw or "未知"
 
 
 async def handle_search(args: str) -> str:
