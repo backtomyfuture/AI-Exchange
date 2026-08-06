@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     INGESTION_HEARTBEAT_SECONDS: PositiveInt = 10
     INGESTION_SHUTDOWN_SECONDS: int = Field(default=30, ge=1, le=30)
 
+    # Daily email-operations digest.  The digest is intentionally independent
+    # from the ingestion command receipts: it has its own durable delivery
+    # record and uses only already-persisted operational facts.
+    DAILY_DIGEST_ENABLED: bool = True
+    DAILY_DIGEST_MESSAGE_MAX_BYTES: PositiveInt = 12_000
+    DAILY_DIGEST_RECONCILIATION_DELAY_SECONDS: PositiveInt = 900
+
     # Exchange
     EXCHANGE_API_URL: str = ""
     EXCHANGE_API_KEY: SecretStr = SecretStr("")

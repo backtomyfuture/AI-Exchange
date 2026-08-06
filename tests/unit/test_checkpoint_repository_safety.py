@@ -16,11 +16,11 @@ from src.maintenance.checkpoint_repository import (
 )
 
 
-def test_cleanup_revision_allowlist_accepts_only_polling_only_head():
+def test_cleanup_revision_allowlist_accepts_only_daily_digest_head():
     from src.maintenance import checkpoint_repository
 
     assert CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS == frozenset(
-        {"20260728_0007"}
+        {"20260805_0008"}
     )
     assert "RUNTIME_COMPATIBLE_DATABASE_REVISIONS" not in inspect.getsource(
         checkpoint_repository
@@ -60,7 +60,7 @@ def _metadata_connection(*, revisions: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_metadata_accepts_exact_polling_only_head(monkeypatch):
+async def test_cleanup_metadata_accepts_exact_daily_digest_head(monkeypatch):
     from src.maintenance import checkpoint_repository
 
     monkeypatch.setattr(
@@ -69,10 +69,10 @@ async def test_cleanup_metadata_accepts_exact_polling_only_head(monkeypatch):
         tuple(range(11)),
     )
     metadata = await _read_database_metadata(
-        _metadata_connection(revisions=["20260728_0007"])
+        _metadata_connection(revisions=["20260805_0008"])
     )
 
-    assert metadata.alembic_revision == "20260728_0007"
+    assert metadata.alembic_revision == "20260805_0008"
 
 
 @pytest.mark.asyncio

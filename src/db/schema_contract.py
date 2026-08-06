@@ -8,6 +8,7 @@ from typing import Final
 import psycopg
 
 from src.db.access_contract import (
+    DAILY_DIGEST_DATABASE_REVISION,
     GREENFIELD_DATABASE_REVISION,
     POLLING_ONLY_DATABASE_REVISION,
     PHASE2_CHECK_CONSTRAINT_SHA256,  # noqa: F401 - compatibility export
@@ -32,7 +33,11 @@ class DatabaseSchemaContractError(RuntimeError):
 
 
 _GREENFIELD_PHYSICAL_REVISIONS: Final = frozenset(
-    {GREENFIELD_DATABASE_REVISION, POLLING_ONLY_DATABASE_REVISION}
+    {
+        GREENFIELD_DATABASE_REVISION,
+        POLLING_ONLY_DATABASE_REVISION,
+        DAILY_DIGEST_DATABASE_REVISION,
+    }
 )
 
 _CHECKPOINT_RELATIONS: Final = frozenset(
@@ -359,6 +364,27 @@ _PHASE2_COLUMN_TYPES_BY_REVISION[GREENFIELD_DATABASE_REVISION] = {
 _PHASE2_COLUMN_TYPES_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
     _PHASE2_COLUMN_TYPES_BY_REVISION[GREENFIELD_DATABASE_REVISION]
 )
+_DAILY_DIGEST_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
+    ("daily_digest_executions", "account_id"): "int8",
+    ("daily_digest_executions", "delivery_scope_hash"): "bpchar",
+    ("daily_digest_executions", "window_start"): "timestamptz",
+    ("daily_digest_executions", "window_end"): "timestamptz",
+    ("daily_digest_executions", "state"): "text",
+    ("daily_digest_executions", "is_backfill"): "bool",
+    ("daily_digest_executions", "delivery_parts"): "jsonb",
+    ("daily_digest_executions", "attempt_count"): "int8",
+    ("daily_digest_executions", "last_attempt_at"): "timestamptz",
+    ("daily_digest_executions", "last_error_code"): "text",
+    ("daily_digest_executions", "confirmed_at"): "timestamptz",
+    ("daily_digest_executions", "missed_at"): "timestamptz",
+    ("daily_digest_executions", "missed_reported_at"): "timestamptz",
+    ("daily_digest_executions", "created_at"): "timestamptz",
+    ("daily_digest_executions", "updated_at"): "timestamptz",
+}
+_PHASE2_COLUMN_TYPES_BY_REVISION[DAILY_DIGEST_DATABASE_REVISION] = {
+    **_PHASE2_COLUMN_TYPES_BY_REVISION[POLLING_ONLY_DATABASE_REVISION],
+    **_DAILY_DIGEST_COLUMN_TYPES,
+}
 
 _PHASE2_NULLABLE_COLUMNS: Final = frozenset(
     {
@@ -541,15 +567,40 @@ _PHASE2_NULLABLE_COLUMNS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
 _PHASE2_DEFAULTED_COLUMNS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION] = (
     _PHASE2_DEFAULTED_COLUMNS_BY_REVISION[GREENFIELD_DATABASE_REVISION]
 )
+_DAILY_DIGEST_NULLABLE_COLUMNS: Final = (
+    _PHASE2_NULLABLE_COLUMNS_BY_REVISION[POLLING_ONLY_DATABASE_REVISION]
+    | {
+        ("daily_digest_executions", "last_attempt_at"),
+        ("daily_digest_executions", "last_error_code"),
+        ("daily_digest_executions", "confirmed_at"),
+        ("daily_digest_executions", "missed_at"),
+        ("daily_digest_executions", "missed_reported_at"),
+    }
+)
+_DAILY_DIGEST_DEFAULT_EXPRESSIONS: Final = {
+    **_GREENFIELD_DEFAULT_EXPRESSIONS,
+    ("daily_digest_executions", "is_backfill"): "false",
+    ("daily_digest_executions", "attempt_count"): "0",
+    ("daily_digest_executions", "created_at"): "CURRENT_TIMESTAMP",
+    ("daily_digest_executions", "updated_at"): "CURRENT_TIMESTAMP",
+}
+_PHASE2_NULLABLE_COLUMNS_BY_REVISION[DAILY_DIGEST_DATABASE_REVISION] = (
+    _DAILY_DIGEST_NULLABLE_COLUMNS
+)
+_PHASE2_DEFAULTED_COLUMNS_BY_REVISION[DAILY_DIGEST_DATABASE_REVISION] = frozenset(
+    _DAILY_DIGEST_DEFAULT_EXPRESSIONS
+)
 _DEFAULT_EXPRESSIONS_BY_REVISION: Final = {
     **PHASE2_DEFAULT_EXPRESSIONS_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_DEFAULT_EXPRESSIONS,
     POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_DEFAULT_EXPRESSIONS,
+    DAILY_DIGEST_DATABASE_REVISION: _DAILY_DIGEST_DEFAULT_EXPRESSIONS,
 }
 _GENERATED_EXPRESSION_SHA256_BY_REVISION: Final = {
     **PHASE2_GENERATED_EXPRESSION_SHA256_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_GENERATED_EXPRESSION_SHA256,
     POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_GENERATED_EXPRESSION_SHA256,
+    DAILY_DIGEST_DATABASE_REVISION: _GREENFIELD_GENERATED_EXPRESSION_SHA256,
 }
 _GREENFIELD_CHECK_CONSTRAINT_SHA256: Final = {
     **{
@@ -669,6 +720,7 @@ _CHECK_CONSTRAINT_SHA256_BY_REVISION: Final = {
     **PHASE2_CHECK_CONSTRAINT_SHA256_BY_REVISION,
     GREENFIELD_DATABASE_REVISION: _GREENFIELD_CHECK_CONSTRAINT_SHA256,
     POLLING_ONLY_DATABASE_REVISION: _GREENFIELD_CHECK_CONSTRAINT_SHA256,
+    DAILY_DIGEST_DATABASE_REVISION: _GREENFIELD_CHECK_CONSTRAINT_SHA256,
 }
 
 
@@ -898,6 +950,20 @@ _GREENFIELD_UNIQUE_CONSTRAINTS: Final = frozenset(
         ),
     }
 )
+
+_DAILY_DIGEST_UNIQUE_CONSTRAINTS: Final = _GREENFIELD_UNIQUE_CONSTRAINTS | {
+    _plain_unique_contract(
+        "daily_digest_executions",
+        "pk_daily_digest_executions",
+        (
+            "account_id",
+            "delivery_scope_hash",
+            "window_start",
+            "window_end",
+        ),
+        constraint_type="p",
+    )
+}
 
 
 def _plain_index_contract(
@@ -2405,6 +2471,7 @@ async def require_database_schema_contract(
         **_EXPECTED_COLUMN_TYPES,
         **_SYNC_RECONCILIATION_COLUMN_TYPES,
         **_GREENFIELD_COLUMN_TYPES,
+        **_DAILY_DIGEST_COLUMN_TYPES,
     }
     relation_names = sorted({key[0] for key in all_column_types})
     view_contract_rows: list[tuple[object, ...]] = []
@@ -2521,7 +2588,13 @@ async def require_database_schema_contract(
             if deployed_phase2_relation_kinds == relation_kinds
             and (
                 revision not in _GREENFIELD_PHYSICAL_REVISIONS
-                or (revision == POLLING_ONLY_DATABASE_REVISION)
+                or (
+                    revision
+                    in {
+                        POLLING_ONLY_DATABASE_REVISION,
+                        DAILY_DIGEST_DATABASE_REVISION,
+                    }
+                )
                 == has_polling_sync_page
             )
         )
@@ -2745,7 +2818,9 @@ async def require_database_schema_contract(
     if actual_views != expected_views:
         raise _invalid_contract()
 
-    if selected_revision in _GREENFIELD_PHYSICAL_REVISIONS:
+    if selected_revision == DAILY_DIGEST_DATABASE_REVISION:
+        expected_unique = _DAILY_DIGEST_UNIQUE_CONSTRAINTS
+    elif selected_revision in _GREENFIELD_PHYSICAL_REVISIONS:
         expected_unique = _GREENFIELD_UNIQUE_CONSTRAINTS
     else:
         expected_unique = {
@@ -2951,7 +3026,8 @@ async def require_database_schema_contract(
     }
     expected_routines = (
         _POLLING_ONLY_ROUTINES
-        if selected_revision == POLLING_ONLY_DATABASE_REVISION
+        if selected_revision
+        in {POLLING_ONLY_DATABASE_REVISION, DAILY_DIGEST_DATABASE_REVISION}
         else _GREENFIELD_ROUTINES
     )
     if actual_routines != expected_routines:
@@ -2960,7 +3036,8 @@ async def require_database_schema_contract(
     actual_routine_digests = {(row[0], row[1]): row[-1] for row in routine_rows}
     expected_routine_digests = (
         _POLLING_ONLY_ROUTINE_SOURCE_SHA256
-        if selected_revision == POLLING_ONLY_DATABASE_REVISION
+        if selected_revision
+        in {POLLING_ONLY_DATABASE_REVISION, DAILY_DIGEST_DATABASE_REVISION}
         else _GREENFIELD_ROUTINE_SOURCE_SHA256
     )
     if any(

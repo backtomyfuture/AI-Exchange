@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from src.config import get_settings
+from src.daily_digest import DailyDigestScheduler
 from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
 from src.db.schema import require_runtime_database
 from src.db.runtime_boundary import require_runtime_database_boundary
@@ -312,6 +313,10 @@ async def _cancel_lark_ws_monitor(
             raise exc
 
 
+async def _async_noop() -> None:
+    """Keep optional lifecycle stages awaitable without special branches."""
+
+
 async def _shutdown_application_components(
     application: FastAPI,
     *,
@@ -322,12 +327,14 @@ async def _shutdown_application_components(
     lark_initialize_attempted: bool,
     lark_ws_start_attempted: bool,
     lark_ws_monitor_task: asyncio.Task[None] | None = None,
+    daily_digest_scheduler: DailyDigestScheduler | None = None,
     runtime_stop_seconds: float = _RUNTIME_STOP_SECONDS,
 ) -> None:
     """Attempt every owned shutdown stage before releasing the fence."""
 
     failures: list[tuple[str, BaseException]] = []
     application.state.ingestion_runtime = None
+    application.state.daily_digest_scheduler = None
 
     def attempt_sync(stage: str, operation) -> bool:
         try:
@@ -367,6 +374,14 @@ async def _shutdown_application_components(
         "lark_ws_monitor_stop",
         lambda: _cancel_lark_ws_monitor(lark_ws_monitor_task),
     )
+    daily_digest_stopped = await attempt_async(
+        "daily_digest_stop",
+        lambda: (
+            daily_digest_scheduler.stop()
+            if daily_digest_scheduler is not None
+            else _async_noop()
+        ),
+    )
     runtime_stop_succeeded = await attempt_async(
         "runtime_stop",
         lambda: asyncio.wait_for(
@@ -401,6 +416,7 @@ async def _shutdown_application_components(
         runtime_stop_succeeded
         and lark_ws_shutdown_started
         and lark_ws_monitor_stopped
+        and daily_digest_stopped
         and lark_disable_succeeded
         and lark_intake_stop_succeeded
         and lark_ws_stop_succeeded
@@ -481,6 +497,8 @@ async def application_lifespan(application: FastAPI):
     lark_initialize_attempted = False
     lark_ws_start_attempted = False
     lark_ws_monitor_task: asyncio.Task[None] | None = None
+    daily_digest_scheduler: DailyDigestScheduler | None = None
+    application.state.daily_digest_scheduler = None
     try:
         if bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)):
             fence = RuntimeCheckpointMaintenanceFence(
@@ -522,6 +540,25 @@ async def application_lifespan(application: FastAPI):
                 name="lark-websocket-connection-monitor",
             )
             lark_app.enable_lark_intake()
+            if bool(getattr(settings, "DAILY_DIGEST_ENABLED", False)):
+                daily_digest_scheduler = DailyDigestScheduler(
+                    database=context.db_manager,
+                    account_id=int(settings.EXCHANGE_ACCOUNT_ID),
+                    chat_id=settings.LARK_CHAT_ID,
+                    health_snapshot=runtime.health_snapshot,
+                    max_message_bytes=int(
+                        getattr(settings, "DAILY_DIGEST_MESSAGE_MAX_BYTES", 12_000)
+                    ),
+                    reconciliation_delay_seconds=int(
+                        getattr(
+                            settings,
+                            "DAILY_DIGEST_RECONCILIATION_DELAY_SECONDS",
+                            900,
+                        )
+                    ),
+                )
+                await daily_digest_scheduler.start()
+                application.state.daily_digest_scheduler = daily_digest_scheduler
         application.state.ingestion_runtime = runtime
         yield
     except BaseException as primary_exc:
@@ -535,6 +572,7 @@ async def application_lifespan(application: FastAPI):
                 lark_initialize_attempted=lark_initialize_attempted,
                 lark_ws_start_attempted=lark_ws_start_attempted,
                 lark_ws_monitor_task=lark_ws_monitor_task,
+                daily_digest_scheduler=daily_digest_scheduler,
                 runtime_stop_seconds=runtime_stop_seconds,
             )
         except BaseException as cleanup_exc:
@@ -555,6 +593,7 @@ async def application_lifespan(application: FastAPI):
             lark_initialize_attempted=lark_initialize_attempted,
             lark_ws_start_attempted=lark_ws_start_attempted,
             lark_ws_monitor_task=lark_ws_monitor_task,
+            daily_digest_scheduler=daily_digest_scheduler,
             runtime_stop_seconds=runtime_stop_seconds,
         )
 

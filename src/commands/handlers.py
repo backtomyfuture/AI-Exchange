@@ -17,6 +17,31 @@ def init_commands(db_manager):
     _circuit_breaker = circuit_breaker
 
 
+def _ingestion_runtime() -> object | None:
+    """Return the already-started durable ingestion runtime without creating one."""
+
+    from src.init_app import get_runtime_app_context
+
+    return get_runtime_app_context().ingestion_runtime
+
+
+async def _runtime_queue_stats() -> tuple[bool, object | None]:
+    """Read the bounded durable Inbox aggregate from the runtime owner."""
+
+    runtime = _ingestion_runtime()
+    check_ready = getattr(runtime, "check_ready", None)
+    queue_stats = getattr(runtime, "queue_stats", None)
+    if not callable(check_ready) or not callable(queue_stats):
+        return False, None
+    try:
+        if not await check_ready():
+            return False, None
+        return True, await queue_stats()
+    except Exception as exc:
+        logger.error("runtime command status unavailable: error_type=%s", type(exc).__name__)
+        return False, None
+
+
 async def handle_help(args: str) -> str:
     _ = args
     return (
@@ -85,11 +110,17 @@ async def handle_stats(args: str) -> dict[str, Any] | str:
 
 async def handle_queue(args: str) -> str:
     _ = args
-    from src.exchange_service import _webhook_queue
-
-    queue_size = _webhook_queue.qsize() if _webhook_queue else 0
-    cb_status = "🔴 熔断中" if _circuit_breaker and _circuit_breaker.is_open else "🟢 正常"
-    return f"📦 队列深度: {queue_size}\n⚡ 熔断器: {cb_status}"
+    available, stats = await _runtime_queue_stats()
+    if not available or stats is None:
+        return "📦 运行时未就绪，暂无法读取队列状态"
+    return (
+        "📦 队列状态:\n"
+        f"  待处理: {stats.pending}\n"
+        f"  重试等待: {stats.retry_wait}\n"
+        f"  处理中: {stats.leased}\n"
+        f"  人工复核: {stats.manual_review}\n"
+        f"  死信: {stats.dead_letter}"
+    )
 
 
 async def handle_pending(args: str) -> str:
@@ -135,16 +166,24 @@ async def handle_search(args: str) -> str:
 
 async def handle_health(args: str) -> str:
     _ = args
-    from src.exchange_service import _webhook_queue
-
-    cb_status = "🔴 OPEN" if _circuit_breaker and _circuit_breaker.is_open else "🟢 CLOSED"
+    available, stats = await _runtime_queue_stats()
     db_ok = "🟢" if _db_manager else "🔴"
-    queue_size = _webhook_queue.qsize() if _webhook_queue else -1
+    runtime_status = "🟢 READY" if available else "🔴 NOT_READY"
+    queue_line = "  队列: 不可用"
+    if stats is not None:
+        queue_line = (
+            "  队列: "
+            f"待处理 {stats.pending}，"
+            f"重试等待 {stats.retry_wait}，"
+            f"处理中 {stats.leased}，"
+            f"人工复核 {stats.manual_review}，"
+            f"死信 {stats.dead_letter}"
+        )
     return (
         "🏥 系统健康状态:\n"
         f"  数据库: {db_ok}\n"
-        f"  熔断器: {cb_status}\n"
-        f"  队列深度: {queue_size}"
+        f"  运行时: {runtime_status}\n"
+        f"{queue_line}"
     )
 
 

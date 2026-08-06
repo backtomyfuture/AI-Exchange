@@ -30,7 +30,8 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 - 旧的内存 Webhook Queue/Worker；
 - Exchange Webhook HTTP 入口或订阅；
 - 无游标的 recent-mail polling；
-- Daily Summary scheduler；
+- 旧的内存 Daily Summary scheduler（独立的持久化 Daily Email Operations
+  Digest 例外：它只读 Durable Inbox 事实并发送飞书纯文本，不使用旧版 LLM 汇总）；
 - SelfHealer 扫描循环。
 
 不要重新引入这些入口。恢复工作由 Durable Inbox、启动恢复、显式运维命令和人工处理

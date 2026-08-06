@@ -5,6 +5,7 @@ from src.db import schema_contract
 
 _REVISION = "20260716_0006"
 _POLLING_REVISION = "20260728_0007"
+_DAILY_DIGEST_REVISION = "20260805_0008"
 
 
 def test_0006_manifest_covers_greenfield_relations_columns_and_expressions() -> None:
@@ -199,3 +200,37 @@ def test_0007_manifest_adds_only_the_fenced_sync_page_routine() -> None:
     assert schema_contract._POLLING_ONLY_ROUTINE_SOURCE_SHA256[
         (routine[0], routine[1])
     ] == "acbc4d4e474cb38f2f929a9327c58a8928db4ebdf8709679b42d6a34bdab292a"
+
+
+def test_0008_manifest_adds_only_the_durable_daily_digest_execution_record() -> None:
+    relations = schema_contract._PHASE2_RELATION_KINDS_BY_REVISION[
+        _DAILY_DIGEST_REVISION
+    ]
+    columns = schema_contract._PHASE2_COLUMN_TYPES_BY_REVISION[
+        _DAILY_DIGEST_REVISION
+    ]
+
+    assert relations == {
+        **schema_contract._PHASE2_RELATION_KINDS_BY_REVISION[_POLLING_REVISION],
+        "daily_digest_executions": "r",
+    }
+    assert columns[("daily_digest_executions", "delivery_parts")] == "jsonb"
+    assert columns[("daily_digest_executions", "delivery_scope_hash")] == "bpchar"
+    assert (
+        "daily_digest_executions",
+        "missed_reported_at",
+    ) in schema_contract._PHASE2_NULLABLE_COLUMNS_BY_REVISION[
+        _DAILY_DIGEST_REVISION
+    ]
+    assert schema_contract._DAILY_DIGEST_DEFAULT_EXPRESSIONS[
+        ("daily_digest_executions", "attempt_count")
+    ] == "0"
+    assert any(
+        row[0:4] == (
+            "daily_digest_executions",
+            "pk_daily_digest_executions",
+            "pk_daily_digest_executions",
+            "p",
+        )
+        for row in schema_contract._DAILY_DIGEST_UNIQUE_CONSTRAINTS
+    )

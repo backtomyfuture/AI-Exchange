@@ -32,8 +32,8 @@ _ROLE_BOUNDARY = {
 }
 
 
-def test_runtime_revision_is_exact_polling_only_0007_head() -> None:
-    assert EXPECTED_DATABASE_REVISION == "20260728_0007"
+def test_runtime_revision_is_exact_daily_digest_0008_head() -> None:
+    assert EXPECTED_DATABASE_REVISION == "20260805_0008"
     assert database_schema.RUNTIME_COMPATIBLE_DATABASE_REVISIONS == frozenset(
         {EXPECTED_DATABASE_REVISION}
     )

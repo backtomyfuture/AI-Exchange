@@ -53,6 +53,19 @@ def test_0007_downgrade_is_explicitly_forward_only() -> None:
         revision.downgrade()
 
 
+def test_0008_downgrade_is_explicitly_forward_only() -> None:
+    path = PROJECT_ROOT / "alembic/versions/20260805_0008_daily_digest_executions.py"
+    spec = spec_from_file_location("daily_digest_forward_only_revision", path)
+    assert spec is not None and spec.loader is not None
+    revision = module_from_spec(spec)
+    spec.loader.exec_module(revision)
+
+    assert revision.revision == "20260805_0008"
+    assert revision.down_revision == "20260728_0007"
+    with pytest.raises(RuntimeError, match="daily_digest_execution_migration_is_forward_only"):
+        revision.downgrade()
+
+
 def test_offline_upgrade_emits_fail_closed_0004_policy_migration_sql() -> None:
     output = StringIO()
     config = Config(str(PROJECT_ROOT / "alembic.ini"), output_buffer=output)
@@ -228,7 +241,10 @@ def test_offline_upgrade_emits_only_the_session_fenced_0007_polling_boundary() -
     command.upgrade(config, "head", sql=True)
 
     rendered = output.getvalue()
-    revision_sql = rendered.split("20260716_0006 -> 20260728_0007", 1)[1]
+    revision_sql = rendered.split("20260716_0006 -> 20260728_0007", 1)[1].split(
+        "20260728_0007 -> 20260805_0008",
+        1,
+    )[0]
     normalized = " ".join(revision_sql.split())
 
     assert "CREATE FUNCTION public.greenfield_commit_sync_page(" in revision_sql
@@ -240,3 +256,23 @@ def test_offline_upgrade_emits_only_the_session_fenced_0007_polling_boundary() -
     assert "greenfield_sync_policy_unavailable" in revision_sql
     assert "greenfield_insert_webhook_event" not in revision_sql
     assert "CREATE TABLE" not in revision_sql
+
+
+def test_offline_upgrade_emits_the_durable_0008_digest_execution_record() -> None:
+    output = StringIO()
+    config = Config(str(PROJECT_ROOT / "alembic.ini"), output_buffer=output)
+    config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql://offline:offline@localhost/offline",
+    )
+
+    command.upgrade(config, "head", sql=True)
+
+    rendered = output.getvalue()
+    revision_sql = rendered.split("20260728_0007 -> 20260805_0008", 1)[1]
+    normalized = " ".join(revision_sql.split())
+    assert "CREATE TABLE public.daily_digest_executions" in revision_sql
+    assert "delivery_scope_hash pg_catalog.bpchar(64) NOT NULL" in normalized
+    assert "delivery_parts pg_catalog.jsonb NOT NULL" in normalized
+    assert "missed_reported_at pg_catalog.timestamptz" in normalized
+    assert "pk_daily_digest_executions PRIMARY KEY" in normalized

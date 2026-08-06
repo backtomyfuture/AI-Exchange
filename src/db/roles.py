@@ -14,6 +14,7 @@ from src.db.access_contract import (
     AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
     AUDITOR_RELATION_ACCESS,
     AUDITOR_RELATION_ACCESS_BY_REVISION,
+    DAILY_DIGEST_DATABASE_REVISION,
     FOREIGN_KEY_SPECS_BY_REVISION,
     MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
     MAINTENANCE_RELATION_ACCESS,
@@ -590,7 +591,10 @@ def _reviewed_profile_matches_sql(schema_oid: str, revision: str) -> str:
     """Match a physical profile, including the function-only 0007 boundary."""
 
     relation_profile = _phase2_profile_matches_sql(schema_oid, revision)
-    if revision == POLLING_ONLY_DATABASE_REVISION:
+    if revision in {
+        POLLING_ONLY_DATABASE_REVISION,
+        DAILY_DIGEST_DATABASE_REVISION,
+    }:
         return (
             "(" + relation_profile + " AND "
             + _polling_only_sync_function_exists_sql(schema_oid) + ")"
@@ -667,6 +671,7 @@ def _relation_access_contract_sql(
         legacy_manifest = manifest
         latest_manifest = manifest
         greenfield_manifest = manifest
+        daily_digest_manifest = manifest
     else:
         base_manifest = manifests_by_revision["20260710_0002"]
         legacy_manifest = manifests_by_revision["20260713_0004"]
@@ -674,6 +679,10 @@ def _relation_access_contract_sql(
         greenfield_manifest = manifests_by_revision.get(
             "20260716_0006",
             manifest,
+        )
+        daily_digest_manifest = manifests_by_revision.get(
+            DAILY_DIGEST_DATABASE_REVISION,
+            greenfield_manifest,
         )
     selected_difference = "unexpected" if allow_missing else "difference"
     return f"""(
@@ -746,6 +755,15 @@ def _relation_access_contract_sql(
         ) AS (
             VALUES {expected_values(greenfield_manifest)}
         ),
+        expected_access_0008(
+            access_kind,
+            relation_name,
+            column_name,
+            privilege_type,
+            is_grantable
+        ) AS (
+            VALUES {expected_values(daily_digest_manifest)}
+        ),
         difference_0002 AS (
             SELECT * FROM (
                 SELECT * FROM actual_access
@@ -817,6 +835,24 @@ def _relation_access_contract_sql(
             SELECT * FROM actual_access
             EXCEPT
             SELECT * FROM expected_access_0006
+        ),
+        difference_0008 AS (
+            SELECT * FROM (
+                SELECT * FROM actual_access
+                EXCEPT
+                SELECT * FROM expected_access_0008
+            ) AS unexpected_access
+            UNION ALL
+            SELECT * FROM (
+                SELECT * FROM expected_access_0008
+                EXCEPT
+                SELECT * FROM actual_access
+            ) AS missing_access
+        ),
+        unexpected_0008 AS (
+            SELECT * FROM actual_access
+            EXCEPT
+            SELECT * FROM expected_access_0008
         )
         SELECT CASE
             WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
@@ -841,6 +877,8 @@ def _relation_access_contract_sql(
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0005)
             WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0006)
+            WHEN {_reviewed_profile_matches_sql(schema_oid, DAILY_DIGEST_DATABASE_REVISION)}
+                THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0008)
             ELSE false
         END
     )"""
@@ -1865,7 +1903,10 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
     )"""
     return f"""(
         CASE
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
+            WHEN (
+                {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
+                OR {_phase2_profile_matches_sql(schema_oid, DAILY_DIGEST_DATABASE_REVISION)}
+            )
                 THEN {greenfield_append_only}
             ELSE {legacy_insert}
         END
