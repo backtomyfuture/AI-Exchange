@@ -70,3 +70,42 @@ async def test_queue_command_reports_durable_inbox_counts(monkeypatch) -> None:
         "  人工复核: 5\n"
         "  死信: 6"
     )
+
+
+@pytest.mark.asyncio
+async def test_search_command_deduplicates_chunks_and_formats_sender(monkeypatch) -> None:
+    raw_sender = (
+        "Mailbox(name='武珉（Annie）', email_address='m.wu@tianjin-air.com', "
+        "routing_type='SMTP', mailbox_type='Mailbox')"
+    )
+    candidates = [
+        {
+            "id": "mail-one",
+            "subject": "中秋、国庆双节福利实物礼包论坛票选活动",
+            "sender": raw_sender,
+        }
+        for _ in range(5)
+    ] + [
+        {
+            "id": "mail-two",
+            "subject": "第二封不同的礼包邮件",
+            "sender": "第二位发件人 <second@example.com>",
+        }
+    ]
+
+    class Retriever:
+        def search(self, *, query_text: str, limit: int):
+            assert query_text == "礼包"
+            return candidates[:limit]
+
+    monkeypatch.setattr("src.utils.retriever.get_retriever", lambda: Retriever())
+    router = CommandRouter()
+    router.register("/search", handlers.handle_search)
+
+    reply = await router.dispatch("/search 礼包")
+
+    assert reply == (
+        "🔍 搜索结果 (2 条):\n\n"
+        "  · [中秋、国庆双节福利实物礼包论坛票选活动] from 武珉（Annie） <m.wu@tianjin-air.com>\n"
+        "  · [第二封不同的礼包邮件] from 第二位发件人 <second@example.com>"
+    )

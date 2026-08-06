@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -7,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 _db_manager = None
 _circuit_breaker = None
+_SEARCH_DISPLAY_LIMIT = 5
+_SEARCH_CANDIDATE_LIMIT = _SEARCH_DISPLAY_LIMIT * 5
 
 
 def init_commands(db_manager):
@@ -146,6 +149,44 @@ async def handle_pending(args: str) -> str:
         return "查询失败，请稍后重试"
 
 
+def _deduplicate_search_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse Qdrant chunks into one command result per logical email."""
+
+    unique_rows: list[dict[str, Any]] = []
+    seen_email_ids: set[str] = set()
+    for row in rows:
+        email_id = row.get("id") or row.get("email_id") or row.get("internet_message_id")
+        if email_id is not None:
+            key = str(email_id).strip()
+            if key:
+                if key in seen_email_ids:
+                    continue
+                seen_email_ids.add(key)
+        unique_rows.append(row)
+        if len(unique_rows) >= _SEARCH_DISPLAY_LIMIT:
+            break
+    return unique_rows
+
+
+def _format_command_sender(value: object) -> str:
+    """Render Exchange's serialized Mailbox value as readable plain text."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return "未知"
+    mailbox = re.search(
+        r"name=['\"]([^'\"]*)['\"].*?email_address=['\"]([^'\"]+)['\"]",
+        raw,
+    )
+    if mailbox:
+        name, address = (part.strip() for part in mailbox.groups())
+        return f"{name} <{address}>" if name else address
+    address = re.search(r"email_address=['\"]([^'\"]+)['\"]", raw)
+    if address:
+        return address.group(1).strip()
+    return raw
+
+
 async def handle_search(args: str) -> str:
     keyword = (args or "").strip()
     if not keyword:
@@ -153,13 +194,19 @@ async def handle_search(args: str) -> str:
     from src.utils.retriever import get_retriever
 
     retriever = get_retriever()
-    results = await asyncio.to_thread(retriever.search, query_text=keyword, limit=5)
+    candidates = await asyncio.to_thread(
+        retriever.search,
+        query_text=keyword,
+        limit=_SEARCH_CANDIDATE_LIMIT,
+    )
+    results = _deduplicate_search_results(candidates)
     if not results:
         return f"🔍 未找到与 '{keyword}' 相关的邮件"
     lines = [f"🔍 搜索结果 ({len(results)} 条):\n"]
     for row in results:
         lines.append(
-            f"  · [{(row.get('subject') or '无主题')[:40]}] from {row.get('sender', '未知')}"
+            f"  · [{(row.get('subject') or '无主题')[:40]}] "
+            f"from {_format_command_sender(row.get('sender'))}"
         )
     return "\n".join(lines)
 
