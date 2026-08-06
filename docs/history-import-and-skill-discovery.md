@@ -1,432 +1,119 @@
-# 历史邮件导入 & Skill 自动发现
+# 历史邮件导入与 Skill 候选发现
 
-本文档包含两个独立工具的使用说明：
+历史邮件是一次性初始化资料，承担两个用途：
 
-1. **`import_pst.py`** — 将历史邮件（PST / Mbox / EML）或 Exchange 服务器当前邮件导入到 Qdrant 向量数据库
-2. **`discover_skills.py`** — 分析历史邮件，自动发现处理模式并生成 Skill
+1. 写入与在线检索相同的 Qdrant `emails` 集合，作为新邮件 RAG 的历史背景；
+2. 离线发现可人工确认的 Tier 1 声明式路由候选。
 
----
+这两个操作都必须由操作者手工发起。服务不会定时扫描 PST、Mbox、EML，也不会把发现结果自动变成生产规则。
 
-## 环境要求
+## 1. 手工导入历史邮件
 
-### 推荐方式：使用 uv（零配置）
+优先导入 Outlook PST。Mbox、EML 和 EML 目录仍可用于迁移或排查，但不会启动任何持续同步。
 
-安装 [uv](https://docs.astral.sh/uv/)（如尚未安装）：
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-之后所有命令用 `uv run` 替代 `python`，**不需要手动创建虚拟环境、不需要 pip install、不需要关心 Python 版本**：
+先预览，再进行一次正式导入：
 
 ```bash
-# uv 会自动：
-#   1. 找到或下载合适的 Python (>=3.11)
-#   2. 创建隔离环境并安装脚本声明的依赖
-#   3. 运行脚本
-uv run scripts/import_pst.py archive.pst --dry-run
+.venv/bin/python scripts/import_pst.py archive.pst --dry-run
+.venv/bin/python scripts/import_pst.py archive.pst
 ```
 
-> **注意**：PST 格式的解析依赖 `libpff-python`，该包需要 C 编译器。
-> 如果 `uv run` 报编译错误，安装一下系统开发包：
->
-> ```bash
-> # Ubuntu / Debian
-> sudo apt install python3-dev build-essential
->
-> # macOS
-> xcode-select --install
-> ```
->
-> Mbox 和 EML 格式不需要任何额外依赖，开箱即用。
+正式导入通过 `EmailProcessor` 写入默认的 `emails` 集合；在线 `retriever_node` 也读取这个集合。因此导入完成后，历史邮件会自然成为当前邮件拟稿的 RAG 背景，无需建立第二个“历史库”。
 
-### 备选方式：使用项目虚拟环境
-
-如果你已经搭建了项目的开发环境（`.venv/`），也可以直接用：
-
-```bash
-source .venv/bin/activate
-
-# 确保安装了 PST 解析库
-pip install libpff-python
-
-python scripts/import_pst.py archive.pst --dry-run
-```
-
----
-
-## 工具一：历史邮件导入 (`import_pst.py`)
-
-### 功能
-
-将本地的历史邮件文件批量解析，写入 Qdrant 向量数据库，供 RAG 检索和 Skill 发现使用。
-
-### 支持的格式
-
-| 格式 | 输入 | 依赖 | 说明 |
-|------|------|------|------|
-| **PST** | `archive.pst` | `libpff-python`（pip 自动安装） | Outlook 数据文件，直接用 Python 读取 |
-| **Mbox** | `mail.mbox` | 无（Python 标准库） | Linux/Thunderbird 常见格式 |
-| **EML** | `email.eml` | 无（Python 标准库） | 单封邮件文件 |
-| **EML 目录** | `./emails/` | 无（Python 标准库） | 递归扫描所有 `.eml` 文件 |
-| **Exchange** | `--source exchange` | 无（使用项目已有 API 客户端） | 从 Exchange 服务器直接拉取当前邮件 |
-
-### 基本用法
-
-#### 第一步：预览（推荐先执行）
-
-预览模式不写入任何数据，只显示解析结果：
-
-```bash
-uv run scripts/import_pst.py archive.pst --dry-run
-```
-
-输出示例：
-
-```
-📧 邮件导入工具
-   来源: PST 文件: archive.pst
-   模式: 预览 (DRY RUN)
-
-  📥 [Inbox] Q4 发票审批 - 请尽快处理              (finance@corp.com)
-  📥 [Inbox] 季度汇报 - 请准备材料                (boss@corp.com)
-  📤 [Sent Items] Re: Q4 发票审批                 (me@corp.com)
-  ...
-
-导入结果汇总:
-  扫描邮件数:  1,234
-  成功导入:    1,230
-  跳过 (空):   4
-```
-
-- 📥 = 收到的邮件（Inbox 等收件文件夹）
-- 📤 = 已发送的邮件（Sent Items 等发件文件夹）
-
-脚本会根据文件夹名称自动识别邮件类型。
-
-#### 第二步：正式导入
-
-确认预览无误后，去掉 `--dry-run` 执行正式导入：
-
-```bash
-uv run scripts/import_pst.py archive.pst
-```
-
-> **前提**：`.env` 中需要配置 Qdrant 和 Embedding 服务地址。
-> 正式导入会调用项目的 `EmailProcessor`，因此需要在项目目录下执行，
-> 且项目依赖需要可用（使用项目 `.venv/` 或通过 `uv run` 补充 `--with`）。
-
-#### 大文件优化
-
-PST 文件可能包含数万封邮件。可以调大批次减少 Qdrant 写入次数：
-
-```bash
-uv run scripts/import_pst.py archive.pst --batch-size 100
-```
-
-### 完整参数
+常用参数：
 
 ```text
-用法: import_pst.py [-h] [--source {file,exchange}] [--folder FOLDER]
-                     [--limit N] [--all-mail] [--batch-size N] [--dry-run]
-                     [SOURCE]
-
-位置参数:
-  SOURCE              PST/Mbox/EML 文件路径，或 EML 目录路径 (--source file 时必填)
-
-可选参数:
-  --source {file,exchange}  数据来源: file=本地文件 (默认), exchange=Exchange 服务器
-  --folder FOLDER     Exchange 文件夹: ALL=全部邮件文件夹 (默认), 或指定如 inbox/sent/drafts
-  --limit N           从 Exchange 拉取的最大邮件数 (默认: 0=全部)
-  --all-mail          拉取全部邮件（含已读），默认只拉未读
-  --batch-size N      每批次处理的邮件数 (默认: 50)
-  --dry-run           仅预览，不写入 Qdrant
+SOURCE                    PST/Mbox/EML 文件或 EML 目录
+--batch-size N            每批处理数量（默认 50）
+--dry-run                 只预览，不写入 Qdrant
+--source exchange         手工从 Exchange 拉取；不是后台同步任务
+--folder NAME             Exchange 文件夹
+--limit N                 Exchange 拉取上限
 ```
 
-### 导入的数据结构
+PST 解析优先使用 `libpff-python`；不可用时，脚本会回退到已安装的 `readpst`。大文件可调大 `--batch-size`，但建议仍先执行 `--dry-run`。
 
-每封邮件在 Qdrant 中存储以下字段：
+## 2. 发现候选，不直接启用规则
 
-| 字段 | 说明 |
-|------|------|
-| `id` | 唯一 ID（本地文件为 `pst_` + 哈希；Exchange 为 `exc_` + Base64） |
-| `subject` | 邮件主题 |
-| `sender` | 发件人 |
-| `to` / `cc` | 收件人 / 抄送人 |
-| `body` | 邮件正文（优先 HTML，回退纯文本） |
-| `received_at` | 收信时间（ISO 格式） |
-| `source_folder` | 来源文件夹名（如 Inbox、Sent Items） |
-| `type` | 邮件类型：`received` / `sent` / `draft` |
-| `in_reply_to` | 回复的原始邮件 ID（用于线程追踪） |
-| `thread_id` | 会话 ID（从 In-Reply-To / References 推断） |
-| `_import_source` | 用于区分数据来源：`pst_import`（本地文件）或 `exchange_import`（服务器） |
-
-### PST 解析策略
-
-脚本内置两种解析器，运行时自动选择：
-
-| 优先级 | 解析器 | 安装方式 | 说明 |
-|--------|--------|----------|------|
-| **1** | `pypff` | `pip install libpff-python` | 纯 Python，直接读取 PST 内部结构 |
-| **2** | `readpst` | Ubuntu: `sudo apt install pst-utils`<br>macOS: `brew install libpst` | 系统命令行工具，仅在 pypff 不可用时使用 |
-
-使用 `uv run` 时会自动安装 `libpff-python`，无需手动操作。
-
----
-
-## 工具二：Skill 自动发现 (`discover_skills.py`)
-
-### 功能
-
-分析历史邮件，从中挖掘出可自动化的处理模式（谁发的、发给谁、内容是什么、是否回复过），以可视化链路图的形式展示给用户确认，然后自动生成 Skill 文件。
-
-### 数据来源
-
-| 模式 | 参数 | 说明 |
-|------|------|------|
-| **Qdrant** | `--source qdrant`（默认） | 从已导入 Qdrant 的邮件中分析 |
-| **EML 目录** | `--source eml --pst-path DIR` | 直接分析 EML 文件夹，不需要先导入 |
-| **PST 文件** | `--source pst --pst-path FILE` | 直接分析 PST 文件，不需要先导入 |
-
-### 快速开始
-
-最简单的用法——直接分析一个 EML 目录，不需要 LLM：
+导入完成后，默认从共享 Qdrant 语料发现候选，并默认调用已配置的 LLM：
 
 ```bash
-uv run scripts/discover_skills.py \
-  --source eml \
-  --pst-path /path/to/emails/ \
-  --no-llm
+.venv/bin/python scripts/discover_skills.py
 ```
 
-### 完整工作流（推荐）
+如需只用统计启发式：
 
 ```bash
-# 1. 先导入历史邮件到 Qdrant
-uv run scripts/import_pst.py archive.pst
-
-# 2. 基于 Qdrant 数据进行分析（使用 LLM 深度挖掘）
-uv run scripts/discover_skills.py
-
-# 3. 按提示选择模式编号 → 自动生成 Skill
-
-# 4. 重启服务，新 Skill 立即生效
-python -m src.main
+.venv/bin/python scripts/discover_skills.py --no-llm
 ```
 
-### 交互流程详解
+发现按时间而不是随机切分：最早 80% 的历史邮件用于发现，最新 20% 用于回放。每个候选都会显示：
 
-运行后脚本会依次经过以下阶段：
+- 完整的生产有效字段：目标 Skill ID、触发条件、条件逻辑、优先级、是否需要回复、语气、动作和固定收件人；
+- 发现期样本量、回复率和置信度；
+- 最新 20% 上的命中数、命中邮件观察回复率，以及少量主题/发件人示例；
+- 不能提升的配置问题，例如运行时不支持的条件或无固定收件人的转发。
 
-**阶段 1：数据收集**
+回放没有自动通过阈值。它是给操作者判断的证据，而不是自动授权。
 
-```
-⏳ 正在收集邮件数据...
-   收集完成: 200 封收件, 85 封已发送
-```
+发现会把候选及其有界回放快照写到本地忽略目录：
 
-**阶段 2：模式分析**
-
-脚本统计发件人频率、回复率、主题关键词等维度，然后：
-- 有 LLM → 调用 LLM 深度分析，发现更细粒度的组合模式
-- `--no-llm` → 使用启发式算法（纯统计，不需要 API）
-
-**阶段 3：链路图展示**
-
-每个发现的模式用 ASCII 链路图展示：
-
-```
-━━━ Pattern #1: 财务邮件自动处理 ━━━━━━━━━━━━━━━━
-
-  触发链路:
-    ┌─────────────────────────────────────┐
-    │ [发件人] 属于: finance@corp.com      │
-    └──────────────┬──────────────────────┘
-                   ↓
-    ┌─────────────────────────────────────┐
-    │ [主题含] 正则: 发票|报销|费用        │
-    └──────────────┬──────────────────────┘
-                   ↓
-    ┌─────────────────────────────────────┐
-    │ ✅ 回复率: 95% (19 封)              │
-    │ 🔴 优先级: P1                       │
-    │ 📝 需要回复: 是                      │
-    │ 💼 语气: 专业正式                    │
-    └─────────────────────────────────────┘
+```text
+artifacts/skill-discovery/review-<UTC 时间>.json
 ```
 
-**阶段 4：多选确认**
+可用 `--review-output` 指定位置。脚本不会写入 `skills_registry/`，也不提供 `--auto-confirm`。
 
-```
-  [1] 财务邮件处理     ✅ 回复率=95% (19封)  置信度=★★★★☆
-  [2] VIP 领导邮件     ✅ 回复率=100% (12封) 置信度=★★★★★
-  [3] 系统通知         ❌ 回复率=5% (30封)   置信度=★★★☆☆
-
-  > 请输入选择: 1,2
-```
-
-- 输入编号，逗号分隔（如 `1,2,5`）
-- 输入 `all` 全选
-- 输入 `q` 退出
-
-**阶段 5：生成 Skill**
-
-```
-  ✅ 财务邮件处理 → skills_registry/skill_auto_finance
-  ✅ VIP 领导邮件 → skills_registry/skill_auto_boss
-
-  🎉 成功生成 2 个 Skill!
-     位置: skills_registry/
-     重启服务后自动加载。
-```
-
-### 生成的 Skill 结构
-
-每个 Skill 是一个目录，包含两个文件：
-
-```
-skills_registry/skill_auto_finance/
-├── manifest.yaml    # 触发规则（发件人、主题正则等）
-└── handler.py       # 处理逻辑（修改优先级、设置回复标记等）
-```
-
-生成的文件格式与现有手写 Skill 完全一致，兼容 `SkillManager` 自动加载。
-
-### 完整参数
-
-```
-用法: discover_skills.py [-h]
-                         [--source {qdrant,pst,eml}]
-                         [--pst-path PATH]
-                         [--no-llm]
-                         [--limit N]
-                         [--auto-confirm]
-
-可选参数:
-  --source {qdrant,pst,eml}   数据来源 (默认: qdrant)
-  --pst-path PATH             PST 文件或 EML 目录路径
-  --no-llm                    不使用 LLM，纯启发式分析
-  --limit N                   最大分析邮件数 (默认: 5000)
-  --auto-confirm              跳过交互选择，自动确认全部模式
-```
-
-### 分析模式对比
-
-| 模式 | 需要 LLM | 需要 Qdrant | 分析质量 | 速度 |
-|------|----------|-------------|----------|------|
-| `--source qdrant` | 可选 | ✅ | 最佳（基于全量数据） | 中等 |
-| `--source eml --no-llm` | ❌ | ❌ | 良好（纯统计） | 快 |
-| `--source eml` | ✅ | ❌ | 较好（LLM + 统计） | 较慢 |
-| `--source pst --no-llm` | ❌ | ❌ | 良好（纯统计） | 快 |
-
----
-
-## 常见场景
-
-### 场景一：「我只想看看 PST 里有什么」
+直接分析尚未导入的 PST 或 EML 只用于发现，**不会**把它们加入在线 RAG：
 
 ```bash
-uv run scripts/import_pst.py archive.pst --dry-run
+.venv/bin/python scripts/discover_skills.py --source pst --pst-path archive.pst
+.venv/bin/python scripts/discover_skills.py --source eml --pst-path ./eml-archive
 ```
 
-零配置，零依赖安装（uv 自动处理），立即看到所有邮件列表。
+如果这些历史还需要供在线邮件检索，应先执行第 1 节的 `import_pst.py`。
 
-### 场景二：「我想快速发现一些可以自动化的规则」
+## 3. 对话确认与提升
+
+候选应由对话助手完整展示给操作者。操作者可以选择候选，并修改任何生产有效字段，包括触发条件和 `forward_to`。修改后的触发条件会在保存的最新 20% 回放快照上重新计算，再进入提升校验。
+
+对话确认后，助手使用同一个发现工具的内部提升模式传入明确选择；没有“默认全选”。选择文件的最小形态如下（通常由对话助手生成）：
+
+```json
+{
+  "selections": [
+    {
+      "candidate_id": "discovered_001",
+      "overrides": {
+        "skill_id": "skill_auto_finance_forward",
+        "suggested_action": "forward",
+        "suggested_forward_to": ["open_id=leader"],
+        "suggested_need_reply": true
+      }
+    }
+  ]
+}
+```
+
+实现接口是：
 
 ```bash
-# 直接分析 PST，不需要 Qdrant 也不需要 LLM
-uv run scripts/discover_skills.py \
-  --source pst \
-  --pst-path archive.pst \
-  --no-llm
+.venv/bin/python scripts/discover_skills.py \
+  --promote-review artifacts/skill-discovery/review-<UTC 时间>.json \
+  --selections /path/to/confirmed-selections.json
 ```
 
-### 场景三：「我要完整走一遍流程」
+这是同一发现工作流的确认阶段，不是给无人值守任务使用的独立批量提升机制。它会：
 
-```bash
-# 1. 导入到 Qdrant（需要 Qdrant + Embedding 服务）
-source .venv/bin/activate
-python scripts/import_pst.py archive.pst
+1. 校验所有被选候选和修改后的字段；
+2. 在写入前检查所有目标 Skill ID；若任一目标已存在，整体停止，不覆盖、不合并；
+3. 仅写入 `manifest.yaml`，不生成 `handler.py`；
+4. 等待下一次计划服务重启加载规则，不热加载运行中的服务。
 
-# 2. 用 LLM 深度分析（需要 LLM API）
-python scripts/discover_skills.py
+生成的规则使用通用 `AutoOutcomeSkill`。发现可以依据历史已发送邮件推测 `forward_to`，以尽量发现有价值的规则；但它始终只是候选，操作者必须在对话中确认或修改。提升后的 `forward` 必须有固定 `forward_to`，并只设置可编辑的转发收件人和审批草稿；真正的外发仍需经过飞书审批，绝不会由发现或路由规则直接发送。
 
-# 3. 选择模式 → 生成 Skill → 重启服务
-python -m src.main
-```
+## 4. 已知边界
 
-### 场景四：「我的邮件不是 PST 格式」
-
-**Outlook 导出为 EML：**
-Outlook → 文件 → 另存为 → 选择文件夹 → 保存为 .eml
-
-**Thunderbird 导出为 Mbox：**
-Thunderbird 的邮件已经以 mbox 格式存储在本地，通常在：
-- Linux: `~/.thunderbird/<profile>/Mail/`
-- macOS: `~/Library/Thunderbird/Profiles/<profile>/Mail/`
-- Windows: `%APPDATA%\Thunderbird\Profiles\<profile>\Mail\`
-
-直接指向对应目录或 mbox 文件即可：
-
-```bash
-uv run scripts/import_pst.py ~/.thunderbird/xxx/Mail/Local\ Folders/ --dry-run
-```
-
-### 场景五：「我想导入 Exchange 服务器上的当前邮件」
-
-```bash
-# 预览服务器上所有文件夹的未读邮件
-uv run scripts/import_pst.py --source exchange --dry-run
-
-# 拉取全部文件夹的全部邮件（含已读），自动分页获取
-uv run scripts/import_pst.py --source exchange --all-mail
-
-# 只拉取指定文件夹的邮件（如收件箱，限制获取前 50 封做测试）
-uv run scripts/import_pst.py --source exchange --folder inbox --limit 50 --dry-run
-
-# 只拉取已发送邮件
-uv run scripts/import_pst.py --source exchange --folder sent --all-mail --dry-run
-```
-
-> **前提**：`.env` 中需要配置好 `EXCHANGE_API_URL`、`EXCHANGE_API_KEY`、`EXCHANGE_ACCOUNT_ID`。
-> Exchange 导入模式会自动通过 API 获取服务器全部有邮件的文件夹，过滤掉日历、联系人等系统内部目录，并采用分页防超时机制直接同步大批量邮件。
-
----
-
-## FAQ
-
-**Q: `libpff-python` 安装失败怎么办？**
-
-这个包需要 C 编译器。安装系统开发工具链后重试：
-
-```bash
-# Ubuntu/Debian
-sudo apt install python3-dev build-essential
-
-# macOS
-xcode-select --install
-
-# 另外，如果 C 依赖报错，macOS 用户还可以直接安装 libpst，提供 readpst 作为纯命令行后备方案：
-# brew install libpst
-
-# 如果以上都不行，可以先把 PST 在 Outlook 里导出为 EML/Mbox 格式，
-# 这两种格式不需要任何额外依赖。
-```
-
-**Q: `--dry-run` 和正式导入有什么区别？**
-
-`--dry-run` 只做解析和预览，不连接 Qdrant，不需要 `.env` 配置。
-正式导入需要 Qdrant 和 Embedding 服务可用。
-
-**Q: 导入后数据在哪？**
-
-在 Qdrant 的 `emails` 集合中。可以通过 Qdrant Dashboard (http://localhost:6333/dashboard) 查看。
-
-**Q: 生成的 Skill 怎么修改？**
-
-直接编辑 `skills_registry/skill_auto_xxx/manifest.yaml` 和 `handler.py`。
-格式参考现有的手写 Skill（如 `skill_vip_handling`）。
-
-**Q: 可以重新运行发现吗？**
-
-可以。重复运行会覆盖同名 Skill 目录。建议先删除不需要的自动生成目录后再重新发现。
+- 运行时当前支持 `sender_match`、`subject_match`、`body_match`、`to_match`、`cc_match`，以及 `eq`、`contains`、`regex`、`in` 操作符。发现可以展示更多历史线索，但不支持的条件不能提升，避免生成永远不会命中的规则。
+- 历史邮件导入并不自动产生 Tier 2 标签；Tier 2 仍只基于已记录的真实路由样本。
+- 发现、回放和提升均不发送邮件；转发规则最多创建可编辑、待审批的计划。

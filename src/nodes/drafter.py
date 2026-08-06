@@ -130,7 +130,7 @@ async def generate_draft(
     ])
     # Forwarding skills may have already persisted their fixed draft in categorizer.
     classification = state.get("classification", {})
-    if classification.get("action") == "forward":
+    if classification.get("action") in {"forward", "transfer"}:
         draft_id = state.get("draft_id")
         if not draft_id:
             draft_id = await dependencies.drafts.save_draft(

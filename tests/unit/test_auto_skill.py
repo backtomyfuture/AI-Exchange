@@ -85,6 +85,27 @@ async def test_auto_outcome_supports_action_for_forward():
     assert cls["intent"] == "转发"
 
 
+@pytest.mark.asyncio
+async def test_auto_outcome_forward_sets_editable_recipient_plan_without_sending():
+    skill = AutoOutcomeSkill(manifest=_make_manifest(
+        auto_outcome=AutoOutcome(
+            priority="P2", need_reply=True, card_type="approval",
+            priority_level=5, action="forward", forward_to=["open_id=leader"],
+            tone_instruction="简洁呈阅",
+        ),
+    ))
+
+    update = await skill.execute({
+        "classification": {},
+        "email": {"subject": "待呈阅", "draft_to": ["old@example.com"]},
+    })
+
+    assert update["classification"]["action"] == "forward"
+    assert update["email"]["draft_to"] == ["open_id=leader"]
+    assert update["email"]["draft_cc"] == []
+    assert "简洁呈阅" in update["system_prompt_modifier"]
+
+
 def test_skill_manager_loads_auto_outcome_without_handler(tmp_path):
     """Manager should auto-install AutoOutcomeSkill for handler-less manifests."""
     skill_dir = tmp_path / "skill_auto_unit"

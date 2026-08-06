@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""
-Skill 自动发现工具 —— 分析历史邮件，发现处理模式，自动生成 Skill。
+"""Discover historical-email skill candidates without enabling them.
 
-快速开始 (使用 uv，无需手动建虚拟环境):
-    uv run scripts/discover_skills.py --source eml --pst-path ./emails/ --no-llm
+The normal flow is deliberately two conversational phases:
 
-完整说明见 docs/history-import-and-skill-discovery.md
+1. discover from the earliest 80% of the selected history and write a local
+   review artifact containing newest-20% replay evidence;
+2. after an operator explicitly selects/edits candidates in a conversation,
+   use this same tool's promotion mode with that selection artifact.
+
+Discovery never writes ``skills_registry`` and has no auto-confirm option.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -30,163 +36,34 @@ logging.basicConfig(
 logger = logging.getLogger("skill_discovery")
 
 from src.skills_discovery.analyzer import (  # noqa: E402
-    DiscoveredPattern,
     EmailHistoryCollector,
     EmailRecord,
     PatternAnalyzer,
+    strip_images_from_body,
 )
-from src.skills_discovery.generator import write_skill  # noqa: E402
+from src.skills_discovery.generator import (  # noqa: E402
+    SkillPromotionConflict,
+    SkillPromotionValidationError,
+    promote_selected_candidates,
+)
+from src.skills_discovery.review import (  # noqa: E402
+    CandidateReviewError,
+    CandidateSelectionError,
+    apply_conversational_selections,
+    create_candidate_review,
+    load_review,
+    render_review,
+    split_records_chronologically,
+    write_review,
+)
 
-
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-def _confidence_stars(confidence: float) -> str:
-    filled = round(confidence * 5)
-    return "★" * filled + "☆" * (5 - filled)
-
-
-def display_pattern(idx: int, pattern: DiscoveredPattern):
-    """Print a single pattern as an ASCII chain diagram."""
-    reply_icon = "✅" if pattern.suggested_need_reply else "❌"
-    priority_color = {
-        "P0": "\033[91m",  # red
-        "P1": "\033[93m",  # yellow
-        "P2": "\033[94m",  # blue
-        "P3": "\033[90m",  # gray
-    }.get(pattern.suggested_priority, "")
-    reset = "\033[0m"
-
-    print(f"\n{'━' * 58}")
-    print(f"  📧 Pattern #{idx}: {pattern.name}")
-    print(f"{'━' * 58}")
-    print()
-    print("  触发链路:")
-
-    for cond in pattern.conditions:
-        cond_type = cond.get("type", "unknown")
-        operator = cond.get("operator", "")
-        value = cond.get("value", "")
-        if isinstance(value, list):
-            value = ", ".join(str(v) for v in value)
-
-        type_labels = {
-            "sender_match": "发件人",
-            "subject_match": "主题含",
-            "to_match": "收件人",
-            "cc_match": "抄送含",
-            "body_match": "正文含",
-            "recipient_role": "收件角色",
-            "thread_depth": "线程深度",
-        }
-        label = type_labels.get(cond_type, cond_type)
-        op_map = {
-            "in": "属于", "contains": "包含",
-            "regex": "正则", "eq": "等于",
-        }
-        op_label = op_map.get(operator, operator)
-
-        display_val = (
-            value if len(str(value)) < 40
-            else str(value)[:37] + "..."
-        )
-        print("    ┌─────────────────────────────────────┐")
-        print(f"    │ [{label}] {op_label}: {display_val:<23}│")
-        print("    └──────────────┬──────────────────────┘")
-        print("                   ↓")
-
-    print("    ┌─────────────────────────────────────┐")
-    print(f"    │ {reply_icon} 回复率: {pattern.reply_rate:.0%} ({pattern.sample_count} 封)      │")
-    print(f"    │ {priority_color}🔴 优先级: {pattern.suggested_priority}{reset}                       │")
-    need_reply_text = "是" if pattern.suggested_need_reply else "否"
-    print(f"    │ 📝 需要回复: {need_reply_text}                      │")
-    if pattern.suggested_tone:
-        tone_display = pattern.suggested_tone[:20]
-        print(f"    │ 💼 语气: {tone_display:<27}│")
-    print("    └─────────────────────────────────────┘")
-
-    print()
-    print(f"  置信度: {_confidence_stars(pattern.confidence)} ({pattern.confidence:.2f})")
-    print(f"  {pattern.description}")
-
-    if pattern.example_subjects:
-        print("  示例:")
-        for subj in pattern.example_subjects[:3]:
-            print(f"    • \"{subj[:50]}\"")
-
-
-def display_all_patterns(patterns: list[DiscoveredPattern]):
-    """Display all discovered patterns."""
-    print(f"\n{'═' * 58}")
-    print(f"  🔍 发现了 {len(patterns)} 个邮件路由模式")
-    print(f"{'═' * 58}")
-
-    for i, pattern in enumerate(patterns, 1):
-        display_pattern(i, pattern)
-
-
-def interactive_select(patterns: list[DiscoveredPattern]) -> list[DiscoveredPattern]:
-    """Let user select patterns interactively."""
-    if not patterns:
-        return []
-
-    print(f"\n{'═' * 58}")
-    print("  请选择要生成 Skill 的模式")
-    print(f"{'═' * 58}")
-    print()
-    print("  输入模式编号 (逗号分隔), 例如: 1,3,5")
-    print("  输入 'all' 选择全部")
-    print("  输入 'q' 退出")
-    print()
-
-    for i, p in enumerate(patterns, 1):
-        reply_icon = "✅" if p.suggested_need_reply else "❌"
-        print(f"  [{i}] {p.name:<25} "
-              f"{reply_icon} 回复率={p.reply_rate:.0%} "
-              f"({p.sample_count}封) "
-              f"置信度={_confidence_stars(p.confidence)}")
-
-    print()
-    try:
-        user_input = input("  > 请输入选择: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  已取消")
-        return []
-
-    if user_input.lower() == "q":
-        return []
-    if user_input.lower() == "all":
-        return patterns
-
-    selected = []
-    try:
-        indices = [int(x.strip()) for x in user_input.split(",") if x.strip()]
-        for idx in indices:
-            if 1 <= idx <= len(patterns):
-                selected.append(patterns[idx - 1])
-            else:
-                print(f"  ⚠️ 忽略无效编号: {idx}")
-    except ValueError:
-        print("  ⚠️ 输入格式有误，请输入数字")
-        return interactive_select(patterns)
-
-    return selected
-
-
-# ---------------------------------------------------------------------------
-# Data collection from PST (direct analysis)
-# ---------------------------------------------------------------------------
 
 def _strip_body(body: str) -> str:
-    """截取 body 到 1000 字符并移除图片标签。"""
-    from src.skills_discovery.analyzer import strip_images_from_body
-    if not body:
-        return ""
-    return strip_images_from_body(body)[:1000]
+    """Keep the same bounded body representation used for review replay."""
+    return strip_images_from_body(body or "")[:1000]
 
 
-def _parsed_to_record(parsed) -> EmailRecord:
+def _parsed_to_record(parsed: Any) -> EmailRecord:
     return EmailRecord(
         id=parsed.id,
         subject=parsed.subject,
@@ -203,7 +80,7 @@ def _parsed_to_record(parsed) -> EmailRecord:
 
 
 def collect_from_pst(pst_path: Path, limit: int = 5000) -> list[EmailRecord]:
-    """Parse a PST file directly and return EmailRecords for analysis."""
+    """Parse a PST directly for discovery; it does not import data into RAG."""
     from scripts.import_pst import iter_from_pst
 
     records = []
@@ -214,10 +91,8 @@ def collect_from_pst(pst_path: Path, limit: int = 5000) -> list[EmailRecord]:
     return records
 
 
-def collect_from_eml_dir(
-    dir_path: Path, limit: int = 5000,
-) -> list[EmailRecord]:
-    """Parse EML files from a directory tree."""
+def collect_from_eml_dir(dir_path: Path, limit: int = 5000) -> list[EmailRecord]:
+    """Parse EML files directly for discovery; it does not import data into RAG."""
     from scripts.import_pst import iter_from_eml_dir
 
     records = []
@@ -229,152 +104,203 @@ def collect_from_eml_dir(
 
 
 def collect_from_qdrant(limit: int = 5000) -> list[EmailRecord]:
-    """Collect email records from Qdrant."""
+    """Collect the shared historical-RAG corpus from Qdrant."""
     from qdrant_client import QdrantClient
     from src.config import get_settings
 
     settings = get_settings()
     client = QdrantClient(url=settings.QDRANT_URL)
-    collector = EmailHistoryCollector(client)
-    return collector.collect(limit=limit)
+    return EmailHistoryCollector(client).collect(limit=limit)
 
 
-# ---------------------------------------------------------------------------
-# Main workflow
-# ---------------------------------------------------------------------------
+def _default_review_output() -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return Path("artifacts/skill-discovery") / f"review-{timestamp}.json"
+
 
 async def run_discovery(
     source: str = "qdrant",
     pst_path: str | None = None,
     use_llm: bool = True,
     limit: int = 5000,
-    auto_confirm: bool = False,
     my_email: str | None = None,
-) -> list[str]:
-    """Run the full discovery workflow. Returns list of generated skill paths."""
-
-    print("\n📊 Skill 自动发现工具")
+    review_output: str | Path | None = None,
+) -> Path | None:
+    """Create candidates and a review artifact; never promote a rule."""
+    print("\n📊 历史邮件 Skill 候选发现")
     print(f"   数据源: {source}")
-    print(f"   LLM 分析: {'是' if use_llm else '否 (启发式)'}")
-    print()
+    print(f"   LLM 分析: {'是（默认）' if use_llm else '否（启发式）'}")
+    print("   结果仅为候选，不会写入 skills_registry。")
 
-    # --- 1. Collect data ---
-    print("⏳ 正在收集邮件数据...")
+    print("\n⏳ 正在收集邮件数据...")
     if source == "pst" and pst_path:
         records = collect_from_pst(Path(pst_path), limit=limit)
+        print("   提示：直接 PST 分析不导入 RAG；如需在线历史背景，请先运行 import_pst.py。")
     elif source == "eml" and pst_path:
         records = collect_from_eml_dir(Path(pst_path), limit=limit)
+        print("   提示：直接 EML 分析不导入 RAG；如需在线历史背景，请先运行 import_pst.py。")
     else:
         records = collect_from_qdrant(limit=limit)
 
     if not records:
         print("❌ 未找到任何邮件数据")
-        print("   提示: 先使用 import_pst.py 导入历史邮件，或确认 Qdrant 中已有数据")
-        return []
+        print("   提示：先手工使用 import_pst.py 导入历史邮件，或确认 Qdrant 中已有数据。")
+        return None
 
-    received = [r for r in records if r.message_type != "sent"]
-    sent = [r for r in records if r.message_type == "sent"]
-    print(f"   收集完成: {len(received)} 封收件, {len(sent)} 封已发送")
+    training_records, validation_records = split_records_chronologically(records)
+    training_received = sum(record.message_type != "sent" for record in training_records)
+    training_sent = len(training_records) - training_received
+    held_out_received = sum(record.message_type != "sent" for record in validation_records)
+    print(
+        "   时间切分完成："
+        f"最早 80% {len(training_records)} 封（收件 {training_received}，已发送 {training_sent}），"
+        f"最新 20% {len(validation_records)} 封（收件 {held_out_received}）用于回放。"
+    )
 
-    # --- 2. Analyze patterns ---
-    print("\n⏳ 正在分析邮件模式...")
-    analyzer = PatternAnalyzer(records, my_email=my_email or "")
-
+    print("\n⏳ 正在从最早 80% 分析候选...")
+    analyzer = PatternAnalyzer(training_records, my_email=my_email or "")
     stats = analyzer.compute_statistics()
     print(f"   发件人: {stats['unique_senders']} 个")
-    print(f"   高频词: {', '.join(w for w, _ in stats['top_subject_words'][:10])}")
+    if stats["top_subject_words"]:
+        print("   高频词: " + ", ".join(word for word, _ in stats["top_subject_words"][:10]))
 
     if use_llm:
-        print("\n⏳ 正在使用 LLM 深度分析...")
+        print("\n⏳ 正在使用已配置的 LLM 发现候选...")
         patterns = await analyzer.discover_with_llm()
     else:
         patterns = analyzer._discover_heuristic()
-
     if not patterns:
-        print("❌ 未发现有意义的模式")
-        return []
+        print("❌ 未发现有意义的候选")
+        return None
 
-    # --- 3. Display patterns ---
-    display_all_patterns(patterns)
-
-    # --- 4. Interactive selection ---
-    if auto_confirm:
-        selected = patterns
-        print(f"\n  自动确认: 选择全部 {len(selected)} 个模式")
-    else:
-        selected = interactive_select(patterns)
-
-    if not selected:
-        print("\n  未选择任何模式，退出。")
-        return []
-
-    # --- 5. Generate skills ---
-    print(f"\n⏳ 正在生成 {len(selected)} 个 Skill...")
-    generated_paths = []
-    for pattern in selected:
-        path = write_skill(pattern)
-        generated_paths.append(path)
-        print(f"  ✅ {pattern.name} → {path}")
-
-    print(f"\n{'═' * 58}")
-    print(f"  🎉 成功生成 {len(generated_paths)} 个 Skill!")
-    print("     位置: skills_registry/")
-    print("     重启服务后自动加载。")
-    print(f"{'═' * 58}")
-
-    return generated_paths
+    review = create_candidate_review(
+        patterns,
+        training_records=training_records,
+        validation_records=validation_records,
+        source=source,
+        my_email=analyzer.my_email,
+    )
+    print("\n" + render_review(review))
+    output = write_review(review, review_output or _default_review_output())
+    print(f"\n✅ 已写入候选审阅文件：{output}")
+    print("   请在对话中明确选择候选并按需编辑全部字段；选择后才会提升，并在计划重启后生效。")
+    return output
 
 
-def main():
+def _load_selection_file(path: str | Path) -> object:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CandidateSelectionError("无法读取选择文件") from exc
+
+
+def run_promotion(
+    review_path: str | Path,
+    selections_path: str | Path,
+    *,
+    registry_path: str = "skills_registry",
+) -> list[str]:
+    """Apply explicit conversational selections and create declarative rules."""
+    review = load_review(review_path)
+    selected = apply_conversational_selections(review, _load_selection_file(selections_path))
+    print("\n" + render_review(replace_candidates(review, selected)))
+    paths = promote_selected_candidates(selected, registry_path=registry_path)
+    print("\n✅ 已提升以下声明式 Skill：")
+    for path in paths:
+        print(f"   - {path}")
+    print("   不会热加载；请在计划的服务重启后使其生效。")
+    return paths
+
+
+def replace_candidates(review, candidates):
+    """Render the effective selected values without mutating the review artifact."""
+    from dataclasses import replace
+
+    return replace(review, candidates=list(candidates))
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Skill 自动发现 —— 分析历史邮件，生成处理规则",
+        description="历史邮件 Skill 发现与对话确认后的声明式提升",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--source",
         choices=["qdrant", "pst", "eml"],
         default="qdrant",
-        help="数据来源: qdrant, pst, eml (默认: qdrant)",
+        help="发现数据来源：qdrant（默认）、pst 或 eml",
     )
     parser.add_argument(
         "--pst-path",
-        help="PST 文件或 EML 目录路径 (当 --source pst/eml 时必需)",
+        help="PST 文件或 EML 目录路径（--source pst/eml 时必填）",
     )
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="不使用 LLM，仅用启发式算法分析",
+        help="不调用已配置的 LLM，仅用启发式算法",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=5000,
-        help="最大分析邮件数 (默认: 5000)",
-    )
-    parser.add_argument(
-        "--auto-confirm",
-        action="store_true",
-        help="自动确认所有发现的模式 (跳过交互选择)",
+        help="最大分析邮件数（默认：5000）",
     )
     parser.add_argument(
         "--my-email",
-        help="你的邮箱地址 (用于识别 TO/CC 角色，默认从已发送邮件推断)",
+        help="你的邮箱地址；默认从早期已发送邮件推断",
     )
-
+    parser.add_argument(
+        "--review-output",
+        help="候选审阅 JSON 输出路径（默认：artifacts/skill-discovery/）",
+    )
+    parser.add_argument(
+        "--promote-review",
+        help="由对话工作流传入的候选审阅 JSON；与 --selections 一起提升",
+    )
+    parser.add_argument(
+        "--selections",
+        help="对话确认后的选择 JSON，格式为 {\"selections\":[{\"candidate_id\":...,\"overrides\":{...}}]}",
+    )
+    parser.add_argument(
+        "--registry-path",
+        default="skills_registry",
+        help="仅提升模式使用的目标注册表路径（默认：skills_registry）",
+    )
     args = parser.parse_args()
 
+    if args.promote_review:
+        if not args.selections:
+            parser.error("--promote-review 需要同时提供 --selections")
+        try:
+            run_promotion(
+                args.promote_review,
+                args.selections,
+                registry_path=args.registry_path,
+            )
+        except SkillPromotionConflict as exc:
+            print("❌ 提升冲突：目标规则已存在，未覆盖也未合并：" + ", ".join(exc.skill_ids))
+            return 2
+        except (CandidateReviewError, CandidateSelectionError, SkillPromotionValidationError) as exc:
+            print(f"❌ 无法提升：{exc}")
+            return 2
+        return 0
+
+    if args.selections:
+        parser.error("--selections 只能与 --promote-review 一起使用")
     if args.source in ("pst", "eml") and not args.pst_path:
         parser.error("使用 --source pst/eml 时需要提供 --pst-path")
-
-    asyncio.run(run_discovery(
-        source=args.source,
-        pst_path=args.pst_path,
-        use_llm=not args.no_llm,
-        limit=args.limit,
-        auto_confirm=args.auto_confirm,
-        my_email=args.my_email,
-    ))
+    asyncio.run(
+        run_discovery(
+            source=args.source,
+            pst_path=args.pst_path,
+            use_llm=not args.no_llm,
+            limit=args.limit,
+            my_email=args.my_email,
+            review_output=args.review_output,
+        )
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

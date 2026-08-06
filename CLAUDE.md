@@ -87,8 +87,8 @@ Qdrant 是可重建的检索投影，不是权威业务存储。PostgreSQL 或�
 - 历史正文：可按段检索的文本，供草稿上下文使用；
 - 风格/偏好：版本化用户画像或可检索偏好。
 
-`scripts/import_pst.py` 负责 PST/Mbox/EML/Exchange 历史导入。PST 原始邮件只有进入
-Qdrant 并不等于形成 Tier 2 数据；必须补充真实的回复行为、动作、意图、优先级、
+`scripts/import_pst.py` 负责手工、通常一次性的 PST/Mbox/EML/Exchange 历史导入；它写入在线
+RAG 使用的同一 Qdrant `emails` 集合。PST 原始邮件只有进入 Qdrant 并不等于形成 Tier 2 数据；必须补充真实的回复行为、动作、意图、优先级、
 标签来源、置信度和版本。
 
 `scripts/discover_skills.py` 只应生成候选规则。目标生命周期是：
