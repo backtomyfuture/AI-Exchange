@@ -1,118 +1,196 @@
-import re
+"""Deterministic matching for declarative Tier 1 skill triggers.
+
+The pure helpers in this module are deliberately shared by the runtime router
+and historical-candidate replay.  A candidate must therefore be validated with
+the exact same matching semantics it will use after a planned restart.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any
+import re
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 from src.router.manager import get_skill_manager
 
 logger = logging.getLogger(__name__)
 
+
+TEXT_CONDITION_TYPES = frozenset({"sender_match", "subject_match", "body_match"})
+RECIPIENT_CONDITION_TYPES = frozenset({"to_match", "cc_match"})
+SUPPORTED_CONDITION_TYPES = TEXT_CONDITION_TYPES | RECIPIENT_CONDITION_TYPES
+SUPPORTED_CONDITION_OPERATORS = frozenset({"eq", "contains", "regex", "in"})
+
+
+def _as_string_list(value: Any) -> list[str]:
+    """Coerce a recipient collection into usable strings without raising."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [str(item) for item in value if isinstance(item, str)]
+    return []
+
+
+def _needs_me_resolution(value: Any) -> bool:
+    if isinstance(value, str):
+        return "$ME" in value
+    if isinstance(value, list):
+        return any(isinstance(item, str) and "$ME" in item for item in value)
+    return False
+
+
+def _resolve_me_placeholder(value: Any, me_email: str | None) -> Any:
+    """Resolve ``$ME`` lazily so pure replay never needs application settings."""
+    if not _needs_me_resolution(value):
+        return value
+    if me_email is None:
+        from src.config import get_settings
+
+        me_email = get_settings().EXCHANGE_ACCOUNT_EMAIL
+    replacement = str(me_email or "")
+    if isinstance(value, str):
+        return value.replace("$ME", replacement)
+    if isinstance(value, list):
+        return [
+            item.replace("$ME", replacement) if isinstance(item, str) else item
+            for item in value
+        ]
+    return value
+
+
+def _match_text(target: str, operator: str, value: Any) -> bool:
+    if operator == "eq":
+        return isinstance(value, str) and target == value
+    if operator == "contains":
+        return isinstance(value, str) and value.lower() in target.lower()
+    if operator == "regex":
+        if not isinstance(value, str):
+            return False
+        try:
+            return bool(re.search(value, target, re.IGNORECASE))
+        except re.error:
+            return False
+    if operator == "in":
+        values = _as_string_list(value)
+        return target.lower() in {item.lower() for item in values}
+    return False
+
+
+def _match_recipients(recipients: list[str], operator: str, value: Any) -> bool:
+    if operator == "eq":
+        return isinstance(value, str) and any(
+            value.lower() == recipient.lower() for recipient in recipients
+        )
+    if operator == "contains":
+        return isinstance(value, str) and any(
+            value.lower() in recipient.lower() for recipient in recipients
+        )
+    if operator == "regex":
+        if not isinstance(value, str):
+            return False
+        try:
+            return any(re.search(value, recipient, re.IGNORECASE) for recipient in recipients)
+        except re.error:
+            return False
+    if operator == "in":
+        values = {item.lower() for item in _as_string_list(value)}
+        return any(recipient.lower() in values for recipient in recipients)
+    return False
+
+
+def condition_matches_email(
+    email: Mapping[str, Any],
+    condition: Mapping[str, Any],
+    *,
+    me_email: str | None = None,
+) -> bool:
+    """Return whether one supported declarative condition matches ``email``.
+
+    Invalid or unsupported conditions intentionally evaluate to ``False``.  The
+    promotion path rejects them before writing a rule, while this behaviour keeps
+    a malformed legacy manifest from taking down routing for an inbound email.
+    """
+    condition_type = condition.get("type")
+    operator = condition.get("operator", "contains")
+    if condition_type not in SUPPORTED_CONDITION_TYPES:
+        return False
+    if operator not in SUPPORTED_CONDITION_OPERATORS:
+        return False
+
+    value = _resolve_me_placeholder(condition.get("value"), me_email)
+    if condition_type == "sender_match":
+        return _match_text(str(email.get("sender") or ""), operator, value)
+    if condition_type == "subject_match":
+        return _match_text(str(email.get("subject") or ""), operator, value)
+    if condition_type == "body_match":
+        return _match_text(str(email.get("body") or ""), operator, value)
+    if condition_type == "to_match":
+        return _match_recipients(_as_string_list(email.get("to") or []), operator, value)
+    if condition_type == "cc_match":
+        return _match_recipients(_as_string_list(email.get("cc") or []), operator, value)
+    return False
+
+
+def conditions_match_email(
+    email: Mapping[str, Any],
+    conditions: Sequence[Mapping[str, Any]] | None,
+    condition_logic: str = "and",
+    *,
+    me_email: str | None = None,
+) -> bool:
+    """Apply a complete Tier 1 trigger using runtime-equivalent semantics."""
+    if not conditions:
+        return False
+    checks = [
+        condition_matches_email(email, condition, me_email=me_email)
+        for condition in conditions
+        if isinstance(condition, Mapping)
+    ]
+    if not checks:
+        return False
+    if condition_logic == "or":
+        return any(checks)
+    return all(checks)
+
+
 class Tier1ReflexRouter:
-    """
-    Tier 1 反射路由器：执行硬编码在 Skill Manifest 中的规则。
-    """
+    """Tier 1 反射路由器：执行 Skill Manifest 中的声明式规则。"""
+
     def __init__(self):
         self.manager = get_skill_manager()
 
-    def route(self, email: Dict[str, Any]) -> List[str]:
-        """
-        根据邮件内容，返回匹配的 Skill ID 列表。
-        支持 condition_logic: and（默认）或 or。
-        """
+    def route(self, email: dict[str, Any]) -> list[str]:
+        """根据邮件内容，返回匹配的 Skill ID 列表。"""
         matched_skills = []
-        triggers = self.manager.get_tier1_triggers()
-
-        to_list = email.get("to") or []
-        cc_list = email.get("cc") or []
-        subject = email.get("subject") or ""
-        body = email.get("body") or ""
-        sender = email.get("sender") or ""
-        if isinstance(to_list, str):
-            to_list = [to_list]
-        if isinstance(cc_list, str):
-            cc_list = [cc_list]
-
-        for trigger in triggers:
+        for trigger in self.manager.get_tier1_triggers():
             skill_id = trigger["skill_id"]
-            conditions = trigger["conditions"]
-            logic = trigger.get("condition_logic", "and")
-
-            if logic == "or":
-                is_match = any(
-                    self._check_condition(cond, subject, body, sender, to_list, cc_list)
-                    for cond in conditions
-                )
-            else:  # 默认 and：所有条件必须满足
-                is_match = all(
-                    self._check_condition(cond, subject, body, sender, to_list, cc_list)
-                    for cond in conditions
-                )
-
-            if is_match:
-                logger.info(f"Tier 1 Match found: {skill_id}")
+            if conditions_match_email(
+                email,
+                trigger.get("conditions"),
+                trigger.get("condition_logic", "and"),
+            ):
+                logger.info("Tier 1 Match found: %s", skill_id)
                 matched_skills.append(skill_id)
-
         return matched_skills
 
-    def _check_condition(self, cond: Dict, subject: str, body: str, sender: str,
-                         to_list: List[str], cc_list: List[str] = None) -> bool:
-        """
-        检查单个条件是否匹配。
-        支持类型: sender_match, subject_match, body_match, header_match, to_match, cc_match
-        支持操作符: eq, contains, regex, in
-        """
-        c_type = cond.get("type")
-        operator = cond.get("operator", "contains")
-        value = cond.get("value")
-        
-        # 处理 $ME 占位符
-        if isinstance(value, str) and "$ME" in value:
-            from src.config import get_settings
-            me_email = get_settings().EXCHANGE_ACCOUNT_EMAIL
-            value = value.replace("$ME", me_email)
-        elif isinstance(value, list):
-            from src.config import get_settings
-            me_email = get_settings().EXCHANGE_ACCOUNT_EMAIL
-            value = [v.replace("$ME", me_email) if isinstance(v, str) else v for v in value]
-        
-        # 获取要检查的目标文本或列表
-        if c_type == "sender_match":
-            target = sender
-        elif c_type == "subject_match":
-            target = subject
-        elif c_type == "body_match":
-            target = body
-        elif c_type == "to_match":
-            # 对收件人列表进行匹配
-            if operator == "contains":
-                return any(value.lower() in t.lower() for t in to_list)
-            elif operator == "eq":
-                return any(value.lower() == t.lower() for t in to_list)
-            elif operator == "in":
-                # 指 value (list) 中是否有任何一个在 to_list 中，或者 value (str) 是否在 to_list 中
-                check_values = value if isinstance(value, list) else [value]
-                return any(t.lower() in [v.lower() for v in check_values] for t in to_list)
-            return False
-        elif c_type == "cc_match":
-            # 对抄送列表进行匹配
-            resolved_cc = cc_list if cc_list is not None else []
-            if operator == "contains":
-                return any(value.lower() in t.lower() for t in resolved_cc)
-            elif operator == "eq":
-                return any(value.lower() == t.lower() for t in resolved_cc)
-            elif operator == "in":
-                check_values = value if isinstance(value, list) else [value]
-                return any(t.lower() in [v.lower() for v in check_values] for t in resolved_cc)
-            return False
-        else:
-            return False
-
-        # 执行标准匹配 (针对字符串 target)
-        if operator == "eq":
-            return target == value
-        elif operator == "contains":
-            return value.lower() in target.lower()
-        elif operator == "regex":
-            return bool(re.search(value, target, re.IGNORECASE))
-        elif operator == "in":
-            return target.lower() in [v.lower() for v in value]
-        
-        return False
+    def _check_condition(
+        self,
+        cond: dict[str, Any],
+        subject: str,
+        body: str,
+        sender: str,
+        to_list: list[str],
+        cc_list: list[str] | None = None,
+    ) -> bool:
+        """Compatibility wrapper retained for callers of the old private seam."""
+        return condition_matches_email(
+            {
+                "subject": subject,
+                "body": body,
+                "sender": sender,
+                "to": to_list,
+                "cc": cc_list or [],
+            },
+            cond,
+        )

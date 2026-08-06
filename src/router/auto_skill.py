@@ -42,7 +42,23 @@ class AutoOutcomeSkill(BaseSkill):
             + f" [Auto-Skill: {self.manifest.name}] 匹配自动发现规则{rate_part}。"
         ).strip()
 
-        return {
+        updates: Dict[str, Any] = {
             "classification": classification,
             "priority_level": outcome.priority_level,
         }
+        if outcome.tone_instruction:
+            modifier = f"【语气指令】{outcome.tone_instruction}"
+            updates["system_prompt_modifier"] = (
+                (state.get("system_prompt_modifier") or "") + "\n" + modifier
+            ).strip()
+
+        # A declarative forward rule only sets an editable recipient plan.  The
+        # graph still creates an approval draft and sender.py only performs the
+        # external effect after a human approval.
+        if outcome.action in {"forward", "transfer"} and outcome.forward_to:
+            email = dict(state.get("email") or {})
+            email["draft_to"] = list(outcome.forward_to)
+            email["draft_cc"] = []
+            updates["email"] = email
+
+        return updates

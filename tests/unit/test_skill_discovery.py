@@ -15,10 +15,11 @@ from src.skills_discovery.analyzer import (
     PatternAnalyzer,
 )
 from src.skills_discovery.generator import (
+    SkillPromotionConflict,
+    SkillPromotionValidationError,
     _card_type_from,
     _priority_to_level,
     _sanitize_skill_id,
-    generate_handler,
     generate_manifest,
     write_skill,
 )
@@ -526,7 +527,7 @@ class TestGenerateManifest:
         assert manifest["execution_mode"] == "modifier"
         assert manifest["triggers"]["conditions"][0]["type"] == "sender_match"
 
-    def test_manifest_without_conditions_uses_examples(self):
+    def test_manifest_keeps_reviewed_conditions_without_implicit_fallback(self):
         pattern = DiscoveredPattern(
             id="test_002",
             name="Subject Skill",
@@ -537,42 +538,45 @@ class TestGenerateManifest:
         )
         manifest = generate_manifest(pattern, "skill_auto_subject")
         conds = manifest["triggers"]["conditions"]
-        assert len(conds) == 1
-        assert conds[0]["type"] == "subject_match"
+        assert conds == []
 
 
-class TestGenerateHandler:
-    def test_handler_without_tone(self):
+class TestDeclarativeOutcome:
+    def test_manifest_has_data_only_outcome_without_handler(self):
         pattern = DiscoveredPattern(
             id="test_001",
             name="Test",
             description="Test skill",
             trigger_type="sender_match",
+            conditions=[{"type": "sender_match", "operator": "contains", "value": "a@b.com"}],
             suggested_priority="P1",
             suggested_need_reply=True,
             reply_rate=0.8,
         )
-        code = generate_handler(pattern)
+        manifest = generate_manifest(pattern, "skill_auto_test")
 
-        assert "class Skill(BaseSkill):" in code
-        assert "async def execute" in code
-        assert '"P1"' in code
-        assert "True" in code
+        assert manifest["auto_outcome"]["priority"] == "P1"
+        assert manifest["auto_outcome"]["need_reply"] is True
+        assert manifest["auto_outcome"]["reply_rate"] == 80.0
 
-    def test_handler_with_tone(self):
+    def test_manifest_preserves_tone_and_forward_target(self):
         pattern = DiscoveredPattern(
             id="test_002",
             name="Tone Test",
             description="Test with tone",
             trigger_type="subject_match",
+            conditions=[{"type": "subject_match", "operator": "contains", "value": "审批"}],
             suggested_priority="P2",
             suggested_need_reply=True,
             suggested_tone="简洁专业",
+            suggested_action="forward",
+            suggested_forward_to=["boss@corp.com"],
             reply_rate=0.6,
         )
-        code = generate_handler(pattern)
-        assert "system_prompt_modifier" in code
-        assert "简洁专业" in code
+        manifest = generate_manifest(pattern, "skill_auto_tone")
+        assert manifest["auto_outcome"]["tone_instruction"] == "简洁专业"
+        assert manifest["auto_outcome"]["action"] == "forward"
+        assert manifest["auto_outcome"]["forward_to"] == ["boss@corp.com"]
 
 
 class TestWriteSkill:
@@ -595,17 +599,15 @@ class TestWriteSkill:
 
         assert skill_dir.exists()
         assert (skill_dir / "manifest.yaml").exists()
-        assert (skill_dir / "handler.py").exists()
+        assert not (skill_dir / "handler.py").exists()
 
         with open(skill_dir / "manifest.yaml") as f:
             manifest = yaml.safe_load(f)
         assert manifest["name"] == "Finance Processor"
         assert manifest["execution_mode"] == "modifier"
+        assert manifest["auto_outcome"]["priority"] == "P1"
 
-        handler_code = (skill_dir / "handler.py").read_text()
-        assert "class Skill(BaseSkill):" in handler_code
-
-    def test_write_skill_idempotent(self, tmp_path: Path):
+    def test_write_skill_stops_on_target_conflict(self, tmp_path: Path):
         pattern = DiscoveredPattern(
             id="test",
             name="Repeat Test",
@@ -614,9 +616,17 @@ class TestWriteSkill:
             conditions=[{"type": "sender_match", "operator": "in", "value": ["x@y.com"]}],
         )
 
-        path1 = write_skill(pattern, registry_path=str(tmp_path))
-        path2 = write_skill(pattern, registry_path=str(tmp_path))
-        assert path1 == path2
+        write_skill(pattern, registry_path=str(tmp_path))
+        with pytest.raises(SkillPromotionConflict):
+            write_skill(pattern, registry_path=str(tmp_path))
+
+    def test_write_skill_rejects_unreviewable_empty_conditions(self, tmp_path: Path):
+        pattern = DiscoveredPattern(
+            id="test", name="Missing trigger", description="无触发条件",
+            trigger_type="subject_match", conditions=[],
+        )
+        with pytest.raises(SkillPromotionValidationError, match="至少需要一个触发条件"):
+            write_skill(pattern, registry_path=str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -898,8 +908,8 @@ class TestGeneratorEnhanced:
         manifest = generate_manifest(pattern, "skill_auto_simple")
         assert "condition_logic" not in manifest["triggers"]
 
-    def test_handler_for_cc_match_pattern(self):
-        """cc_match 触发类型的 handler 应能正常生成。"""
+    def test_declarative_manifest_for_cc_match_pattern(self):
+        """cc_match 规则应使用通用声明式 outcome，不生成 handler。"""
         pattern = DiscoveredPattern(
             id="test", name="CC 通知",
             description="CC 中不需要回复",
@@ -909,13 +919,12 @@ class TestGeneratorEnhanced:
             suggested_need_reply=False,
             reply_rate=0.1,
         )
-        code = generate_handler(pattern)
-        assert "class Skill(BaseSkill):" in code
-        assert '"P3"' in code
-        assert "False" in code
+        manifest = generate_manifest(pattern, "skill_auto_cc")
+        assert manifest["auto_outcome"]["priority"] == "P3"
+        assert manifest["auto_outcome"]["need_reply"] is False
 
-    def test_handler_for_thread_depth_pattern(self):
-        """thread_depth 触发类型的 handler 应能正常生成。"""
+    def test_write_skill_rejects_thread_depth_not_supported_by_runtime(self, tmp_path):
+        """发现阶段可展示线程候选，但不能提升为不会匹配的生产规则。"""
         pattern = DiscoveredPattern(
             id="test", name="深度讨论",
             description="高深度线程",
@@ -925,9 +934,8 @@ class TestGeneratorEnhanced:
             suggested_need_reply=True,
             reply_rate=0.8,
         )
-        code = generate_handler(pattern)
-        assert "class Skill(BaseSkill):" in code
-        assert '"P1"' in code
+        with pytest.raises(SkillPromotionValidationError, match="不受运行时支持"):
+            write_skill(pattern, registry_path=str(tmp_path))
 
     def test_write_skill_with_or_logic(self, tmp_path):
         """写入的 manifest.yaml 中 condition_logic 字段应正确序列化。"""

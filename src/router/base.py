@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, List
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 from src.graph.state import AgentState
 
 class SkillTrigger(BaseModel):
@@ -23,6 +24,8 @@ class AutoOutcome(BaseModel):
     reply_rate: Optional[float] = None
     intent: Optional[str] = None
     action: Optional[str] = None  # e.g. "forward" / "transfer" - propagates downstream
+    forward_to: List[str] = Field(default_factory=list)
+    tone_instruction: Optional[str] = None
 
 class SkillManifest(BaseModel):
     id: str

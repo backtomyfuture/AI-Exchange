@@ -92,6 +92,8 @@ async def categorize_email(
         "active_skills",
         "system_prompt_modifier",
         "priority_level",
+        "draft_to",
+        "draft_cc",
         "metadata",
         "tool_calls",
     ):
