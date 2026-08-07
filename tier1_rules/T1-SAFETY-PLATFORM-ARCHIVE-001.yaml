@@ -1,0 +1,50 @@
+schema_version: 1
+rule_id: T1-SAFETY-PLATFORM-ARCHIVE-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  Rewrite of legacy skill_safety_platform_archive (auto-archives system
+  emails from the HNA digital safety-management platform). Also absorbs
+  legacy skill_auto_hnasafety, whose match condition (sender=hnasafety AND
+  to=q-fu) was a strict subset of this rule's sender-only anchor; both
+  produced the same P3/no-reply outcome, so skill_auto_hnasafety is retired
+  as redundant rather than migrated separately.
+
+validity:
+  effective_from: "2025-01-01T00:00:00Z"
+  expires_at: "2026-06-01T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: sender.address
+        op: eq
+        value: hnasafety@hnaaviation.com
+
+decision:
+  route: no_action
+  business_flow_id: automated-system-notification-archive
+  params:
+    reason_code: automated_system_notification
+
+governance:
+  criticality: P3
+  positive_cases:
+    - case_id: from-safety-platform
+      email:
+        sender: {address: hnasafety@hnaaviation.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: from-safety-platform-no-to-owner
+      email:
+        sender: {address: hnasafety@hnaaviation.com}
+        to: [some-other-recipient@tianjin-air.com]
+  negative_cases:
+    - case_id: unrelated-sender
+      email:
+        sender: {address: someone-else@hnaaviation.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: lookalike-sender-different-address
+      email:
+        sender: {address: hnasafety@hnair.com}
+        to: [q-fu@tianjin-air.com]

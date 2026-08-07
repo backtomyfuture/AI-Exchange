@@ -1,0 +1,55 @@
+schema_version: 1
+rule_id: T1-VIP-CC-ONLY-READONLY-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  SPLIT half B of legacy skill_vip_handling: same VIP senders, but the
+  mailbox owner is not a direct (To) recipient -- read-only FYI, no reply
+  expected. See T1-VIP-DIRECT-REPLY-001 for the direct-recipient half and
+  the retired legacy skill_auto_lanjuan this pair supersedes.
+
+validity:
+  effective_from: "2025-01-01T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: sender.address
+        op: in
+        values:
+          - lanjuan@tianjin-air.com
+          - xt_zong@tianjin-air.com
+  conditions:
+    all:
+      - not:
+          field: to.addresses
+          op: has_any
+          values: ["$ME"]
+
+decision:
+  route: read_only
+  business_flow_id: vip-fyi-only
+
+governance:
+  criticality: P1
+  risk_notes: >
+    $ME must resolve to the mailbox owner's real address at evaluation time;
+    if unresolved, the negated condition is also UNKNOWN (not a silent
+    False), forcing manual_review rather than a wrong route.
+  positive_cases:
+    - case_id: lanjuan-cc-only
+      email:
+        sender: {address: lanjuan@tianjin-air.com}
+        to: [someone-else@tianjin-air.com]
+        cc: [q-fu@tianjin-air.com]
+  negative_cases:
+    - case_id: lanjuan-direct-to-me-is-the-other-half
+      email:
+        sender: {address: lanjuan@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: unrelated-sender-cc-only
+      email:
+        sender: {address: someone-else@tianjin-air.com}
+        to: [someone-else2@tianjin-air.com]
+        cc: [q-fu@tianjin-air.com]

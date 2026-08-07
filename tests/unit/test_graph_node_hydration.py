@@ -215,8 +215,14 @@ async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
         1,
     )[0]
     assert "请及时填写信息评估结论。" not in current_section
+    # need_reply here comes from the LLM's own classification, not a Tier 1
+    # override: skill_auto_1446 (the body_match skill that used to fire on
+    # "呈阅") was retired during the Tier 1 v1 migration -- it had no
+    # sender/to/cc anchor, which the new schema requires and the old one
+    # didn't (see docs/tier1-migration-inventory.md RETIRE group). The
+    # current/quoted-history separation this test actually exercises is
+    # asserted above via captured["prompt"].
     assert result["classification"]["need_reply"] is False
-    assert "skill_auto_1446" in result["active_skills"]
 
 
 @pytest.mark.asyncio
@@ -256,7 +262,9 @@ async def test_categorizer_does_not_route_on_keyword_found_only_in_history():
     ):
         result = await categorize_email(state, dependencies)
 
-    assert "skill_auto_1446" not in result["active_skills"]
+    # skill_auto_1446 (retired, see comment in the test above) used to be the
+    # probe for "a keyword only in quoted history must not trigger Tier 1";
+    # that guarantee now lives in the current/quoted-history split itself.
     assert result["classification"]["need_reply"] is True
     assert result["next_step"] == "rag_search"
 

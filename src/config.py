@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: PositiveInt = 52_428_800
     # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
     LEADER_SENDERS: str = ""
+    # Tier 1 v1 registry compiler: internal domain allowlist (CSV) used only at
+    # compile time to decide whether a `forward` rule's fixed_recipients target
+    # an external address. Compile-time only, no live directory lookup.
+    INTERNAL_EMAIL_DOMAINS: str = ""
 
     # Lark
     LARK_APP_ID: str = ""
