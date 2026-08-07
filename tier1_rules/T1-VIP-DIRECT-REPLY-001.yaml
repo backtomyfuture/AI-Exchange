@@ -1,0 +1,65 @@
+schema_version: 1
+rule_id: T1-VIP-DIRECT-REPLY-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  SPLIT half A of legacy skill_vip_handling. The legacy handler.py branched
+  at runtime on is_direct_recipient(email): direct recipient -> P0/approval,
+  cc-only -> P1/read_only. The new schema has no runtime branching inside a
+  rule, so the branch becomes two rules distinguished by the $ME anchor on
+  to.addresses. Also retires the redundant/buggier legacy skill_auto_lanjuan
+  (priority 60, lower than vip_handling's 100, but applied *after* it in the
+  legacy last-write-wins pipeline order and unconditionally forcing P1/
+  approval even for a lanjuan email where the mailbox owner was cc-only) --
+  this rule and T1-VIP-CC-ONLY-READONLY-001 supersede it without that bug.
+
+validity:
+  effective_from: "2025-01-01T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: sender.address
+        op: in
+        values:
+          - lanjuan@tianjin-air.com
+          - xt_zong@tianjin-air.com
+  conditions:
+    all:
+      - field: to.addresses
+        op: has_any
+        values: ["$ME"]
+
+decision:
+  route: reply
+  business_flow_id: vip-escalation
+  params:
+    reply_mode: sender_and_original_cc
+
+governance:
+  criticality: P0
+  risk_notes: >
+    $ME must resolve to the mailbox owner's real address at evaluation time
+    (see src/router/tier1/dsl.py); if unresolved, evaluation is UNKNOWN and
+    the email is forced to manual_review rather than silently skipping VIP
+    escalation.
+  positive_cases:
+    - case_id: lanjuan-direct-to-me
+      email:
+        sender: {address: lanjuan@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: xt-zong-direct-to-me
+      email:
+        sender: {address: xt_zong@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]
+  negative_cases:
+    - case_id: lanjuan-cc-only-not-direct
+      email:
+        sender: {address: lanjuan@tianjin-air.com}
+        to: [someone-else@tianjin-air.com]
+        cc: [q-fu@tianjin-air.com]
+    - case_id: unrelated-sender-direct-to-me
+      email:
+        sender: {address: someone-else@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]

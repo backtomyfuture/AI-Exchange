@@ -151,16 +151,17 @@ def test_skill_manager_skips_skill_with_neither_handler_nor_outcome(tmp_path):
     assert mgr.get_skill("skill_orphan") is None
 
 
-def test_real_skill_auto_lanjuan_loads_with_correct_outcome():
-    """Sanity check the real registry after migration."""
+def test_real_skill_auto_lanjuan_retired_from_production_registry():
+    """skill_auto_lanjuan was retired during the Tier 1 v1 migration: it
+    duplicated skill_vip_handling and, due to last-write-wins skill ordering,
+    silently clobbered vip_handling's direct-recipient-aware decision (see
+    docs/tier1-migration-inventory.md RETIRE group). It now lives under
+    skills_registry_retired/, not skills_registry/, so the live SkillManager
+    must not load it."""
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     mgr = SkillManager(registry_path=os.path.join(root, "skills_registry"))
-    lan = mgr.get_skill("skill_auto_lanjuan")
-    assert lan is not None
-    assert type(lan).__name__ == "AutoOutcomeSkill"
-    assert lan.manifest.auto_outcome.priority == "P1"
-    assert lan.manifest.auto_outcome.need_reply is True
-    # Most other auto skills should be P3/no-reply
+    assert mgr.get_skill("skill_auto_lanjuan") is None
+    # Most other auto skills should still load normally, e.g. P3/no-reply.
     zx = mgr.get_skill("skill_auto_zhang_xia")
     assert zx.manifest.auto_outcome.priority == "P3"
     assert zx.manifest.auto_outcome.need_reply is False

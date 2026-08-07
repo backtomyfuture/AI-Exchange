@@ -1,0 +1,49 @@
+schema_version: 1
+rule_id: T1-ZHANGXIA-FORWARD-READONLY-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  Rewrite of legacy skill_zhangxia_forward: forwarded informational emails
+  from zhang-xia@tianjin-air.com are read-only notifications, not something
+  needing a reply.
+
+validity:
+  effective_from: "2025-01-01T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: sender.address
+        op: eq
+        value: zhang-xia@tianjin-air.com
+  conditions:
+    all:
+      - field: subject
+        op: regex
+        value: "转发|Fw:|FW:"
+
+decision:
+  route: read_only
+  business_flow_id: forwarded-fyi-from-zhang-xia
+
+governance:
+  criticality: P3
+  positive_cases:
+    - case_id: forwarded-subject-fw
+      email:
+        sender: {address: zhang-xia@tianjin-air.com}
+        subject: "Fw: 通知转发"
+    - case_id: forwarded-subject-chinese
+      email:
+        sender: {address: zhang-xia@tianjin-air.com}
+        subject: "转发：请知悉"
+  negative_cases:
+    - case_id: same-sender-not-a-forward
+      email:
+        sender: {address: zhang-xia@tianjin-air.com}
+        subject: "请审批本季度预算"
+    - case_id: forward-subject-different-sender
+      email:
+        sender: {address: someone-else@tianjin-air.com}
+        subject: "Fw: 通知转发"

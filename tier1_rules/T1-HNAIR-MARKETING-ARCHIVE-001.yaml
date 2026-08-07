@@ -1,0 +1,44 @@
+schema_version: 1
+rule_id: T1-HNAIR-MARKETING-ARCHIVE-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  Rewrite of legacy skill_hnair_marketing (auto-archives marketing emails
+  from the HNA airline commerce platform). Legacy set intent="垃圾邮件"; the
+  new schema drops the free-form intent field, so the spam classification is
+  carried entirely by reason_code=marketing_spam.
+
+validity:
+  effective_from: "2025-01-01T00:00:00Z"
+  expires_at: "2026-06-01T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: sender.address
+        op: eq
+        value: hhsc@hnair.com
+
+decision:
+  route: no_action
+  business_flow_id: marketing-notification-archive
+  params:
+    reason_code: marketing_spam
+
+governance:
+  criticality: P3
+  positive_cases:
+    - case_id: from-hnair-commerce-marketing
+      email:
+        sender: {address: hhsc@hnair.com}
+        to: [q-fu@tianjin-air.com]
+  negative_cases:
+    - case_id: unrelated-sender
+      email:
+        sender: {address: someone-else@hnair.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: distlist-address-in-to-not-sender
+      email:
+        sender: {address: someone-else@hnair.com}
+        to: [hhsc@hnair.com]
