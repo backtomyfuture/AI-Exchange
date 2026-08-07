@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,8 +13,19 @@ from psycopg_pool import AsyncConnectionPool
 from src.db.bootstrap import bootstrap_database
 from src.domain.email_state import ProcessingOutcome
 from src.ingestion.legacy_adapter import LegacyProcessingAdapter
-from src.ingestion.models import ChangeKind, IngressSource, ProcessingPolicy
+from src.ingestion.models import (
+    ChangeKind,
+    IngressSource,
+    ProcessingPolicy,
+    SyncChange,
+)
+from src.ingestion.normalization import normalize_sync_change
 from src.ingestion.policy import FolderScope, PolicySnapshot
+from src.ingestion.polling import (
+    GreenfieldSyncPageWriter,
+    PollingPageCommitResult,
+    PostgresPollingCursorStore,
+)
 from src.ingestion.processing import GuardedExternalEffectFailed
 from src.ingestion.repository import InboxRepository
 from src.ingestion.runtime import build_ingestion_runtime
@@ -66,7 +76,7 @@ def _snapshot() -> PolicySnapshot:
             FolderScope.configured(
                 canonical_key="INBOX",
                 webhook_ids=("inbox-id",),
-                sync_folder="Inbox",
+                sync_folder="INBOX",
                 event_policy_matrix=matrix,
             ),
         )
@@ -132,15 +142,101 @@ def _runtime_settings(schema) -> SimpleNamespace:
     )
 
 
-def _webhook_payload() -> dict[str, object]:
-    return {
-        "account_id": 8,
-        "event": "NewMailEvent",
-        "timestamp": 1_752_384_245,
-        "item_id": {"id": "runtime-message-1", "changekey": "version-1"},
-        "parent_folder_id": {"id": "inbox-id"},
-        "message": "new mail",
-    }
+class _RuntimeLeasePageCommitter:
+    """Bind sync-page commits to the runtime's current session lease."""
+
+    def __init__(self, writer: GreenfieldSyncPageWriter, runtime) -> None:
+        self._writer = writer
+        self._runtime = runtime
+        self.last_result: PollingPageCommitResult | None = None
+
+    async def commit_page(
+        self,
+        checkpoint,
+        next_cursor: str,
+        events,
+        *,
+        activation: bool,
+    ) -> PollingPageCommitResult:
+        result = await self._writer.commit_page(
+            self._runtime.lease,
+            checkpoint,
+            next_cursor,
+            tuple(events),
+            activation=activation,
+        )
+        self.last_result = result
+        return result
+
+
+def _sync_event(
+    event_cursor: str,
+    *,
+    external_email_id: str = "runtime-message-1",
+    source_version: str = "version-1",
+):
+    return normalize_sync_change(
+        8,
+        "INBOX",
+        event_cursor,
+        SyncChange(
+            kind=ChangeKind.CREATE,
+            external_email_id=external_email_id,
+            item={},
+            source_version=source_version,
+        ),
+        processing_policy=ProcessingPolicy.FULL,
+    )
+
+
+async def _ingest_via_sync(
+    runtime,
+    schema,
+    next_cursor: str,
+    events,
+) -> PollingPageCommitResult:
+    """Commit one sync page through the runtime's session-fenced boundary."""
+
+    pool = AsyncConnectionPool(
+        conninfo=schema.runtime_dsn,
+        min_size=1,
+        max_size=2,
+        open=False,
+        kwargs={"row_factory": dict_row},
+    )
+    await pool.open()
+    try:
+        committer = _RuntimeLeasePageCommitter(
+            GreenfieldSyncPageWriter(pool),
+            runtime,
+        )
+        store = PostgresPollingCursorStore(
+            pool,
+            committer,
+            account_id=8,
+            folder="INBOX",
+        )
+        checkpoint = await store.load(8, "INBOX")
+        if checkpoint.cursor is None:
+            await store.commit_activation_boundary(checkpoint, "activation-cursor")
+            checkpoint = await store.load(8, "INBOX")
+        await store.commit_delta(checkpoint, next_cursor, tuple(events))
+        result = committer.last_result
+    finally:
+        await pool.close()
+    if result is None:
+        raise AssertionError("sync page commit did not return a result")
+    return result
+
+
+def _inbox_id(schema, external_email_id: str) -> str:
+    return str(
+        schema.scalar(
+            "SELECT id FROM event_inbox "
+            "WHERE account_id = 8 AND external_email_id = %s",
+            (external_email_id,),
+        )
+    )
 
 
 async def _wait_for_inbox_status(
@@ -177,31 +273,24 @@ async def _wait_for_inbox_status(
 
 
 @pytest.mark.asyncio
-async def test_greenfield_runtime_persists_webhook_and_clean_restart_deduplicates(
+async def test_greenfield_runtime_persists_sync_event_and_clean_restart_deduplicates(
     empty_schema,
 ) -> None:
     await bootstrap_database(empty_schema.dsn, **empty_schema.bootstrap_identity)
     await _initialize(empty_schema)
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
 
     first = build_ingestion_runtime(_runtime_settings(empty_schema))
     await first.start()
     try:
         assert await first.check_ready() is True
-        service = first.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        result = await _ingest_via_sync(
+            first,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
-        assert receipt.duplicate is False
+        assert result.inserted_count == 1
+        assert result.duplicate_count == 0
         assert (await first.queue_stats()).pending == 1
     finally:
         await first.stop()
@@ -224,14 +313,14 @@ async def test_greenfield_runtime_persists_webhook_and_clean_restart_deduplicate
     second = build_ingestion_runtime(_runtime_settings(empty_schema))
     await second.start()
     try:
-        service = second.webhook_ingress_service
-        assert service is not None
-        duplicate = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        duplicate = await _ingest_via_sync(
+            second,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
-        assert duplicate.duplicate is True
+        assert duplicate.inserted_count == 0
+        assert duplicate.duplicate_count == 1
         assert (await second.queue_stats()).pending == 1
     finally:
         await second.stop()
@@ -245,7 +334,7 @@ async def test_greenfield_runtime_persists_webhook_and_clean_restart_deduplicate
 
 
 @pytest.mark.asyncio
-async def test_phase4_runtime_processes_webhook_to_completion_with_real_postgres(
+async def test_phase4_runtime_processes_sync_event_to_completion_with_real_postgres(
     empty_schema,
     monkeypatch,
 ) -> None:
@@ -301,49 +390,40 @@ async def test_phase4_runtime_processes_webhook_to_completion_with_real_postgres
         settings,
         processing_context=processing_context,
     )
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
     await runtime.start()
     try:
         assert runtime.processing_ready is True
         assert await runtime.check_ready() is True
-        service = runtime.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        await _ingest_via_sync(
+            runtime,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
-        assert receipt.duplicate is False
-        await _wait_for_inbox_status(empty_schema, receipt.inbox_id, "completed")
+        inbox_id = _inbox_id(empty_schema, "runtime-message-1")
+        await _wait_for_inbox_status(empty_schema, inbox_id, "completed")
     finally:
         await runtime.stop()
 
     assert (
         empty_schema.scalar(
             "SELECT status FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         )
         == "completed"
     )
     assert empty_schema.scalar(
         "SELECT processing_started_at IS NOT NULL FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert empty_schema.scalar(
         "SELECT effect_started_at IS NOT NULL FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert empty_schema.scalar(
         "SELECT lease_owner IS NULL AND lease_until IS NULL "
         "AND lease_session_id IS NULL FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert (
         empty_schema.scalar(
@@ -405,36 +485,28 @@ async def test_phase4_runtime_retries_missing_detail_without_effect_marker(
         settings,
         processing_context=processing_context,
     )
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
     await runtime.start()
     try:
-        service = runtime.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        await _ingest_via_sync(
+            runtime,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
-        await _wait_for_inbox_status(empty_schema, receipt.inbox_id, "retry_wait")
+        inbox_id = _inbox_id(empty_schema, "runtime-message-1")
+        await _wait_for_inbox_status(empty_schema, inbox_id, "retry_wait")
     finally:
         await runtime.stop()
 
     assert empty_schema.scalar(
         "SELECT effect_started_at IS NULL FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert empty_schema.scalar(
         "SELECT status = 'retry_wait' "
         "AND safe_error_code = 'inbox.transient_dependency' "
         "FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert empty_schema.scalar(
         "SELECT status = 'retry_wait' "
@@ -495,24 +567,16 @@ async def test_phase4_runtime_keeps_unknown_side_effect_in_manual_review(
         settings,
         processing_context=processing_context,
     )
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
     await runtime.start()
     try:
-        service = runtime.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        await _ingest_via_sync(
+            runtime,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
-        await _wait_for_inbox_status(empty_schema, receipt.inbox_id, "manual_review")
+        inbox_id = _inbox_id(empty_schema, "runtime-message-1")
+        await _wait_for_inbox_status(empty_schema, inbox_id, "manual_review")
     finally:
         await runtime.stop()
 
@@ -521,7 +585,7 @@ async def test_phase4_runtime_keeps_unknown_side_effect_in_manual_review(
         "AND effect_started_at IS NOT NULL "
         "AND safe_error_code = 'inbox.effect_outcome_unknown' "
         "FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True
     assert empty_schema.scalar(
         "SELECT status = 'manual_review' "
@@ -540,24 +604,16 @@ async def test_expired_runtime_session_cannot_begin_processing_effect(
 ) -> None:
     await bootstrap_database(empty_schema.dsn, **empty_schema.bootstrap_identity)
     await _initialize(empty_schema)
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
     ingress_runtime = build_ingestion_runtime(_runtime_settings(empty_schema))
     await ingress_runtime.start()
     try:
-        service = ingress_runtime.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        await _ingest_via_sync(
+            ingress_runtime,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
+        inbox_id = _inbox_id(empty_schema, "runtime-message-1")
     finally:
         await ingress_runtime.stop()
 
@@ -590,12 +646,12 @@ async def test_expired_runtime_session_cannot_begin_processing_effect(
         )
         assert len(leases) == 1
         lease = leases[0]
-        assert lease.id == receipt.inbox_id
+        assert lease.id == inbox_id
         application = await repository.apply_email_event(lease)
         assert application.should_process is True
         assert empty_schema.scalar(
             "SELECT effect_started_at IS NULL FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         ) is True
         assert empty_schema.scalar(
             "SELECT external_effects_started_at IS NULL FROM emails "
@@ -620,7 +676,7 @@ async def test_expired_runtime_session_cannot_begin_processing_effect(
         assert empty_schema.scalar(
             "SELECT lease_until > pg_catalog.clock_timestamp() "
             "FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         ) is True
 
         assert (
@@ -634,7 +690,7 @@ async def test_expired_runtime_session_cannot_begin_processing_effect(
         )
         assert empty_schema.scalar(
             "SELECT effect_started_at IS NULL FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         ) is True
         assert empty_schema.scalar(
             "SELECT external_effects_started_at IS NULL FROM emails "
@@ -651,24 +707,16 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
 ) -> None:
     await bootstrap_database(empty_schema.dsn, **empty_schema.bootstrap_identity)
     await _initialize(empty_schema)
-    raw_payload = _webhook_payload()
-    raw_body = json.dumps(
-        raw_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
     ingress_runtime = build_ingestion_runtime(_runtime_settings(empty_schema))
     await ingress_runtime.start()
     try:
-        service = ingress_runtime.webhook_ingress_service
-        assert service is not None
-        receipt = await service.accept(
-            raw_body=raw_body,
-            payload=raw_payload,
-            header_event="NewMailEvent",
+        await _ingest_via_sync(
+            ingress_runtime,
+            empty_schema,
+            "delta-cursor-1",
+            (_sync_event("delta-cursor-1"),),
         )
+        inbox_id = _inbox_id(empty_schema, "runtime-message-1")
     finally:
         await ingress_runtime.stop()
 
@@ -725,7 +773,7 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
         )
         assert len(leases) == 1
         lease = leases[0]
-        assert lease.id == receipt.inbox_id
+        assert lease.id == inbox_id
         assert lease.lease_session_id == worker_session_id
 
         forged_session_lease = replace(lease, lease_session_id=str(uuid4()))
@@ -747,7 +795,7 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
         assert empty_schema.scalar(
             "SELECT lease_until > pg_catalog.clock_timestamp() "
             "FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         ) is True
         assert await repository.renew(lease, 3) is None
 
@@ -755,13 +803,13 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
             "UPDATE event_inbox SET "
             "lease_until = processing_started_at + INTERVAL '1 microsecond', "
             "updated_at = pg_catalog.clock_timestamp() WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         )
         assert empty_schema.scalar(
             "SELECT lease_until > received_at "
             "AND lease_until <= pg_catalog.clock_timestamp() "
             "FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         ) is True
 
         assert await repository.recover_expired_leases(1) == 1
@@ -771,7 +819,7 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
     assert (
         empty_schema.scalar(
             "SELECT status FROM event_inbox WHERE id = %s",
-            (receipt.inbox_id,),
+            (inbox_id,),
         )
         != "leased"
     )
@@ -779,5 +827,5 @@ async def test_expired_unlinked_lease_with_existing_email_is_recovered(
         "SELECT lease_owner IS NULL AND lease_until IS NULL "
         "AND lease_session_id IS NULL "
         "FROM event_inbox WHERE id = %s",
-        (receipt.inbox_id,),
+        (inbox_id,),
     ) is True

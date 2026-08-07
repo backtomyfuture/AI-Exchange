@@ -184,6 +184,8 @@ secret，并遵循 `deploy/README.md` 的角色和所有权检查。
 - 删除 module 前验证生产可达性、动态导入、运维入口、数据迁移职责和测试职责；
 - 测试通过 module 的 interface 验证行为，不为已删除的兼容壳保留专属测试；
 - Qdrant、邮件处理和审批变更必须使用现实 payload shape 做 E2E 验证；
+- Phase 2 PostgreSQL Gate 全绿才允许合并 PR；gate 红时先修绿再合并，不得把已知
+  失败当作"与本次改动无关"跳过；
 - `ruff` 和全量测试通过不等于运行态正确，部署后还要验证 Compose、`/health`、
   `/ready`、日志和逐阶段处理结果。
 

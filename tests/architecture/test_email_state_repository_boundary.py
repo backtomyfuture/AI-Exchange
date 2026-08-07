@@ -306,7 +306,7 @@ _TASK7_TASK5_SUCCESSOR_PATHS = frozenset(
 _TASK8_REVIEWED_STRUCTURAL_AST_SHA256 = {
     # AttachmentPolicy is the shared admission boundary for Drive uploads.
     "src/exchange_service.py": (
-        "33eb53e00b17ed7d4870b7e9cab202d363c31599a1f87e6b5c9ed93f63530ed2"
+        "069b700dbef24241ddd642012d05719d9c2225297ba5ce3231fe638319b78069"
     ),
     "src/ingestion/processing.py": (
         "5fa7573575386d597da77b5f27f59f7b79378d5f2318b2d5d81c83862616bbf5"
