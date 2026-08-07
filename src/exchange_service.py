@@ -807,16 +807,28 @@ async def _delete_replaced_pdf(
 async def _dispatch_manual_review_notification(
     email_id: str,
     pipeline_result: dict,
+    ctx,
     *,
     _effect_boundary: ExternalEffectBoundary | None = None,
-) -> bool:
-    """Surface a fail-closed result without acknowledging the Exchange email."""
+) -> dict:
+    """Surface a fail-closed result without acknowledging the Exchange email.
+
+    Returns ``{"delivered": bool, "pdf_token": str | None}``. ``pdf_token`` is
+    the Drive handle the sent card links to (if any) so the caller preserves
+    it during later best-effort cleanup instead of deleting it out from under
+    the card that was just delivered.
+    """
     safe_code = normalize_manual_review_code(
         pipeline_result.get("safe_error_summary")
     )
     email_data = pipeline_result.get("email")
     if not isinstance(email_data, dict):
         email_data = {}
+    classification = pipeline_result.get("classification")
+    if not isinstance(classification, dict):
+        classification = {}
+    routing_log = pipeline_result.get("routing_log", [])
+    active_skills = pipeline_result.get("active_skills", [])
     logger.info(
         "Sending Lark manual-review request: email=%s reason=%s",
         fingerprint_identifier(email_id, namespace="email"),
@@ -825,7 +837,36 @@ async def _dispatch_manual_review_notification(
     await _authorize_external_effect(
         _effect_boundary,
         ExternalEffectKind.FEISHU,
-        31,
+        32,
+        {"operation": "generate_notification_pdf", "email_id": email_id},
+    )
+    try:
+        pdf_result = await lark_app.generate_and_upload_pdf(email_id)
+    except Exception:
+        if _effect_boundary is not None:
+            raise GuardedExternalEffectFailed() from None
+        raise
+    pdf_stage = await _stage_notification_pdf(
+        email_id,
+        ctx,
+        pdf_result,
+        _effect_boundary=_effect_boundary,
+    )
+    if _effect_boundary is not None and (
+        not pdf_stage.ready or pdf_stage.new_token is None or pdf_stage.url is None
+    ):
+        raise GuardedExternalEffectFailed()
+    if not pdf_stage.ready:
+        logger.error(
+            "Manual-review notification PDF staging failed: code=%s",
+            pdf_stage.error_code,
+        )
+        return {"delivered": False, "pdf_token": None}
+
+    await _authorize_external_effect(
+        _effect_boundary,
+        ExternalEffectKind.FEISHU,
+        33,
         {
             "operation": "send_manual_review_card",
             "email_id": email_id,
@@ -838,6 +879,10 @@ async def _dispatch_manual_review_notification(
             email_id=email_id,
             email_data=email_data,
             reason=safe_code,
+            classification=classification,
+            pdf_url=pdf_stage.url,
+            routing_log=routing_log,
+            active_skills=active_skills,
         )
     except Exception:
         if _effect_boundary is not None:
@@ -851,13 +896,38 @@ async def _dispatch_manual_review_notification(
             "Manual-review card delivery failed; leaving Exchange unread: email=%s",
             fingerprint_identifier(email_id, namespace="email"),
         )
+        try:
+            from src.observability.metrics import record_card_dispatch
+
+            record_card_dispatch("manual_review", False)
+        except Exception:
+            pass
+        return {"delivered": False, "pdf_token": pdf_stage.new_token}
+    try:
+        await _delete_replaced_pdf(
+            email_id,
+            ctx,
+            pdf_stage.old_token,
+            pdf_stage.new_token,
+            _effect_boundary=_effect_boundary,
+        )
+    except asyncio.CancelledError as exc:
+        raise NotificationSideEffectCommittedError(
+            kind="manual_review",
+            cause=exc,
+        ) from None
+    except Exception as exc:
+        raise NotificationSideEffectCommittedError(
+            kind="manual_review",
+            cause=exc,
+        ) from None
     try:
         from src.observability.metrics import record_card_dispatch
 
-        record_card_dispatch("manual_review", delivered)
+        record_card_dispatch("manual_review", True)
     except Exception:
         pass
-    return delivered
+    return {"delivered": True, "pdf_token": pdf_stage.new_token}
 
 
 async def _dispatch_notification(
@@ -1972,11 +2042,14 @@ async def _run_ai_path(
             safe_code = normalize_manual_review_code(
                 pipeline_result.get("safe_error_summary")
             )
-            manual_delivered = await _dispatch_manual_review_notification(
+            manual_dispatch = await _dispatch_manual_review_notification(
                 thread_id,
                 pipeline_result,
+                ctx,
                 _effect_boundary=_effect_boundary,
             )
+            manual_delivered = manual_dispatch.get("delivered", False)
+            manual_pdf_token = manual_dispatch.get("pdf_token")
             if not manual_delivered:
                 await _cleanup_graph_drive_files(
                     thread_id,
@@ -2039,7 +2112,7 @@ async def _run_ai_path(
                     ctx,
                     fallback_attachment_tokens=attachment_tokens,
                     preserve_attachment_tokens=list(baseline.attachment_tokens),
-                    preserve_pdf_token=baseline.pdf_token,
+                    preserve_pdf_token=manual_pdf_token,
                     **_effect_boundary_kwargs(_effect_boundary),
                 )
             except asyncio.CancelledError:

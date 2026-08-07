@@ -1033,7 +1033,7 @@ async def test_ai_path_sends_manual_review_card_without_marking_exchange_read():
             "body": "请在7月30日前完成。",
         },
     }
-    manual_card = AsyncMock(return_value=True)
+    manual_card = AsyncMock(return_value={"delivered": True, "pdf_token": None})
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
         "src.exchange_service._snapshot_cleanup_handles",
@@ -1068,6 +1068,7 @@ async def test_ai_path_sends_manual_review_card_without_marking_exchange_read():
     manual_card.assert_awaited_once_with(
         "mail-manual-review",
         pipeline_result,
+        ctx,
         _effect_boundary=None,
     )
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_once()
@@ -1094,7 +1095,7 @@ async def test_ai_path_keeps_manual_review_email_unread_when_card_delivery_fails
         "safe_error_summary": "content_guard_rejected",
         "email": {"id": "mail-manual-card-failed", "body": "需要人工处理"},
     }
-    manual_card = AsyncMock(return_value=False)
+    manual_card = AsyncMock(return_value={"delivered": False, "pdf_token": None})
 
     with patch("src.exchange_service.get_settings", return_value=_settings()), patch(
         "src.exchange_service._snapshot_cleanup_handles",
@@ -1129,6 +1130,7 @@ async def test_ai_path_keeps_manual_review_email_unread_when_card_delivery_fails
     manual_card.assert_awaited_once_with(
         "mail-manual-card-failed",
         pipeline_result,
+        ctx,
         _effect_boundary=None,
     )
     ctx.db_manager.compare_and_set_manual_review.assert_not_awaited()

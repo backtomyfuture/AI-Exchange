@@ -81,12 +81,15 @@ def test_send_approval_card(mock_client_cls, mock_lark_deps, mock_env):
 
 
 def test_manual_review_card_surfaces_email_content_without_an_acknowledge_action():
+    from src.utils.card_builder import LarkCardBuilder
+
     client = MagicMock()
     response = MagicMock()
     response.success.return_value = True
     response.data.message_id = "message-1"
     client.im.v1.message.create.return_value = response
     settings = MagicMock(LARK_CHAT_ID="chat-1")
+    builder = LarkCardBuilder(lark_api_client=None, exchange_client=None)
 
     with patch("src.utils.lark_messaging.get_settings", return_value=settings):
         delivered = lark_messaging.send_manual_review_card(
@@ -94,21 +97,29 @@ def test_manual_review_card_surfaces_email_content_without_an_acknowledge_action
             {
                 "subject": "需要人工处理",
                 "sender": "sender@example.test",
+                "to": ["recipient@example.test"],
+                "cc": ["cc@example.test"],
                 "body": "<p>需要人工处理的正文</p>",
             },
             "content_guard_rejected",
+            pdf_url="https://example.invalid/original.pdf",
             lark_api_client=client,
+            card_builder=builder,
         )
 
     request = client.im.v1.message.create.call_args.args[0]
     card = json.loads(request.request_body.content)
+    elements_json = json.dumps(card["elements"], ensure_ascii=False)
     assert delivered is True
     assert card["header"]["template"] == "red"
     assert "需要人工处理" in card["header"]["title"]["content"]
-    assert any(
-        "需要人工处理的正文" in element.get("text", {}).get("content", "")
-        for element in card["elements"]
-    )
+    # The raw internal error code must not leak; a translated reason should.
+    assert "content_guard_rejected" not in elements_json
+    assert "幻觉" in elements_json
+    assert "需要人工处理的正文" in elements_json
+    assert "收件人" in elements_json
+    assert "抄送" in elements_json
+    assert "example.invalid/original.pdf" in elements_json
     assert all(element["tag"] != "action" for element in card["elements"])
 
 
