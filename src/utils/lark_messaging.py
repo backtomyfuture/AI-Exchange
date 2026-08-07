@@ -16,9 +16,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 from src.config import get_settings
-from src.graph.state_factory import truncate_utf8
 from src.security.redaction import fingerprint_identifier
-from src.utils.email_body_projection import project_email_body_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -153,17 +151,27 @@ def send_manual_review_card(
     email_id: str,
     email_data: dict,
     reason: str,
+    classification: dict | None = None,
+    pdf_url=None,
+    routing_log: List | None = None,
+    active_skills: List | None = None,
     *,
     lark_api_client=None,
+    card_builder=None,
 ) -> bool:
     """Send an immutable manual-review alert without an acknowledge action."""
     if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client
+        from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
 
         lark_api_client = _client
+        card_builder = _cb
 
     if not lark_api_client:
         logger.error("Lark Client not initialized. Cannot send manual-review card.")
+        return False
+
+    if not card_builder:
+        logger.error("Card builder not initialized. Cannot send manual-review card.")
         return False
 
     settings = get_settings()
@@ -173,43 +181,17 @@ def send_manual_review_card(
         return False
 
     data = email_data if isinstance(email_data, dict) else {}
-    subject = truncate_utf8(data.get("subject", "无主题"), max_bytes=512)
-    sender = truncate_utf8(data.get("sender", "未知发件人"), max_bytes=512)
-    body = project_email_body_for_model(data.get("body", "")).text
-    excerpt = truncate_utf8(body or "无正文摘要", max_bytes=1800)
-    safe_reason = truncate_utf8(reason, max_bytes=128)
-    card_content = {
-        "header": {
-            "template": "red",
-            "title": {"content": f"⚠️ 需要人工处理: {subject}", "tag": "plain_text"},
-        },
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "plain_text",
-                    "content": f"发件人: {sender}\n复核原因: {safe_reason}",
-                },
-            },
-            {"tag": "hr"},
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "plain_text",
-                    "content": f"邮件内容摘要:\n{excerpt}",
-                },
-            },
-            {
-                "tag": "note",
-                "elements": [
-                    {
-                        "tag": "plain_text",
-                        "content": "邮件保持未读，请在 Exchange 收件箱手工处理。",
-                    }
-                ],
-            },
-        ],
-    }
+    try:
+        card_content = card_builder.build_manual_review_card(
+            email_id, data, reason, classification=classification, pdf_url=pdf_url,
+            routing_log=routing_log, active_skills=active_skills,
+        )
+    except Exception as exc:
+        logger.error(
+            "Manual-review card build failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return False
 
     try:
         request = CreateMessageRequest.builder() \

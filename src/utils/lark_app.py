@@ -641,7 +641,9 @@ def send_system_notification(title: str, content: str, template: str = "red"):
     return _impl(title, content, template, lark_api_client=lark_api_client)
 
 
-def send_manual_review_card(email_id: str, email_data: dict, reason: str):
+def send_manual_review_card(email_id: str, email_data: dict, reason: str,
+                            classification: dict = None, pdf_url=None,
+                            routing_log: List = None, active_skills: List = None):
     """Send a manual-review alert card. Delegates to lark_messaging."""
     from src.utils.lark_messaging import send_manual_review_card as _impl
 
@@ -649,7 +651,12 @@ def send_manual_review_card(email_id: str, email_data: dict, reason: str):
         email_id,
         email_data,
         reason,
+        classification=classification,
+        pdf_url=pdf_url,
+        routing_log=routing_log,
+        active_skills=active_skills,
         lark_api_client=lark_api_client,
+        card_builder=card_builder,
     )
 
 

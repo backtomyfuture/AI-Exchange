@@ -7,6 +7,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from src.config import get_settings
+from src.safety.manual_review import manual_review_reason_label, normalize_manual_review_code
 from src.security.redaction import fingerprint_identifier
 from src.utils.email_attachments import select_business_attachments
 
@@ -973,6 +974,139 @@ class LarkCardBuilder:
                 {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 已阅"},
                  "type": "primary", "value": {"action": "mark_read", "id": email_id}}
             ]
+        })
+
+        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
+
+        return {"header": header, "elements": elements}
+
+    def build_manual_review_card(
+        self,
+        email_id: str,
+        email_data: dict,
+        reason: str,
+        classification: Optional[dict] = None,
+        pdf_url: Any = None,
+        routing_log: Optional[List[str]] = None,
+        active_skills: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        构建人工复核卡片 - 用于系统安全兜底转人工的邮件。
+
+        与只读卡片相比：
+        - 保留: 邮件信息展示（发件人/收件人/抄送）、附件链接、PDF原文链接、内容摘要
+        - 移除: 所有操作按钮（不可确认，只能去 Exchange 手工处理）
+        - 新增: 人工复核原因（中文说明）
+        """
+        subject = email_data.get("subject", "No Subject")
+        subject = re.sub(r"^(Subject|主题)[:：]\s*", "", subject, flags=re.IGNORECASE).strip()
+        raw_sender = email_data.get("sender", "Unknown")
+
+        to_list = email_data.get("to", [])
+        if isinstance(to_list, str):
+            to_list = [to_list]
+
+        cc_list = email_data.get("cc", [])
+        if isinstance(cc_list, str):
+            cc_list = [cc_list]
+
+        # Collect all emails for user lookup
+        all_emails = []
+        sender_email = extract_email_address(raw_sender)
+        if sender_email:
+            all_emails.append(sender_email)
+        for r in to_list:
+            e = extract_email_address(r)
+            if e:
+                all_emails.append(e)
+        for c in cc_list:
+            e = extract_email_address(c)
+            if e:
+                all_emails.append(e)
+
+        user_map = self.lookup_lark_users(list(set(all_emails)))
+
+        elements = []
+
+        header = {
+            "template": "red",
+            "title": {
+                "content": f"⚠️ 需要人工处理: {subject}",
+                "tag": "plain_text"
+            }
+        }
+
+        safe_code = normalize_manual_review_code(reason)
+        reason_label = manual_review_reason_label(safe_code)
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": f"💡 复核原因: {reason_label}"}]
+        })
+
+        # Email info section: Sender / To / Cc on separate rows
+        elements.extend(self._build_email_info_section(
+            raw_sender, to_list, cc_list, user_map
+        ))
+        elements.append({"tag": "hr"})
+
+        resolved_pdf_url = self._normalize_pdf_url(pdf_url)
+
+        header_text = "**📄 邮件内容摘要:**"
+        if resolved_pdf_url:
+            header_text = f"**📄 邮件内容摘要:** ([📄 查看完整原文 (PDF)]({resolved_pdf_url}))"
+
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": header_text
+            }
+        })
+
+        classification = classification or {}
+        llm_summary = classification.get("summary")
+        if llm_summary:
+            original_snippet = llm_summary
+        else:
+            raw_body = email_data.get("body", "")
+            if raw_body:
+                try:
+                    soup = BeautifulSoup(raw_body, "html.parser")
+                    text = soup.get_text(separator=" ", strip=True)
+                    original_snippet = text[:300] + "..." if len(text) > 300 else text
+                except Exception:
+                    original_snippet = raw_body[:300]
+            else:
+                original_snippet = "无内容摘要"
+
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": f"*{original_snippet}*"}
+        })
+
+        # Attachments - show only standalone business files.
+        real_attachments = select_business_attachments(email_data)
+        if real_attachments:
+            att_lines = []
+            for att in real_attachments[:5]:
+                name = att.get('name', 'Unknown File')
+                if att.get('lark_file_url'):
+                    att_lines.append(f"📎 [{name}]({att['lark_file_url']})")
+                else:
+                    continue
+            if att_lines:
+                att_text = "\n".join(att_lines)
+                elements.append({"tag": "div", "text": {"tag": "lark_md", "content": att_text}})
+
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": "邮件保持未读，请在 Exchange 收件箱手工处理。",
+                }
+            ],
         })
 
         elements.extend(self._build_routing_note(routing_log, active_skills, classification))

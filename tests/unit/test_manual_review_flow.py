@@ -238,7 +238,7 @@ async def test_run_ai_path_sends_manual_review_card_without_mark_read():
         side_effect=lambda *_args, **_kwargs: call_order.append(
             "manual_card_delivered"
         )
-        or True
+        or {"delivered": True, "pdf_token": None}
     )
 
     with patch(
@@ -288,6 +288,7 @@ async def test_run_ai_path_sends_manual_review_card_without_mark_read():
     manual_card.assert_awaited_once_with(
         email_id,
         projection,
+        ctx,
         _effect_boundary=None,
     )
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_with(
@@ -355,7 +356,7 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
         "next_step": "approval",
         "safe_error_summary": "private-content-should-not-be-persisted",
     }
-    manual_card = AsyncMock(return_value=True)
+    manual_card = AsyncMock(return_value={"delivered": True, "pdf_token": None})
 
     with patch(
         "src.exchange_service.get_settings",
@@ -396,6 +397,7 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
     manual_card.assert_awaited_once_with(
         email_id,
         projection,
+        ctx,
         _effect_boundary=None,
     )
     ctx.db_manager.compare_and_set_manual_review.assert_awaited_with(
@@ -435,7 +437,7 @@ async def test_run_ai_path_escalates_card_delivery_when_manual_review_cas_loses(
         "next_step": "manual_review",
         "safe_error_summary": "reviewer_model_failed",
     }
-    manual_card = AsyncMock(return_value=True)
+    manual_card = AsyncMock(return_value={"delivered": True, "pdf_token": None})
 
     with patch(
         "src.exchange_service.get_settings",
@@ -476,6 +478,7 @@ async def test_run_ai_path_escalates_card_delivery_when_manual_review_cas_loses(
     manual_card.assert_awaited_once_with(
         email_id,
         projection,
+        ctx,
         _effect_boundary=None,
     )
     cleanup.assert_not_awaited()
@@ -532,7 +535,7 @@ async def test_manual_review_commit_then_raise_is_confirmed_before_cleanup(caplo
         new=cleanup,
     ), patch(
         "src.exchange_service._dispatch_manual_review_notification",
-        new=AsyncMock(return_value=True),
+        new=AsyncMock(return_value={"delivered": True, "pdf_token": None}),
     ):
         outcome = await _run_ai_path(
             email_id,
@@ -589,7 +592,7 @@ async def test_manual_cleanup_cancellation_preserves_manual_and_cancellation_ide
         new=cleanup,
     ), patch(
         "src.exchange_service._dispatch_manual_review_notification",
-        new=AsyncMock(return_value=True),
+        new=AsyncMock(return_value={"delivered": True, "pdf_token": None}),
     ), pytest.raises(asyncio.CancelledError) as caught:
         await _run_ai_path(
             email_id,
