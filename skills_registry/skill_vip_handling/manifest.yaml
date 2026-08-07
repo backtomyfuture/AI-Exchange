@@ -6,7 +6,11 @@ execution_mode: "modifier"
 
 triggers:
   priority: 100
+  condition_logic: "or"
   conditions:
     - type: "sender_match"
-      operator: "in"
-      value: ["lanjuan@tianjin-air.com", "xt_zong@tianjin-air.com"]
+      operator: "contains"
+      value: "lanjuan@tianjin-air.com"
+    - type: "sender_match"
+      operator: "contains"
+      value: "xt_zong@tianjin-air.com"

@@ -237,3 +237,200 @@ async def test_real_forward_skill_projects_safe_recipients_and_draft(
     assert graph_node_harness.draft_saves == [(f"forward-{tier}", "test forward")]
     assert "email" not in result
     assert "draft" not in result
+
+
+def _skill_routed_state(classification):
+    """Engine output after a Tier 1 modifier skill decided classification fields."""
+    return {
+        "classification": classification,
+        "active_skills": ["skill_auto_cc"],
+        "routing_log": ["Tier 1 Match: ['skill_auto_cc']"],
+        "routing_stage": "tier1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_tier1_skill_need_reply_false_is_not_overridden_by_llm(
+    graph_node_harness,
+):
+    """CC 规则判定 need_reply=false 后，LLM 分类不得再覆盖为需要回复。
+
+    回归：「呈兰总阅示」邮件（我在 CC）被 skill_auto_cc 命中后，LLM 以
+    need_reply=true/P1 覆盖 Skill 结果，导致飞书收到草稿审批卡片。
+    """
+    mock_engine = MagicMock()
+    mock_engine.execute_router = AsyncMock(
+        return_value=_skill_routed_state(
+            {
+                "priority": "P3",
+                "need_reply": False,
+                "card_type": "none",
+                "reasoning": "[Auto-Skill: 抄送通知] 回复率 0%。",
+            }
+        )
+    )
+
+    state = graph_node_harness.state(
+        {
+            "id": "cc-only-mail",
+            "subject": "【呈兰总阅示】需求风险评估及排期请示",
+            "body": "兰总：现将风险评估呈上，请批示。",
+            "sender": "Mailbox(name='宗晓婷(Vicky)', email_address='xt_zong@tianjin-air.com')",
+            "to": ["Mailbox(name='兰娟(juliet)', email_address='lanjuan@tianjin-air.com')"],
+            "cc": ["Mailbox(name='傅强3', email_address='q-fu@tianjin-air.com')"],
+        }
+    )
+
+    llm_classification = {
+        "priority": "P1",
+        "need_reply": True,
+        "intent": "审批",
+        "summary": "傅强呈报需求风险评估，请求领导审批。",
+        "reasoning": "正式审批申请，需要领导决策。",
+        "confidence": 0.95,
+    }
+    with patch(
+        "src.nodes.categorizer.get_routing_engine",
+        return_value=mock_engine,
+    ), patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(lambda value: value),
+    ), patch(
+        "src.nodes.categorizer.with_llm_retry",
+        side_effect=_fixed_classification(llm_classification),
+    ):
+        from src.nodes.categorizer import categorize_email
+
+        result = await categorize_email(state, graph_node_harness.dependencies)
+
+    # Skill 显式决定的字段保持权威；LLM 只补充未决定的字段。
+    assert result["classification"]["need_reply"] is False
+    assert result["classification"]["priority"] == "P3"
+    assert result["classification"]["summary"] == "傅强呈报需求风险评估，请求领导审批。"
+    assert result["classification"]["intent"] == "审批"
+    assert result["next_step"] == "end"
+    assert result["active_skills"] == ["skill_auto_cc"]
+
+
+@pytest.mark.asyncio
+async def test_tier1_skill_need_reply_true_is_not_overridden_by_llm(
+    graph_node_harness,
+):
+    """Skill 判定需要回复时，LLM 也不得降级为不回复。"""
+    mock_engine = MagicMock()
+    mock_engine.execute_router = AsyncMock(
+        return_value=_skill_routed_state(
+            {
+                "priority": "P1",
+                "need_reply": True,
+                "card_type": "approval",
+                "reasoning": "[Skill Match: Direct Recipient] 确保回复。",
+            }
+        )
+    )
+
+    state = graph_node_harness.state(
+        {
+            "id": "direct-mail",
+            "subject": "呈阅知：月度会会议纪要",
+            "body": "请各位知悉。",
+            "sender": "sender@example.com",
+            "to": ["q-fu@tianjin-air.com"],
+            "cc": [],
+        }
+    )
+
+    llm_classification = {
+        "priority": "P2",
+        "need_reply": False,
+        "intent": "通知",
+        "summary": "会议纪要通报。",
+        "reasoning": "仅需知悉。",
+        "confidence": 0.9,
+    }
+    with patch(
+        "src.nodes.categorizer.get_routing_engine",
+        return_value=mock_engine,
+    ), patch(
+        "src.providers.factory.get_llm_for_role",
+        return_value=RunnableLambda(lambda value: value),
+    ), patch(
+        "src.nodes.categorizer.with_llm_retry",
+        side_effect=_fixed_classification(llm_classification),
+    ):
+        from src.nodes.categorizer import categorize_email
+
+        result = await categorize_email(state, graph_node_harness.dependencies)
+
+    assert result["classification"]["need_reply"] is True
+    assert result["classification"]["priority"] == "P1"
+    assert result["classification"]["summary"] == "会议纪要通报。"
+    assert result["next_step"] == "rag_search"
+
+
+@pytest.mark.asyncio
+async def test_categorizer_prompt_includes_recipient_context_and_my_role(
+    graph_node_harness,
+    monkeypatch,
+):
+    """LLM 分类提示词必须包含发件人/收件人/抄送和系统判定的“我的角色”。"""
+    from src.config import get_settings
+
+    monkeypatch.setenv("EXCHANGE_ACCOUNT_EMAIL", "q-fu@tianjin-air.com")
+    get_settings.cache_clear()
+
+    mock_engine = MagicMock()
+    mock_engine.execute_router = AsyncMock(side_effect=lambda local_state: local_state)
+
+    state = graph_node_harness.state(
+        {
+            "id": "recipient-context-mail",
+            "subject": "【呈兰总阅示】需求风险评估及排期请示",
+            "body": "兰总：请批示。",
+            "sender": "Mailbox(name='宗晓婷(Vicky)', email_address='xt_zong@tianjin-air.com')",
+            "to": ["Mailbox(name='兰娟(juliet)', email_address='lanjuan@tianjin-air.com')"],
+            "cc": ["Mailbox(name='傅强3', email_address='q-fu@tianjin-air.com')"],
+        }
+    )
+
+    captured = {}
+
+    def capture_budget(_role, value, *, budget):
+        captured["prompt"] = value
+
+    llm_classification = {
+        "priority": "P3",
+        "need_reply": False,
+        "intent": "通知",
+        "summary": "呈领导阅示，抄送我知悉。",
+        "reasoning": "我仅在 CC 中。",
+        "confidence": 0.9,
+    }
+    try:
+        with patch(
+            "src.nodes.categorizer.get_routing_engine",
+            return_value=mock_engine,
+        ), patch(
+            "src.nodes.categorizer.enforce_model_input_budget",
+            side_effect=capture_budget,
+        ), patch(
+            "src.providers.factory.get_llm_for_role",
+            return_value=RunnableLambda(lambda value: value),
+        ), patch(
+            "src.nodes.categorizer.with_llm_retry",
+            side_effect=_fixed_classification(llm_classification),
+        ):
+            from src.nodes.categorizer import categorize_email
+
+            await categorize_email(state, graph_node_harness.dependencies)
+    finally:
+        get_settings.cache_clear()
+
+    prompt = captured["prompt"]
+    assert "发件人: 宗晓婷(Vicky) <xt_zong@tianjin-air.com>" in prompt
+    assert "收件人(To): 兰娟(juliet) <lanjuan@tianjin-air.com>" in prompt
+    assert "抄送(CC): 傅强3 <q-fu@tianjin-air.com>" in prompt
+    # 系统判定的角色行必须位于不可信邮件内容之外。
+    trusted_zone = prompt.split("</email_content>", 1)[1]
+    assert "仅被抄送" in trusted_zone
+    assert "q-fu@tianjin-air.com" in trusted_zone
