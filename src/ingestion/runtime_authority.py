@@ -1472,6 +1472,189 @@ class RuntimeInstanceRepository:
         return current
 
 
+class RuntimeUnavailableError(RuntimeError):
+    """Safe fixed-token failure for an unavailable greenfield runtime."""
+
+
+_CAPABILITY_SQL = (
+    "SELECT stage, schema_revision, schema_digest::text AS schema_digest, "
+    "protocol_version, minimum_build_id, config_hash::text AS config_hash, "
+    "adapter_hash::text AS adapter_hash, "
+    "policy_manifest_hash::text AS policy_manifest_hash, "
+    "evidence_manifest_hash::text AS evidence_manifest_hash, "
+    "predecessor_hash::text AS predecessor_hash "
+    "FROM public.pipeline_runtime_capabilities "
+    "WHERE capability_hash = %s AND policy_manifest_hash = %s"
+)
+_SCOPES_SQL = (
+    "SELECT canonical_key, webhook_ids, sync_folder, event_policy_matrix, "
+    "scope_hash::text AS scope_hash, "
+    "policy_manifest_hash::text AS policy_manifest_hash "
+    "FROM public.pipeline_folder_scopes "
+    "WHERE account_id = %s AND initialization_id = %s "
+    "ORDER BY canonical_key"
+)
+
+
+def _row_mapping(
+    row: object,
+    columns: tuple[str, ...],
+    *,
+    error: str,
+) -> dict[str, object]:
+    if isinstance(row, Mapping):
+        if set(row) != set(columns):
+            raise RuntimeUnavailableError(error)
+        return {column: row[column] for column in columns}
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
+        if len(row) != len(columns):
+            raise RuntimeUnavailableError(error)
+        return dict(zip(columns, row, strict=True))
+    raise RuntimeUnavailableError(error)
+
+
+def _policy_matrix_from_database(
+    value: object,
+) -> dict[tuple[IngressSource, str, ChangeKind], ProcessingPolicy]:
+    if not isinstance(value, Mapping):
+        raise RuntimeUnavailableError("manifest_unavailable")
+    matrix: dict[tuple[IngressSource, str, ChangeKind], ProcessingPolicy] = {}
+    try:
+        for key, raw_policy in value.items():
+            if type(key) is not str:
+                raise ValueError
+            source_text, raw_event_type, kind_text = key.split(":", 2)
+            matrix[
+                (IngressSource(source_text), raw_event_type, ChangeKind(kind_text))
+            ] = ProcessingPolicy(raw_policy)
+    except (TypeError, ValueError):
+        raise RuntimeUnavailableError("manifest_unavailable") from None
+    return matrix
+
+
+class RuntimeManifestRepository:
+    """Load and revalidate the immutable capability and policy DB facts."""
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    async def load(
+        self,
+        authority: RuntimeAuthority,
+    ) -> tuple[RuntimeContract, PolicySnapshot]:
+        exact_authority = require_phase2_ingress_authority(authority)
+        capability_columns = (
+            "stage",
+            "schema_revision",
+            "schema_digest",
+            "protocol_version",
+            "minimum_build_id",
+            "config_hash",
+            "adapter_hash",
+            "policy_manifest_hash",
+            "evidence_manifest_hash",
+            "predecessor_hash",
+        )
+        scope_columns = (
+            "canonical_key",
+            "webhook_ids",
+            "sync_folder",
+            "event_policy_matrix",
+            "scope_hash",
+            "policy_manifest_hash",
+        )
+        try:
+            async with self._pool.connection() as connection:
+                capability_cursor = await connection.execute(
+                    _CAPABILITY_SQL,
+                    (
+                        exact_authority.capability_hash,
+                        exact_authority.policy_manifest_hash,
+                    ),
+                )
+                capability_row = await capability_cursor.fetchone()
+                if capability_row is None:
+                    raise RuntimeUnavailableError("manifest_unavailable")
+                material = _row_mapping(
+                    capability_row,
+                    capability_columns,
+                    error="manifest_unavailable",
+                )
+                scopes_cursor = await connection.execute(
+                    _SCOPES_SQL,
+                    (
+                        exact_authority.account_id,
+                        exact_authority.initialization_id,
+                    ),
+                )
+                scope_rows = await scopes_cursor.fetchall()
+
+            capability = RuntimeCapabilityManifest(
+                stage=material["stage"],
+                schema_revision=material["schema_revision"],
+                schema_digest=material["schema_digest"],
+                protocol_version=material["protocol_version"],
+                minimum_build_id=material["minimum_build_id"],
+                config_hash=material["config_hash"],
+                adapter_hash=material["adapter_hash"],
+                policy_manifest_hash=material["policy_manifest_hash"],
+                evidence_manifest_hash=material["evidence_manifest_hash"],
+                predecessor_hash=material["predecessor_hash"],
+            )
+            if (
+                capability.stage is not RuntimeCapabilityStage.PHASE2_INGESTION
+                or capability.capability_hash != exact_authority.capability_hash
+            ):
+                raise RuntimeUnavailableError("manifest_unavailable")
+
+            scopes: list[FolderScope] = []
+            for row in scope_rows:
+                scope = _row_mapping(row, scope_columns, error="manifest_unavailable")
+                if (
+                    scope["policy_manifest_hash"]
+                    != exact_authority.policy_manifest_hash
+                ):
+                    raise RuntimeUnavailableError("manifest_unavailable")
+                configured = FolderScope.configured(
+                    canonical_key=scope["canonical_key"],
+                    webhook_ids=scope["webhook_ids"],
+                    sync_folder=scope["sync_folder"],
+                    event_policy_matrix=_policy_matrix_from_database(
+                        scope["event_policy_matrix"]
+                    ),
+                )
+                if configured.config_hash != scope["scope_hash"]:
+                    raise RuntimeUnavailableError("manifest_unavailable")
+                scopes.append(configured)
+            snapshot = PolicySnapshot(scopes=tuple(scopes))
+            manifest = canonical_policy_manifest(snapshot)
+            if (
+                manifest.hash != exact_authority.policy_manifest_hash
+                or capability.policy_manifest_hash != manifest.hash
+            ):
+                raise RuntimeUnavailableError("manifest_unavailable")
+            contract = RuntimeContract(
+                schema_revision=capability.schema_revision,
+                schema_digest=capability.schema_digest,
+                protocol_version=capability.protocol_version,
+                build_id=capability.minimum_build_id,
+                config_hash=capability.config_hash,
+                capability_manifest=capability,
+            )
+            if (
+                contract.schema_revision != exact_authority.schema_revision
+                or contract.protocol_version != exact_authority.protocol_version
+                or contract.build_id != exact_authority.build_id
+                or contract.config_hash != exact_authority.config_hash
+            ):
+                raise RuntimeUnavailableError("manifest_unavailable")
+            return contract, snapshot
+        except RuntimeUnavailableError:
+            raise
+        except (KeyError, TypeError, ValueError, psycopg.Error):
+            raise RuntimeUnavailableError("manifest_unavailable") from None
+
+
 __all__ = [
     "AuthorityTransitionReceipt",
     "GREENFIELD_PIPELINE_NAME",
