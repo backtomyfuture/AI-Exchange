@@ -21,12 +21,6 @@ async def require_runtime_database_boundary(
     await require_database(
         settings.database_url,
         durable_inbox_enabled=bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)),
-        ingestion_shadow_enabled=bool(
-            getattr(settings, "INGESTION_SHADOW_ENABLED", False)
-        ),
-        sync_reconciliation_enabled=bool(
-            getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)
-        ),
         role_separation_required=bool(
             getattr(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False)
         ),

@@ -114,7 +114,7 @@ class _Repository:
         self.scan = _Scan(
             database_fingerprint="f" * 64,
             database_timezone="UTC",
-            alembic_revision="20260710_0002",
+            alembic_revision="20260808_0001",
             checkpoint_revision=9,
             candidates=candidates,
             excluded_buckets=empty_exclusion_buckets(),

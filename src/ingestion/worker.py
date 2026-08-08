@@ -48,7 +48,6 @@ _WORKER_CANCELLATION_SECONDS = 1.0
 _LOCAL_COMPLETION_POLICIES = frozenset(
     {
         ProcessingPolicy.METADATA_ONLY,
-        ProcessingPolicy.HISTORICAL_SUPPRESSED,
         ProcessingPolicy.IGNORED,
     }
 )

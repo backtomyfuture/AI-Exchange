@@ -50,7 +50,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 - `src/ingestion/legacy_adapter.py`：持久化 Worker 到邮件处理实现的 Adapter。
 
 `src/ingestion/__init__.py` 不再做重型再导出。调用者必须从拥有类型或行为的 module
-直接导入，避免导入 models 时加载 cold-start、sync 和 repository 实现。
+直接导入，避免导入 models 时加载运行时或 repository 实现。
 
 轮询完成一页 `sync_state` 的提交只表示变化已进入 Inbox，不表示 Qdrant、草稿、飞书
 卡片或发送已经成功。排障必须逐阶段验证。
@@ -105,8 +105,8 @@ RAG 使用的同一 Qdrant `emails` 集合。PST 原始邮件只有进入 Qdrant
 - Preference Memory：用户修改、拒绝、长度、语气和收件人偏好；
 - Style Profile：从用户真实发件中提炼的版本化写作风格。
 
-读取逻辑存在并不代表学习闭环已经运行。新增学习逻辑时必须有明确触发器、持久化
-位置、数据版本、回滚方式和离线评估。
+读取逻辑存在并不代表学习闭环已经运行。默认 `MEMORY_LEARNING_ENABLED=false`；新增学习
+逻辑必须有明确触发器、持久化位置、数据版本、回滚方式和离线评估。
 
 ### 3.5 LangGraph 与 Checkpointer
 
@@ -147,8 +147,8 @@ Provider interface，不得重新增加 `src.utils.llm_factory` 兼容壳。OAut
 
 ```bash
 cp .env.example .env
-.venv/bin/python scripts/configure_deployment.py
-.venv/bin/python scripts/deploy_system.py check
+.venv/bin/python scripts/configure_deployment.py --project-name ai-exchange-greenfield
+.venv/bin/python scripts/deploy_system.py check --project-name ai-exchange-greenfield
 ```
 
 数据库角色、DSN、令牌、ContentStore key、运行限额和部署状态生成到忽略版本控制的
@@ -184,7 +184,7 @@ secret，并遵循 `deploy/README.md` 的角色和所有权检查。
 - 删除 module 前验证生产可达性、动态导入、运维入口、数据迁移职责和测试职责；
 - 测试通过 module 的 interface 验证行为，不为已删除的兼容壳保留专属测试；
 - Qdrant、邮件处理和审批变更必须使用现实 payload shape 做 E2E 验证；
-- Phase 2 PostgreSQL Gate 全绿才允许合并 PR；gate 红时先修绿再合并，不得把已知
+- PostgreSQL Gate 全绿才允许合并 PR；gate 红时先修绿再合并，不得把已知
   失败当作"与本次改动无关"跳过；
 - `ruff` 和全量测试通过不等于运行态正确，部署后还要验证 Compose、`/health`、
   `/ready`、日志和逐阶段处理结果。

@@ -1,303 +1,140 @@
-# AI Email Assistant (Enterprise Edition)
+# AI Exchange
 
-这是一个为企业环境设计的 AI 邮件处理系统。它通过可配置 Provider 调用模型，使用 Qdrant 提供历史检索，并由 LangGraph 编排可持久化的 Agent 工作流。系统通过飞书 (Lark) 与用户进行审批互动。
+AI Exchange 是一个单账户、单进程的邮件助手：它通过 Exchange `sync_state` 轮询发现变化，先写入 PostgreSQL Durable Inbox，再由 LangGraph 处理、生成草稿并通过飞书审批卡片完成外部动作。Qdrant 只保存经过内容投影的检索数据。
 
-## 核心功能
+## 当前支持边界
 
-1.  **可靠收件**: 仅通过 Exchange `sync_state` 轮询发现邮件变化，先写入 PostgreSQL Durable Inbox，再异步处理。
-2.  **智能分类**: 使用 LLM 识别邮件意图，判断是否需要回复及其紧急程度。
-3.  **历史检索**: 将经过内容投影的邮件文本写入 Qdrant；图片只按需分析，Base64、data URI 和附件字节不会进入向量库。
-4.  **人机协作 (Human-in-the-Loop)**:
-    -   系统生成回复草稿并通过飞书交互式卡片推送给用户。
-    -   用户可以点击“通过”、“拒绝”或“修改”建议。
-5.  **自动回复 & 归档**: 审批通过后，系统自动发送邮件并将回复内容索引回 Qdrant。
+- 唯一入站方式是轮询；没有 HTTP Webhook 路由、Webhook 密钥或订阅。
+- 数据库只支持**全新初始化**。不要把旧版本数据库、旧 Compose volume 或旧 Alembic 历史接入当前版本。
+- 首次轮询建立 `sync_state` 基线并忽略已有历史；之后才处理增量变化。
+- 标准部署固定为一个应用进程、一个 Exchange 账户和一个飞书账户；不要扩容应用服务。
+- Tier1 v1 规则资产已保留，但尚未接入运行时，不能把它当作已启用功能。
+- 偏好/风格记忆学习默认关闭。标准 Compose 显式设置 `MEMORY_LEARNING_ENABLED=false`；只有经过单独评审的显式配置才可开启。
 
-## 系统架构
+## 本地开发
 
--   **编排层**: `LangGraph` (基于 Postgres 的状态持久化)。
--   **向量数据库**: `Qdrant` (存储邮件嵌入向量，支持语义搜索)。
--   **推理引擎**: 通过 `src/providers/` 为不同角色选择模型和 Adapter。
--   **集成端口**:
-    -   `Exchange API`: 自定义适配器，处理邮件收发和状态更新。
-    -   `Lark (飞书)`: 采用 WebSocket (长连接) 监听回调，HTTP API 发送交互卡片。
+需要 Docker Desktop 或 OrbStack、Git 与 `uv`。macOS 可执行：
 
-## 单进程服务
-
-当前精简上线形态只有一个 **`ai-assistant-service`**：同一进程内的 `sync_state`
-轮询入口和单消费者 Durable Inbox Worker 复用现有 LangGraph、ContentStore 和飞书
-WebSocket 完成处理与审批。轮询仅把变化通知可靠写入 Inbox；Worker 仍按既有流程获取
-邮件详情、按需处理图片、调用模型并发送飞书卡片。该形态面向单 Exchange 账户、单飞书
-账户和全新初始化；不包含 Shadow、Webhook、历史回填、多账户或多实例滚动切换。
-
-## 快速开始
-
-### 1. 环境准备
-
-安装依赖（MacOS 环境）:
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-uv sync --frozen
+brew install uv
+uv python install 3.12
+uv venv --python 3.12 .venv
+uv sync --frozen --group dev
+.venv/bin/ruff check src/ tests/
+.venv/bin/python -m pytest -q
 ```
 
-### 2. 配置环境变量
+Docker 镜像固定使用 Python 3.12。不要把本机已有的其他 Python 版本当作部署基线。
 
-复制模板并只填写其中列出的 16 项：
+## 从空环境首次部署
+
+以下流程会创建一个新的 Compose project 和新的命名卷。它不会升级、接管或删除任何旧部署。
+
+1. 从模板建立用户配置，只填写 16 个集成/模型字段：
 
 ```bash
 cp .env.example .env
-# 编辑 .env 后生成内部配置
-.venv/bin/python scripts/configure_deployment.py
-.venv/bin/python scripts/deploy_system.py check
+# 编辑 .env；不要把生成的 secrets/ 提交到仓库
+.venv/bin/python scripts/configure_deployment.py \
+  --project-name ai-exchange-greenfield
 ```
 
-`.env` 只包含服务地址、Exchange、飞书、LLM 和 Embedding 接入参数。数据库四角色、
-Metrics Token、ContentStore Key、迁移/维护 DSN、运行限额和部署状态均由配置工具生成到
-忽略版本控制的 `secrets/`，权限固定为 `0600`。已有旧版 `.env` 执行同一命令会原地
-迁移，并把正在使用的私网 TLS、归档目录和飞书云盘设置保存到自动管理的内部配置；
-不会输出任何密钥值。
-
-生产 preflight 仍会检查：
-
-- Exchange HTTPS URL、API key 和账户 ID；
-- 飞书 `LARK_APP_ID`、至少 16 字节的 `LARK_APP_SECRET`/`LARK_ENCRYPT_KEY`、
-  `LARK_CHAT_ID`，以及至少一个真实且非 `*` 的 `LARK_ALLOWED_OPEN_IDS`；
-- 真实模型及 Embedding 凭据、地址和模型名；
-- 非占位、无用户信息的真实 HTTPS `EXTERNAL_URL`。本机冒烟可以用 HTTP curl 访问
-  `127.0.0.1`；它不再承担 Exchange 入站回调职责。
-
-生产 Compose 会显式注入 `EXCHANGE_SSL_VERIFY=true`，Exchange 地址必须通过证书校验。
-若服务实际通过私网 IP 访问、证书却只覆盖 DNS 名称，部署工具会复用已迁移的内部
-DNS/IP/CA 覆盖；不要通过关闭 TLS 校验解决证书问题。新环境的特殊私网 TLS 初始化见
-[`deploy/README.md`](deploy/README.md)。
-
-Exchange 入站 Webhook 已退役：应用不公开 `/webhooks/exchange`，不需要
-`EXCHANGE_WEBHOOK_SECRET`，也不应创建或启用 Exchange Webhook 订阅。
-`docker-compose.webhook-tls.yml` 仅作为旧部署回滚资料保留，轮询部署不会加载它。
-
-`sync_state` 仍会访问 Gateway，因此保留 `docker-compose.exchange-tls.yml` 作为**出站**
-证书、SNI 和私网 DNS/IP 映射。私网 TLS 场景可在镜像构建后，使用同一个
-Compose project、TLS overlay 和应用镜像执行一个不传 `--build` 的 `--no-deps` one-shot；它从
-容器环境读取 API key，不把密钥放入命令行，并利用 overlay 的 SNI/DNS/CA 配置：
+HTTPS Exchange 的生产部署运行：
 
 ```bash
-umask 077
-docker compose -p "$PROJECT_NAME" \
-  -f docker-compose.yml -f docker-compose.exchange-tls.yml \
-  run --rm --no-deps --entrypoint python ai-assistant-service -c '
-import asyncio
-from src.config import get_settings
-from src.utils.exchange_api import ExchangeClient
-async def main():
-    settings = get_settings()
-    if settings.EXCHANGE_SSL_VERIFY is not True:
-        raise SystemExit("exchange_tls_verification_required")
-    client = ExchangeClient(settings)
-    try:
-        folders = await client.get_all_folders(force_refresh=True)
-        expected = {name.strip().casefold()
-                    for name in settings.EXCHANGE_FOLDERS_FULL.split(",")
-                    if name.strip()}
-        matches = [folder_id for folder_id, name in folders.items()
-                   if name.strip().casefold() in expected]
-        if len(matches) != 1:
-            raise SystemExit("inbox_folder_not_unique")
-        print(matches[0])
-    finally:
-        await client.close()
-asyncio.run(main())
-' > "/tmp/ai-exchange-inbox-$PROJECT_NAME"
-test -s "/tmp/ai-exchange-inbox-$PROJECT_NAME"
+.venv/bin/python scripts/deploy_system.py check \
+  --project-name ai-exchange-greenfield
 ```
 
-输出文件只用于随后生成本次 manifest，不能提交。若 Exchange 域名本身正常解析且证书链
-完整，则去掉 TLS overlay 参数。生成 manifest 时仍需传入这个 opaque ID，以满足冻结的
-策略 schema；它只是兼容性元数据，不会创建 Webhook 路由或订阅。实际轮询 scope 固定为
-`INBOX`，首次新库启动会丢弃 Gateway 返回的完整历史同步结果并建立游标，之后才把增量
-写入 Durable Inbox。
-
-### 3. 运行系统
-
-已有系统的完整重建和重启只需要：
+本机或受控开发环境中的 HTTP/私网 Exchange 则改为运行：
 
 ```bash
-.venv/bin/python scripts/deploy_system.py redeploy
+.venv/bin/python scripts/deploy_system.py check \
+  --development --project-name ai-exchange-greenfield
 ```
 
-命令会校验 16 项用户配置与所有内部 secret，构建一个新的统一应用镜像，在不删除
-PostgreSQL、Qdrant 和 ContentStore 数据卷的前提下重建应用，并等待
-`/ready` 同时返回 `status=ready` 与 `processing=active`。
+配置工具会将数据库角色、DSN、指标 token、内容加密密钥和 Compose project 名生成到受忽略的 `secrets/`；不会输出密钥。若配置了私网 Exchange TLS，请按 [`deploy/README.md`](deploy/README.md) 加上 TLS overlay。
 
-以下内容仅适用于全新数据库的首次生产初始化；数据库 provisioning、migration 与
-Durable Inbox policy 仍是独立的安全门禁，详见 [`deploy/README.md`](deploy/README.md)。
-
-只从已经提交且干净的当前 HEAD 部署。先严格执行
-[`deploy/README.md`](deploy/README.md) 第 1 节：完整测试、显式构建当前镜像并记录
-image ID，不能复用旧镜像。为本次部署选择一个从未使用过的 Compose project name；
-以下每条 Compose 命令必须使用同一个 project，避免意外复用默认项目的 PostgreSQL、
-Qdrant 或 ContentStore volume。随后执行：
+2. 只在已提交且工作树干净的 revision 上发布。构建镜像并初始化全新 PostgreSQL：
 
 ```bash
-PROJECT_NAME="ai-exchange-phase4-20260717-1"
+PROJECT_NAME=ai-exchange-greenfield
+COMPOSE=(docker compose --env-file .env --project-name "$PROJECT_NAME")
+if [[ -f secrets/deployment.env ]]; then
+  COMPOSE=(docker compose --env-file secrets/deployment.env --env-file .env --project-name "$PROJECT_NAME")
+fi
 
-# 两条都必须为空；非空就换一个全新 project name，不删除或接管现有资源。
-test -z "$(docker ps -aq --filter label=com.docker.compose.project="$PROJECT_NAME")"
-test -z "$(docker volume ls -q --filter label=com.docker.compose.project="$PROJECT_NAME")"
-
-# 只支持本 Compose 创建的全新、专用 PostgreSQL volume；禁止共享/外部集群。
-# 集群除 POSTGRES_DB、postgres、template0、template1 外存在任何数据库都会拒绝。
-docker compose -p "$PROJECT_NAME" up -d postgres qdrant
-
-docker compose -p "$PROJECT_NAME" --profile database-provision run --rm database-provision
-docker compose -p "$PROJECT_NAME" --profile migration run --rm database-bootstrap
+"${COMPOSE[@]}" config --quiet
+"${COMPOSE[@]}" build ai-assistant-service
+"${COMPOSE[@]}" up -d postgres qdrant
+"${COMPOSE[@]}" --profile database-provision run --rm database-provision
+"${COMPOSE[@]}" --profile migration run --rm database-bootstrap
 ```
 
-从 Exchange 读取本账户真实 Inbox opaque folder ID（仅作冻结策略 schema 的兼容性
-元数据）后，按
-[`deploy/README.md`](deploy/README.md) 第 2–3 节生成
-`deploy/generated-<BUILD_ID>/POLICY.json` 与 `CONTRACT.json`，先 dry-run，再把该
-精确子目录只读挂载给 `ingestion-maintenance initialize`。不要挂载整个 `deploy/`，
-不要手写 hash，也不要引用仓库中不存在的根级 `deploy/POLICY.json`。
+`database-provision` 和 `database-bootstrap` 只接受空应用数据库；失败时不要用旧库重试。换一个新的 project/volume，修复原因后从头执行。
 
-初始化成功并配置真实 Exchange、飞书和模型凭据后，运行时会固定启用 Durable Inbox 和
-`sync_state` 轮询，并保持 Shadow 与 Sync reconciliation 关闭；不得对应用服务执行
-`--scale`。启动和就绪验证由
-`scripts/deploy_system.py redeploy` 完成。
-
-常规 `docker compose -p "$PROJECT_NAME" up -d` 不会启动带 profile 的 bootstrap 或维护容器，也不会
-挂载它们的私有文件。`database-provision` 是唯一接收 admin DSN 和四个角色密码
-文件的容器，并且只接受空数据库；成功后可安全重试，但不能用于历史库改造。
-`database-bootstrap` 只接收 migration DSN，以及四个角色名
-用于迁移和授权；它不接收 maintenance DSN/receipt key。`ai-assistant-service` 只接收
-runtime 凭据和其余三个非秘密角色名，用于启动门禁；它不接收任何 migration 或
-maintenance secret。
-
-数据库门禁会在任何 DDL、应用上下文或外部 worker 启动前验证
-migration/runtime/maintenance/auditor 均为独立 `LOGIN NOINHERIT` 非特权角色，四者没有
-任何授予型 membership，目标 database/schema/对象均由 migration role 持有，且
-除 migration owner 外无人拥有目标 schema 的 `CREATE`。runtime 还必须没有
-database `CREATE/TEMP` 和 schema `CREATE`；maintenance 仅保留 checkpoint 清理
-所需的精确只读/删除权限，不能访问 durable-ingestion 业务表。当前 database、目标
-schema 与目标对象的显式 ACL 必须符合四角色精确清单；auditor 只允许目标 database
-的非 grantable `CONNECT`、目标 schema 的非 grantable `USAGE`，以及
-`alembic_version(version_num)`、`checkpoint_migrations(v)`、
-`emails_log(id,status,updated_at)` 与三张 checkpoint 关系中计划扫描所需列的
-非 grantable 直接列级 `SELECT`；未列出的现有列和未来新增列默认不可读，
-auditor 不得拥有任何 membership。
-`PUBLIC` 或其他角色不能读取目标数据，也不能借助其他用户 schema、large object、FDW/server、系统目录
-新增 ACL 或 `SECURITY DEFINER` 间接提权。四个受管角色和当前 database 不允许
-任何 `ALTER ROLE/DATABASE SET` 覆盖，
-会话必须保持触发器、row security 与 large-object 权限语义的安全默认值。
-
-migration role 的默认权限必须显式撤销 `PUBLIC` 对新函数的 `EXECUTE` 和对新类型的
-`USAGE`；当前 database 还必须撤销 `PUBLIC` 对 `lo_creat`、`lo_create` 与
-`lo_from_bytea` 的 `EXECUTE`，使 runtime 不能在两次门禁之间创建 large object。
-同一 PostgreSQL cluster 内所有其他可连接 database 也必须撤销 `PUBLIC` 的
-`CONNECT/TEMPORARY`，确保 migration/runtime/maintenance/auditor 四个受管角色对其他
-`datallowconn` database 均无有效 `CONNECT`，再只向四个受管角色显式授权。新 Compose
-volume 会通过 init SQL 处理 `postgres/template1`。provisioner 会拒绝额外 database、
-业务对象和不完整的受管角色集合，但无法证明宿主 volume 从未被使用；全新 project/volume
-仍由上述部署前检查保证。一次成功 provision 后可以在同一专用新集群中安全重试。
-bootstrap 在 DDL 前后都会验证已知业务/Checkpointer 列确实绑定
-`pg_catalog` 类型，并校验锁定的 `langgraph-checkpoint-postgres==3.0.4` migration
-manifest；依赖内容漂移会在第一条 DDL 前失败。所有校验失败只会返回通用错误，
-不会回退 admin 凭据或自动修改权限。
-
-0003 之后只允许版本化访问清单中逐项声明的 foreign key、constraint/user trigger
-及其函数；任何额外 trigger、rewrite rule、`SECURITY DEFINER` routine、启用的
-event trigger 或继承/分区关系都会使门禁失败。runtime 可访问的 ordinary view
-必须设置 `security_invoker=true`，避免隐式执行路径获得 migration-owner 权限；本次
-greenfield 部署不创建或保留任何历史迁移桥。
-
-### 4. 手工 checkpoint maintenance
-
-维护 profile 不属于应用启动流程。先确认 live 服务仍未被授权迁移或切换；只有在
-独立 DBA checkpoint 已核对备份、四角色 ACL、只读 auditor、当前 Alembic/Checkpointer revision
-和 disposable PostgreSQL 证据后，才可在获批的目标库上执行以下命令。
-
-先由 DBA 建立独立 auditor `LOGIN NOINHERIT`：不得拥有任何角色成员关系，只能直接
-获得目标 database 的 `CONNECT`、目标 schema 的 `USAGE` 与上述精确列级 `SELECT`，
-不得拥有对象、grant option 或任何写权限。plan 使用 auditor DSN，execute
-使用 maintenance DSN；两者不能复用。准备三个权限精确为 0400 或 0600 的受控文件：
-auditor DSN、maintenance DSN，以及单行 base64 编码的 Ed25519 原始公钥（解码后必须
-恰好 32 bytes）。只读计划容器只挂载 auditor DSN；执行容器只持验证公钥，外部备份
-系统独占私钥 seed，因此维护容器不能签发或伪造 v2 receipt。计划制品保存在独立
-named volume 中，供后续精确确认使用：
+3. 为这次构建生成发布证据和轮询初始化 manifest。发布证据的完整格式、镜像 digest 获取方法和 TLS 变体见 [`deploy/README.md`](deploy/README.md)。生成器只接受当前干净 Git HEAD、真实账户 ID 与 `INBOX` scope：
 
 ```bash
-docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance run --rm checkpoint-maintenance \
-  plan --older-than-hours 24 --limit 100
+BUILD_ID=greenfield-$(git rev-parse --short HEAD)
+OUTPUT_DIR="deploy/generated-$BUILD_ID"
+ACCOUNT_ID=123456 # 替换为 .env 中的数字 Exchange 账户 ID
+
+.venv/bin/python scripts/prepare_ingestion_manifests.py \
+  --account-id "$ACCOUNT_ID" \
+  --sync-folder INBOX \
+  --build-id "$BUILD_ID" \
+  --release-evidence-file /absolute/path/release-evidence.json \
+  --output-dir "$OUTPUT_DIR"
+
+"${COMPOSE[@]}" --profile ingestion-maintenance run --rm \
+  --volume "$PWD/$OUTPUT_DIR:/run/manifest:ro" \
+  ingestion-maintenance initialize \
+  --account-id "$ACCOUNT_ID" \
+  --policy-file /run/manifest/POLICY.json \
+  --contract-file /run/manifest/CONTRACT.json \
+  --actor <operator-id> \
+  --reason initial-greenfield-deployment \
+  --idempotency-key "$BUILD_ID"
 ```
 
-删除不会自动发生。`--operator-attests-service-quiesced` 是操作员对“应用已经停写”的
-显式声明，不是系统独立验证出的停写证明；执行前仍必须从编排平台或 DBA 侧核实所有
-runtime 实例已经停止。`execute` 还必须同时满足：备份 receipt 已由外部流程签名、
-`plan-id` 双重确认一致、批次上限已审批。receipt 文件必须是 0600 普通文件。执行
-容器固定以 UID 0 运行，所以 bind mount 后该文件在容器内也必须由 UID 0 拥有；如
-宿主文件不是 root:root，先复制到受控的 root-owned 目录并设为 0600。不要把
-receipt、私钥、DSN 或邮件内容输出到终端/日志。
+可先在最后一条命令追加 `--dry-run` 检查 manifest；dry-run 不写数据库。生成目录包含发布证据派生信息，保持在忽略目录中，不要提交或复用到另一账户。
 
-每个 runtime 实例使用双层数据库栅栏。第一层是独立 dedicated connection 持有同一
-maintenance advisory key 的 session-level 共享锁，并由每次 checkpoint mutation 在执行
-SQL 前精确核对该连接仍拥有锁；第二层由 LangGraph connection pool 的 configure callback
-让每个 pool backend 在完整连接生命周期内持有同一共享锁。fenced saver 会先取得已配置的
-pool connection，再核对 dedicated fence，最后才把 cursor 交给 `aput`、`aput_writes` 或
-`adelete_thread`。因此 dedicated backend 若在核对后、写入前丢失，当前 pool connection
-仍阻止 maintenance 独占锁；若 dedicated 与全部旧 pool backend 都丢失、maintenance 已完成，
-恢复后的 pool backend 会重新取得共享锁，但 saver 会因 dedicated 核对失败而在任何
-checkpoint SQL 前硬退出，不能在清理后重新写回。
+4. 启动并验证：
 
-共享锁连接或锁所有权失效会先关闭 Lark 异步 intake，再立即硬退出进程；正常停机则依次
-停止调度与 Exchange Worker、收集在途 Lark 动作、关闭数据库连接池，最后才释放 dedicated
-共享锁。维护进程取得独占锁后的固定 20 秒等待仍保留为 defense-in-depth，用于扩大故障检测
-与运维响应裕量，但它不是互斥安全性的证明；正确性来自上述双层 session lock 和写前核对。
-稳定期结束后会重新核对数据库身份、schema/checkpointer revision 与 plan 有效期，之后才
-开放删除 session。该等待不能由环境变量缩短。`scripts/reprocess_email.py` 的三种恢复用法
-也会先通过 runtime security 与四角色/schema/revision preflight，再启动 dedicated fence、
-绑定 write guard 并使用同一 fenced saver；退出时先关闭 context/pool，之后才释放 dedicated
-fence。context 关闭有固定 10 秒墙钟上限；超时或异常会直接硬退出且绝不释放 fence，避免
-吞取消的连接 close 让脚本无限挂起或错误开放维护窗口。其他未绑定 write guard 的
-`AppContext.setup_async()` 会在任何 I/O 前失败关闭。该栅栏仍不能识别旧版本、绕过协议的
-外部客户端或非 checkpoint 写入，因此人工停写核验始终是必需条件。
+HTTPS Exchange 的生产部署运行：
 
 ```bash
-docker compose -p "$PROJECT_NAME" --profile checkpoint-maintenance-execute run --rm \
-  --volume /absolute/path/backup-receipt.json:/run/backup-receipt.json:ro \
-  checkpoint-maintenance-execute execute \
-  --plan-id <PLAN_ID> --confirm-plan-id <PLAN_ID> \
-  --backup-id <BACKUP_ID> \
-  --backup-receipt /run/backup-receipt.json \
-  --operator-attests-service-quiesced --limit 100
+.venv/bin/python scripts/deploy_system.py redeploy \
+  --project-name "$PROJECT_NAME"
 ```
 
-这些命令仅描述手工 checkpoint 维护入口。精简上线只允许显式打开
-`DURABLE_INBOX_ENABLED=true` 与 `POLLING_ENABLED=true`；
-`INGESTION_SHADOW_ENABLED` 与 `SYNC_RECONCILIATION_ENABLED` 必须保持 `false`。
-这不是原六阶段方案中的完整 cutover/production-ready 声明，而是面向可清空测试数据、
-单账户、单进程的新系统启动。
+若当前 Exchange 地址是本机或非 HTTPS 地址，改为运行受控开发覆盖层：
 
-本地启动同一个应用：`python -m src.main`。`sync_state` 轮询是当前部署拓扑中的唯一
-邮件入口。
+```bash
+.venv/bin/python scripts/deploy_system.py redeploy \
+  --development --project-name "$PROJECT_NAME"
+```
 
-## 目录结构说明
+两种模式均用以下命令检查：
 
--   `src/graph`: 定义 LangGraph 状态机和工作流逻辑。
--   `src/nodes`: 工作流中的各个功能节点（分类、检索、草稿、发送）。
--   `src/ingestion`: Durable Inbox、租约、策略和唯一运行时。
--   `src/router` 与 `skills_registry`: Tiered Router 和生产 Skill。
--   `src/utils`: Exchange、飞书、数据库与检索实现。
--   `scripts`: 部署、维护、PST 导入和 Skill Discovery 入口。
+```bash
+curl --fail http://127.0.0.1:8000/ready
+```
 
-## 运维建议
+`/ready` 必须同时报告 `status=ready` 与 `processing=active`。随后使用受保护的 `/queue`、`/metrics` 和一次真实的非破坏性邮件流验证轮询、Durable Inbox、分类和飞书卡片。健康接口本身不代表外部副作用已经验证。
 
--   **监控日志**: 核心日志输出在控制台，可通过 Docker logs 查看。
--   **轮询健康**: 使用受 `METRICS_TOKEN` 保护的 `/queue` 和 `/metrics`；`ingress`、
-    `cursor`、`processing` 分别反映轮询调度器、首轮基线游标和 Durable Inbox Worker。
--   **不确定副作用**: 首次外部调用前会持久化副作用标记。进程在远端结果未知时会进入
-    `manual_review`，而不是自动重试或重复发送飞书卡片。先人工核对飞书和 Exchange
-    的实际结果；不要把该状态加入批量 `reprocess_email.py --all-stuck`。
--   **数据库管理**: Postgres 存储了所有的 LangGraph checkpoints，支持在服务重启后恢复处理中的任务。
--   **模型切换**: 在 Provider 配置中按角色选择模型，不让供应商细节进入业务 module。
+## 切换与清理旧部署
 
----
-**Last Updated**: 2026-07-22
+新 project 完成上述启动与业务验证前，不要停止旧实例。两套实例不能同时对同一账户处于活跃轮询状态；切换窗口需要由操作员决定重复与遗漏风险。
+
+确认新实例可用后，先停止旧实例，再仅针对已核对的旧 Compose project 执行 `docker compose --project-name <old-project> down --volumes`。这会删除该项目容器和命名卷；不要删除 `secrets/`，也不要对新 project 或任何共享 Docker 资源执行该命令。
+
+## 常用运维入口
+
+- `scripts/deploy_system.py check|redeploy`：验证配置、重建镜像并等待 `/ready`；本机/受控开发环境须显式加 `--development`，生产环境保持默认模式。
+- `scripts/manage_ingestion.py status|pause|resume-ingress|requeue`：受限的运行时控制；每个写操作都需要 actor、reason 与 idempotency key。
+- `scripts/checkpoint_cleanup.py`：独立的 checkpoint 维护流程，不属于应用启动流程。
+- `src/router/tier1/`：已保留的未来 Tier1 v1 规则资产；未接入时不应修改默认路由。
+
+详细的初始 manifest、私网 TLS 和 checkpoint 维护说明见 [`deploy/README.md`](deploy/README.md)。

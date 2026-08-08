@@ -74,7 +74,9 @@ def _private_file(path: Path) -> str:
 
 def _deployment_context(
     project_override: str | None,
-) -> tuple[list[str], dict[str, str], str, int, bool]:
+    *,
+    development: bool = False,
+) -> tuple[list[str], dict[str, str], str, int]:
     user_values, _ = read_env_file(PROJECT_ROOT / ".env")
     actual_keys = set(user_values)
     expected_keys = set(USER_ENV_KEYS)
@@ -108,10 +110,8 @@ def _deployment_context(
         if not ca_path.is_file():
             raise DeploymentError("exchange_ca_file_missing")
         compose_files.append(PROJECT_ROOT / "docker-compose.exchange-tls.yml")
-
-    # Webhook ingress is intentionally retired. Existing TLS material remains
-    # on disk for rollback/audit but must never alter the polling deployment.
-    webhook_tls_enabled = False
+    if development:
+        compose_files.append(PROJECT_ROOT / "docker-compose.dev.yml")
 
     project_name = project_override or _private_file(
         secrets_dir / "compose_project_name"
@@ -147,7 +147,7 @@ def _deployment_context(
         raise DeploymentError("app_port_invalid") from None
     if not 1 <= port <= 65535:
         raise DeploymentError("app_port_invalid")
-    return compose, environment, project_name, port, webhook_tls_enabled
+    return compose, environment, project_name, port
 
 
 def _wait_ready(port: int, timeout_seconds: int = 900) -> None:
@@ -172,25 +172,32 @@ def _wait_ready(port: int, timeout_seconds: int = 900) -> None:
 
 def check(
     project_name: str | None = None,
-) -> tuple[list[str], dict[str, str], str, int, bool]:
-    compose, environment, resolved_project, port, webhook_tls_enabled = (
-        _deployment_context(project_name)
+    *,
+    development: bool = False,
+) -> tuple[list[str], dict[str, str], str, int]:
+    compose, environment, resolved_project, port = _deployment_context(
+        project_name,
+        development=development,
     )
     _run([*compose, "config", "--quiet"], environment=environment)
     print(
         f"Deployment configuration valid: project={resolved_project} "
-        f"user_keys={len(USER_ENV_KEYS)} webhook_ingress=disabled"
+        f"user_keys={len(USER_ENV_KEYS)} ingress=polling-only "
+        f"mode={'development' if development else 'production'}"
     )
-    return compose, environment, resolved_project, port, webhook_tls_enabled
+    return compose, environment, resolved_project, port
 
 
-def redeploy(project_name: str | None = None) -> None:
-    compose, environment, resolved_project, port, webhook_tls_enabled = check(
-        project_name
+def redeploy(
+    project_name: str | None = None,
+    *,
+    development: bool = False,
+) -> None:
+    compose, environment, resolved_project, port = check(
+        project_name,
+        development=development,
     )
     application_services = ["ai-assistant-service"]
-    if webhook_tls_enabled:
-        application_services.append("webhook-tls-ingress")
     print("Building the canonical application image...")
     _run(
         [*compose, "build", "--pull", "ai-assistant-service"],
@@ -226,12 +233,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("check", "redeploy"))
     parser.add_argument("--project-name")
+    parser.add_argument(
+        "--development",
+        action="store_true",
+        help="使用 docker-compose.dev.yml；仅适用于本机或受控开发环境。",
+    )
     arguments = parser.parse_args()
     try:
         if arguments.command == "check":
-            check(arguments.project_name)
+            check(arguments.project_name, development=arguments.development)
         else:
-            redeploy(arguments.project_name)
+            redeploy(arguments.project_name, development=arguments.development)
     except DeploymentError as exc:
         print(f"Deployment failed: {exc}", file=sys.stderr)
         return 1

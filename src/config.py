@@ -55,11 +55,8 @@ class Settings(BaseSettings):
     POSTGRES_CHECKPOINT_AUDITOR_ROLE: str = "ai_exchange_checkpoint_auditor"
     DATABASE_ROLE_SEPARATION_REQUIRED: bool = False
 
-    # Phase4-Lite keeps safe defaults off. A fresh single-account deployment may
-    # enable only Durable Inbox processing; Shadow and Sync remain out of scope.
+    # A fresh single-account deployment may enable durable polling ingestion.
     DURABLE_INBOX_ENABLED: bool = False
-    INGESTION_SHADOW_ENABLED: bool = False
-    SYNC_RECONCILIATION_ENABLED: bool = False
     POLLING_ENABLED: bool = False
     POLLING_INTERVAL_SECONDS: PositiveInt = 60
     INGESTION_INSTANCE_ID: str = "ai-exchange-web"
@@ -81,17 +78,19 @@ class Settings(BaseSettings):
     EXCHANGE_ACCOUNT_EMAIL: str = ""
     EXCHANGE_SSL_VERIFY: bool = True
     EXCHANGE_CA_FILE: str = ""
-    EXCHANGE_WEBHOOK_SECRET: SecretStr = SecretStr("")
     EXCHANGE_FOLDERS_FULL: str = "收件箱"
     EXCHANGE_FOLDERS_ARCHIVE: str = ""
     EXCHANGE_FOLDER_SENTITEMS: str = "Sent Items"
     EXCHANGE_FOLDER_DRAFTS: str = "Drafts"
-    WEBHOOK_MAX_BYTES: PositiveInt = 1_048_576
     EXCHANGE_RESPONSE_MAX_BYTES: PositiveInt = 67_108_864
     EMAIL_BODY_MAX_BYTES: PositiveInt = 10_485_760
     EMAIL_ATTACHMENT_MAX_COUNT: PositiveInt = 20
     EMAIL_ATTACHMENT_SINGLE_MAX_BYTES: PositiveInt = 26_214_400
     EMAIL_ATTACHMENT_TOTAL_MAX_BYTES: PositiveInt = 52_428_800
+
+    # Memory reads are safe during processing. Any analysis which derives and
+    # persists new memory is explicitly opt-in to avoid implicit LLM cost.
+    MEMORY_LEARNING_ENABLED: bool = False
     # 领导/VIP 发件人名单（CSV，逗号分隔）。用于「非回复但值得阅读」的推送判定。
     LEADER_SENDERS: str = ""
     # Tier 1 v1 registry compiler: internal domain allowlist (CSV) used only at

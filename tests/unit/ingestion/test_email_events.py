@@ -102,16 +102,16 @@ def _application(**overrides: object):
     return module.EmailEventApplication(**values)
 
 
-def _migration_email_statuses() -> set[str]:
-    migration = (
+def _baseline_email_statuses() -> set[str]:
+    baseline = (
         Path(__file__).parents[3]
         / "alembic"
         / "versions"
-        / "20260710_0003_durable_ingestion.py"
+        / "20260808_0001_polling_baseline.sql"
     ).read_text(encoding="utf-8")
     match = re.search(
-        r"CONSTRAINT ck_emails_status CHECK \(\s*status IN \((?P<values>.*?)\)\s*\)",
-        migration,
+        r"CONSTRAINT ck_emails_status CHECK \(\(status = ANY \(ARRAY\[(?P<values>.*?)\]\)\)\)",
+        baseline,
         flags=re.DOTALL,
     )
     assert match is not None
@@ -126,7 +126,7 @@ def test_email_event_enums_and_transition_manifest_match_database_vocabulary() -
     assert {
         status.value for status in module.EMAIL_STATUS_TRANSITIONS
     } == DATABASE_STATUSES
-    assert _migration_email_statuses() == DATABASE_STATUSES
+    assert _baseline_email_statuses() == DATABASE_STATUSES
     assert {reason.value for reason in module.EmailEventReason} == REASONS
     assert {value.value for value in module.EmailEventDisposition} == DISPOSITIONS
 

@@ -7,7 +7,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PHASE2_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "phase2-postgres.yml"
+POLLING_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "polling-postgres.yml"
 PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 
 PINNED_POSTGRES_IMAGE = (
@@ -34,28 +34,28 @@ MANDATORY_COVERAGE_TARGETS = (
     "src/ingestion/*",
 )
 COMPOSE_PLACEHOLDERS = {
-    "AI_EXCHANGE_IMAGE": "ai-exchange:phase2-ci",
-    "EXTERNAL_URL": "https://phase2-ci.invalid",
-    "EXCHANGE_API_URL": ("https://exchange.phase2-ci.invalid/api/v1/exchange/emails"),
-    "EXCHANGE_API_KEY": "phase2-ci-exchange-key",
+    "AI_EXCHANGE_IMAGE": "ai-exchange:polling-ci",
+    "EXTERNAL_URL": "https://polling-ci.invalid",
+    "EXCHANGE_API_URL": ("https://exchange.polling-ci.invalid/api/v1/exchange/emails"),
+    "EXCHANGE_API_KEY": "polling-ci-exchange-key",
     "EXCHANGE_ACCOUNT_ID": "8",
-    "EXCHANGE_ACCOUNT_EMAIL": "phase2-ci@example.invalid",
-    "LARK_APP_ID": "phase2-ci-lark-app",
-    "LARK_APP_SECRET": "phase2-ci-lark-secret",
-    "LARK_ENCRYPT_KEY": "phase2-ci-lark-encrypt",
-    "LARK_CHAT_ID": "phase2-ci-lark-chat",
-    "LARK_ALLOWED_OPEN_IDS": "phase2-ci-open-id",
-    "OPENAI_API_KEY": "phase2-ci-model-key",
-    "OPENAI_API_BASE": "https://models.phase2-ci.invalid/v1",
-    "LLM_MODEL": "phase2-ci-model",
-    "EMBEDDING_API_KEY": "phase2-ci-embedding-key",
-    "EMBEDDING_BASE_URL": "https://embeddings.phase2-ci.invalid/v1",
-    "EMBEDDING_MODEL": "phase2-ci-embedding-model",
+    "EXCHANGE_ACCOUNT_EMAIL": "polling-ci@example.invalid",
+    "LARK_APP_ID": "polling-ci-lark-app",
+    "LARK_APP_SECRET": "polling-ci-lark-secret",
+    "LARK_ENCRYPT_KEY": "polling-ci-lark-encrypt",
+    "LARK_CHAT_ID": "polling-ci-lark-chat",
+    "LARK_ALLOWED_OPEN_IDS": "polling-ci-open-id",
+    "OPENAI_API_KEY": "polling-ci-model-key",
+    "OPENAI_API_BASE": "https://models.polling-ci.invalid/v1",
+    "LLM_MODEL": "polling-ci-model",
+    "EMBEDDING_API_KEY": "polling-ci-embedding-key",
+    "EMBEDDING_BASE_URL": "https://embeddings.polling-ci.invalid/v1",
+    "EMBEDDING_MODEL": "polling-ci-embedding-model",
 }
 
 
-def test_phase2_ci_forces_real_postgres_role_ddl_suite() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_forces_real_postgres_role_ddl_suite() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "image: postgres:15" in workflow
     assert "TEST_POSTGRES_ADMIN_URL:" in workflow
@@ -64,15 +64,15 @@ def test_phase2_ci_forces_real_postgres_role_ddl_suite() -> None:
     assert "continue-on-error" not in workflow
 
 
-def test_phase2_ci_uses_digest_pinned_postgres_service_image() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_uses_digest_pinned_postgres_service_image() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert f"image: {PINNED_POSTGRES_IMAGE}" in workflow
     assert ":latest" not in workflow
 
 
-def test_phase2_ci_uses_commit_pinned_official_actions() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_uses_commit_pinned_official_actions() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert f"uses: {PINNED_CHECKOUT_ACTION}" in workflow
     assert f"uses: {PINNED_SETUP_PYTHON_ACTION}" in workflow
@@ -80,8 +80,8 @@ def test_phase2_ci_uses_commit_pinned_official_actions() -> None:
     assert "@v5" not in workflow
 
 
-def test_phase2_ci_fails_before_pytest_when_mandatory_postgres_env_is_missing() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_fails_before_pytest_when_mandatory_postgres_env_is_missing() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in workflow
     assert "${TEST_POSTGRES_ADMIN_URL:?" in workflow
@@ -89,8 +89,8 @@ def test_phase2_ci_fails_before_pytest_when_mandatory_postgres_env_is_missing() 
     assert 'test "$TEST_POSTGRES_ROLE_DDL" = "1"' in workflow
 
 
-def test_phase2_ci_uses_project_python_and_frozen_dependency_lock() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_uses_project_python_and_frozen_dependency_lock() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
     normalized_workflow = " ".join(workflow.split())
 
     assert "runs-on: ubuntu-24.04" in workflow
@@ -106,14 +106,14 @@ def test_phase2_ci_uses_project_python_and_frozen_dependency_lock() -> None:
     assert "uv pip check --python .venv/bin/python" in workflow
 
 
-def test_phase2_ci_does_not_enable_an_empty_pip_cache() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_does_not_enable_an_empty_pip_cache() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "cache: pip" not in workflow
 
 
-def test_phase2_ci_runs_pinned_ruff_without_mutating_the_lock() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_runs_pinned_ruff_without_mutating_the_lock() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "uv run --frozen ruff check src tests" in workflow
     assert "uvx" not in workflow
@@ -123,7 +123,7 @@ def test_phase2_ci_runs_pinned_ruff_without_mutating_the_lock() -> None:
 
 def test_ruff_is_an_exact_dev_dependency_excluded_from_production_export() -> None:
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "ruff==0.15.13" in pyproject["dependency-groups"]["dev"]
     assert "uv export --frozen --no-dev --no-emit-project" in workflow
@@ -144,8 +144,8 @@ def test_test_frameworks_are_dev_dependencies_excluded_from_production() -> None
     assert production.isdisjoint(expected)
 
 
-def test_phase2_ci_proves_hashed_runtime_wheels_exist_for_linux_architectures() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_proves_hashed_runtime_wheels_exist_for_linux_architectures() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
     normalized_workflow = " ".join(workflow.split())
 
     assert (
@@ -162,8 +162,8 @@ def test_phase2_ci_proves_hashed_runtime_wheels_exist_for_linux_architectures() 
         ) in normalized_workflow
 
 
-def test_phase2_ci_validates_production_compose_with_only_placeholders() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_validates_production_compose_with_only_placeholders() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
     parsed_workflow = yaml.safe_load(workflow)
     compose_step = next(
         step
@@ -181,8 +181,8 @@ def test_phase2_ci_validates_production_compose_with_only_placeholders() -> None
     assert "--env-file /dev/null config --quiet" in workflow
 
 
-def test_phase2_ci_runs_the_full_suite_without_skip_filters() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_runs_the_full_suite_without_skip_filters() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
     pytest_lines = [
         line.strip().removeprefix("run: ")
         for line in workflow.splitlines()
@@ -194,8 +194,8 @@ def test_phase2_ci_runs_the_full_suite_without_skip_filters() -> None:
     assert all(" -k " not in line for line in pytest_lines)
 
 
-def test_phase2_ci_enforces_ninety_percent_for_each_critical_target() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_enforces_ninety_percent_for_each_critical_target() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     for target in MANDATORY_COVERAGE_TARGETS:
         expected = (
@@ -210,8 +210,8 @@ def test_phase2_ci_enforces_ninety_percent_for_each_critical_target() -> None:
     ) in workflow
 
 
-def test_phase2_ci_has_no_failure_bypass_for_mandatory_gates() -> None:
-    workflow = PHASE2_WORKFLOW.read_text(encoding="utf-8")
+def test_polling_ci_has_no_failure_bypass_for_mandatory_gates() -> None:
+    workflow = POLLING_WORKFLOW.read_text(encoding="utf-8")
 
     assert "continue-on-error" not in workflow
     assert "|| true" not in workflow

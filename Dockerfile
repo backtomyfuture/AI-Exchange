@@ -44,6 +44,8 @@ COPY scripts/manage_ingestion.py scripts/checkpoint_cleanup.py ./scripts/
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY skills_registry ./skills_registry
+# Tier1 v1 规则尚未接入运行时；随镜像保留以便后续受控启用。
+COPY tier1_rules ./tier1_rules
 
 # 设置目录权限；预建挂载点以便新 named volume 继承 appuser 所有权
 RUN mkdir -p /app/data/content && \

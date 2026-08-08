@@ -14,15 +14,14 @@ from src.db.access_contract import (
     AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
     AUDITOR_RELATION_ACCESS,
     AUDITOR_RELATION_ACCESS_BY_REVISION,
-    DAILY_DIGEST_DATABASE_REVISION,
+    DATABASE_REVISION,
     FOREIGN_KEY_SPECS_BY_REVISION,
     MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
     MAINTENANCE_RELATION_ACCESS,
     MAINTENANCE_RELATION_ACCESS_BY_REVISION,
-    PHASE2_RELATIONS,
-    PHASE2_RELATIONS_BY_REVISION,
-    PHASE2_VIEW_SPECS_BY_REVISION,
-    POLLING_ONLY_DATABASE_REVISION,
+    POLLING_RELATIONS,
+    POLLING_RELATIONS_BY_REVISION,
+    POLLING_VIEW_SPECS_BY_REVISION,
     RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
     RUNTIME_RELATION_ACCESS,
     RUNTIME_RELATION_ACCESS_BY_REVISION,
@@ -493,53 +492,23 @@ def _sql_text_array(values: tuple[str, ...]) -> str:
     return f"ARRAY[{members}]::pg_catalog.text[]"
 
 
-def _phase2_relation_count_sql(schema_oid: str) -> str:
-    relation_names = ", ".join(map(_sql_text_literal, PHASE2_RELATIONS))
+def _baseline_relation_count_sql(schema_oid: str) -> str:
+    relation_names = ", ".join(map(_sql_text_literal, POLLING_RELATIONS))
     return f"""(
         SELECT pg_catalog.count(*)
-        FROM pg_catalog.pg_class AS phase2_relation
-        WHERE phase2_relation.relnamespace = {schema_oid}
-          AND phase2_relation.relname IN ({relation_names})
-          AND phase2_relation.relkind = 'r'
+        FROM pg_catalog.pg_class AS business_relation
+        WHERE business_relation.relnamespace = {schema_oid}
+          AND business_relation.relname IN ({relation_names})
+          AND business_relation.relkind = 'r'
     )"""
 
 
-def _phase2_profile_matches_sql(schema_oid: str, revision: str) -> str:
-    expected = {
-        **{
-            relation_name: "r"
-            for relation_name in PHASE2_RELATIONS_BY_REVISION[revision]
-        },
-        **{
-            view.name: view.relation_kind
-            for view in PHASE2_VIEW_SPECS_BY_REVISION[revision]
-        },
-    }
-    all_names = tuple(
-        sorted(
-            {
-                relation_name
-                for relations in PHASE2_RELATIONS_BY_REVISION.values()
-                for relation_name in relations
-            }
-            | {
-                view.name
-                for views in PHASE2_VIEW_SPECS_BY_REVISION.values()
-                for view in views
-            }
-        )
-    )
-    actual_filter = ", ".join(map(_sql_text_literal, all_names))
-    if not expected:
-        return f"""NOT EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_class AS managed_relation
-            WHERE managed_relation.relnamespace = {schema_oid}
-              AND managed_relation.relname IN ({actual_filter})
-        )"""
+def _baseline_profile_matches_sql(schema_oid: str) -> str:
+    """Match the one business relation set produced by the baseline."""
+
+    actual_filter = ", ".join(map(_sql_text_literal, POLLING_RELATIONS))
     expected_rows = ", ".join(
-        f"({_sql_text_literal(name)}, {_sql_text_literal(kind)})"
-        for name, kind in sorted(expected.items())
+        f"({_sql_text_literal(name)}, 'r')" for name in sorted(POLLING_RELATIONS)
     )
     return f"""(
         WITH actual_managed_relations(relation_name, relation_kind) AS (
@@ -565,6 +534,16 @@ def _phase2_profile_matches_sql(schema_oid: str, revision: str) -> str:
     )"""
 
 
+def _empty_baseline_profile_sql(schema_oid: str) -> str:
+    relation_names = ", ".join(map(_sql_text_literal, POLLING_RELATIONS))
+    return f"""NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS business_relation
+        WHERE business_relation.relnamespace = {schema_oid}
+          AND business_relation.relname IN ({relation_names})
+    )"""
+
+
 _POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS: Final = (
     "p_account_id bigint, p_session_id uuid, "
     "p_expected_lease_version bigint, p_folder_key text, "
@@ -573,8 +552,8 @@ _POLLING_SYNC_PAGE_IDENTITY_ARGUMENTS: Final = (
 )
 
 
-def _polling_only_sync_function_exists_sql(schema_oid: str) -> str:
-    """Prove the physical 0007 marker without trusting runtime settings."""
+def _polling_sync_function_exists_sql(schema_oid: str) -> str:
+    """Prove the polling boundary without trusting runtime settings."""
 
     return f"""EXISTS (
         SELECT 1
@@ -587,19 +566,36 @@ def _polling_only_sync_function_exists_sql(schema_oid: str) -> str:
     )"""
 
 
-def _reviewed_profile_matches_sql(schema_oid: str, revision: str) -> str:
-    """Match a physical profile, including the function-only 0007 boundary."""
+def _reviewed_baseline_matches_sql(schema_oid: str) -> str:
+    """Match the complete polling database shape used by all identities."""
 
-    relation_profile = _phase2_profile_matches_sql(schema_oid, revision)
-    if revision in {
-        POLLING_ONLY_DATABASE_REVISION,
-        DAILY_DIGEST_DATABASE_REVISION,
-    }:
-        return (
-            "(" + relation_profile + " AND "
-            + _polling_only_sync_function_exists_sql(schema_oid) + ")"
-        )
-    return relation_profile
+    return (
+        "(" + _baseline_profile_matches_sql(schema_oid) + " AND "
+        + _polling_sync_function_exists_sql(schema_oid) + ")"
+    )
+
+
+# The generic catalog predicates below remain revision-indexed so that their
+# SQL is easy to audit against ``alembic_version``.  There is only one allowed
+# revision; these narrow adapters deliberately do not reintroduce any old
+# schema profile.
+def _polling_relation_count_sql(schema_oid: str) -> str:
+    return _baseline_relation_count_sql(schema_oid)
+
+
+def _polling_profile_matches_sql(schema_oid: str, revision: str) -> str:
+    if revision != DATABASE_REVISION:
+        return "false"
+    return (
+        "(" + _empty_baseline_profile_sql(schema_oid) + " OR "
+        + _baseline_profile_matches_sql(schema_oid) + ")"
+    )
+
+
+def _reviewed_profile_matches_sql(schema_oid: str, revision: str) -> str:
+    if revision != DATABASE_REVISION:
+        return "false"
+    return _reviewed_baseline_matches_sql(schema_oid)
 
 
 def _relation_access_contract_sql(
@@ -666,22 +662,22 @@ def _relation_access_contract_sql(
         base_manifest = {
             name: access
             for name, access in manifest.items()
-            if name not in PHASE2_RELATIONS
+            if name not in POLLING_RELATIONS
         }
         legacy_manifest = manifest
         latest_manifest = manifest
         greenfield_manifest = manifest
         daily_digest_manifest = manifest
     else:
-        base_manifest = manifests_by_revision["20260710_0002"]
-        legacy_manifest = manifests_by_revision["20260713_0004"]
-        latest_manifest = manifests_by_revision["20260713_0005"]
+        base_manifest = manifests_by_revision[DATABASE_REVISION]
+        legacy_manifest = manifests_by_revision[DATABASE_REVISION]
+        latest_manifest = manifests_by_revision[DATABASE_REVISION]
         greenfield_manifest = manifests_by_revision.get(
-            "20260716_0006",
+            DATABASE_REVISION,
             manifest,
         )
         daily_digest_manifest = manifests_by_revision.get(
-            DAILY_DIGEST_DATABASE_REVISION,
+            DATABASE_REVISION,
             greenfield_manifest,
         )
     selected_difference = "unexpected" if allow_missing else "difference"
@@ -855,7 +851,7 @@ def _relation_access_contract_sql(
             SELECT * FROM expected_access_0008
         )
         SELECT CASE
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+            WHEN {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
              AND NOT EXISTS (
                  SELECT 1
                  FROM pg_catalog.pg_class AS revision_relation
@@ -863,7 +859,7 @@ def _relation_access_contract_sql(
                    AND revision_relation.relname = 'alembic_version'
                    AND revision_relation.relkind = 'r'
              ) THEN NOT EXISTS (SELECT 1 FROM actual_access)
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+            WHEN {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
              AND EXISTS (
                  SELECT 1
                  FROM pg_catalog.pg_class AS revision_relation
@@ -871,13 +867,13 @@ def _relation_access_contract_sql(
                    AND revision_relation.relname = 'alembic_version'
                    AND revision_relation.relkind = 'r'
              ) THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0002)
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260713_0004")}
+            WHEN {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0004)
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260713_0005")}
+            WHEN {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0005)
-            WHEN {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
+            WHEN {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0006)
-            WHEN {_reviewed_profile_matches_sql(schema_oid, DAILY_DIGEST_DATABASE_REVISION)}
+            WHEN {_reviewed_profile_matches_sql(schema_oid, DATABASE_REVISION)}
                 THEN NOT EXISTS (SELECT 1 FROM {selected_difference}_0008)
             ELSE false
         END
@@ -897,8 +893,8 @@ def _selected_access_revision_sql(
         + _sql_text_literal(revision)
         + "::pg_catalog.text"
         for revision in sorted(set(revisions), reverse=True)
-        if revision in PHASE2_RELATIONS_BY_REVISION
-        and revision in PHASE2_VIEW_SPECS_BY_REVISION
+        if revision in POLLING_RELATIONS_BY_REVISION
+        and revision in POLLING_VIEW_SPECS_BY_REVISION
     )
     return f"CASE\n{clauses}\nELSE NULL::pg_catalog.text\nEND"
 
@@ -983,8 +979,16 @@ def _routine_execute_contract_sql(
             EXCEPT
             SELECT * FROM expected_access
         )
-        SELECT (SELECT revision IS NOT NULL FROM selected_revision)
-        AND NOT EXISTS (SELECT 1 FROM {selected_difference})
+        SELECT (
+            (
+                (SELECT revision IS NOT NULL FROM selected_revision)
+                AND NOT EXISTS (SELECT 1 FROM {selected_difference})
+            )
+            OR (
+                {_empty_baseline_profile_sql(schema_oid)}
+                AND NOT EXISTS (SELECT 1 FROM actual_access)
+            )
+        )
         AND NOT EXISTS (
             SELECT 1
             FROM pg_catalog.pg_proc AS routine
@@ -1058,8 +1062,16 @@ def _security_definer_contract_sql(
                 SELECT * FROM actual_functions
             ) AS missing_function
         )
-        SELECT (SELECT revision IS NOT NULL FROM selected_revision)
-        AND NOT EXISTS (SELECT 1 FROM function_difference)
+        SELECT (
+            (
+                (SELECT revision IS NOT NULL FROM selected_revision)
+                AND NOT EXISTS (SELECT 1 FROM function_difference)
+            )
+            OR (
+                {_empty_baseline_profile_sql(schema_oid)}
+                AND NOT EXISTS (SELECT 1 FROM actual_functions)
+            )
+        )
         AND NOT EXISTS (
             SELECT 1
             FROM pg_catalog.pg_proc AS routine
@@ -1456,7 +1468,7 @@ def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
     )"""
     revision_contracts = [
         f"""(
-            {_phase2_profile_matches_sql(schema_oid, revision)}
+            {_polling_profile_matches_sql(schema_oid, revision)}
             AND {
             _target_foreign_keys_exact_for_specs_sql(
                 schema_oid,
@@ -1465,11 +1477,11 @@ def _target_foreign_keys_exact_sql(schema_oid: str) -> str:
         }
         )"""
         for revision, specs in FOREIGN_KEY_SPECS_BY_REVISION.items()
-        if revision in PHASE2_RELATIONS_BY_REVISION
-        and revision in PHASE2_VIEW_SPECS_BY_REVISION
+        if revision in POLLING_RELATIONS_BY_REVISION
+        and revision in POLLING_VIEW_SPECS_BY_REVISION
     ]
     no_foreign_key_contract = f"""(
-        {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+        {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
         AND {no_foreign_keys}
     )"""
     return "(" + " OR ".join((no_foreign_key_contract, *revision_contracts)) + ")"
@@ -1756,12 +1768,12 @@ def _target_trigger_contract_exact_sql(
         & set(TRIGGER_FUNCTION_SEARCH_PATH_BY_REVISION)
         & set(TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION)
         & set(FOREIGN_KEY_SPECS_BY_REVISION)
-        & set(PHASE2_RELATIONS_BY_REVISION)
-        & set(PHASE2_VIEW_SPECS_BY_REVISION)
+        & set(POLLING_RELATIONS_BY_REVISION)
+        & set(POLLING_VIEW_SPECS_BY_REVISION)
     )
     revision_contracts = [
         f"""(
-            {_phase2_profile_matches_sql(schema_oid, revision)}
+            {_polling_profile_matches_sql(schema_oid, revision)}
             AND {
             _target_trigger_contract_exact_for_revision_sql(
                 schema_oid,
@@ -1773,7 +1785,7 @@ def _target_trigger_contract_exact_sql(
         for revision in sorted(revisions)
     ]
     no_trigger_contract = f"""(
-        {_phase2_profile_matches_sql(schema_oid, "20260710_0002")}
+        {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
         AND {no_trigger_hooks}
     )"""
     return "(" + " OR ".join((no_trigger_contract, *revision_contracts)) + ")"
@@ -1904,8 +1916,8 @@ def _runtime_audit_permissions_sql(role_oid: str, schema_oid: str) -> str:
     return f"""(
         CASE
             WHEN (
-                {_phase2_profile_matches_sql(schema_oid, "20260716_0006")}
-                OR {_phase2_profile_matches_sql(schema_oid, DAILY_DIGEST_DATABASE_REVISION)}
+                {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
+                OR {_polling_profile_matches_sql(schema_oid, DATABASE_REVISION)}
             )
                 THEN {greenfield_append_only}
             ELSE {legacy_insert}

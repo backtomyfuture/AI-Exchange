@@ -16,11 +16,11 @@ from src.maintenance.checkpoint_repository import (
 )
 
 
-def test_cleanup_revision_allowlist_accepts_only_daily_digest_head():
+def test_cleanup_revision_allowlist_accepts_only_greenfield_baseline():
     from src.maintenance import checkpoint_repository
 
     assert CHECKPOINT_CLEANUP_COMPATIBLE_DATABASE_REVISIONS == frozenset(
-        {"20260805_0008"}
+        {"20260808_0001"}
     )
     assert "RUNTIME_COMPATIBLE_DATABASE_REVISIONS" not in inspect.getsource(
         checkpoint_repository
@@ -60,7 +60,7 @@ def _metadata_connection(*, revisions: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_metadata_accepts_exact_daily_digest_head(monkeypatch):
+async def test_cleanup_metadata_accepts_exact_greenfield_baseline(monkeypatch):
     from src.maintenance import checkpoint_repository
 
     monkeypatch.setattr(
@@ -69,10 +69,10 @@ async def test_cleanup_metadata_accepts_exact_daily_digest_head(monkeypatch):
         tuple(range(11)),
     )
     metadata = await _read_database_metadata(
-        _metadata_connection(revisions=["20260805_0008"])
+        _metadata_connection(revisions=["20260808_0001"])
     )
 
-    assert metadata.alembic_revision == "20260805_0008"
+    assert metadata.alembic_revision == "20260808_0001"
 
 
 @pytest.mark.asyncio
@@ -80,10 +80,10 @@ async def test_cleanup_metadata_accepts_exact_daily_digest_head(monkeypatch):
     "revisions",
     [
         [],
-        ["20260713_0005"],
-        ["20260713_0005", "20260728_0007"],
+        ["obsolete"],
+        ["obsolete", "another-head"],
     ],
-    ids=["unversioned", "legacy-0005", "multiple-heads"],
+    ids=["unversioned", "obsolete", "multiple-heads"],
 )
 async def test_cleanup_metadata_rejects_non_current_revision(revisions, monkeypatch):
     from src.maintenance import checkpoint_repository

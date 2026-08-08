@@ -443,7 +443,7 @@ class ExchangeClient:
 
         self._http_client: httpx.AsyncClient | None = None
 
-        # --- Folder cache for webhook routing ---
+    # --- Folder cache for Exchange mail operations ---
         self._folder_cache: dict | None = None
         self._folder_tree: dict | None = None
         self._folder_policies: dict | None = None

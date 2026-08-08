@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 from uuid import uuid4
 
+import httpx
 from dotenv import load_dotenv
 
 # Allow direct execution from the repository root or scripts directory.
@@ -274,13 +275,11 @@ async def _inject_debug_original(
 ) -> bool:
     """可选地把测试原文送入启用 DEBUG 的本地服务进程。"""
     try:
-        import requests
-
         external_url = os.getenv("EXTERNAL_URL", "http://localhost:8000")
         debug_url = f"{external_url}/debug/inject_email"
         logger.info("Injecting mock email to debug endpoint")
         response = await asyncio.to_thread(
-            requests.post,
+            httpx.post,
             debug_url,
             json={
                 **email_data,
@@ -325,14 +324,12 @@ async def _cleanup_test_card_files(
 async def _remove_debug_original(email_id: str) -> bool:
     """Best-effort removal of a test state after confirmed card-send failure."""
     try:
-        import requests
-
         external_url = os.getenv("EXTERNAL_URL", "http://localhost:8000")
         debug_url = (
             f"{external_url}/debug/inject_email/{quote(email_id, safe='')}"
         )
         response = await asyncio.to_thread(
-            requests.delete,
+            httpx.delete,
             debug_url,
             timeout=5,
         )

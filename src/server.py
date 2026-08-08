@@ -102,7 +102,7 @@ def _runtime_stop_timeout_seconds(settings: Any) -> float:
     return 2.0 * float(value) + _RUNTIME_STOP_MARGIN_SECONDS
 
 
-_ReadinessContract = tuple[bytes, bool, bool, bool, bool, str, str, str, str, str]
+_ReadinessContract = tuple[bytes, bool, bool, str, str, str, str, str]
 
 
 @dataclass
@@ -124,8 +124,6 @@ def _readiness_contract(settings, database_url: str) -> _ReadinessContract:
     return (
         hashlib.sha256(database_url.encode()).digest(),
         bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)),
-        bool(getattr(settings, "INGESTION_SHADOW_ENABLED", False)),
-        bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)),
         bool(getattr(settings, "DATABASE_ROLE_SEPARATION_REQUIRED", False)),
         str(getattr(settings, "POSTGRES_USER", "")),
         str(getattr(settings, "POSTGRES_MIGRATION_OWNER_ROLE", "")),
@@ -181,14 +179,12 @@ async def _require_cached_runtime_database(settings) -> None:
                 await require_runtime_database(
                     database_url,
                     durable_inbox_enabled=contract[1],
-                    ingestion_shadow_enabled=contract[2],
-                    sync_reconciliation_enabled=contract[3],
-                    role_separation_required=contract[4],
-                    expected_runtime_role=contract[5],
-                    expected_migration_role=contract[6],
-                    expected_maintenance_role=contract[7],
-                    expected_auditor_role=contract[8],
-                    target_schema=contract[9],
+                    role_separation_required=contract[2],
+                    expected_runtime_role=contract[3],
+                    expected_migration_role=contract[4],
+                    expected_maintenance_role=contract[5],
+                    expected_auditor_role=contract[6],
+                    target_schema=contract[7],
                 )
         except Exception:
             state.contract = contract
@@ -480,7 +476,7 @@ async def _shutdown_application_components(
 
 @asynccontextmanager
 async def application_lifespan(application: FastAPI):
-    """Own the one ingress runtime and optional Phase4-Lite processing stack."""
+    """Own the one polling runtime and optional processing stack."""
 
     settings = get_settings()
     runtime_stop_seconds = _runtime_stop_timeout_seconds(settings)

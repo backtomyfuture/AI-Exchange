@@ -11,7 +11,6 @@ async def test_debug_endpoint_blocked_in_production():
     mock_settings.LARK_APP_ID = ""
     mock_settings.LARK_APP_SECRET = ""
     mock_settings.LARK_CHAT_ID = ""
-    mock_settings.EXCHANGE_WEBHOOK_SECRET = "test"
 
     with patch("src.server.get_settings", return_value=mock_settings), \
          patch("src.utils.lark_app.get_settings", return_value=mock_settings):
@@ -34,7 +33,6 @@ async def test_debug_endpoint_allowed_in_debug_mode():
     mock_settings.LARK_APP_ID = ""
     mock_settings.LARK_APP_SECRET = ""
     mock_settings.LARK_CHAT_ID = ""
-    mock_settings.EXCHANGE_WEBHOOK_SECRET = "test"
 
     with patch("src.server.get_settings", return_value=mock_settings), \
          patch("src.utils.lark_app.get_settings", return_value=mock_settings), \

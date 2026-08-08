@@ -145,6 +145,27 @@ def test_legacy_environment_migrates_without_losing_advanced_behavior(
     ).read_text(encoding="utf-8") == "metrics-token-secret-value"
 
 
+def test_explicit_greenfield_project_name_replaces_a_previous_local_project(
+    tmp_path: Path,
+) -> None:
+    _private(
+        tmp_path / ".env",
+        "".join(f"{key}={value}\n" for key, value in _minimal_user_values().items()),
+    )
+
+    configured = configure_deployment(
+        tmp_path,
+        project_name="ai-exchange-greenfield-20260808",
+    )
+    repeated = configure_deployment(tmp_path)
+
+    assert configured.project_name == "ai-exchange-greenfield-20260808"
+    assert repeated.project_name == "ai-exchange-greenfield-20260808"
+    assert (tmp_path / "secrets" / "compose_project_name").read_text(
+        encoding="utf-8"
+    ) == "ai-exchange-greenfield-20260808"
+
+
 def test_polling_settings_default_to_an_explicitly_disabled_bounded_schedule():
     assert Settings.model_fields["POLLING_ENABLED"].default is False
     assert Settings.model_fields["POLLING_INTERVAL_SECONDS"].default == 60
@@ -163,40 +184,32 @@ def test_python_dotenv_disabled_skips_local_env_file(tmp_path: Path, monkeypatch
     assert Settings().EXCHANGE_ACCOUNT_EMAIL == ""
 
 
-def test_deployment_ignores_legacy_webhook_tls_material(
+def test_deployment_context_uses_only_the_polling_compose_stack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _isolated_deployment_script(tmp_path, monkeypatch)
-    _private(
-        tmp_path / "secrets" / "webhook_tls_fullchain.pem",
-        "-----BEGIN CERTIFICATE-----\ncertificate\n-----END CERTIFICATE-----\n",
-    )
-    _private(
-        tmp_path / "secrets" / "webhook_tls_key.pem",
-        "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
-    )
-
-    compose, _, _, _, webhook_tls_enabled = deploy_system._deployment_context(
+    compose, _environment, project_name, port = deploy_system._deployment_context(
         "test-project"
     )
 
-    assert webhook_tls_enabled is False
-    assert str(tmp_path / "docker-compose.webhook-tls.yml") not in compose
+    assert project_name == "test-project"
+    assert port == 8000
+    assert all("webhook" not in item for item in compose)
+    assert str(tmp_path / "docker-compose.dev.yml") not in compose
 
 
-def test_deployment_ignores_partial_legacy_webhook_tls_material(
+def test_deployment_context_adds_the_development_overlay_only_on_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _isolated_deployment_script(tmp_path, monkeypatch)
-    _private(
-        tmp_path / "secrets" / "webhook_tls_fullchain.pem",
-        "certificate",
+
+    compose, _environment, project_name, port = deploy_system._deployment_context(
+        "test-project",
+        development=True,
     )
 
-    _compose, _, _, _, webhook_tls_enabled = deploy_system._deployment_context(
-        "test-project"
-    )
-
-    assert webhook_tls_enabled is False
+    assert project_name == "test-project"
+    assert port == 8000
+    assert str(tmp_path / "docker-compose.dev.yml") in compose

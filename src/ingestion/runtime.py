@@ -10,27 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import RFC_4122, UUID, uuid4
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from src.domain.email_state import PipelineGenerationState
 from src.ingestion.models import (
-    ChangeKind,
     InboxStats,
-    IngressReceipt,
-    IngressSource,
     NormalizedIngressEvent,
-    PipelineGeneration,
-    ProcessingPolicy,
 )
-from src.ingestion.policy import FolderScope, PolicySnapshot, ProcessingPolicyResolver
+from src.ingestion.policy import PolicySnapshot, ProcessingPolicyResolver
 from src.ingestion.runtime_authority import (
     GREENFIELD_PIPELINE_NAME,
     RuntimeAuthority,
@@ -40,15 +33,11 @@ from src.ingestion.runtime_authority import (
     RuntimeInstanceLease,
     RuntimeInstanceLifecycle,
     RuntimeInstanceRepository,
-    canonical_policy_manifest,
-    require_phase2_ingress_authority,
+    RuntimeManifestRepository,
+    RuntimeUnavailableError,
+    require_polling_ingress_authority,
 )
-from src.ingestion.runtime_capability import (
-    RuntimeCapabilityManifest,
-    RuntimeCapabilityStage,
-)
-from src.ingestion.repository import GreenfieldWebhookWriter, InboxRepository
-from src.ingestion.webhook import WebhookIngressService, WebhookIngressUnavailable
+from src.ingestion.repository import InboxRepository
 
 
 logger = logging.getLogger(__name__)
@@ -125,14 +114,6 @@ class _InstancePort(Protocol):
     async def drain(self, lease: RuntimeInstanceLease) -> RuntimeInstanceLease: ...
 
 
-class _WebhookWriterPort(Protocol):
-    async def insert(
-        self,
-        lease: RuntimeInstanceLease,
-        event: NormalizedIngressEvent,
-    ) -> IngressReceipt: ...
-
-
 class _InboxRecoveryPort(Protocol):
     async def recover_expired_leases(self, limit: int) -> int: ...
 
@@ -188,113 +169,11 @@ class _SessionState:
     rejected_count: int = 0
 
 
-class _FrozenSnapshotProvider:
-    def __init__(self, account_id: int, snapshot: PolicySnapshot) -> None:
-        self._account_id = account_id
-        self._snapshot = snapshot
-
-    async def get_ready_snapshot(self, account_id: int) -> PolicySnapshot:
-        if account_id != self._account_id:
-            raise WebhookIngressUnavailable()
-        return self._snapshot
-
-
-class _RuntimeOwnershipView:
-    def __init__(self, account_id: int, repository: _AuthorityPort) -> None:
-        self._account_id = account_id
-        self._repository = repository
-
-    async def current_ingress(self, account_id: int) -> PipelineGeneration | None:
-        if account_id != self._account_id:
-            return None
-        authority = await self._repository.get(account_id)
-        if (
-            type(authority) is not RuntimeAuthority
-            or authority.state is not RuntimeAuthorityState.INGEST_ONLY
-        ):
-            return None
-        return PipelineGeneration(
-            account_id=authority.account_id,
-            generation=authority.generation,
-            pipeline_name=authority.pipeline_name,
-            state=PipelineGenerationState.CURRENT_INGRESS,
-            fencing_token=authority.fencing_token,
-        )
-
-
-class _SessionBoundWebhookInbox:
-    def __init__(
-        self,
-        state: _SessionState,
-        writer: _WebhookWriterPort,
-        renewer: _LeaseRenewerPort,
-    ) -> None:
-        self._state = state
-        self._writer = writer
-        self._renewer = renewer
-
-    def disable(self) -> None:
-        self._state.accepting = False
-
-    async def wait_idle(self) -> None:
-        async with self._state.lock:
-            return
-
-    async def insert(
-        self,
-        event: NormalizedIngressEvent,
-        generation: int,
-        fencing_token: int,
-    ) -> IngressReceipt:
-        if not self._state.accepting:
-            raise WebhookIngressUnavailable()
-        async with self._state.lock:
-            lease = self._state.lease
-            if (
-                not self._state.accepting
-                or type(lease) is not RuntimeInstanceLease
-                or lease.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
-                or generation != lease.generation
-                or fencing_token != lease.fencing_token
-            ):
-                raise WebhookIngressUnavailable()
-            try:
-                current = await self._renewer(
-                    lease,
-                    self._state.accepted_count,
-                    self._state.rejected_count,
-                )
-                if (
-                    not self._state.accepting
-                    or type(current) is not RuntimeInstanceLease
-                    or current.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
-                    or current.session_id != lease.session_id
-                    or current.generation != lease.generation
-                    or current.fencing_token != lease.fencing_token
-                    or current.authority_epoch != lease.authority_epoch
-                    or current.capability_hash != lease.capability_hash
-                    or current.lease_version != lease.lease_version + 1
-                    or current.accepted_count != self._state.accepted_count
-                    or current.rejected_count != self._state.rejected_count
-                ):
-                    raise WebhookIngressUnavailable()
-                self._state.lease = current
-                receipt = await self._writer.insert(current, event)
-            except BaseException:
-                self._state.rejected_count += 1
-                raise
-            if type(receipt) is not IngressReceipt:
-                self._state.rejected_count += 1
-                raise WebhookIngressUnavailable()
-            self._state.accepted_count += 1
-            return receipt
-
-
 class _SessionBoundPollingCommitter:
-    """Serialize polling-page commits with the Web session heartbeat.
+    """Serialize polling-page commits with the runtime session heartbeat.
 
-    The Gateway request happens before this object is entered.  Once a page is
-    ready to persist, it renews the same ``web`` lease and holds the shared
+    The Exchange request happens before this object is entered. Once a page is
+    ready to persist, it renews the same runtime lease and holds the shared
     session lock until the database's fenced, one-page transaction returns.
     """
 
@@ -387,7 +266,6 @@ class IngestionRuntime:
         authority_repository: _AuthorityPort,
         manifest_repository: _ManifestPort,
         instance_repository: _InstancePort,
-        webhook_writer: _WebhookWriterPort,
         instance_id: str,
         session_id: str,
         lease_seconds: int,
@@ -424,7 +302,6 @@ class IngestionRuntime:
             (instance_repository, "register"),
             (instance_repository, "heartbeat"),
             (instance_repository, "drain"),
-            (webhook_writer, "insert"),
         ):
             if not callable(getattr(dependency, method, None)):
                 raise ValueError("runtime dependency is invalid")
@@ -464,12 +341,6 @@ class IngestionRuntime:
         self._polling_runtime: _PollingRuntimePort | None = None
         self._fail_stop = fail_stop
         self._state = _SessionState() if session_state is None else session_state
-        self._webhook_inbox = _SessionBoundWebhookInbox(
-            self._state,
-            webhook_writer,
-            self._renew_webhook_lease,
-        )
-        self._service: WebhookIngressService | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._pool_open = False
@@ -545,14 +416,6 @@ class IngestionRuntime:
     def lease(self) -> RuntimeInstanceLease | None:
         return self._state.lease
 
-    @property
-    def webhook_inbox(self) -> _SessionBoundWebhookInbox:
-        return self._webhook_inbox
-
-    @property
-    def webhook_ingress_service(self) -> WebhookIngressService | None:
-        return self._service
-
     async def start(self) -> None:
         if self._started or self._stopped:
             raise RuntimeUnavailableError("runtime_not_startable")
@@ -560,7 +423,7 @@ class IngestionRuntime:
             self._pool_open_attempted = True
             await self._pool.open()
             self._pool_open = True
-            authority = require_phase2_ingress_authority(
+            authority = require_polling_ingress_authority(
                 await self._authority_repository.get(self._account_id)
             )
             contract, snapshot = await self._manifest_repository.load(authority)
@@ -585,22 +448,11 @@ class IngestionRuntime:
             self._state.rejected_count = lease.rejected_count
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(),
-                name="greenfield-web-session-heartbeat",
-            )
-            self._service = WebhookIngressService(
-                expected_account_id=self._account_id,
-                snapshot_provider=_FrozenSnapshotProvider(self._account_id, snapshot),
-                policy_resolver=ProcessingPolicyResolver(),
-                ownership_repository=_RuntimeOwnershipView(
-                    self._account_id,
-                    self._authority_repository,
-                ),
-                inbox_repository=self._webhook_inbox,
+                name="greenfield-runtime-session-heartbeat",
             )
             await self._start_processing()
-            # Polling uses the same session-bound intake gate as the retired
-            # Webhook adapter.  It must be open during the baseline cycle,
-            # while public readiness remains false until that cycle completes.
+            # Polling must be able to commit its baseline cursor before public
+            # readiness becomes true, so the runtime session opens first.
             self._state.accepting = True
             await self._start_polling(snapshot)
             if self._heartbeat_task is None or self._heartbeat_task.done():
@@ -768,7 +620,6 @@ class IngestionRuntime:
                 self._pool_open = False
                 self._pool_open_attempted = False
                 self._registered_lease = None
-        self._service = None
 
     async def _stop_polling(self) -> None:
         polling = self._polling_runtime
@@ -784,7 +635,7 @@ class IngestionRuntime:
         except asyncio.CancelledError:
             raise
         except RuntimeUnavailableError as error:
-            logger.critical("Greenfield Web session heartbeat failed closed")
+            logger.critical("Greenfield runtime session heartbeat failed closed")
             if self._fail_stop is not None:
                 reason = (
                     "ingestion_runtime_processing_lost"
@@ -796,26 +647,6 @@ class IngestionRuntime:
                     )
                 )
                 self._fail_stop(reason)
-
-    async def _renew_webhook_lease(
-        self,
-        lease: RuntimeInstanceLease,
-        accepted_count: int,
-        rejected_count: int,
-    ) -> RuntimeInstanceLease:
-        try:
-            return await self._instance_repository.heartbeat(
-                lease,
-                accepted_count,
-                rejected_count,
-                self._lease_seconds,
-            )
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            self._ready = False
-            self._state.accepting = False
-            raise WebhookIngressUnavailable() from None
 
     async def heartbeat_once(self) -> None:
         try:
@@ -899,6 +730,12 @@ class IngestionRuntime:
             _raise_if_current_task_cancelled(error)
             pass
 
+    async def _wait_for_session_idle(self) -> None:
+        """Wait until an in-flight polling page has left the shared session."""
+
+        async with self._state.lock:
+            return
+
     async def stop(self) -> None:
         if self._stopped:
             self._ready = False
@@ -916,7 +753,7 @@ class IngestionRuntime:
         if not self._pool_open:
             raise RuntimeShutdownError("shutdown_incomplete")
         self._ready = False
-        self._webhook_inbox.disable()
+        self._state.accepting = False
         cleanup = asyncio.create_task(
             self._finish_stop(),
             name="greenfield-runtime-stop",
@@ -956,8 +793,8 @@ class IngestionRuntime:
             record_failure("polling_stop", exc)
 
         idle_waiter = asyncio.create_task(
-            self._webhook_inbox.wait_idle(),
-            name="greenfield-webhook-intake-drain",
+            self._wait_for_session_idle(),
+            name="greenfield-polling-session-drain",
         )
         try:
             await asyncio.wait_for(
@@ -1052,7 +889,6 @@ class IngestionRuntime:
             self._pool_open_attempted = False
             self._registered_lease = None
             self._stopped = True
-            self._service = None
         if process_control is not None:
             raise process_control
         if failures:
@@ -1067,10 +903,6 @@ def build_ingestion_runtime(
 ) -> IngestionRuntime:
     """Create the one production runtime around one dedicated business pool."""
 
-    if bool(getattr(settings, "INGESTION_SHADOW_ENABLED", False)):
-        raise ValueError("Phase4-Lite does not permit ingestion Shadow")
-    if bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)):
-        raise ValueError("Phase4-Lite does not permit Sync reconciliation")
     processing_enabled = bool(getattr(settings, "DURABLE_INBOX_ENABLED", False))
     polling_enabled = bool(getattr(settings, "POLLING_ENABLED", False))
     if polling_enabled and not processing_enabled:
@@ -1206,7 +1038,6 @@ def build_ingestion_runtime(
         authority_repository=authority_repository,
         manifest_repository=RuntimeManifestRepository(pool),
         instance_repository=instance_repository,
-        webhook_writer=GreenfieldWebhookWriter(pool),
         instance_id=str(getattr(settings, "INGESTION_INSTANCE_ID", "ai-exchange-web")),
         session_id=session_id,
         lease_seconds=int(getattr(settings, "INGESTION_LEASE_SECONDS", 30)),
@@ -1221,7 +1052,6 @@ def build_ingestion_runtime(
 
 
 __all__ = [
-    "GreenfieldWebhookWriter",
     "IngestionRuntime",
     "RuntimeHealthSnapshot",
     "RuntimeManifestRepository",

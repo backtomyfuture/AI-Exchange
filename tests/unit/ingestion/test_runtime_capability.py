@@ -9,13 +9,13 @@ import pytest
 from src.ingestion.runtime_capability import (
     CAPABILITY_CHAIN_ROOT_HASH,
     CAPABILITY_STAGE_ORDER,
-    PHASE2_AUTHORIZED_AUTHORITY_STATES,
-    PHASE2_SCHEMA_REVISION,
+    POLLING_AUTHORIZED_AUTHORITY_STATES,
+    POLLING_SCHEMA_REVISION,
     POSTGRES_BIGINT_MAX,
     RuntimeCapabilityManifest,
     RuntimeCapabilityStage,
     canonical_capability_hash,
-    install_phase2_capability,
+    install_polling_capability,
     require_exact_predecessor,
     validate_capability_chain,
 )
@@ -47,12 +47,12 @@ class _HostileInt(int):
 
 def _manifest(
     *,
-    stage: RuntimeCapabilityStage = RuntimeCapabilityStage.PHASE2_INGESTION,
+    stage: RuntimeCapabilityStage = RuntimeCapabilityStage.POLLING_INGESTION,
     predecessor_hash: str = CAPABILITY_CHAIN_ROOT_HASH,
-    schema_revision: str = PHASE2_SCHEMA_REVISION,
+    schema_revision: str = POLLING_SCHEMA_REVISION,
     schema_digest: str = _HASHES["schema_digest"],
     protocol_version: int = 1,
-    minimum_build_id: str = "build-20260716.1+abc123",
+    minimum_build_id: str = "build-v1.1+abc123",
     config_hash: str = _HASHES["config_hash"],
     adapter_hash: str = _HASHES["adapter_hash"],
     policy_manifest_hash: str = _HASHES["policy_manifest_hash"],
@@ -80,59 +80,59 @@ def _successor(
         stage=stage,
         predecessor_hash=predecessor.capability_hash,
         schema_revision=(
-            "20260716_0007"
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
-            else "20260716_0008"
+            "approval-v1"
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
+            else "projection-v1"
         ),
         schema_digest=(
             "6" * 64
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
             else "7" * 64
         ),
         protocol_version=(
-            2 if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND else 3
+            2 if stage is RuntimeCapabilityStage.APPROVAL_SEND else 3
         ),
         minimum_build_id=(
-            "build-20260716.2"
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
-            else "build-20260716.3"
+            "build-v2"
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
+            else "build-v3"
         ),
         config_hash=(
             "8" * 64
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
             else "9" * 64
         ),
         adapter_hash=(
             "a" * 64
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
             else "b" * 64
         ),
         policy_manifest_hash=(
             "c" * 64
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
             else "d" * 64
         ),
         evidence_manifest_hash=(
             "e" * 64
-            if stage is RuntimeCapabilityStage.PHASE3_APPROVAL_SEND
+            if stage is RuntimeCapabilityStage.APPROVAL_SEND
             else "f" * 64
         ),
     )
 
 
-def test_stage_order_and_phase2_authority_boundary_are_exact() -> None:
+def test_stage_order_and_polling_authority_boundary_are_exact() -> None:
     assert tuple(RuntimeCapabilityStage) == (
-        RuntimeCapabilityStage.PHASE2_INGESTION,
-        RuntimeCapabilityStage.PHASE3_APPROVAL_SEND,
-        RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION,
+        RuntimeCapabilityStage.POLLING_INGESTION,
+        RuntimeCapabilityStage.APPROVAL_SEND,
+        RuntimeCapabilityStage.GRAPH_PROJECTION,
     )
     assert tuple(stage.value for stage in CAPABILITY_STAGE_ORDER) == (
-        "phase2_ingestion",
-        "phase3_approval_send",
-        "phase4_graph_projection",
+        "polling_ingestion",
+        "approval_send",
+        "graph_projection",
     )
-    assert PHASE2_AUTHORIZED_AUTHORITY_STATES == frozenset({"ingest_only", "paused"})
-    assert "active" not in PHASE2_AUTHORIZED_AUTHORITY_STATES
+    assert POLLING_AUTHORIZED_AUTHORITY_STATES == frozenset({"ingest_only", "paused"})
+    assert "active" not in POLLING_AUTHORIZED_AUTHORITY_STATES
 
 
 def test_manifest_is_frozen_slotted_and_has_only_the_frozen_contract_fields() -> None:
@@ -157,24 +157,24 @@ def test_manifest_is_frozen_slotted_and_has_only_the_frozen_contract_fields() ->
 
 def test_manifest_normalizes_exact_plain_stage_text_to_enum() -> None:
     values = dataclasses.asdict(_manifest())
-    values["stage"] = "phase2_ingestion"
+    values["stage"] = "polling_ingestion"
 
     manifest = RuntimeCapabilityManifest(**values)
 
-    assert manifest.stage is RuntimeCapabilityStage.PHASE2_INGESTION
+    assert manifest.stage is RuntimeCapabilityStage.POLLING_INGESTION
 
 
 @pytest.mark.parametrize(
     "stage",
     [
         "",
-        " phase2_ingestion",
-        "phase2_ingestion ",
-        "PHASE2_INGESTION",
+        " polling_ingestion",
+        "polling_ingestion ",
+        "POLLING_INGESTION",
         "phase5_unknown",
         2,
         True,
-        _HostileString("phase2_ingestion"),
+        _HostileString("polling_ingestion"),
     ],
 )
 def test_manifest_rejects_nonexact_stage(stage: object) -> None:
@@ -189,12 +189,12 @@ def test_manifest_rejects_nonexact_stage(stage: object) -> None:
     ("field", "value"),
     [
         ("schema_revision", ""),
-        ("schema_revision", " 20260716_0006"),
-        ("schema_revision", "20260716/0006"),
+        ("schema_revision", " polling-v1"),
+        ("schema_revision", "polling/v1"),
         ("schema_revision", "r" * 129),
         ("schema_revision", "版本_0006"),
-        ("schema_revision", "20260716_0006\n"),
-        ("schema_revision", "20260716_0006\x00"),
+        ("schema_revision", "polling-v1\n"),
+        ("schema_revision", "polling-v1\x00"),
         ("minimum_build_id", ""),
         ("minimum_build_id", " build-1"),
         ("minimum_build_id", "build 1"),
@@ -203,7 +203,7 @@ def test_manifest_rejects_nonexact_stage(stage: object) -> None:
         ("minimum_build_id", "b" * 129),
         ("minimum_build_id", "build-1\ud800"),
         ("minimum_build_id", _HostileString("build-1")),
-        ("schema_revision", _HostileString(PHASE2_SCHEMA_REVISION)),
+        ("schema_revision", _HostileString(POLLING_SCHEMA_REVISION)),
     ],
 )
 def test_manifest_rejects_noncanonical_or_unbounded_ascii_identifiers(
@@ -322,10 +322,10 @@ def test_capability_hash_is_stable_across_equivalent_field_construction_order() 
 @pytest.mark.parametrize(
     "changed",
     [
-        {"schema_revision": "20260716_0007"},
+        {"schema_revision": "polling-v2"},
         {"schema_digest": "6" * 64},
         {"protocol_version": 2},
-        {"minimum_build_id": "build-20260716.2"},
+        {"minimum_build_id": "build-v2"},
         {"config_hash": "7" * 64},
         {"adapter_hash": "8" * 64},
         {"policy_manifest_hash": "9" * 64},
@@ -343,37 +343,37 @@ def test_every_bound_manifest_field_changes_capability_hash(
 
 
 def test_exact_predecessor_accepts_the_complete_ordered_chain() -> None:
-    phase2 = _manifest()
-    phase3 = _successor(phase2, RuntimeCapabilityStage.PHASE3_APPROVAL_SEND)
-    phase4 = _successor(phase3, RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION)
+    polling = _manifest()
+    approval = _successor(polling, RuntimeCapabilityStage.APPROVAL_SEND)
+    graph = _successor(approval, RuntimeCapabilityStage.GRAPH_PROJECTION)
 
-    assert require_exact_predecessor(phase2, None) is phase2
-    assert require_exact_predecessor(phase3, phase2) is phase3
-    assert require_exact_predecessor(phase4, phase3) is phase4
-    assert validate_capability_chain((phase2, phase3, phase4)) == (
-        phase2,
-        phase3,
-        phase4,
+    assert require_exact_predecessor(polling, None) is polling
+    assert require_exact_predecessor(approval, polling) is approval
+    assert require_exact_predecessor(graph, approval) is graph
+    assert validate_capability_chain((polling, approval, graph)) == (
+        polling,
+        approval,
+        graph,
     )
 
 
-def test_phase2_requires_the_exact_domain_separated_chain_root() -> None:
+def test_polling_requires_the_exact_domain_separated_chain_root() -> None:
     with pytest.raises(ValueError, match="predecessor"):
         require_exact_predecessor(
             _manifest(predecessor_hash="0" * 64),
             None,
         )
 
-    phase2 = _manifest()
+    polling = _manifest()
     with pytest.raises(ValueError, match="predecessor"):
-        require_exact_predecessor(phase2, phase2)
+        require_exact_predecessor(polling, polling)
 
 
 @pytest.mark.parametrize(
     "candidate_stage",
     [
-        RuntimeCapabilityStage.PHASE3_APPROVAL_SEND,
-        RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION,
+        RuntimeCapabilityStage.APPROVAL_SEND,
+        RuntimeCapabilityStage.GRAPH_PROJECTION,
     ],
 )
 def test_successor_requires_a_predecessor(
@@ -386,46 +386,46 @@ def test_successor_requires_a_predecessor(
 
 
 def test_successor_rejects_wrong_stage_or_mismatched_predecessor_hash() -> None:
-    phase2 = _manifest()
-    phase3 = _successor(phase2, RuntimeCapabilityStage.PHASE3_APPROVAL_SEND)
-    wrong_phase2 = dataclasses.replace(phase2, config_hash="f" * 64)
+    polling = _manifest()
+    approval = _successor(polling, RuntimeCapabilityStage.APPROVAL_SEND)
+    wrong_polling = dataclasses.replace(polling, config_hash="f" * 64)
 
     with pytest.raises(ValueError, match="predecessor"):
-        require_exact_predecessor(phase3, wrong_phase2)
+        require_exact_predecessor(approval, wrong_polling)
 
-    phase4 = _successor(phase3, RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION)
+    graph = _successor(approval, RuntimeCapabilityStage.GRAPH_PROJECTION)
     with pytest.raises(ValueError, match="predecessor"):
-        require_exact_predecessor(phase4, phase2)
+        require_exact_predecessor(graph, polling)
 
 
 @pytest.mark.parametrize(
     "chain_builder",
     [
-        lambda phase2, phase3, phase4: (),
-        lambda phase2, phase3, phase4: (phase3,),
-        lambda phase2, phase3, phase4: (phase2, phase2),
-        lambda phase2, phase3, phase4: (phase2, phase4),
-        lambda phase2, phase3, phase4: (phase2, phase3, phase3),
-        lambda phase2, phase3, phase4: (phase2, phase3, phase4, phase4),
+        lambda polling, approval, graph: (),
+        lambda polling, approval, graph: (approval,),
+        lambda polling, approval, graph: (polling, polling),
+        lambda polling, approval, graph: (polling, graph),
+        lambda polling, approval, graph: (polling, approval, approval),
+        lambda polling, approval, graph: (polling, approval, graph, graph),
     ],
 )
 def test_chain_validator_rejects_empty_duplicate_gapped_or_extra_chains(
     chain_builder,
 ) -> None:
-    phase2 = _manifest()
-    phase3 = _successor(phase2, RuntimeCapabilityStage.PHASE3_APPROVAL_SEND)
-    phase4 = _successor(phase3, RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION)
+    polling = _manifest()
+    approval = _successor(polling, RuntimeCapabilityStage.APPROVAL_SEND)
+    graph = _successor(approval, RuntimeCapabilityStage.GRAPH_PROJECTION)
 
     with pytest.raises(ValueError, match="capability chain"):
-        validate_capability_chain(chain_builder(phase2, phase3, phase4))
+        validate_capability_chain(chain_builder(polling, approval, graph))
 
 
 @pytest.mark.parametrize(
     "chain",
     [
-        "phase2_ingestion",
+        "polling_ingestion",
         [_manifest(), object()],
-        (_HostileString("phase2_ingestion"),),
+        (_HostileString("polling_ingestion"),),
     ],
 )
 def test_chain_validator_rejects_nonmanifest_inputs(chain: object) -> None:
@@ -433,28 +433,28 @@ def test_chain_validator_rejects_nonmanifest_inputs(chain: object) -> None:
         validate_capability_chain(chain)  # type: ignore[arg-type]
 
 
-def test_phase2_install_accepts_only_exact_first_stage_and_head() -> None:
-    phase2 = _manifest()
+def test_polling_install_accepts_only_exact_first_stage_and_head() -> None:
+    polling = _manifest()
 
-    installed = install_phase2_capability(phase2)
+    installed = install_polling_capability(polling)
 
-    assert installed is phase2
-    assert installed.stage is RuntimeCapabilityStage.PHASE2_INGESTION
+    assert installed is polling
+    assert installed.stage is RuntimeCapabilityStage.POLLING_INGESTION
     assert installed.predecessor_hash == CAPABILITY_CHAIN_ROOT_HASH
-    assert "active" not in PHASE2_AUTHORIZED_AUTHORITY_STATES
+    assert "active" not in POLLING_AUTHORIZED_AUTHORITY_STATES
 
 
-def test_phase2_install_rejects_later_stage_wrong_root_or_wrong_schema_head() -> None:
-    phase2 = _manifest()
-    phase3 = _successor(phase2, RuntimeCapabilityStage.PHASE3_APPROVAL_SEND)
+def test_polling_install_rejects_later_stage_wrong_root_or_wrong_schema_head() -> None:
+    polling = _manifest()
+    approval = _successor(polling, RuntimeCapabilityStage.APPROVAL_SEND)
 
     for manifest in (
-        phase3,
+        approval,
         _manifest(predecessor_hash="0" * 64),
-        _manifest(schema_revision="20260716_0005"),
+        _manifest(schema_revision="other-v1"),
     ):
-        with pytest.raises(ValueError, match="phase2 capability"):
-            install_phase2_capability(manifest)
+        with pytest.raises(ValueError, match="polling capability"):
+            install_polling_capability(manifest)
 
 
 def test_public_functions_reject_manifest_subclasses_and_plain_objects() -> None:
@@ -466,7 +466,7 @@ def test_public_functions_reject_manifest_subclasses_and_plain_objects() -> None
 
     for callable_ in (
         canonical_capability_hash,
-        install_phase2_capability,
+        install_polling_capability,
     ):
         with pytest.raises(ValueError, match="exact RuntimeCapabilityManifest"):
             callable_(subclass)
@@ -480,8 +480,8 @@ def test_public_functions_reject_manifest_subclasses_and_plain_objects() -> None
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("stage", _HostileString("phase2_ingestion")),
-        ("schema_revision", "20260716/0006"),
+        ("stage", _HostileString("polling_ingestion")),
+        ("schema_revision", "polling/v1"),
         ("schema_digest", "A" * 64),
         ("protocol_version", True),
         ("minimum_build_id", "build/1"),

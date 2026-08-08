@@ -147,7 +147,7 @@ class AppContext:
             await self.pool.open()
             logger.info("AsyncConnectionPool opened.")
 
-        # Initialize folder cache and precompute folder policies for webhook routing.
+        # Initialize the Exchange folder cache for active mail operations.
         try:
             await self.exchange_client.get_all_folders()
             settings = get_settings()

@@ -1,4 +1,4 @@
-name: Phase 2 PostgreSQL Gate
+name: Polling PostgreSQL Gate
 
 on:
   pull_request:
@@ -17,7 +17,7 @@ jobs:
         image: postgres:15@sha256:f30e3de0ac9cc938dac627ef2231099867c694b5f949fadb924c8c977428c399
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: phase2-ci-only
+          POSTGRES_PASSWORD: polling-ci-only
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
@@ -27,7 +27,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      TEST_POSTGRES_ADMIN_URL: postgresql://postgres:phase2-ci-only@127.0.0.1:5432/postgres
+      TEST_POSTGRES_ADMIN_URL: postgresql://postgres:polling-ci-only@127.0.0.1:5432/postgres
       TEST_POSTGRES_ROLE_DDL: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -62,23 +62,23 @@ jobs:
       - name: Validate production Compose
         shell: bash
         env:
-          AI_EXCHANGE_IMAGE: ai-exchange:phase2-ci
-          EXTERNAL_URL: https://phase2-ci.invalid
-          EXCHANGE_API_URL: https://exchange.phase2-ci.invalid/api/v1/exchange/emails
-          EXCHANGE_API_KEY: phase2-ci-exchange-key
+          AI_EXCHANGE_IMAGE: ai-exchange:polling-ci
+          EXTERNAL_URL: https://polling-ci.invalid
+          EXCHANGE_API_URL: https://exchange.polling-ci.invalid/api/v1/exchange/emails
+          EXCHANGE_API_KEY: polling-ci-exchange-key
           EXCHANGE_ACCOUNT_ID: "8"
-          EXCHANGE_ACCOUNT_EMAIL: phase2-ci@example.invalid
-          LARK_APP_ID: phase2-ci-lark-app
-          LARK_APP_SECRET: phase2-ci-lark-secret
-          LARK_ENCRYPT_KEY: phase2-ci-lark-encrypt
-          LARK_CHAT_ID: phase2-ci-lark-chat
-          LARK_ALLOWED_OPEN_IDS: phase2-ci-open-id
-          OPENAI_API_KEY: phase2-ci-model-key
-          OPENAI_API_BASE: https://models.phase2-ci.invalid/v1
-          LLM_MODEL: phase2-ci-model
-          EMBEDDING_API_KEY: phase2-ci-embedding-key
-          EMBEDDING_BASE_URL: https://embeddings.phase2-ci.invalid/v1
-          EMBEDDING_MODEL: phase2-ci-embedding-model
+          EXCHANGE_ACCOUNT_EMAIL: polling-ci@example.invalid
+          LARK_APP_ID: polling-ci-lark-app
+          LARK_APP_SECRET: polling-ci-lark-secret
+          LARK_ENCRYPT_KEY: polling-ci-lark-encrypt
+          LARK_CHAT_ID: polling-ci-lark-chat
+          LARK_ALLOWED_OPEN_IDS: polling-ci-open-id
+          OPENAI_API_KEY: polling-ci-model-key
+          OPENAI_API_BASE: https://models.polling-ci.invalid/v1
+          LLM_MODEL: polling-ci-model
+          EMBEDDING_API_KEY: polling-ci-embedding-key
+          EMBEDDING_BASE_URL: https://embeddings.polling-ci.invalid/v1
+          EMBEDDING_MODEL: polling-ci-embedding-model
         run: |
           set -euo pipefail
           docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --quiet

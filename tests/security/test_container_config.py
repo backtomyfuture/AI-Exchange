@@ -14,7 +14,6 @@ from src.deployment.configuration import USER_ENV_KEYS
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
 EXCHANGE_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.exchange-tls.yml"
-WEBHOOK_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.webhook-tls.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
 BOOTSTRAP_REQUIREMENTS = PROJECT_ROOT / "requirements.bootstrap.txt"
@@ -35,10 +34,6 @@ PINNED_POSTGRES_IMAGE = (
 PINNED_QDRANT_IMAGE = (
     "qdrant/qdrant:v1.17.0@"
     "sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb"
-)
-PINNED_WEBHOOK_TLS_IMAGE = (
-    "nginxinc/nginx-unprivileged:1.27.5-alpine@"
-    "sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0"
 )
 PINNED_UV_WHEEL_HASHES = {
     "041e4b80bebc58d7142ac9394370cacd73185fd8d066d6675d14707d83408f6d",
@@ -237,7 +232,7 @@ def test_production_does_not_publish_legacy_port_15000():
     assert all("15000" not in port for port in ports)
 
 
-def test_production_application_publishes_one_webhook_port():
+def test_production_application_publishes_one_api_port():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     ports = _ports(compose["services"]["ai-assistant-service"])
 
@@ -303,44 +298,14 @@ def test_optional_exchange_tls_overlay_pins_dns_alias_and_read_only_ca():
     assert "host-gateway" not in EXCHANGE_TLS_COMPOSE.read_text(encoding="utf-8")
 
 
-def test_optional_webhook_tls_ingress_is_minimal_and_digest_pinned():
-    compose = _load_yaml(WEBHOOK_TLS_COMPOSE)
-    service = compose["services"]["webhook-tls-ingress"]
+def test_polling_deployment_has_no_webhook_ingress_or_tls_overlay():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    compose_source = PRODUCTION_COMPOSE.read_text(encoding="utf-8").casefold()
 
-    assert service["image"] == PINNED_WEBHOOK_TLS_IMAGE
-    assert service["read_only"] is True
-    assert service["cap_drop"] == ["ALL"]
-    assert service["security_opt"] == ["no-new-privileges:true"]
-    assert _network_names(service) == {"edge"}
-    assert service["ports"] == ["${WEBHOOK_TLS_PORT:-8443}:8443"]
-    assert service["depends_on"] == {
-        "ai-assistant-service": {"condition": "service_healthy"}
-    }
-
-
-def test_optional_webhook_tls_ingress_mounts_only_reviewed_config_and_secrets():
-    compose = _load_yaml(WEBHOOK_TLS_COMPOSE)
-    service = compose["services"]["webhook-tls-ingress"]
-    config = (PROJECT_ROOT / "deploy" / "webhook-tls" / "nginx.conf").read_text(
-        encoding="utf-8"
-    )
-
-    assert service["volumes"] == [
-        {
-            "type": "bind",
-            "source": "./deploy/webhook-tls/nginx.conf",
-            "target": "/etc/nginx/nginx.conf",
-            "read_only": True,
-        }
-    ]
-    assert service["secrets"] == [
-        {"source": "webhook_tls_fullchain", "target": "webhook_tls_fullchain.pem"},
-        {"source": "webhook_tls_key", "target": "webhook_tls_key.pem"},
-    ]
-    assert "location = /webhooks/exchange" not in config
-    assert "location = /ready" in config
-    assert "location /" in config and "return 404" in config
-    assert "ssl_protocols TLSv1.2 TLSv1.3" in config
+    assert "webhook" not in compose_source
+    assert "webhook-tls-ingress" not in compose["services"]
+    assert not (PROJECT_ROOT / "docker-compose.webhook-tls.yml").exists()
+    assert not (PROJECT_ROOT / "deploy" / "webhook-tls").exists()
 
 
 def test_production_application_has_no_source_or_test_bind_mounts():
@@ -662,6 +627,7 @@ def test_dockerfile_copies_only_the_explicit_runtime_allowlist():
         "COPY alembic ./alembic",
         "COPY alembic.ini ./alembic.ini",
         "COPY skills_registry ./skills_registry",
+        "COPY tier1_rules ./tier1_rules",
     } <= dockerfile_lines
     assert "COPY scripts ./scripts" not in dockerfile_lines
     assert not any(line.startswith("COPY fonts") for line in dockerfile_lines)

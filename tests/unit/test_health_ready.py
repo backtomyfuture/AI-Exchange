@@ -43,8 +43,6 @@ def test_ready_checks_database_revision_and_returns_minimal_success():
     settings = SimpleNamespace(
         database_url="postgresql://private-dsn-sentinel",
         DURABLE_INBOX_ENABLED=False,
-        INGESTION_SHADOW_ENABLED=True,
-        SYNC_RECONCILIATION_ENABLED=False,
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
@@ -150,8 +148,6 @@ def test_ready_failure_is_generic_and_never_logs_or_returns_exception_text(caplo
     runtime_gate.assert_awaited_once_with(
         settings.database_url,
         durable_inbox_enabled=False,
-        ingestion_shadow_enabled=False,
-        sync_reconciliation_enabled=False,
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
@@ -169,8 +165,6 @@ def test_ready_runs_security_validation_before_database_preflight():
         database_url="postgresql://private-dsn-sentinel",
         DATABASE_ROLE_SEPARATION_REQUIRED=False,
         DURABLE_INBOX_ENABLED=False,
-        INGESTION_SHADOW_ENABLED=False,
-        SYNC_RECONCILIATION_ENABLED=False,
     )
     runtime_gate = AsyncMock()
     security_gate = MagicMock(side_effect=RuntimeError("unsafe_runtime_settings"))
@@ -201,8 +195,6 @@ async def test_ready_database_preflight_coalesces_concurrent_requests():
     settings = SimpleNamespace(
         database_url="postgresql://runtime/private",
         DURABLE_INBOX_ENABLED=False,
-        INGESTION_SHADOW_ENABLED=False,
-        SYNC_RECONCILIATION_ENABLED=False,
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
@@ -243,8 +235,6 @@ async def test_ready_database_preflight_coalesces_concurrent_requests():
     runtime_gate.assert_awaited_once_with(
         settings.database_url,
         durable_inbox_enabled=False,
-        ingestion_shadow_enabled=False,
-        sync_reconciliation_enabled=False,
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
@@ -261,8 +251,6 @@ async def test_ready_database_preflight_caches_failure_and_has_timeout(
     settings = SimpleNamespace(
         database_url="postgresql://runtime/private",
         DURABLE_INBOX_ENABLED=False,
-        INGESTION_SHADOW_ENABLED=False,
-        SYNC_RECONCILIATION_ENABLED=False,
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",

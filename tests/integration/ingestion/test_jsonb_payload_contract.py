@@ -17,8 +17,8 @@ from src.ingestion.models import (
 def _event(payload: object) -> NormalizedIngressEvent:
     return NormalizedIngressEvent(
         account_id=8,
-        source=IngressSource.WEBHOOK,
-        raw_event_type="NewMailEvent",
+        source=IngressSource.SYNC,
+        raw_event_type="create",
         kind=ChangeKind.CREATE,
         external_email_id="numeric-payload-message",
         folder="INBOX",

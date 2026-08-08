@@ -28,13 +28,8 @@ from src.ingestion.policy import FolderScope, PolicySnapshot
 def _scope() -> FolderScope:
     return FolderScope.configured(
         canonical_key="INBOX",
-        webhook_ids=("legacy-webhook-id",),
         sync_folder="INBOX",
         event_policy_matrix={
-            (IngressSource.WEBHOOK, "NewMailEvent", ChangeKind.CREATE): ProcessingPolicy.FULL,
-            (IngressSource.WEBHOOK, "CreatedEvent", ChangeKind.CREATE): ProcessingPolicy.IGNORED,
-            (IngressSource.WEBHOOK, "ModifiedEvent", ChangeKind.UPDATE): ProcessingPolicy.METADATA_ONLY,
-            (IngressSource.WEBHOOK, "DeletedEvent", ChangeKind.DELETE): ProcessingPolicy.METADATA_ONLY,
             (IngressSource.SYNC, "create", ChangeKind.CREATE): ProcessingPolicy.FULL,
             (IngressSource.SYNC, "update", ChangeKind.UPDATE): ProcessingPolicy.METADATA_ONLY,
             (IngressSource.SYNC, "delete", ChangeKind.DELETE): ProcessingPolicy.METADATA_ONLY,
@@ -343,7 +338,6 @@ def test_polling_ingress_rejects_non_gateway_inbox_aliases() -> None:
 
     scope = FolderScope.configured(
         canonical_key="INBOX",
-        webhook_ids=("legacy-webhook-id",),
         sync_folder="Inbox",
         event_policy_matrix=_scope().event_policy_matrix,
     )

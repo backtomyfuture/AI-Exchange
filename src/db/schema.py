@@ -8,7 +8,7 @@ from src.db.roles import DatabaseRoleError, require_runtime_database_role
 from src.db.schema_contract import require_database_schema_contract
 
 
-EXPECTED_DATABASE_REVISION = "20260805_0008"
+EXPECTED_DATABASE_REVISION = "20260808_0001"
 RUNTIME_COMPATIBLE_DATABASE_REVISIONS = frozenset({EXPECTED_DATABASE_REVISION})
 
 
@@ -47,8 +47,6 @@ async def require_runtime_database(
     dsn: str,
     *,
     durable_inbox_enabled: bool,
-    ingestion_shadow_enabled: bool,
-    sync_reconciliation_enabled: bool,
     role_separation_required: bool = False,
     expected_runtime_role: str = "",
     expected_migration_role: str = "",
@@ -56,16 +54,13 @@ async def require_runtime_database(
     expected_auditor_role: str = "",
     target_schema: str = "public",
 ) -> None:
-    """Require the one greenfield schema and reject unavailable capabilities."""
-    if sync_reconciliation_enabled:
-        raise DatabaseRevisionError("sync_reconciliation_capability_unavailable")
-
+    """Require the one polling schema and its separated runtime identity."""
     if not role_separation_required:
         raise DatabaseRoleError("database_role_preflight_failed")
 
-    # Retained keyword arguments are a call-shape compatibility seam only. They
-    # cannot select a predecessor revision or mint database authority.
-    _ = durable_inbox_enabled, ingestion_shadow_enabled
+    # The durability mode cannot select a predecessor revision or mint database
+    # authority; it is validated by the application runtime separately.
+    _ = durable_inbox_enabled
     await require_runtime_database_role(
         dsn,
         expected_runtime_role=expected_runtime_role,

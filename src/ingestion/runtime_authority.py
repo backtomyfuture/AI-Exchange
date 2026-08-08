@@ -10,19 +10,27 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final
 from uuid import UUID
 
-from src.ingestion.models import POSTGRES_BIGINT_MAX
+import psycopg
+
+from src.ingestion.models import (
+    ChangeKind,
+    IngressSource,
+    POSTGRES_BIGINT_MAX,
+    ProcessingPolicy,
+)
 from src.ingestion.policy import FolderScope, PolicySnapshot
 from src.ingestion.runtime_capability import (
-    PHASE2_SCHEMA_REVISION,
+    POLLING_SCHEMA_REVISION,
     RuntimeCapabilityManifest,
-    install_phase2_capability,
+    RuntimeCapabilityStage,
+    install_polling_capability,
 )
 
 
@@ -46,8 +54,6 @@ _INSTANCE_ID_PATTERN: Final = re.compile(
     flags=re.ASCII,
 )
 _MAX_LEASE_SECONDS: Final = 3600
-_MAX_WEBHOOK_IDS_PER_SCOPE: Final = 64
-_MAX_WEBHOOK_IDS_JSON_BYTES: Final = 32768
 
 _AUTHORITY_COLUMNS: Final = (
     "account_id",
@@ -403,19 +409,7 @@ def _canonical_scope(scope: FolderScope) -> dict[str, object]:
         ],
         "scope_hash": scope.config_hash,
         "sync_folder": scope.sync_folder,
-        "webhook_ids": sorted(scope.webhook_ids),
     }
-
-
-def _database_webhook_ids_canonical_json(webhook_ids: frozenset[str]) -> str:
-    """Mirror PostgreSQL jsonb array text used by the schema byte constraint."""
-
-    return json.dumps(
-        sorted(webhook_ids),
-        ensure_ascii=False,
-        separators=(", ", ": "),
-        allow_nan=False,
-    )
 
 
 def _greenfield_policy_scopes(snapshot: object) -> tuple[FolderScope, ...]:
@@ -435,7 +429,6 @@ def _greenfield_policy_scopes(snapshot: object) -> tuple[FolderScope, ...]:
         try:
             exact_scope = FolderScope(
                 canonical_key=scope.canonical_key,
-                webhook_ids=scope.webhook_ids,
                 sync_folder=scope.sync_folder,
                 event_policy_matrix=scope.event_policy_matrix,
                 config_hash=scope.config_hash,
@@ -444,13 +437,6 @@ def _greenfield_policy_scopes(snapshot: object) -> tuple[FolderScope, ...]:
             raise ValueError(
                 "policy snapshot contains an invalid folder scope"
             ) from None
-        webhook_count = len(exact_scope.webhook_ids)
-        webhook_json = _database_webhook_ids_canonical_json(exact_scope.webhook_ids)
-        if (
-            not 1 <= webhook_count <= _MAX_WEBHOOK_IDS_PER_SCOPE
-            or len(webhook_json.encode("utf-8")) > _MAX_WEBHOOK_IDS_JSON_BYTES
-        ):
-            raise ValueError("policy scope webhook_ids exceed database bounds")
         exact_scopes.append(exact_scope)
 
     try:
@@ -499,7 +485,7 @@ class RuntimeContract:
     capability_manifest: RuntimeCapabilityManifest
 
     def __post_init__(self) -> None:
-        if self.schema_revision != PHASE2_SCHEMA_REVISION:
+        if self.schema_revision != POLLING_SCHEMA_REVISION:
             raise ValueError("runtime contract requires the exact greenfield schema")
         _require_sha256("schema_digest", self.schema_digest)
         _require_bigint("protocol_version", self.protocol_version, minimum=1)
@@ -507,7 +493,7 @@ class RuntimeContract:
         _require_sha256("config_hash", self.config_hash)
         if type(self.capability_manifest) is not RuntimeCapabilityManifest:
             raise ValueError("capability_manifest must be exact")
-        capability = install_phase2_capability(self.capability_manifest)
+        capability = install_polling_capability(self.capability_manifest)
         if (
             capability.schema_revision != self.schema_revision
             or capability.schema_digest != self.schema_digest
@@ -549,7 +535,7 @@ class RuntimeAuthority:
             raise ValueError("greenfield authority requires durable_v1")
         _require_stored_bigint("authority_epoch", self.authority_epoch, minimum=1)
         _require_stored_bigint("version", self.version, minimum=1)
-        if self.schema_revision != PHASE2_SCHEMA_REVISION:
+        if self.schema_revision != POLLING_SCHEMA_REVISION:
             raise ValueError("authority schema revision is invalid")
         _require_bigint("protocol_version", self.protocol_version, minimum=1)
         _require_pattern_text("build_id", self.build_id, _BUILD_ID_PATTERN)
@@ -566,7 +552,7 @@ class RuntimeAuthority:
         )
 
 
-def require_phase2_ingress_authority(authority: RuntimeAuthority) -> RuntimeAuthority:
+def require_polling_ingress_authority(authority: RuntimeAuthority) -> RuntimeAuthority:
     if type(authority) is not RuntimeAuthority:
         raise RuntimeError("runtime_authority_unavailable")
     try:
@@ -605,7 +591,7 @@ class RuntimeInstanceLease:
         _require_bigint("account_id", self.account_id, minimum=1)
         workload = _require_exact_enum("workload", self.workload, RuntimeWorkload)
         if workload is not RuntimeWorkload.WEB:
-            raise ValueError("Phase 2 may register only a web workload")
+            raise ValueError("Polling may register only a web workload")
         object.__setattr__(self, "workload", workload)
         _require_pattern_text("instance_id", self.instance_id, _INSTANCE_ID_PATTERN)
         object.__setattr__(
@@ -617,7 +603,7 @@ class RuntimeInstanceLease:
             raise ValueError("greenfield instance requires generation and fence 1")
         _require_stored_bigint("authority_epoch", self.authority_epoch, minimum=1)
         _require_sha256("capability_hash", self.capability_hash)
-        if self.schema_revision != PHASE2_SCHEMA_REVISION:
+        if self.schema_revision != POLLING_SCHEMA_REVISION:
             raise ValueError("instance schema revision is invalid")
         _require_bigint("protocol_version", self.protocol_version, minimum=1)
         _require_pattern_text("build_id", self.build_id, _BUILD_ID_PATTERN)
@@ -631,7 +617,7 @@ class RuntimeInstanceLease:
             RuntimeInstanceLifecycle.ACTIVE,
             RuntimeInstanceLifecycle.DRAINING,
         }:
-            raise ValueError("Phase 2 web lifecycle is invalid")
+            raise ValueError("Polling web lifecycle is invalid")
         object.__setattr__(self, "lifecycle", lifecycle)
         _require_stored_bigint("lease_version", self.lease_version, minimum=1)
         _require_stored_bigint("accepted_count", self.accepted_count, minimum=0)
@@ -830,7 +816,7 @@ def canonical_authority_transition_payload(
     actor: str,
     reason: str,
 ) -> tuple[str, str]:
-    """Freeze one of the only two Phase 2 authority transitions."""
+    """Freeze one of the only two Polling authority transitions."""
 
     exact_authority = _revalidate_authority(authority)
     exact_target = _require_exact_enum(
@@ -850,7 +836,7 @@ def canonical_authority_transition_payload(
     ):
         command_name = _RESUME_COMMAND_NAME
     else:
-        raise ValueError("Phase 2 authority transition is invalid")
+        raise ValueError("Polling authority transition is invalid")
     if (
         exact_authority.authority_epoch >= POSTGRES_BIGINT_MAX - 1
         or exact_authority.version >= POSTGRES_BIGINT_MAX - 1
@@ -1229,7 +1215,7 @@ class GreenfieldInitializer:
 
 
 class RuntimeAuthorityRepository:
-    """Read, pause, or resume the Phase 2 ingress authority."""
+    """Read, pause, or resume the Polling ingress authority."""
 
     __slots__ = ("_pool",)
 
@@ -1338,7 +1324,7 @@ class RuntimeAuthorityRepository:
 
 
 class RuntimeInstanceRepository:
-    """Register and maintain only Phase 2 web runtime sessions."""
+    """Register and maintain only Polling web runtime sessions."""
 
     __slots__ = ("_pool",)
 
@@ -1487,7 +1473,7 @@ _CAPABILITY_SQL = (
     "WHERE capability_hash = %s AND policy_manifest_hash = %s"
 )
 _SCOPES_SQL = (
-    "SELECT canonical_key, webhook_ids, sync_folder, event_policy_matrix, "
+    "SELECT canonical_key, sync_folder, event_policy_matrix, "
     "scope_hash::text AS scope_hash, "
     "policy_manifest_hash::text AS policy_manifest_hash "
     "FROM public.pipeline_folder_scopes "
@@ -1542,7 +1528,7 @@ class RuntimeManifestRepository:
         self,
         authority: RuntimeAuthority,
     ) -> tuple[RuntimeContract, PolicySnapshot]:
-        exact_authority = require_phase2_ingress_authority(authority)
+        exact_authority = require_polling_ingress_authority(authority)
         capability_columns = (
             "stage",
             "schema_revision",
@@ -1557,7 +1543,6 @@ class RuntimeManifestRepository:
         )
         scope_columns = (
             "canonical_key",
-            "webhook_ids",
             "sync_folder",
             "event_policy_matrix",
             "scope_hash",
@@ -1602,7 +1587,7 @@ class RuntimeManifestRepository:
                 predecessor_hash=material["predecessor_hash"],
             )
             if (
-                capability.stage is not RuntimeCapabilityStage.PHASE2_INGESTION
+                capability.stage is not RuntimeCapabilityStage.POLLING_INGESTION
                 or capability.capability_hash != exact_authority.capability_hash
             ):
                 raise RuntimeUnavailableError("manifest_unavailable")
@@ -1617,7 +1602,6 @@ class RuntimeManifestRepository:
                     raise RuntimeUnavailableError("manifest_unavailable")
                 configured = FolderScope.configured(
                     canonical_key=scope["canonical_key"],
-                    webhook_ids=scope["webhook_ids"],
                     sync_folder=scope["sync_folder"],
                     event_policy_matrix=_policy_matrix_from_database(
                         scope["event_policy_matrix"]
@@ -1668,9 +1652,11 @@ __all__ = [
     "RuntimeInstanceLease",
     "RuntimeInstanceLifecycle",
     "RuntimeInstanceRepository",
+    "RuntimeManifestRepository",
+    "RuntimeUnavailableError",
     "RuntimeWorkload",
     "canonical_authority_transition_payload",
     "canonical_initialization_payload",
     "canonical_policy_manifest",
-    "require_phase2_ingress_authority",
+    "require_polling_ingress_authority",
 ]

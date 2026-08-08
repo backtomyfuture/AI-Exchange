@@ -109,24 +109,20 @@ class StyleProfiler:
             Style profile dict with keys ``general_style``, ``register_profiles``,
             and ``common_replacements``.
         """
+        if not _memory_learning_enabled():
+            logger.info("Style profiling skipped: Memory Learning is disabled.")
+            return _empty_profile()
+
         sent_emails = await self._fetch_sent_replies()
         if not sent_emails:
             logger.info("Style profiling skipped: no sent replies found.")
-            return {
-                "general_style": "",
-                "register_profiles": [],
-                "common_replacements": [],
-            }
+            return _empty_profile()
 
         grouped = self._group_by_recipient(sent_emails)
         profile = await self._analyze_with_llm(sent_emails, grouped)
 
         if not profile:
-            return {
-                "general_style": "",
-                "register_profiles": [],
-                "common_replacements": [],
-            }
+            return _empty_profile()
 
         if self.email_processor:
             await self._store_profile(profile)
@@ -203,6 +199,8 @@ class StyleProfiler:
                 except (ValueError, TypeError):
                     pass
 
+        if not _memory_learning_enabled():
+            return stored
         return await self.build_profile()
 
     async def _load_stored_profile(self) -> dict | None:
@@ -449,3 +447,15 @@ class StyleProfiler:
                 return rp
 
         return register_profiles[0] if register_profiles else None
+
+
+def _memory_learning_enabled() -> bool:
+    return bool(getattr(get_settings(), "MEMORY_LEARNING_ENABLED", False))
+
+
+def _empty_profile() -> dict:
+    return {
+        "general_style": "",
+        "register_profiles": [],
+        "common_replacements": [],
+    }

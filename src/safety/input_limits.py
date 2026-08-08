@@ -6,7 +6,6 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class InputLimits:
-    webhook_bytes: int = 1_048_576
     exchange_response_bytes: int = 67_108_864
     body_bytes: int = 10_485_760
     attachment_count: int = 20
@@ -30,11 +29,6 @@ def _integer_setting(settings: Any, name: str, default: int) -> int:
 def input_limits_from_settings(settings: Any) -> InputLimits:
     defaults = InputLimits()
     return InputLimits(
-        webhook_bytes=_integer_setting(
-            settings,
-            "WEBHOOK_MAX_BYTES",
-            defaults.webhook_bytes,
-        ),
         exchange_response_bytes=_integer_setting(
             settings,
             "EXCHANGE_RESPONSE_MAX_BYTES",

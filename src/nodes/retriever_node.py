@@ -169,7 +169,7 @@ async def retrieve_context(
     if experience_hints:
         metadata["experience_hints"] = experience_hints
 
-    # Priority 4: thread summary (Phase 3)
+    # Priority 4: thread summary (Approval)
     if results:
         try:
             thread_summary = await _generate_thread_summary(results, subject)
@@ -189,7 +189,7 @@ async def retrieve_context(
     if style_guidance:
         metadata["style_guidance"] = style_guidance
 
-    # Priority 6: user preference hints (Phase 2)
+    # Priority 6: user preference hints (Polling)
     preference_hints = await _retrieve_user_preferences(subject, sender)
     if preference_hints:
         metadata["preference_hints"] = preference_hints

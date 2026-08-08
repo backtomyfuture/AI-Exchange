@@ -59,8 +59,8 @@ def _lease() -> InboxLease:
     now = datetime.now(UTC)
     event = NormalizedIngressEvent(
         account_id=8,
-        source=IngressSource.WEBHOOK,
-        raw_event_type="NewMailEvent",
+        source=IngressSource.SYNC,
+        raw_event_type="create",
         kind=ChangeKind.CREATE,
         external_email_id="message-1",
         folder="INBOX",
@@ -68,7 +68,7 @@ def _lease() -> InboxLease:
         dedupe_key="a" * 64,
         payload={"id": "message-1"},
         processing_policy=ProcessingPolicy.FULL,
-        source_event_at=now,
+        source_event_at=None,
     )
     return InboxLease(
         id=str(uuid4()),
@@ -182,7 +182,7 @@ async def test_public_inputs_are_rejected_before_database_access(
         await getattr(ownership, method_name)(*args)
 
 
-def test_phase2_exposes_no_public_generation_switch() -> None:
+def test_polling_exposes_no_public_generation_switch() -> None:
     public_repository_methods = {
         name
         for name in PipelineOwnershipRepository.__dict__

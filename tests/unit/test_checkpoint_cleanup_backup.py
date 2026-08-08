@@ -26,9 +26,9 @@ from src.maintenance.cleanup_backup import (
 KEY = b"k" * 32
 PLAN_ID = "1" * 64
 DATABASE_FINGERPRINT = "2" * 64
-BACKUP_ID = "backup-20260712-001"
+BACKUP_ID = "backup-20260808-001"
 MANIFEST_SHA256 = "a" * 64
-ALEMBIC_REVISION = "20260710_0002"
+ALEMBIC_REVISION = "20260808_0001"
 CHECKPOINT_REVISION = 9
 PLAN_CREATED_AT = datetime(2026, 7, 12, 1, 0, tzinfo=timezone.utc)
 COMPLETED_AT = datetime(2026, 7, 12, 1, 5, tzinfo=timezone.utc)
@@ -477,9 +477,9 @@ def test_ed25519_signature_covers_canonical_json_for_every_unsigned_claim() -> N
         "signature_algorithm": "Ed25519ph",
         "plan_id": "3" * 64,
         "database_fingerprint": "4" * 64,
-        "alembic_revision": "20260710_0003",
+        "alembic_revision": "other-baseline",
         "checkpoint_revision": 10,
-        "backup_id": "backup-20260712-002",
+        "backup_id": "backup-20260808-002",
         "completed_at": "2026-07-12T01:06:00Z",
         "scope": "checkpoint",
         "manifest_sha256": "b" * 64,

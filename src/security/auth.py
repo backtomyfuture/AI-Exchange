@@ -50,7 +50,7 @@ _PLACEHOLDER_PREFIXES = (
     "your-",
 )
 _MIN_BOUNDARY_SECRET_LENGTH = 16
-_PHASE4_LITE_INSTANCE_ID = "ai-exchange-web"
+_POLLING_INSTANCE_ID = "ai-exchange-web"
 _BOUNDARY_SECRET_FIELDS = frozenset(
     {
         "POSTGRES_PASSWORD",
@@ -196,13 +196,9 @@ def validate_runtime_security(settings: Any | None = None) -> Any:
         invalid.add("DATABASE_ROLE_SEPARATION_REQUIRED")
     if _setting(settings, "DURABLE_INBOX_ENABLED", False) is not True:
         invalid.add("DURABLE_INBOX_ENABLED")
-    if _setting(settings, "INGESTION_SHADOW_ENABLED", False) is not False:
-        invalid.add("INGESTION_SHADOW_ENABLED")
-    if _setting(settings, "SYNC_RECONCILIATION_ENABLED", False) is not False:
-        invalid.add("SYNC_RECONCILIATION_ENABLED")
     if _setting(settings, "POLLING_ENABLED", False) is not True:
         invalid.add("POLLING_ENABLED")
-    if _plain(settings, "INGESTION_INSTANCE_ID") != _PHASE4_LITE_INSTANCE_ID:
+    if _plain(settings, "INGESTION_INSTANCE_ID") != _POLLING_INSTANCE_ID:
         invalid.add("INGESTION_INSTANCE_ID")
 
     target_schema = _plain(settings, "POSTGRES_SCHEMA")

@@ -146,7 +146,7 @@ def test_synchronous_lark_network_calls_run_off_the_event_loop() -> None:
     } <= threaded_targets
 
 
-def test_phase2_adapter_effect_ceilings_are_closed_and_exact() -> None:
+def test_polling_adapter_effect_ceilings_are_closed_and_exact() -> None:
     from src.ingestion import legacy_adapter
 
     assert legacy_adapter._FULL_EFFECTS == frozenset(ExternalEffectKind)

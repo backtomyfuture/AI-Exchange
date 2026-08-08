@@ -193,7 +193,7 @@ class LarkCardBuilder:
                 )
                 unresolved_emails.append(email)
 
-        # Phase 2: Exchange contact resolution fallback
+        # Polling: Exchange contact resolution fallback
         if unresolved_emails and self.exchange_client:
             import asyncio
             logger.info(
