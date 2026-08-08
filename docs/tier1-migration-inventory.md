@@ -11,9 +11,9 @@
   （`TIER2_MIN_HITS=2`, `TIER2_MIN_RATIO=0.5`）已经存在，不需要新代码；
   `migration_status=already_supported`。业务 owner 复核后确认这 6 条也应直接退休
   （历史回复率 20%–50%、样本 4–6 封，不值得保留硬编码静默），已从
-  `skills_registry/` 移出到 `skills_registry_retired/`（`git mv`，可逆）。
-- **明确退休且业务 owner 接受**：RETIRE（9）—— 已从 `skills_registry/` 移出到
-  `skills_registry_retired/`（`git mv`，可逆）。
+  `skills_registry/` 退休移除（审计记录见 Git 历史）。
+- **明确退休且业务 owner 接受**：RETIRE（9）—— 已从 `skills_registry/` 退休移除
+  （审计记录见 Git 历史）。
 - 本次没有规则归入 `manual_review` 或 `explicitly_deferred`（不删除旧行为）类别。
 
 新旧规则不存在双跑：`tier1_rules/` 尚未接入运行时（见下文"运行时集成"仍是独立的、
@@ -46,7 +46,7 @@
 
 ---
 
-## RETIRE（9 条，已从 `skills_registry/` 移至 `skills_registry_retired/`）
+## RETIRE（9 条，已从 `skills_registry/` 退休移除）
 
 | old_rule_id | business_purpose | final_decision 理由 |
 |---|---|---|
@@ -146,8 +146,7 @@
 - **validity**: 不适用。
 - **final_decision**: 旧 Tier 1 硬编码规则退休（不产生新 Tier 1 规则），落回 Tier 2
   历史投票 + Tier 3 LLM 兜底判断。业务 owner 复核后确认直接接受此风险，6 条旧
-  `skills_registry/` 目录已 `git mv` 至 `skills_registry_retired/`（与 RETIRE 组
-  同样的可逆退休方式，理由见该目录 `README.md`）。
+  `skills_registry/` 目录已退休移除（与 RETIRE 组相同，审计记录见 Git 历史）。
 
 ---
 
@@ -216,7 +215,7 @@
   1 条 SPLIT 源）**保持原样、继续在旧引擎下运行**，行为不变——它们对应的新
   `tier1_rules/` 规则已编译验证但尚未接入运行时，提前移除旧目录会造成真实的覆盖
   缺口。
-- 已下线到 `skills_registry_retired/` 的合计 **16 条**：
+- 已退休下线的合计 **16 条**（退休目录已随清理物理删除，审计记录见 Git 历史）：
   - **9 条纯 RETIRE**（无替代规则、业务 owner 已确认接受 LLM 兜底）；
   - **2 条冗余重复**（`skill_auto_lanjuan`/`skill_auto_hnasafety`，退休后仍有未
     改动的姊妹规则 `skill_vip_handling`/`skill_safety_platform_archive` 继续覆盖

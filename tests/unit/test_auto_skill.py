@@ -155,9 +155,9 @@ def test_real_skill_auto_lanjuan_retired_from_production_registry():
     """skill_auto_lanjuan was retired during the Tier 1 v1 migration: it
     duplicated skill_vip_handling and, due to last-write-wins skill ordering,
     silently clobbered vip_handling's direct-recipient-aware decision (see
-    docs/tier1-migration-inventory.md RETIRE group). It now lives under
-    skills_registry_retired/, not skills_registry/, so the live SkillManager
-    must not load it."""
+    docs/tier1-migration-inventory.md RETIRE group). It has been removed from
+    the production skills_registry/, so the live SkillManager must not load
+    it."""
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     mgr = SkillManager(registry_path=os.path.join(root, "skills_registry"))
     assert mgr.get_skill("skill_auto_lanjuan") is None
