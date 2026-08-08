@@ -31,10 +31,15 @@
 - `public.alembic_version = 20260808_0001`；
 - capability stage 仅允许 `polling_ingestion`、`approval_send`、`graph_projection`；
 - schema contract、角色 preflight 与 checkpoint bootstrap 均在 bootstrap 中完成；
-- 全量测试：`5041 passed, 167 skipped`；Ruff 通过。
+- 全量测试：`5042 passed, 167 skipped`；Ruff 通过。
 
 ## 首次真实部署与旧资源回收
 
-真实部署必须使用新的 Compose project name，保留现有 `secrets/`，按以下顺序完成：生成部署配置、创建空卷、provision、bootstrap、生成并初始化 polling manifest、启动服务并通过 `/ready`。只有该新项目通过 readiness 后，才可精确识别并删除旧 Compose 项目的容器和命名卷；不得删除 `secrets/` 或任何未确认归属的 Docker 资源。
+已于 2026-08-08 使用独立项目 `ai-exchange-greenfield` 完成首次正式绿地部署。运行时代码 revision 为 `76ffeb1f1b45a246ec5aaee4ee7322f9941b8427`，镜像为 `ai-exchange:greenfield-76ffeb1f1b45`（`a8b83e2018c88ee5c9c0372bad7d66f35cef4b3f3c70a13907e924342b0ab791`）。执行顺序为：生成部署配置、创建空 PostgreSQL/Qdrant 卷、provision、bootstrap、生成并初始化 polling manifest、启动服务。
+
+- 新运行时在 `127.0.0.1:8000` 通过 `/ready`（`processing=active`）和 `/health`；OpenAPI 路径中 Webhook 数量为 0。
+- 初始化状态为 `schema_revision=polling-v1`、`state=ingest_only`、一个 INBOX scope；容器内确认 `MEMORY_LEARNING_ENABLED=false`。
+- 当前使用 `--development` Compose 覆盖层，因为已配置的 Exchange 地址是本地/非 HTTPS 开发端点。默认生产模式仍会拒绝该不安全配置，未被绕过。
+- 新实例验收后，已精确删除旧 `ai-exchange` 项目的三个容器以及 `ai-exchange_content_data`、`ai-exchange_postgres_data`、`ai-exchange_qdrant_data` 三个命名卷；`secrets/` 已保留。
 
 外部 Exchange/Lark 实际效果仍取决于部署环境中已配置的集成凭据；健康检查、数据库基线、轮询授权和应用就绪需与外部副作用验证分开记录。
