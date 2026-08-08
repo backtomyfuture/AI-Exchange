@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures"
 SYNTHETIC_EML = FIXTURES / "synthetic_notification.eml"
-CONVERT_SCRIPT = PROJECT_ROOT / "tests" / "convert_eml.py"
+CONVERT_SCRIPT = PROJECT_ROOT / "scripts" / "convert_eml.py"
 CARD_SCRIPT = PROJECT_ROOT / "scripts" / "push_test_card.py"
 
 _ALLOWED_MAIL_FIXTURES = {Path("synthetic_notification.eml")}
