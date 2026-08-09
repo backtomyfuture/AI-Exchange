@@ -262,9 +262,6 @@ async def test_common_email_boundary_rejects_before_mutation_or_side_effects(
     ctx.exchange_client = AsyncMock()
 
     with patch("src.exchange_service.get_settings") as mock_settings, patch(
-        "src.exchange_service._upload_attachments_to_lark",
-        new_callable=AsyncMock,
-    ) as mock_upload, patch(
         "src.exchange_service._ingest_to_qdrant",
         new_callable=AsyncMock,
     ) as mock_ingest, patch(
@@ -284,7 +281,6 @@ async def test_common_email_boundary_rejects_before_mutation_or_side_effects(
     assert "draft_to" not in email
     assert "draft_cc" not in email
     ctx.db_manager.log_initial_email.assert_not_awaited()
-    mock_upload.assert_not_awaited()
     mock_ingest.assert_not_awaited()
     mock_graph.assert_not_awaited()
 
@@ -305,11 +301,7 @@ async def test_malicious_attachment_is_rejected_at_common_boundary_without_side_
     ctx.graph = AsyncMock()
     ctx.exchange_client = AsyncMock()
 
-    with patch(
-        "src.exchange_service._upload_attachments_to_lark",
-        new_callable=AsyncMock,
-    ) as mock_upload, patch(
-        "src.exchange_service._ingest_to_qdrant",
+    with patch("src.exchange_service._ingest_to_qdrant",
         new_callable=AsyncMock,
     ) as mock_ingest, patch(
         "src.exchange_service._run_ai_pipeline",
@@ -323,6 +315,5 @@ async def test_malicious_attachment_is_rejected_at_common_boundary_without_side_
     assert "draft_to" not in email
     assert "draft_cc" not in email
     ctx.db_manager.log_initial_email.assert_not_awaited()
-    mock_upload.assert_not_awaited()
     mock_ingest.assert_not_awaited()
     mock_graph.assert_not_awaited()

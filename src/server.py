@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from typing import Any
 from src.config import get_settings
 from src.daily_digest import DailyDigestScheduler
+from src.email_feishu_delivery import build_email_feishu_delivery
 from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
 from src.db.schema import require_runtime_database
 from src.db.runtime_boundary import require_runtime_database_boundary
@@ -514,6 +515,13 @@ async def application_lifespan(application: FastAPI):
                 worker_loop_arg=asyncio.get_running_loop(),
                 dependencies=context.graph_dependencies,
             )
+            context.email_feishu_delivery = build_email_feishu_delivery(
+                database=context.db_manager,
+                graph=context.graph,
+                graph_dependencies=context.graph_dependencies,
+                lark_api_client=lark_app.lark_api_client,
+                card_builder=lark_app.card_builder,
+            )
             # init_lark_app retains its legacy default of enabling intake. No
             # callback may be accepted until the runtime registration, recovery,
             # and Worker startup below have all succeeded.
@@ -721,4 +729,3 @@ async def queue_status(request: Request):
             "oldest_pending_seconds": stats.oldest_pending_seconds,
         },
     }
-

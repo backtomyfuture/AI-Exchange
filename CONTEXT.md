@@ -136,8 +136,20 @@ An Inbound Email classified as requiring a reply or forward, and therefore eligi
 _Avoid_: Important email, approval email
 
 **Feishu Delivery**:
-A user-facing Feishu message that surfaces an Inbound Email or a Daily Email Operations Digest, as a Read Notification, Draft Approval, or concise daily digest message.
+A user-facing Feishu message that surfaces an Inbound Email or a Daily Email Operations Digest, as an Email Feishu Delivery or concise daily digest message.
 _Avoid_: Visual analysis, model result
+
+**Email Feishu Delivery**:
+A user-facing Feishu card for exactly one Inbound Email, as a Read Notification, Draft Approval, or Manual Review Notification. It excludes Daily Digest Delivery, inbound Feishu events, and card-action handling.
+_Avoid_: Daily Digest Delivery, Lark event handling
+
+**Email Delivery Outcome**:
+The durable result of attempting one Email Feishu Delivery: confirmed delivery, known failure, or unknown outcome. It is distinct from the Exchange read state; only confirmed delivery can advance delivery state, and an unknown outcome is not safe to replay automatically.
+_Avoid_: Email processing outcome, mark-as-read result
+
+**Delivery Resource**:
+A rendered Review Material PDF or uploaded Business Attachment referenced by one Email Feishu Delivery. A production Email Feishu Delivery requires its Review Material PDF; staging, preservation, replacement, and cleanup belong to that delivery lifecycle rather than the email-processing graph.
+_Avoid_: Graph state, generic temporary file
 
 **Read Notification**:
 A Feishu Delivery that asks the recipient to read an email but does not contain a reply draft.
@@ -146,6 +158,10 @@ _Avoid_: Draft approval, skipped email
 **Draft Approval**:
 A Feishu Delivery containing a proposed reply or forward for human review and decision.
 _Avoid_: Read notification, automatic reply
+
+**Manual Review Notification**:
+An Email Feishu Delivery that presents an unresolved or unsafe processing outcome for human inspection, without offering a draft-approval action or uploading Business Attachments.
+_Avoid_: Draft approval, automatic retry
 
 **Review Material**:
 The faithful, safely rendered original email presented to a human decision-maker, including Inline Images in their original context.

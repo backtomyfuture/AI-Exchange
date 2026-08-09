@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import base64
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.exchange_service import _upload_attachments_to_lark
+from src.email_feishu_delivery import (
+    EmailFeishuDelivery,
+    LarkCardDelivery,
+    ReadNotificationRequest,
+)
 from src.nodes.retriever_node import _visual_analysis_inputs
 from src.safety.attachments import AttachmentPolicy
 
@@ -106,11 +111,37 @@ async def test_delivery_boundary_withholds_disguised_attachment_before_remote_io
         ]
     }
 
-    with patch("src.exchange_service.lark_app.upload_file_to_drive") as upload:
-        result = await _upload_attachments_to_lark(email)
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(
+        return_value=SimpleNamespace(values={"attachment_tokens": [], "pdf_token": None})
+    )
+    graph.aupdate_state = AsyncMock()
+    upload = MagicMock()
 
-    assert result.tokens == ()
-    assert result.links == ()
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/review", "file_token": "review-pdf"}
+
+    delivery = EmailFeishuDelivery(
+        database=AsyncMock(),
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=lambda *_args: LarkCardDelivery(True, True),
+        upload_file=upload,
+        delete_file=MagicMock(return_value=True),
+    )
+
+    await delivery.deliver(
+        ReadNotificationRequest(
+            email_id="mail-attachment-policy",
+            email_data=email,
+            classification={"need_reply": False},
+            context=(),
+            routing_log=(),
+        ),
+        effect_boundary=None,
+    )
+
     upload.assert_not_called()
 
 

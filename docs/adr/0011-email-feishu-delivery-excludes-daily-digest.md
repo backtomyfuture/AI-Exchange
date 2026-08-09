@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# Keep email card delivery separate from daily digest delivery
+
+Email Feishu Delivery owns the outbound card lifecycle for one Inbound Email: Read Notification, Draft Approval, and Manual Review Notification. It exposes one typed `deliver()` interface with kind-specific request payloads and an Email Delivery Outcome. It stages a required Review Material PDF, uploads Business Attachments only for Read Notifications and Draft Approvals, builds and sends cards, confirms delivery-specific durable state (`waiting_approval`, `notified_readonly`, or `manual_review`), and cleans up or preserves Delivery Resources; the Exchange orchestration retains mark-as-read and Inbox completion. Its outcome is explicitly confirmed delivery, known failure, or unknown outcome: only the first advances delivery state, while unknown outcomes are manual review and never automatic replay. It is constructed once from existing explicit stable database, Lark, card-building, and file/PDF dependencies; each delivery invocation receives the existing External Effect Boundary to authorize its individual external steps. This uses neither a dependency-injection framework nor reverse imports from `lark_app`. The module does not own inbound Feishu events or card-action handling. Daily Digest Delivery remains a separate durable delivery model because its persisted bundle, reconciliation, and at-most-one-confirmed-bundle semantics differ materially from a per-email card; combining them would widen the email-card module without reducing its complexity.
