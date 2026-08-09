@@ -13,7 +13,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -250,9 +249,8 @@ def _deployment_context(
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         raise DeploymentError("git_revision_unavailable") from None
-    timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     environment = dict(os.environ)
-    environment["AI_EXCHANGE_IMAGE"] = f"ai-exchange:local-{timestamp}-{head}"
+    environment["AI_EXCHANGE_IMAGE"] = f"ai-exchange:local-{head}"
     rules_dir = PROJECT_ROOT / "tier1_rules"
     if rules_dir.is_dir():
         environment["TIER1_ARTIFACT_DIGEST"] = _prepare_tier1_artifact(
