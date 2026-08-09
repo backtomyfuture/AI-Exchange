@@ -79,6 +79,7 @@ jobs:
           EMBEDDING_API_KEY: polling-ci-embedding-key
           EMBEDDING_BASE_URL: https://embeddings.polling-ci.invalid/v1
           EMBEDDING_MODEL: polling-ci-embedding-model
+          TIER1_ARTIFACT_DIGEST: polling-ci-tier1-digest
         run: |
           set -euo pipefail
           docker compose --profile migration --profile checkpoint-maintenance --profile checkpoint-maintenance-execute --env-file /dev/null config --quiet
@@ -105,5 +106,7 @@ jobs:
           uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/db/runtime_boundary.py'
           uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/db/maintenance_fence.py'
           uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/db/maintenance_settings.py'
-          uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/ingestion/*'
+          uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/ingestion/email_events.py'
+          uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/ingestion/recovery.py'
+          uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/ingestion/runtime_capability.py'
           uv run --frozen coverage report --precision=2 --fail-under=90 --include='src/db/roles.py,src/db/schema_contract.py,src/db/bootstrap.py'

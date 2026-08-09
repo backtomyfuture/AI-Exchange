@@ -609,6 +609,36 @@ async def test_checkpoint_auditor_cuts_off_driver_error_and_private_values(caplo
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_auditor_rejects_missing_catalog_snapshot(caplog):
+    module = importlib.import_module("src.db.auditor")
+    cursor = AsyncMock()
+    cursor.fetchone.return_value = None
+    connection = AsyncMock()
+    connection.__aenter__.return_value = connection
+    connection.execute.return_value = cursor
+
+    with (
+        patch.object(
+            module.psycopg.AsyncConnection,
+            "connect",
+            new=AsyncMock(return_value=connection),
+        ),
+        caplog.at_level("ERROR", logger="src.db.auditor"),
+        pytest.raises(module.CheckpointAuditorRoleError),
+    ):
+        await module.require_checkpoint_auditor_database_role(
+            AUDITOR_ROLE,
+            expected_auditor_role=AUDITOR_ROLE,
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            target_schema="public",
+        )
+
+    assert "failed_invariants=snapshot_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["migration", "runtime", "maintenance"])
 @pytest.mark.parametrize(
     (

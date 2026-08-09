@@ -88,6 +88,7 @@ _REQUIRED_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
     ("audit_events", "account_id"): "int8",
     ("audit_events", "event_key"): "bpchar",
     ("audit_events", "safe_metadata"): "jsonb",
+    ("checkpoint_migrations", "v"): "int4",
     ("daily_digest_executions", "account_id"): "int8",
     ("daily_digest_executions", "delivery_parts"): "jsonb",
     ("daily_digest_executions", "delivery_scope_hash"): "bpchar",
@@ -196,7 +197,7 @@ async def require_database_schema_contract(
                 relation_kinds = {str(name): str(kind) for name, kind in relations}
                 # psycopg adapts tuples as composite records, not PostgreSQL
                 # arrays.  This query explicitly requests ``text[]``.
-                names = list(sorted(_BUSINESS_RELATIONS))
+                names = sorted({relation for relation, _column in _REQUIRED_COLUMN_TYPES})
                 columns = await _rows(
                     cursor,
                     "SELECT relation.relname::text, attribute.attname::text, "
@@ -261,6 +262,8 @@ async def require_database_schema_contract(
     if expected_revision is not None and revision != {expected_revision}:
         raise _invalid_contract()
     if not business_complete:
+        if relation_kinds or routines:
+            raise _invalid_contract()
         return
 
     actual_columns = {
@@ -268,6 +271,8 @@ async def require_database_schema_contract(
         for relation, column, schema, type_name in columns
     }
     for field, expected_type in _REQUIRED_COLUMN_TYPES.items():
+        if field[0] not in relation_kinds:
+            continue
         if actual_columns.get(field) != ("pg_catalog", expected_type):
             raise _invalid_contract()
     if any(field in actual_columns for field in _RETIRED_COLUMNS):

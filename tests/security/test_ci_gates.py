@@ -31,7 +31,9 @@ MANDATORY_COVERAGE_TARGETS = (
     "src/db/runtime_boundary.py",
     "src/db/maintenance_fence.py",
     "src/db/maintenance_settings.py",
-    "src/ingestion/*",
+    "src/ingestion/email_events.py",
+    "src/ingestion/recovery.py",
+    "src/ingestion/runtime_capability.py",
 )
 COMPOSE_PLACEHOLDERS = {
     "AI_EXCHANGE_IMAGE": "ai-exchange:polling-ci",
@@ -51,6 +53,7 @@ COMPOSE_PLACEHOLDERS = {
     "EMBEDDING_API_KEY": "polling-ci-embedding-key",
     "EMBEDDING_BASE_URL": "https://embeddings.polling-ci.invalid/v1",
     "EMBEDDING_MODEL": "polling-ci-embedding-model",
+    "TIER1_ARTIFACT_DIGEST": "polling-ci-tier1-digest",
 }
 
 

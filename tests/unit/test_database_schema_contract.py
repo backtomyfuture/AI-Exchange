@@ -96,10 +96,42 @@ async def test_contract_allows_an_empty_database_before_bootstrap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_contract_rejects_catalog_shadows_before_greenfield_bootstrap() -> None:
+    with pytest.raises(schema_contract.DatabaseSchemaContractError):
+        await _require_with_catalog(
+            [
+                [("pg_class", "v")],
+                [],
+                [("current_schema",)],
+            ],
+            require_complete=False,
+            require_business_complete=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_contract_accepts_the_complete_baseline_catalog() -> None:
     await _require_with_catalog(
         _complete_catalog(),
         require_complete=True,
+        expected_revision=schema_contract.GREENFIELD_DATABASE_REVISION,
+    )
+
+
+@pytest.mark.asyncio
+async def test_contract_accepts_business_baseline_before_checkpoint_setup() -> None:
+    catalog = _complete_catalog()
+    catalog[0] = [
+        row for row in catalog[0] if row[0] not in schema_contract._CHECKPOINT_RELATIONS
+    ]
+    catalog[1] = [
+        row for row in catalog[1] if row[0] not in schema_contract._CHECKPOINT_RELATIONS
+    ]
+
+    await _require_with_catalog(
+        catalog,
+        require_complete=False,
+        require_business_complete=True,
         expected_revision=schema_contract.GREENFIELD_DATABASE_REVISION,
     )
 
@@ -142,6 +174,21 @@ async def test_contract_rejects_a_required_column_type_drift() -> None:
     with pytest.raises(schema_contract.DatabaseSchemaContractError):
         await _require_with_catalog(
             _complete_catalog(wrong_column=("event_inbox", "payload")),
+            require_complete=True,
+            expected_revision=schema_contract.GREENFIELD_DATABASE_REVISION,
+        )
+
+
+@pytest.mark.asyncio
+async def test_contract_rejects_checkpoint_migration_type_drift() -> None:
+    catalog = _complete_catalog()
+    catalog[1].append(
+        ("checkpoint_migrations", "v", "public", "checkpoint_version")
+    )
+
+    with pytest.raises(schema_contract.DatabaseSchemaContractError):
+        await _require_with_catalog(
+            catalog,
             require_complete=True,
             expected_revision=schema_contract.GREENFIELD_DATABASE_REVISION,
         )
