@@ -646,7 +646,6 @@ async def test_pipeline_restart_builds_slim_state_from_database_ref():
         "draft_id": None,
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
     }
     ctx.graph.aget_state.return_value = final_state
 
@@ -707,8 +706,7 @@ async def test_pipeline_rejects_non_none_malformed_draft_id_without_loading_it(
             "draft_id": malformed_draft_id,
             "context_summaries": [],
             "routing_log": [],
-            "active_skills": [],
-        }
+            }
     )
 
     with patch("src.exchange_service.get_settings", return_value=_settings()):

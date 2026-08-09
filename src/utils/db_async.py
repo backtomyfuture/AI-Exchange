@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from src.domain.email_state import InitialEmailWriteResult
 from src.domain.errors import DatabaseOperationError
 from src.graph.state_factory import content_ref_from_json, content_ref_to_json
+from src.router.decision import RouteDecision
 from src.storage import ContentRef
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,15 @@ EMAIL_STATUS_CAS_TRANSITIONS = frozenset(
         ("approved", "sending"),
         ("sending", "sent"),
         ("saving_draft", "draft_saved"),
+    }
+)
+HANDOFF_TRANSITIONS = frozenset(
+    {
+        ("planned", "effect_committed"),
+        ("planned", "completed"),
+        ("planned", "failed"),
+        ("effect_committed", "completed"),
+        ("effect_committed", "failed"),
     }
 )
 
@@ -116,6 +126,151 @@ class AsyncDatabaseManager:
                 operation="log_initial_email",
                 retryable=isinstance(exc, psycopg.OperationalError),
                 message="initial email persistence failed",
+            ) from None
+
+    async def persist_route_decision(
+        self,
+        *,
+        inbox_id: str,
+        account_id: int,
+        external_email_id: str,
+        decision_raw: object,
+    ) -> RouteDecision:
+        """Create one immutable decision and its mutable handoff exactly once."""
+        try:
+            decision = RouteDecision.model_validate(decision_raw)
+        except Exception:
+            raise DatabaseOperationError(
+                operation="persist_route_decision",
+                retryable=False,
+                message="route decision is invalid",
+            ) from None
+        payload = decision.model_dump(mode="json")
+        digest = decision.canonical_digest()
+        try:
+            async with self.get_connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO tier1_decisions (
+                                inbox_id, account_id, external_email_id,
+                                decision_digest, decision_json, outcome, route,
+                                tier, artifact_digest
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (inbox_id) DO NOTHING
+                            """,
+                            (
+                                inbox_id,
+                                account_id,
+                                external_email_id,
+                                digest,
+                                Jsonb(payload),
+                                decision.outcome.value,
+                                decision.route.value if decision.route else None,
+                                decision.provenance.tier.value,
+                                decision.provenance.artifact_digest,
+                            ),
+                        )
+                        await cur.execute(
+                            """
+                            SELECT decision_digest, decision_json
+                            FROM tier1_decisions
+                            WHERE inbox_id = %s
+                            """,
+                            (inbox_id,),
+                        )
+                        row = await cur.fetchone()
+                        existing_json = row.get("decision_json") if row else None
+                        if isinstance(existing_json, str):
+                            existing_json = json.loads(existing_json)
+                        if (
+                            row is None
+                            or row.get("decision_digest") != digest
+                            or existing_json != payload
+                        ):
+                            raise DatabaseOperationError(
+                                operation="persist_route_decision",
+                                retryable=False,
+                                message="immutable route decision conflict",
+                            )
+                        await cur.execute(
+                            """
+                            INSERT INTO handoff_executions (
+                                inbox_id, decision_digest, state
+                            ) VALUES (%s, %s, 'planned')
+                            ON CONFLICT (inbox_id) DO NOTHING
+                            """,
+                            (inbox_id, digest),
+                        )
+                        await cur.execute(
+                            """
+                            SELECT decision_digest FROM handoff_executions
+                            WHERE inbox_id = %s
+                            """,
+                            (inbox_id,),
+                        )
+                        handoff = await cur.fetchone()
+                        if handoff is None or handoff.get("decision_digest") != digest:
+                            raise DatabaseOperationError(
+                                operation="persist_route_decision",
+                                retryable=False,
+                                message="handoff decision conflict",
+                            )
+        except DatabaseOperationError:
+            raise
+        except (psycopg.Error, ValueError, TypeError):
+            raise DatabaseOperationError(
+                operation="persist_route_decision",
+                retryable=False,
+                message="route decision persistence failed",
+            ) from None
+        return decision
+
+    async def advance_handoff_execution(
+        self,
+        *,
+        inbox_id: str,
+        expected_state: str,
+        next_state: str,
+        error_code: str | None = None,
+    ) -> None:
+        """Advance the mutable handoff row using an exact compare-and-set."""
+        if (expected_state, next_state) not in HANDOFF_TRANSITIONS:
+            raise ValueError("invalid_handoff_transition")
+        if error_code is not None and (
+            not isinstance(error_code, str)
+            or not error_code
+            or len(error_code.encode("utf-8")) > 128
+        ):
+            raise ValueError("invalid_handoff_error_code")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE handoff_executions
+                        SET state = %s,
+                            safe_error_code = %s,
+                            version = version + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE inbox_id = %s AND state = %s
+                        """,
+                        (next_state, error_code, inbox_id, expected_state),
+                    )
+                    if cur.rowcount != 1:
+                        raise DatabaseOperationError(
+                            operation="advance_handoff_execution",
+                            retryable=False,
+                            message="handoff state conflict",
+                        )
+        except DatabaseOperationError:
+            raise
+        except psycopg.Error as exc:
+            raise DatabaseOperationError(
+                operation="advance_handoff_execution",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="handoff transition failed",
             ) from None
 
     async def get_email_status(self, email_id: str) -> str | None:
@@ -349,11 +504,11 @@ class AsyncDatabaseManager:
             "classification", "summary", "priority", "need_reply",
             "card_type", "draft", "draft_content", "message_id", "intent",
             "reasoning", "error_message",
-            "routing_log", "active_skills",
+            "routing_log",
             "original_draft", "final_draft", "draft_diff",
             "approver_user_id", "rejection_reason",
         }
-        JSONB_COLUMNS = {"classification", "routing_log", "active_skills"}
+        JSONB_COLUMNS = {"classification", "routing_log"}
         if status is not None and (
             not isinstance(status, str)
             or not status.strip()

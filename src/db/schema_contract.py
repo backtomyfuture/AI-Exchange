@@ -29,6 +29,7 @@ _BUSINESS_RELATIONS: Final[dict[str, str]] = {
     "emails": "r",
     "emails_log": "r",
     "event_inbox": "r",
+    "handoff_executions": "r",
     "pipeline_command_receipts": "r",
     "pipeline_folder_scopes": "r",
     "pipeline_initializations": "r",
@@ -38,6 +39,7 @@ _BUSINESS_RELATIONS: Final[dict[str, str]] = {
     "pipeline_runtime_instances": "r",
     "processed_emails": "v",
     "sync_cursors": "r",
+    "tier1_decisions": "r",
 }
 _CHECKPOINT_RELATIONS: Final[dict[str, str]] = {
     "checkpoint_blobs": "r",
@@ -114,6 +116,10 @@ _REQUIRED_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
     ("event_inbox", "processing_policy"): "text",
     ("event_inbox", "source"): "text",
     ("event_inbox", "status"): "text",
+    ("handoff_executions", "decision_digest"): "bpchar",
+    ("handoff_executions", "inbox_id"): "uuid",
+    ("handoff_executions", "state"): "text",
+    ("handoff_executions", "version"): "int8",
     ("pipeline_command_receipts", "authority_epoch"): "int8",
     ("pipeline_command_receipts", "canonical_payload_hash"): "bpchar",
     ("pipeline_command_receipts", "command_name"): "text",
@@ -142,6 +148,10 @@ _REQUIRED_COLUMN_TYPES: Final[dict[tuple[str, str], str]] = {
     ("sync_cursors", "folder_key"): "text",
     ("sync_cursors", "status"): "text",
     ("sync_cursors", "version"): "int8",
+    ("tier1_decisions", "decision_digest"): "bpchar",
+    ("tier1_decisions", "decision_json"): "jsonb",
+    ("tier1_decisions", "inbox_id"): "uuid",
+    ("tier1_decisions", "route"): "text",
 }
 
 

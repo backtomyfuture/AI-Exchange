@@ -929,17 +929,17 @@ def build_ingestion_runtime(
     )
     if processing_enabled:
         # Local imports are required: ``init_app`` imports this runtime while
-        # the compatibility adapter reaches ``exchange_service`` and then
+        # the pipeline adapter reaches ``exchange_service`` and then
         # ``init_app`` again.
-        from src.ingestion.legacy_adapter import LegacyProcessingAdapter
+        from src.ingestion.email_pipeline import EmailProcessingAdapter
         from src.ingestion.ownership import PipelineOwnershipRepository
         from src.ingestion.processing import ProcessingAdapterRouter
         from src.ingestion.worker import DurableInboxWorker
 
         inbox_repository = InboxRepository(pool)
-        adapter = LegacyProcessingAdapter(
+        adapter = EmailProcessingAdapter(
             processing_context,
-            legacy_account_id=settings.EXCHANGE_ACCOUNT_ID,
+            account_id=settings.EXCHANGE_ACCOUNT_ID,
         )
         processing_worker = DurableInboxWorker(
             inbox_repository,

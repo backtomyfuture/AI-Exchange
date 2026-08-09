@@ -70,8 +70,8 @@ def test_removed_command_receipt_adapter_is_not_a_live_python_module() -> None:
     assert not (ROOT / "src" / "ingestion" / "command_receipts.py").exists()
 
 
-def test_legacy_processing_adapter_is_explicitly_retained_as_runtime_bridge() -> None:
+def test_email_processing_pipeline_is_the_runtime_bridge() -> None:
     runtime_source = RUNTIME.read_text(encoding="utf-8")
 
-    assert "LegacyProcessingAdapter" in runtime_source
-    assert (ROOT / "src" / "ingestion" / "legacy_adapter.py").is_file()
+    assert "EmailProcessingAdapter" in runtime_source
+    assert (ROOT / "src" / "ingestion" / "email_pipeline.py").is_file()

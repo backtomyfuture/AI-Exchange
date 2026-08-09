@@ -5,13 +5,13 @@ import inspect
 from pathlib import Path
 
 from src.exchange_service import process_and_archive_email_guarded
-from src.ingestion.legacy_adapter import LegacyProcessingAdapter
+from src.ingestion.email_pipeline import EmailProcessingAdapter
 from src.ingestion.processing import ExternalEffectKind
 
 
 ROOT = Path(__file__).resolve().parents[2]
 EXCHANGE_SERVICE = ROOT / "src" / "exchange_service.py"
-LEGACY_ADAPTER = ROOT / "src" / "ingestion" / "legacy_adapter.py"
+EMAIL_PIPELINE = ROOT / "src" / "ingestion" / "email_pipeline.py"
 RUNTIME = ROOT / "src" / "ingestion" / "runtime.py"
 LIVE_ROOTS = (
     ROOT / "src" / "main.py",
@@ -50,7 +50,7 @@ def test_guarded_entry_and_adapter_require_injected_async_effect_port() -> None:
     guarded = inspect.signature(process_and_archive_email_guarded)
     guarded_port = guarded.parameters["before_external_effect"]
     guarded_scope = guarded.parameters["effect_scope"]
-    adapter_port = inspect.signature(LegacyProcessingAdapter.process).parameters[
+    adapter_port = inspect.signature(EmailProcessingAdapter.process).parameters[
         "before_external_effect"
     ]
 
@@ -62,13 +62,13 @@ def test_guarded_entry_and_adapter_require_injected_async_effect_port() -> None:
     assert adapter_port.default is inspect.Parameter.empty
 
 
-def test_adapter_default_is_only_the_guarded_legacy_entry() -> None:
+def test_adapter_default_is_only_the_guarded_pipeline_entry() -> None:
     default = (
-        inspect.signature(LegacyProcessingAdapter)
+        inspect.signature(EmailProcessingAdapter)
         .parameters["guarded_processor"]
         .default
     )
-    tree = _tree(LEGACY_ADAPTER)
+    tree = _tree(EMAIL_PIPELINE)
     imports = {
         alias.name
         for node in ast.walk(tree)
@@ -81,14 +81,14 @@ def test_adapter_default_is_only_the_guarded_legacy_entry() -> None:
     assert not any(isinstance(node, ast.Lambda) for node in ast.walk(tree))
 
 
-def test_legacy_adapter_has_exactly_one_runtime_factory_wiring() -> None:
+def test_email_pipeline_has_exactly_one_runtime_factory_wiring() -> None:
     violations: list[str] = []
     for root in (*LIVE_ROOTS, RUNTIME):
         for path in _python_files(root):
             source = path.read_text(encoding="utf-8")
             if (
-                "src.ingestion.legacy_adapter" in source
-                or "LegacyProcessingAdapter" in source
+                "src.ingestion.email_pipeline" in source
+                or "EmailProcessingAdapter" in source
             ):
                 violations.append(str(path.relative_to(ROOT)))
 
@@ -99,12 +99,12 @@ def test_legacy_adapter_has_exactly_one_runtime_factory_wiring() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "LegacyProcessingAdapter"
+        and node.func.id == "EmailProcessingAdapter"
     ]
     assert len(constructors) == 1
 
 
-def test_every_legacy_external_call_owner_has_an_effect_authorization_gate() -> None:
+def test_every_external_call_owner_has_an_effect_authorization_gate() -> None:
     tree = _tree(EXCHANGE_SERVICE)
     functions = {
         node.name: node
@@ -147,10 +147,10 @@ def test_synchronous_lark_network_calls_run_off_the_event_loop() -> None:
 
 
 def test_polling_adapter_effect_ceilings_are_closed_and_exact() -> None:
-    from src.ingestion import legacy_adapter
+    from src.ingestion import email_pipeline
 
-    assert legacy_adapter._FULL_EFFECTS == frozenset(ExternalEffectKind)
-    assert legacy_adapter._ARCHIVE_EFFECTS == frozenset(
+    assert email_pipeline._FULL_EFFECTS == frozenset(ExternalEffectKind)
+    assert email_pipeline._ARCHIVE_EFFECTS == frozenset(
         {
             ExternalEffectKind.DETAIL,
             ExternalEffectKind.CONTENT,

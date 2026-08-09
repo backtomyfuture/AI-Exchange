@@ -12,12 +12,20 @@ from src.domain.email_state import (
 )
 from src.domain.errors import DatabaseOperationError, ErrorKind, ManualReviewRequired
 from src.utils.db_async import AsyncDatabaseManager
+from src.router.decision import RouteDecision
 
 
 class FakeCursor:
-    def __init__(self, *, rowcount: int = 1, fetchone_result=None):
+    def __init__(
+        self,
+        *,
+        rowcount: int = 1,
+        fetchone_result=None,
+        fetchone_results=None,
+    ):
         self.rowcount = rowcount
         self.fetchone_result = fetchone_result
+        self.fetchone_results = list(fetchone_results or [])
         self.executions = []
 
     async def __aenter__(self):
@@ -30,7 +38,17 @@ class FakeCursor:
         self.executions.append((query, params))
 
     async def fetchone(self):
+        if self.fetchone_results:
+            return self.fetchone_results.pop(0)
         return self.fetchone_result
+
+
+class FakeTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
 
 
 class FakeConnection:
@@ -39,6 +57,9 @@ class FakeConnection:
 
     def cursor(self):
         return self._cursor
+
+    def transaction(self):
+        return FakeTransaction()
 
 
 class FailingConnection:
@@ -118,6 +139,84 @@ def test_manual_review_error_keeps_safe_fields():
     assert error.reason == "ambiguous send result"
     assert error.safe_summary == "Delivery must be verified manually"
     assert str(error) == "Delivery must be verified manually"
+
+
+def _canonical_decision() -> dict:
+    return {
+        "outcome": "matched",
+        "route": "read_only",
+        "params": {},
+        "provenance": {
+            "tier": "tier2",
+            "source_version": "routing-label-v1",
+            "evidence_ids": ["history-1", "history-2"],
+            "confidence": 1.0,
+        },
+        "reason_code": "historical_consensus",
+        "selected_action_fingerprint": "sha256:" + "a" * 64,
+        "candidate_actions": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_route_decision_is_inserted_once_with_exact_readback(db_manager):
+    decision = RouteDecision.model_validate(_canonical_decision())
+    cursor = FakeCursor(
+        fetchone_results=[
+            {
+                "decision_digest": decision.canonical_digest(),
+                "decision_json": decision.model_dump(mode="json"),
+            },
+            {"decision_digest": decision.canonical_digest()},
+        ]
+    )
+    db_manager.get_connection = connection_factory(cursor)
+
+    persisted = await db_manager.persist_route_decision(
+        inbox_id="00000000-0000-4000-8000-000000000001",
+        account_id=8,
+        external_email_id="mail-1",
+        decision_raw=decision,
+    )
+
+    assert persisted == decision
+    statements = [" ".join(query.split()) for query, _ in cursor.executions]
+    assert any("ON CONFLICT (inbox_id) DO NOTHING" in query for query in statements)
+    assert any("INSERT INTO handoff_executions" in query for query in statements)
+
+
+@pytest.mark.asyncio
+async def test_route_decision_conflict_fails_closed(db_manager):
+    cursor = FakeCursor(
+        fetchone_results=[
+            {"decision_digest": "0" * 64, "decision_json": {}},
+        ]
+    )
+    db_manager.get_connection = connection_factory(cursor)
+
+    with pytest.raises(DatabaseOperationError, match="immutable route decision conflict"):
+        await db_manager.persist_route_decision(
+            inbox_id="00000000-0000-4000-8000-000000000001",
+            account_id=8,
+            external_email_id="mail-1",
+            decision_raw=_canonical_decision(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_handoff_transition_is_exact_compare_and_set(db_manager):
+    cursor = FakeCursor(rowcount=1)
+    db_manager.get_connection = connection_factory(cursor)
+
+    await db_manager.advance_handoff_execution(
+        inbox_id="00000000-0000-4000-8000-000000000001",
+        expected_state="planned",
+        next_state="effect_committed",
+    )
+
+    query, params = cursor.executions[-1]
+    assert "WHERE inbox_id = %s AND state = %s" in query
+    assert params[-1] == "planned"
 
 
 @pytest.mark.asyncio

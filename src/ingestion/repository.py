@@ -1327,7 +1327,7 @@ class InboxRepository:
         }
         if completion is not None:
             metadata["requested_email_status"] = completion.target_status.value
-            metadata["legacy_outcome"] = completion.legacy_outcome.value
+            metadata["processing_outcome"] = completion.processing_outcome.value
             metadata["completion_safe_error_code"] = completion.safe_error_code
             metadata["completion_safe_error_summary"] = completion.safe_error_summary
         return metadata

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.domain.errors import IngressValidationError
-from src.ingestion.legacy_adapter import LegacyProcessingAdapter, LegacyProcessingFailed
+from src.ingestion.email_pipeline import EmailProcessingAdapter, EmailProcessingFailed
 from src.ingestion.models import (
     ChangeKind,
     IngressSource,
@@ -119,10 +119,10 @@ async def _guarded_processor(**_kwargs: object) -> object:
     raise AssertionError("not called by constructor")
 
 
-def test_legacy_processor_bridge_remains_explicitly_constructed() -> None:
-    adapter = LegacyProcessingAdapter(
-        object(), legacy_account_id=1, guarded_processor=_guarded_processor
+def test_email_pipeline_bridge_is_explicitly_constructed() -> None:
+    adapter = EmailProcessingAdapter(
+        object(), account_id=1, guarded_processor=_guarded_processor
     )
 
-    assert adapter.legacy_account_id == 1
-    assert LegacyProcessingFailed().safe_code == "legacy.processing_failed"
+    assert adapter.account_id == 1
+    assert EmailProcessingFailed().safe_code == "pipeline.processing_failed"

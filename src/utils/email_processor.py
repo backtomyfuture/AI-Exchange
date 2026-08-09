@@ -305,7 +305,7 @@ class EmailProcessor:
     def update_email_labels(
         self,
         email_id: str,
-        active_skills: Optional[List[str]] = None,
+        route_decision: Optional[Dict[str, Any]] = None,
         priority: Optional[str] = None,
         intent: Optional[str] = None,
         need_reply: Optional[bool] = None,
@@ -313,15 +313,19 @@ class EmailProcessor:
         """
         Write classification/routing labels back into Qdrant payload for already-ingested emails.
 
-        Used by Tier 2 (semantic routing) to vote on past similar emails' skills.
+        Used by Tier 2 to vote on canonical historical route actions.
         Returns True if at least one point was updated.
         """
         if not email_id:
             return False
 
         payload_update: Dict[str, Any] = {}
-        if active_skills is not None:
-            payload_update["active_skills"] = list(active_skills)
+        if route_decision is not None:
+            from src.router.decision import RouteDecision
+
+            payload_update["route_decision"] = RouteDecision.model_validate(
+                route_decision
+            ).model_dump(mode="json")
         if priority is not None:
             payload_update["priority"] = priority
         if intent is not None:

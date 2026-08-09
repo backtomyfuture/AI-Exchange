@@ -18,7 +18,7 @@ from src.ingestion.processing import (
     ExternalEffectAuthorizationError,
     ExternalEffectBoundary,
     GuardedExternalEffectFailed,
-    LegacyEffectScope,
+    ProcessingEffectScope,
     ProcessingPolicyRejected,
 )
 from src.storage import ContentRef
@@ -68,8 +68,8 @@ def test_helper_functions_exist():
     assert "async def _mark_email_read(" in source, "Missing _mark_email_read"
 
 
-def _scope(email_id: str, *, account_id: int = 8) -> LegacyEffectScope:
-    return LegacyEffectScope(
+def _scope(email_id: str, *, account_id: int = 8) -> ProcessingEffectScope:
+    return ProcessingEffectScope(
         account_id=account_id,
         inbox_id=str(uuid4()),
         generation=1,
@@ -222,13 +222,24 @@ def _guarded_pipeline_result(*, need_reply: bool) -> dict[str, object]:
         "context": [],
         "email": {"id": "message-1", "subject": "subject"},
         "routing_log": [],
-        "active_skills": [],
+        "route_decision": {
+            "outcome": "matched",
+            "route": "read_only",
+            "params": {},
+            "provenance": {"tier": "system", "source_version": "test-v1"},
+            "reason_code": None,
+            "selected_action_fingerprint": None,
+            "candidate_actions": [],
+        },
     }
 
 
 def _guarded_dispatch_ctx() -> SimpleNamespace:
     return SimpleNamespace(
-        db_manager=SimpleNamespace(update_status=AsyncMock()),
+        db_manager=SimpleNamespace(
+            update_status=AsyncMock(),
+            persist_route_decision=AsyncMock(),
+        ),
         email_processor=SimpleNamespace(
             update_email_labels=MagicMock(return_value=True)
         ),

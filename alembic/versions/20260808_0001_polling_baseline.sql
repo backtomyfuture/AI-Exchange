@@ -2363,6 +2363,14 @@ CREATE FUNCTION public.reject_pipeline_command_receipts_mutation() RETURNS trigg
             RAISE EXCEPTION 'pipeline command receipts are append-only';
         END
         $$;
+CREATE FUNCTION public.reject_tier1_decisions_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'public'
+    AS $$
+        BEGIN
+            RAISE EXCEPTION 'canonical route decisions are append-only';
+        END
+        $$;
 CREATE FUNCTION public.reject_pipeline_folder_scopes_mutation() RETURNS trigger
     LANGUAGE plpgsql
     SET search_path TO 'pg_catalog'
@@ -2509,7 +2517,6 @@ CREATE TABLE public.emails_log (
     processed_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     routing_log jsonb,
-    active_skills jsonb,
     original_draft text,
     final_draft text,
     draft_diff text,
@@ -2569,6 +2576,39 @@ CREATE TABLE public.event_inbox (
     CONSTRAINT ck_event_inbox_source CHECK ((source = 'sync'::text)),
     CONSTRAINT ck_event_inbox_source_version CHECK (((source_version IS NULL) OR ((btrim(source_version) <> ''::text) AND (char_length(source_version) <= 512)))),
     CONSTRAINT ck_event_inbox_status CHECK ((status = ANY (ARRAY['pending'::text, 'retry_wait'::text, 'leased'::text, 'completed'::text, 'dead_letter'::text, 'manual_review'::text])))
+);
+CREATE TABLE public.tier1_decisions (
+    inbox_id uuid NOT NULL,
+    account_id bigint NOT NULL,
+    external_email_id text NOT NULL,
+    decision_digest character(64) NOT NULL,
+    decision_json jsonb NOT NULL,
+    outcome text NOT NULL,
+    route text,
+    tier text NOT NULL,
+    artifact_digest character(64),
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT ck_tier1_decisions_account CHECK (account_id > 0),
+    CONSTRAINT ck_tier1_decisions_artifact CHECK ((artifact_digest IS NULL) OR ((artifact_digest)::text ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT ck_tier1_decisions_digest CHECK ((decision_digest)::text ~ '^[0-9a-f]{64}$'::text),
+    CONSTRAINT ck_tier1_decisions_external_email CHECK ((btrim(external_email_id) <> ''::text) AND (char_length(external_email_id) <= 1024)),
+    CONSTRAINT ck_tier1_decisions_json CHECK ((jsonb_typeof(decision_json) = 'object'::text) AND (octet_length((decision_json)::text) <= 16384)),
+    CONSTRAINT ck_tier1_decisions_outcome CHECK (outcome = ANY (ARRAY['matched'::text, 'abstain'::text, 'conflict'::text, 'error'::text])),
+    CONSTRAINT ck_tier1_decisions_route CHECK ((route IS NULL) OR (route = ANY (ARRAY['reply'::text, 'forward'::text, 'read_only'::text, 'no_action'::text, 'manual_review'::text]))),
+    CONSTRAINT ck_tier1_decisions_tier CHECK (tier = ANY (ARRAY['tier1'::text, 'tier2'::text, 'tier3'::text, 'system'::text]))
+);
+CREATE TABLE public.handoff_executions (
+    inbox_id uuid NOT NULL,
+    decision_digest character(64) NOT NULL,
+    state text DEFAULT 'planned'::text NOT NULL,
+    version bigint DEFAULT 0 NOT NULL,
+    safe_error_code text,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT ck_handoff_executions_digest CHECK ((decision_digest)::text ~ '^[0-9a-f]{64}$'::text),
+    CONSTRAINT ck_handoff_executions_error CHECK ((safe_error_code IS NULL) OR ((btrim(safe_error_code) <> ''::text) AND (char_length(safe_error_code) <= 128))),
+    CONSTRAINT ck_handoff_executions_state CHECK (state = ANY (ARRAY['planned'::text, 'effect_committed'::text, 'completed'::text, 'failed'::text])),
+    CONSTRAINT ck_handoff_executions_version CHECK (version >= 0)
 );
 CREATE TABLE public.pipeline_command_receipts (
     id uuid NOT NULL,
@@ -2765,6 +2805,10 @@ ALTER TABLE ONLY public.emails
     ADD CONSTRAINT pk_emails PRIMARY KEY (id);
 ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT pk_event_inbox PRIMARY KEY (id);
+ALTER TABLE ONLY public.tier1_decisions
+    ADD CONSTRAINT pk_tier1_decisions PRIMARY KEY (inbox_id);
+ALTER TABLE ONLY public.handoff_executions
+    ADD CONSTRAINT pk_handoff_executions PRIMARY KEY (inbox_id);
 ALTER TABLE ONLY public.pipeline_command_receipts
     ADD CONSTRAINT pk_pipeline_command_receipts PRIMARY KEY (id);
 ALTER TABLE ONLY public.pipeline_folder_scopes
@@ -2836,6 +2880,8 @@ CREATE INDEX ix_emails_account_status ON public.emails USING btree (account_id, 
 CREATE INDEX ix_emails_owner_status ON public.emails USING btree (account_id, owner_generation, owner_fencing_token, owner_authority_epoch, owner_capability_hash, status);
 CREATE INDEX ix_event_inbox_claim ON public.event_inbox USING btree (pipeline_name, status, available_at, received_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry_wait'::text]));
 CREATE INDEX ix_event_inbox_expired_lease ON public.event_inbox USING btree (lease_until, execution_epoch, authority_epoch, capability_hash, lease_session_id, id) WHERE (status = 'leased'::text);
+CREATE INDEX ix_tier1_decisions_route ON public.tier1_decisions USING btree (account_id, route, created_at DESC);
+CREATE INDEX ix_handoff_executions_state ON public.handoff_executions USING btree (state, updated_at);
 CREATE INDEX ix_pipeline_folder_scopes_account ON public.pipeline_folder_scopes USING btree (account_id, canonical_key);
 CREATE INDEX ix_pipeline_runtime_authority_state ON public.pipeline_runtime_authority USING btree (state, account_id);
 CREATE INDEX ix_pipeline_runtime_capabilities_stage ON public.pipeline_runtime_capabilities USING btree (stage_ordinal, created_at, capability_hash);
@@ -2862,6 +2908,8 @@ CREATE TRIGGER trg_pipeline_runtime_capabilities_guard_row BEFORE DELETE OR UPDA
 CREATE TRIGGER trg_pipeline_runtime_capabilities_guard_truncate BEFORE TRUNCATE ON public.pipeline_runtime_capabilities FOR EACH STATEMENT EXECUTE FUNCTION public.reject_pipeline_runtime_capabilities_mutation();
 CREATE TRIGGER trg_pipeline_runtime_instances_guard_row BEFORE INSERT OR DELETE OR UPDATE ON public.pipeline_runtime_instances FOR EACH ROW EXECUTE FUNCTION public.guard_pipeline_runtime_instances();
 CREATE TRIGGER trg_pipeline_runtime_instances_guard_truncate BEFORE TRUNCATE ON public.pipeline_runtime_instances FOR EACH STATEMENT EXECUTE FUNCTION public.guard_pipeline_runtime_instances();
+CREATE TRIGGER trg_tier1_decisions_guard_row BEFORE DELETE OR UPDATE ON public.tier1_decisions FOR EACH ROW EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
+CREATE TRIGGER trg_tier1_decisions_guard_truncate BEFORE TRUNCATE ON public.tier1_decisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
 ALTER TABLE ONLY public.audit_events
     ADD CONSTRAINT fk_audit_events_email FOREIGN KEY (account_id, email_id) REFERENCES public.emails(account_id, id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.emails
@@ -2876,6 +2924,10 @@ ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT fk_event_inbox_pipeline_ownership FOREIGN KEY (account_id, generation, fencing_token, pipeline_name) REFERENCES public.pipeline_ownership(account_id, generation, fencing_token, pipeline_name) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT fk_event_inbox_runtime_capability FOREIGN KEY (capability_hash) REFERENCES public.pipeline_runtime_capabilities(capability_hash) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT;
+ALTER TABLE ONLY public.tier1_decisions
+    ADD CONSTRAINT fk_tier1_decisions_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+ALTER TABLE ONLY public.handoff_executions
+    ADD CONSTRAINT fk_handoff_executions_decision FOREIGN KEY (inbox_id) REFERENCES public.tier1_decisions(inbox_id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.pipeline_folder_scopes
     ADD CONSTRAINT fk_pipeline_folder_scopes_initialization FOREIGN KEY (initialization_id, account_id, policy_manifest_hash) REFERENCES public.pipeline_initializations(initialization_id, account_id, policy_manifest_hash) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.pipeline_initializations

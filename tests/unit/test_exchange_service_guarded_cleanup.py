@@ -12,7 +12,7 @@ from src.exchange_service import (
 from src.ingestion.processing import (
     ExternalEffectBoundary,
     GuardedExternalEffectFailed,
-    LegacyEffectScope,
+    ProcessingEffectScope,
 )
 
 
@@ -22,7 +22,7 @@ async def _allow_effect(_kind: str, _ordinal: int, _target_hash: str) -> None:
 
 def _boundary() -> ExternalEffectBoundary:
     return ExternalEffectBoundary(
-        scope=LegacyEffectScope(
+        scope=ProcessingEffectScope(
             account_id=8,
             inbox_id=str(uuid4()),
             generation=1,

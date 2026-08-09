@@ -100,7 +100,7 @@ def test_runtime_modules_do_not_execute_dynamic_python() -> None:
         INGESTION / "repository.py",
         INGESTION / "worker.py",
         INGESTION / "processing.py",
-        INGESTION / "legacy_adapter.py",
+        INGESTION / "email_pipeline.py",
     ):
         tree = ast.parse(_source(path), filename=str(path))
         calls = {

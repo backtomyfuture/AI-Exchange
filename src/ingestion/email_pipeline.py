@@ -1,4 +1,4 @@
-"""Fail-closed bridge from durable Inbox attempts to the legacy processor."""
+"""Fail-closed bridge from durable Inbox attempts to the email processor."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from src.ingestion.processing import (
     ExternalEffectAuthorizationError,
     ExternalEffectBoundary,
     ExternalEffectKind,
-    LegacyEffectScope,
+    ProcessingEffectScope,
     ProcessingCompletion,
     ProcessingPolicyRejected,
     ReplaySafeExternalEffectFailed,
@@ -57,24 +57,24 @@ def _log_stage_failure(stage: str, error: BaseException) -> None:
     """Log only fixed stage metadata and an exception class, never its value."""
 
     logger.error(
-        "Legacy processing stage failed: stage=%s error_type=%s",
+        "Email processing stage failed: stage=%s error_type=%s",
         stage,
         type(error).__name__,
     )
 
 
-class LegacyProcessingFailed(RuntimeError):
-    """Fixed, privacy-safe failure emitted by the compatibility adapter."""
+class EmailProcessingFailed(RuntimeError):
+    """Fixed, privacy-safe failure emitted by the pipeline adapter."""
 
     kind = ErrorKind.TRANSIENT_DEPENDENCY
-    safe_code = "legacy.processing_failed"
-    safe_summary = "Legacy email processing failed"
+    safe_code = "pipeline.processing_failed"
+    safe_summary = "Email processing failed"
 
     def __init__(self) -> None:
         super().__init__(self.safe_summary)
 
     def __repr__(self) -> str:
-        return f"LegacyProcessingFailed(safe_code={self.safe_code!r})"
+        return f"EmailProcessingFailed(safe_code={self.safe_code!r})"
 
 
 def _is_async_callable(value: object) -> bool:
@@ -125,43 +125,43 @@ class _PolicyBoundEffectPort:
 GuardedProcessor = Callable[..., Awaitable[ProcessingOutcome]]
 
 
-class LegacyProcessingAdapter:
+class EmailProcessingAdapter:
     """Existing processor bridge selected only by the production pipeline stamp."""
 
     pipeline_name = GREENFIELD_PIPELINE_NAME
 
-    __slots__ = ("_ctx", "_guarded_processor", "_legacy_account_id")
+    __slots__ = ("_ctx", "_guarded_processor", "_account_id")
 
     def __init__(
         self,
         ctx: Any,
         *,
-        legacy_account_id: int,
+        account_id: int,
         guarded_processor: GuardedProcessor = process_and_archive_email_guarded,
     ) -> None:
         if ctx is None:
             raise ValueError("ctx is required")
         if (
-            type(legacy_account_id) is not int
-            or legacy_account_id <= 0
-            or legacy_account_id > POSTGRES_BIGINT_MAX
+            type(account_id) is not int
+            or account_id <= 0
+            or account_id > POSTGRES_BIGINT_MAX
         ):
-            raise ValueError("legacy_account_id must be a positive PostgreSQL BIGINT")
+            raise ValueError("account_id must be a positive PostgreSQL BIGINT")
         if not _is_async_callable(guarded_processor):
             raise ValueError("guarded_processor must be an async callable")
         object.__setattr__(self, "_ctx", ctx)
-        object.__setattr__(self, "_legacy_account_id", legacy_account_id)
+        object.__setattr__(self, "_account_id", account_id)
         object.__setattr__(self, "_guarded_processor", guarded_processor)
 
     def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("LegacyProcessingAdapter is immutable")
+        raise AttributeError("EmailProcessingAdapter is immutable")
 
     def __delattr__(self, _name: str) -> None:
-        raise AttributeError("LegacyProcessingAdapter is immutable")
+        raise AttributeError("EmailProcessingAdapter is immutable")
 
     @property
-    def legacy_account_id(self) -> int:
-        return self._legacy_account_id
+    def account_id(self) -> int:
+        return self._account_id
 
     async def process(
         self,
@@ -173,10 +173,10 @@ class LegacyProcessingAdapter:
         policy = self._validate_attempt(
             lease,
             application,
-            legacy_account_id=self._legacy_account_id,
+            account_id=self._account_id,
         )
         allowed = self._allowed_effects(policy)
-        scope = LegacyEffectScope.from_processing(lease, application)
+        scope = ProcessingEffectScope.from_processing(lease, application)
 
         # Constructing the boundary validates the injected port before any I/O.
         ExternalEffectBoundary(scope, before_external_effect)
@@ -240,14 +240,14 @@ class LegacyProcessingAdapter:
             raise error
 
         try:
-            legacy_status = await self._ctx.db_manager.get_email_status(
+            persisted_status = await self._ctx.db_manager.get_email_status(
                 lease.event.external_email_id
             )
         except Exception as error:
             _log_stage_failure("completion_readback", error)
             raise
         try:
-            return self._map_completion(policy, outcome, legacy_status)
+            return self._map_completion(policy, outcome, persisted_status)
         except Exception as error:
             _log_stage_failure("completion_projection", error)
             raise
@@ -257,7 +257,7 @@ class LegacyProcessingAdapter:
         lease: InboxLease,
         application: EmailEventApplication,
         *,
-        legacy_account_id: int,
+        account_id: int,
     ) -> ProcessingPolicy:
         if (
             type(lease) is not InboxLease
@@ -265,8 +265,8 @@ class LegacyProcessingAdapter:
         ):
             raise ProcessingPolicyRejected()
         if (
-            lease.account_id != legacy_account_id
-            or lease.pipeline_name != LegacyProcessingAdapter.pipeline_name
+            lease.account_id != account_id
+            or lease.pipeline_name != EmailProcessingAdapter.pipeline_name
             or application.disposition not in _EXECUTABLE_DISPOSITIONS
             or application.should_process is not True
             or application.persisted_status is not EmailStatus.PROCESSING
@@ -292,13 +292,13 @@ class LegacyProcessingAdapter:
         if details is None:
             raise ReplaySafeExternalEffectFailed()
         if not isinstance(details, Mapping):
-            raise LegacyProcessingAdapter._manual_review()
+            raise EmailProcessingAdapter._manual_review()
         email_data = dict(details)
         detail_id = email_data.get("id")
         if type(detail_id) is not str or detail_id != lease.event.external_email_id:
             raise ManualReviewRequired(
-                reason="legacy_detail_identity_mismatch",
-                safe_summary="Legacy email detail requires manual review",
+                reason="detail_identity_mismatch",
+                safe_summary="Email detail requires manual review",
             )
         email_data["id"] = lease.event.external_email_id
         email_data.setdefault("subject", "")
@@ -314,45 +314,46 @@ class LegacyProcessingAdapter:
         email_data["_parent_folder_id"] = lease.event.folder
         email_data["_parent_folder_name"] = lease.event.folder
         email_data["_event_type"] = lease.event.raw_event_type
+        email_data["_inbox_id"] = lease.id
         return email_data
 
     @staticmethod
     def _map_completion(
         policy: ProcessingPolicy,
         outcome: ProcessingOutcome,
-        legacy_status: object,
+        persisted_status: object,
     ) -> ProcessingCompletion:
         if outcome is ProcessingOutcome.FAILED:
-            raise LegacyProcessingFailed()
+            raise EmailProcessingFailed()
         if (
             outcome is ProcessingOutcome.MANUAL_REVIEW
-            and type(legacy_status) is str
-            and legacy_status == "manual_review"
+            and type(persisted_status) is str
+            and persisted_status == "manual_review"
         ):
             return ProcessingCompletion.manual_review()
         if policy is ProcessingPolicy.ARCHIVE:
             if (
                 outcome is ProcessingOutcome.ARCHIVED
-                and type(legacy_status) is str
-                and legacy_status == "archived"
+                and type(persisted_status) is str
+                and persisted_status == "archived"
             ):
                 return ProcessingCompletion.archived()
-            raise LegacyProcessingAdapter._manual_review()
-        if outcome is ProcessingOutcome.PROCESSED and type(legacy_status) is str:
-            if legacy_status == "waiting_approval":
+            raise EmailProcessingAdapter._manual_review()
+        if outcome is ProcessingOutcome.PROCESSED and type(persisted_status) is str:
+            if persisted_status == "waiting_approval":
                 return ProcessingCompletion.waiting_approval()
-            if legacy_status == "notified_readonly":
+            if persisted_status == "notified_readonly":
                 return ProcessingCompletion.notified_readonly()
-            if legacy_status in {"skipped", "no_action"}:
+            if persisted_status in {"skipped", "no_action"}:
                 return ProcessingCompletion.no_action()
-        raise LegacyProcessingAdapter._manual_review()
+        raise EmailProcessingAdapter._manual_review()
 
     @staticmethod
     def _manual_review() -> ManualReviewRequired:
         return ManualReviewRequired(
-            reason="legacy_projection_unmapped",
-            safe_summary="Legacy processing result requires manual review",
+            reason="pipeline_projection_unmapped",
+            safe_summary="Email processing result requires manual review",
         )
 
 
-__all__ = ["LegacyProcessingAdapter", "LegacyProcessingFailed"]
+__all__ = ["EmailProcessingAdapter", "EmailProcessingFailed"]

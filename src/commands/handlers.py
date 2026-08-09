@@ -242,7 +242,14 @@ async def handle_routing(args: str) -> str:
         async with _db_manager.get_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT routing_log, active_skills, classification FROM emails_log WHERE id = %s",
+                    """
+                    SELECT e.routing_log, e.classification,
+                           d.decision_json, d.decision_digest
+                    FROM emails_log AS e
+                    LEFT JOIN tier1_decisions AS d
+                      ON d.external_email_id = e.id
+                    WHERE e.id = %s
+                    """,
                     (email_id,),
                 )
                 row = await cur.fetchone()
@@ -253,15 +260,17 @@ async def handle_routing(args: str) -> str:
         routing_log = row.get("routing_log") or []
         if isinstance(routing_log, str):
             routing_log = _json.loads(routing_log)
-        active_skills = row.get("active_skills") or []
-        if isinstance(active_skills, str):
-            active_skills = _json.loads(active_skills)
+        decision = row.get("decision_json") or {}
+        if isinstance(decision, str):
+            decision = _json.loads(decision)
         cls = row.get("classification") or {}
         if isinstance(cls, str):
             cls = _json.loads(cls)
 
         lines = [f"🔀 路由详情 [{email_id[:20]}...]:\n"]
-        lines.append(f"  Skills: {', '.join(active_skills) if active_skills else '无'}")
+        lines.append(f"  决策摘要: {row.get('decision_digest') or '无'}")
+        lines.append(f"  路由: {decision.get('route', '无')}")
+        lines.append(f"  层级: {(decision.get('provenance') or {}).get('tier', '无')}")
         lines.append(f"  路由链: {' → '.join(routing_log) if routing_log else '无记录'}")
         lines.append(f"  Priority: {cls.get('priority', '?')}")
         lines.append(f"  Intent: {cls.get('intent', '?')}")

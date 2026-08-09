@@ -230,7 +230,6 @@ async def test_run_ai_path_sends_manual_review_card_without_mark_read():
         "context": [],
         "email": {"id": email_id},
         "routing_log": [],
-        "active_skills": [],
         "next_step": "manual_review",
         "safe_error_summary": "categorizer_model_failed",
     }
@@ -351,7 +350,6 @@ async def test_run_ai_path_normalizes_untrusted_manual_review_code():
         "context": [],
         "email": {"id": email_id},
         "routing_log": [],
-        "active_skills": [],
         "approval_status": "manual_review",
         "next_step": "approval",
         "safe_error_summary": "private-content-should-not-be-persisted",

@@ -94,6 +94,7 @@ POLLING_RELATIONS: Final = (
     "daily_digest_executions",
     "emails",
     "event_inbox",
+    "handoff_executions",
     "pipeline_command_receipts",
     "pipeline_folder_scopes",
     "pipeline_initializations",
@@ -102,6 +103,7 @@ POLLING_RELATIONS: Final = (
     "pipeline_runtime_capabilities",
     "pipeline_runtime_instances",
     "sync_cursors",
+    "tier1_decisions",
 )
 POLLING_RELATIONS_BY_REVISION: Final = {DATABASE_REVISION: POLLING_RELATIONS}
 POLLING_VIEW_SPECS_BY_REVISION: Final = {DATABASE_REVISION: ()}
@@ -118,7 +120,6 @@ RUNTIME_RELATION_ACCESS: Final = {
             "draft_content",
             "updated_at",
             "routing_log",
-            "active_skills",
             "original_draft",
             "final_draft",
             "approver_user_id",
@@ -282,6 +283,25 @@ RUNTIME_RELATION_ACCESS: Final = {
             "updated_at",
         ),
     ),
+    "tier1_decisions": _access(
+        table=("SELECT",),
+        insert=(
+            "inbox_id",
+            "account_id",
+            "external_email_id",
+            "decision_digest",
+            "decision_json",
+            "outcome",
+            "route",
+            "tier",
+            "artifact_digest",
+        ),
+    ),
+    "handoff_executions": _access(
+        table=("SELECT",),
+        insert=("inbox_id", "decision_digest", "state"),
+        update=("state", "version", "safe_error_code", "updated_at"),
+    ),
 }
 RUNTIME_RELATION_ACCESS_BY_REVISION: Final = {DATABASE_REVISION: RUNTIME_RELATION_ACCESS}
 
@@ -304,6 +324,8 @@ MAINTENANCE_RELATION_ACCESS: Final = {
     "pipeline_folder_scopes": _access(table=("SELECT",)),
     "pipeline_runtime_authority": _access(table=("SELECT",)),
     "pipeline_runtime_instances": _access(table=("SELECT",)),
+    "tier1_decisions": _access(table=("SELECT",)),
+    "handoff_executions": _access(table=("SELECT",)),
 }
 MAINTENANCE_RELATION_ACCESS_BY_REVISION: Final = {
     DATABASE_REVISION: MAINTENANCE_RELATION_ACCESS
@@ -348,6 +370,8 @@ AUDITOR_RELATION_ACCESS: Final = {
     "pipeline_ownership": _access(table=("SELECT",)),
     "pipeline_command_receipts": _access(table=("SELECT",)),
     "audit_events": _access(table=("SELECT",)),
+    "tier1_decisions": _access(table=("SELECT",)),
+    "handoff_executions": _access(table=("SELECT",)),
     "pipeline_folder_scopes": _access(
         select=(
             "initialization_id",
@@ -759,6 +783,8 @@ TRIGGER_SPECS: Final = (
     TriggerSpec("trg_pipeline_runtime_capabilities_guard_truncate", "pipeline_runtime_capabilities", "reject_pipeline_runtime_capabilities_mutation", 34),
     TriggerSpec("trg_pipeline_runtime_instances_guard_row", "pipeline_runtime_instances", "guard_pipeline_runtime_instances", 31),
     TriggerSpec("trg_pipeline_runtime_instances_guard_truncate", "pipeline_runtime_instances", "guard_pipeline_runtime_instances", 34),
+    TriggerSpec("trg_tier1_decisions_guard_row", "tier1_decisions", "reject_tier1_decisions_mutation", 27),
+    TriggerSpec("trg_tier1_decisions_guard_truncate", "tier1_decisions", "reject_tier1_decisions_mutation", 34),
 )
 TRIGGER_SPECS_BY_REVISION: Final = {DATABASE_REVISION: TRIGGER_SPECS}
 TRIGGER_FUNCTION_SOURCE_SHA256: Final = {
