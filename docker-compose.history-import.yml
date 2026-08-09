@@ -1,0 +1,54 @@
+services:
+  history-import:
+    profiles: ["history-import"]
+    build:
+      context: .
+      dockerfile: Dockerfile.history-import
+      args:
+        AI_EXCHANGE_BASE_IMAGE: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
+    image: ${AI_EXCHANGE_HISTORY_IMPORT_IMAGE:-ai-exchange-history-import:local}
+    restart: "no"
+    entrypoint: ["python", "scripts/import_pst.py"]
+    command:
+      - "--source"
+      - "exchange"
+      - "--folder"
+      - "ALL"
+      - "--limit"
+      - "0"
+      - "--all-mail"
+      - "--supplement"
+      - "/imports/history.pst"
+      - "--dry-run"
+    user: "1000:1000"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TMPDIR: /work
+      QDRANT_URL: http://qdrant:6333
+      EXCHANGE_SSL_VERIFY: "true"
+      EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}
+      EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?EMBEDDING_API_KEY is required}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:?EMBEDDING_BASE_URL is required}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:?EMBEDDING_MODEL is required}
+      TZ: Asia/Shanghai
+    volumes:
+      - type: bind
+        source: ${HISTORY_IMPORT_SOURCE:?HISTORY_IMPORT_SOURCE is required}
+        target: /imports/history.pst
+        read_only: true
+      - type: bind
+        source: ${HISTORY_IMPORT_WORKDIR:?HISTORY_IMPORT_WORKDIR is required}
+        target: /work
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    networks:
+      - backend
+      - edge

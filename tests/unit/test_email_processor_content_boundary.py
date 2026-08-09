@@ -764,10 +764,11 @@ def test_email_processor_never_creates_a_second_image_base64_copy():
     }
     before = deepcopy(email)
 
-    assert processor.process_batch([email]) == 1
+    assert processor.process_batch([email], wait=True) == 1
 
     assert email == before
     point = processor.qdrant_client.upsert.call_args.kwargs["points"][0]
+    assert processor.qdrant_client.upsert.call_args.kwargs["wait"] is True
     assert "VISIBLE-BODY-SENTINEL" in captured["indexed_text"]
     assert "[内嵌图片]" in captured["indexed_text"]
     assert "data:image" not in captured["indexed_text"]

@@ -6,8 +6,11 @@ import email as email_lib
 import email.policy
 import mailbox
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
+import pytest
 
 from scripts.import_pst import (
     ImportStats,
@@ -233,7 +236,25 @@ class TestRunImport:
         stats = run_import(mbox_path, batch_size=10)
         assert stats.total == 1
         assert stats.imported == 1
-        mock_proc.process_batch.assert_called_once()
+        imported_batch = mock_proc.process_batch.call_args.args[0]
+        assert len(imported_batch) == 1
+        assert mock_proc.process_batch.call_args.kwargs == {"wait": True}
+
+    @patch("src.utils.email_processor.EmailProcessor")
+    def test_zero_qdrant_points_are_reported_as_failed(self, mock_proc_cls, tmp_path: Path):
+        mock_proc = MagicMock()
+        mock_proc.process_batch.return_value = 0
+        mock_proc_cls.return_value = mock_proc
+
+        eml_file = tmp_path / "failed.eml"
+        eml_file.write_text(_make_eml(subject="Embedding failed", body="History"))
+
+        stats = run_import(eml_file, batch_size=10)
+
+        assert stats.total == 1
+        assert stats.imported == 0
+        assert stats.failed == 1
+        assert stats.points_created == 0
 
     def test_empty_body_skipped(self, tmp_path: Path):
         eml = (
@@ -246,6 +267,52 @@ class TestRunImport:
         (tmp_path / "empty.eml").write_text(eml)
         stats = run_import(tmp_path, dry_run=True)
         assert stats.skipped >= 1
+
+    def test_same_internet_message_id_is_counted_once(self, tmp_path: Path):
+        first = (
+            "From: sender@example.com\r\n"
+            "To: recipient@example.com\r\n"
+            "Subject: First copy\r\n"
+            "Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n"
+            "Message-ID: <shared-message@example.com>\r\n"
+            "\r\n"
+            "First body\r\n"
+        )
+        second = (
+            "From: sender@example.com\r\n"
+            "To: recipient@example.com\r\n"
+            "Subject: Exported copy\r\n"
+            "Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n"
+            "Message-ID: <shared-message@example.com>\r\n"
+            "\r\n"
+            "Body changed by an export tool\r\n"
+        )
+        (tmp_path / "first.eml").write_text(first)
+        (tmp_path / "second.eml").write_text(second)
+
+        stats = run_import(tmp_path, dry_run=True)
+
+        assert stats.total == 2
+        assert stats.imported == 1
+        assert stats.duplicates == 1
+
+    def test_stable_signature_deduplicates_mail_without_message_id(self, tmp_path: Path):
+        exported = (
+            "From: sender@example.com\r\n"
+            "To: recipient@example.com\r\n"
+            "Subject: No message id\r\n"
+            "Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n"
+            "\r\n"
+            "Same historical body\r\n"
+        )
+        (tmp_path / "copy-a.eml").write_text(exported)
+        (tmp_path / "copy-b.eml").write_text(exported)
+
+        stats = run_import(tmp_path, dry_run=True)
+
+        assert stats.total == 2
+        assert stats.imported == 1
+        assert stats.duplicates == 1
 
 
 class TestPypffParser:
@@ -340,6 +407,25 @@ class TestImportStats:
         assert "10" in output
         assert "8" in output
         assert "24" in output
+
+
+class TestImportCli:
+    def test_failed_import_returns_a_nonzero_exit_status(self, tmp_path: Path):
+        from scripts.import_pst import main
+
+        source = tmp_path / "history.eml"
+        source.write_text(_make_eml())
+        with (
+            patch("sys.argv", ["import_pst.py", str(source)]),
+            patch(
+                "scripts.import_pst.run_import",
+                return_value=ImportStats(total=1, failed=1),
+            ),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            main()
+
+        assert exit_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +530,22 @@ class TestExchangeImport:
         d = result.to_dict()
         assert d["_import_source"] == "exchange_import"
 
+    def test_exchange_internet_message_id_is_preserved_for_deduplication(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        result = _exchange_item_to_parsed_email(
+            {
+                "id": "ExchangeId",
+                "internet_message_id": "<shared@example.com>",
+                "subject": "History",
+                "body": "body",
+            },
+            folder="INBOX",
+        )
+
+        assert result is not None
+        assert result.internet_message_id == "<shared@example.com>"
+
     def test_exchange_dry_run(self, tmp_path: Path):
         """Verify dry-run with exchange source via mocked iter_from_exchange."""
         from scripts.import_pst import _exchange_item_to_parsed_email
@@ -467,3 +569,295 @@ class TestExchangeImport:
             assert stats.total == 3
             assert stats.imported == 3
             assert stats.points_created == 0
+
+    def test_exchange_is_preferred_over_a_duplicate_local_supplement(
+        self, tmp_path: Path, capsys
+    ):
+        local_copy = (
+            "From: sender@example.com\r\n"
+            "To: recipient@example.com\r\n"
+            "Subject: Local exported copy\r\n"
+            "Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n"
+            "Message-ID: <shared-source@example.com>\r\n"
+            "\r\n"
+            "Local body\r\n"
+        )
+        local_path = tmp_path / "local.eml"
+        local_path.write_text(local_copy)
+        exchange_copy = ParsedEmail(
+            id="exc_server",
+            subject="Exchange server copy",
+            sender="sender@example.com",
+            to=["recipient@example.com"],
+            cc=[],
+            body="Server body",
+            received_at="2024-01-01T10:00:00+00:00",
+            internet_message_id="<shared-source@example.com>",
+            import_source="exchange_import",
+        )
+
+        with patch(
+            "scripts.import_pst.iter_from_exchange",
+            return_value=iter([exchange_copy]),
+        ):
+            stats = run_import(
+                source=None,
+                dry_run=True,
+                source_type="exchange",
+                exchange_folder="ALL",
+                exchange_limit=0,
+                exchange_all_mail=True,
+                supplement_source=local_path,
+            )
+
+        output = capsys.readouterr().out
+        assert stats.total == 2
+        assert stats.imported == 1
+        assert stats.duplicates == 1
+        assert "Exchange server copy" in output
+        assert "Local exported copy" not in output
+
+    def test_selected_exchange_folder_is_used_for_list_and_detail_requests(self):
+        """A selected non-Inbox folder remains selected while fetching details."""
+        from scripts.import_pst import iter_from_exchange
+
+        observed: list[tuple[str, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed.append((request.url.path, request.url.params.get("folder")))
+            if request.url.path.endswith("/list"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "total": 1,
+                            "items": [{"id": "sent-message-id"}],
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "sent-message-id",
+                        "subject": "Sent history",
+                        "sender": "me@example.com",
+                        "body": "Historical reply",
+                    }
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            messages = list(
+                iter_from_exchange(folder="sent", limit=1, all_mail=True)
+            )
+
+        assert len(messages) == 1
+        assert observed == [
+            ("/api/v1/exchange/emails/list", "sent"),
+            ("/api/v1/exchange/emails/sent-message-id", "sent"),
+        ]
+
+    def test_exchange_history_uses_the_configured_private_ca(self):
+        from scripts.import_pst import iter_from_exchange
+
+        configured_verify: list[object] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": {"total": 0, "items": []}})
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            configured_verify.append(kwargs["verify"])
+            kwargs["verify"] = False
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+            EXCHANGE_CA_FILE="/run/ai-exchange/exchange-ca.pem",
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            assert list(iter_from_exchange(folder="sent", limit=0, all_mail=True)) == []
+
+        assert configured_verify == ["/run/ai-exchange/exchange-ca.pem"]
+
+    def test_all_exchange_history_excludes_non_business_system_folders(self):
+        """ALL means business mail history, not drafts, trash, junk, or outbox."""
+        from scripts.import_pst import iter_from_exchange
+
+        requested_folders: list[str | None] = []
+        folders = [
+            "Inbox",
+            "Sent Items",
+            "Projects",
+            "Drafts",
+            "Deleted Items",
+            "Junk Email",
+            "Outbox",
+        ]
+
+        def folder_response(*args, **kwargs):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "folders": [
+                            {
+                                "name": name,
+                                "total_count": 1,
+                                "folder_class": "IPF.Note",
+                            }
+                            for name in folders
+                        ]
+                    }
+                },
+            )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_folders.append(request.url.params.get("folder"))
+            return httpx.Response(200, json={"data": {"total": 0, "items": []}})
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.get", side_effect=folder_response),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            assert list(iter_from_exchange(folder="ALL", limit=0, all_mail=True)) == []
+
+        assert requested_folders == ["inbox", "sent", "Projects"]
+
+    def test_exchange_detail_failure_marks_the_import_incomplete(self, caplog):
+        from scripts.import_pst import ExchangeImportIncomplete, iter_from_exchange
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/list"):
+                return httpx.Response(
+                    200,
+                    json={"data": {"total": 1, "items": [{"id": "missing-detail"}]}},
+                )
+            return httpx.Response(404, json={"code": 404, "msg": "not found"})
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            with pytest.raises(ExchangeImportIncomplete, match="detail_failed"):
+                list(iter_from_exchange(folder="sent", limit=0, all_mail=True))
+
+        assert "missing-detail" not in caplog.text
+        assert "not found" not in caplog.text
+
+    def test_exchange_list_count_mismatch_marks_the_import_incomplete(self):
+        from scripts.import_pst import ExchangeImportIncomplete, iter_from_exchange
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/list"):
+                return httpx.Response(
+                    200,
+                    json={"data": {"total": 2, "items": [{"id": "only-item"}]}},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "only-item",
+                        "subject": "One of two",
+                        "sender": "sender@example.com",
+                        "body": "body",
+                    }
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            with pytest.raises(ExchangeImportIncomplete, match="count_mismatch"):
+                list(iter_from_exchange(folder="sent", limit=0, all_mail=True))
+
+    def test_all_exchange_history_fails_when_folder_discovery_fails(self):
+        from scripts.import_pst import ExchangeImportIncomplete, iter_from_exchange
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        failed = httpx.Response(503, json={"code": 503, "msg": "unavailable"})
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.get", return_value=failed),
+        ):
+            with pytest.raises(ExchangeImportIncomplete, match="folder_discovery"):
+                list(iter_from_exchange(folder="ALL", limit=0, all_mail=True))
