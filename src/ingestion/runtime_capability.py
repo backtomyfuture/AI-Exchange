@@ -1,8 +1,8 @@
 """Immutable, fail-closed runtime capability manifests.
 
 The capability chain is a pure value contract.  It performs no database,
-configuration, network, or authority mutation.  Phase 2 may prepare only the
-first manifest; later phases append exact hash-linked successors.
+configuration, network, or authority mutation. Polling may prepare only the
+first manifest; later capabilities append exact hash-linked successors.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Final
 
 
 POSTGRES_BIGINT_MAX: Final = 2**63 - 1
-PHASE2_SCHEMA_REVISION: Final = "20260716_0006"
+POLLING_SCHEMA_REVISION: Final = "polling-v1"
 
 _CANONICAL_SCHEMA_VERSION: Final = 1
 _CAPABILITY_HASH_DOMAIN: Final = b"ai-exchange-runtime-capability-manifest-v1\x00"
@@ -41,17 +41,17 @@ _BUILD_ID_PATTERN: Final = re.compile(
 class RuntimeCapabilityStage(StrEnum):
     """The only legal append order for runtime capabilities."""
 
-    PHASE2_INGESTION = "phase2_ingestion"
-    PHASE3_APPROVAL_SEND = "phase3_approval_send"
-    PHASE4_GRAPH_PROJECTION = "phase4_graph_projection"
+    POLLING_INGESTION = "polling_ingestion"
+    APPROVAL_SEND = "approval_send"
+    GRAPH_PROJECTION = "graph_projection"
 
 
 CAPABILITY_STAGE_ORDER: Final = (
-    RuntimeCapabilityStage.PHASE2_INGESTION,
-    RuntimeCapabilityStage.PHASE3_APPROVAL_SEND,
-    RuntimeCapabilityStage.PHASE4_GRAPH_PROJECTION,
+    RuntimeCapabilityStage.POLLING_INGESTION,
+    RuntimeCapabilityStage.APPROVAL_SEND,
+    RuntimeCapabilityStage.GRAPH_PROJECTION,
 )
-PHASE2_AUTHORIZED_AUTHORITY_STATES: Final = frozenset(
+POLLING_AUTHORIZED_AUTHORITY_STATES: Final = frozenset(
     {
         "ingest_only",
         "paused",
@@ -238,10 +238,10 @@ def validate_capability_chain(
     return chain
 
 
-def install_phase2_capability(
+def install_polling_capability(
     manifest: RuntimeCapabilityManifest,
 ) -> RuntimeCapabilityManifest:
-    """Validate the only capability Task 10G is allowed to install.
+    """Validate the only initial polling capability that may be installed.
 
     Persistence remains the responsibility of the later DB-authority layer.
     This API deliberately has no activation operation.
@@ -249,10 +249,10 @@ def install_phase2_capability(
 
     exact = _require_exact_manifest(manifest)
     if (
-        exact.stage is not RuntimeCapabilityStage.PHASE2_INGESTION
-        or exact.schema_revision != PHASE2_SCHEMA_REVISION
+        exact.stage is not RuntimeCapabilityStage.POLLING_INGESTION
+        or exact.schema_revision != POLLING_SCHEMA_REVISION
         or exact.predecessor_hash != CAPABILITY_CHAIN_ROOT_HASH
     ):
-        raise ValueError("phase2 capability manifest is not the exact first stage")
+        raise ValueError("polling capability manifest is not the exact first stage")
     require_exact_predecessor(exact, None)
     return exact

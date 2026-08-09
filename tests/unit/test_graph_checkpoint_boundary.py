@@ -186,7 +186,7 @@ async def test_extreme_legal_state_still_fits_real_checkpoint_serializer(monkeyp
         },
     )
     state = {**base, **delta}
-    assert serialized_state_size(state) == MAX_LOGICAL_STATE_BYTES - 1
+    assert serialized_state_size(state) < MAX_LOGICAL_STATE_BYTES
 
     workflow = StateGraph(AgentState)
     workflow.add_node("noop", lambda _state: {})

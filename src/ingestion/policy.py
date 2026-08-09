@@ -1,4 +1,4 @@
-"""Pure, fail-closed processing-policy manifest and resolver."""
+"""Immutable polling policy for the one supported Exchange ingress."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from src.ingestion.models import ChangeKind, IngressSource, ProcessingPolicy
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_FOLDER_IDENTITY_LENGTH: Final = 512
 _MAX_EVENT_TYPE_LENGTH: Final = 128
-_FOLDER_SCOPE_CONFIG_SCHEMA_VERSION: Final = 1
+_FOLDER_SCOPE_CONFIG_SCHEMA_VERSION: Final = 2
 _RESOLVABLE_POLICIES: Final = frozenset(
     {
         ProcessingPolicy.FULL,
@@ -29,26 +29,6 @@ _RESOLVABLE_POLICIES: Final = frozenset(
 
 PolicyMatrixKey: TypeAlias = tuple[IngressSource, str, ChangeKind]
 
-_WEBHOOK_NEW_MAIL_KEY: Final[PolicyMatrixKey] = (
-    IngressSource.WEBHOOK,
-    "NewMailEvent",
-    ChangeKind.CREATE,
-)
-_WEBHOOK_CREATED_KEY: Final[PolicyMatrixKey] = (
-    IngressSource.WEBHOOK,
-    "CreatedEvent",
-    ChangeKind.CREATE,
-)
-_WEBHOOK_MODIFIED_KEY: Final[PolicyMatrixKey] = (
-    IngressSource.WEBHOOK,
-    "ModifiedEvent",
-    ChangeKind.UPDATE,
-)
-_WEBHOOK_DELETED_KEY: Final[PolicyMatrixKey] = (
-    IngressSource.WEBHOOK,
-    "DeletedEvent",
-    ChangeKind.DELETE,
-)
 _SYNC_CREATE_KEY: Final[PolicyMatrixKey] = (
     IngressSource.SYNC,
     "create",
@@ -65,35 +45,16 @@ _SYNC_DELETE_KEY: Final[PolicyMatrixKey] = (
     ChangeKind.DELETE,
 )
 _REQUIRED_POLICY_MATRIX_KEYS: Final = frozenset(
-    {
-        _WEBHOOK_NEW_MAIL_KEY,
-        _WEBHOOK_CREATED_KEY,
-        _WEBHOOK_MODIFIED_KEY,
-        _WEBHOOK_DELETED_KEY,
-        _SYNC_CREATE_KEY,
-        _SYNC_UPDATE_KEY,
-        _SYNC_DELETE_KEY,
-    }
+    {_SYNC_CREATE_KEY, _SYNC_UPDATE_KEY, _SYNC_DELETE_KEY}
 )
-_METADATA_POLICY_KEYS: Final = frozenset(
-    {
-        _WEBHOOK_MODIFIED_KEY,
-        _WEBHOOK_DELETED_KEY,
-        _SYNC_UPDATE_KEY,
-        _SYNC_DELETE_KEY,
-    }
-)
+_METADATA_POLICY_KEYS: Final = frozenset({_SYNC_UPDATE_KEY, _SYNC_DELETE_KEY})
 _CREATE_POLICIES: Final = frozenset(
-    {
-        ProcessingPolicy.FULL,
-        ProcessingPolicy.ARCHIVE,
-        ProcessingPolicy.IGNORED,
-    }
+    {ProcessingPolicy.FULL, ProcessingPolicy.ARCHIVE, ProcessingPolicy.IGNORED}
 )
 
 
 class PolicySnapshotUnavailableError(RuntimeError):
-    """The account policy snapshot cannot safely authorize processing."""
+    """The account policy snapshot cannot safely authorize polling."""
 
     def __init__(self) -> None:
         super().__init__("policy snapshot unavailable")
@@ -119,7 +80,7 @@ def _require_exact_text(name: str, value: object, *, max_length: int) -> str:
 
 
 def require_canonical_folder_key(value: object) -> str:
-    """Validate that a cursor identity is already normalization-canonical."""
+    """Validate a canonical cursor identity."""
 
     try:
         return require_canonical_folder_identity(value)
@@ -131,13 +92,17 @@ def require_canonical_folder_key(value: object) -> str:
 
 def _require_source(value: object) -> IngressSource:
     if type(value) is IngressSource:
-        return value
-    if type(value) is not str:
+        source = value
+    elif type(value) is str:
+        try:
+            source = IngressSource(value)
+        except ValueError:
+            raise ValueError("source must be a valid IngressSource") from None
+    else:
         raise ValueError("source must be a valid IngressSource")
-    try:
-        return IngressSource(value)
-    except ValueError:
-        raise ValueError("source must be a valid IngressSource") from None
+    if source is not IngressSource.SYNC:
+        raise ValueError("only sync ingress is supported")
+    return source
 
 
 def _require_kind(value: object) -> ChangeKind:
@@ -162,26 +127,8 @@ def _require_policy(value: object) -> ProcessingPolicy:
     else:
         raise ValueError("event policy must be a valid ProcessingPolicy")
     if policy not in _RESOLVABLE_POLICIES:
-        raise ValueError("event policy is not resolvable for an ingress event")
+        raise ValueError("event policy is not resolvable for a polling event")
     return policy
-
-
-def _freeze_webhook_ids(value: object) -> frozenset[str]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
-        raise ValueError("webhook_ids must be a non-empty iterable")
-    identities = tuple(
-        _require_exact_text(
-            "webhook_id",
-            identity,
-            max_length=_MAX_FOLDER_IDENTITY_LENGTH,
-        )
-        for identity in value
-    )
-    if not identities:
-        raise ValueError("webhook_ids must be a non-empty iterable")
-    if len(frozenset(identities)) != len(identities):
-        raise ValueError("webhook_ids must be unique")
-    return frozenset(identities)
 
 
 def _freeze_policy_matrix(value: object) -> Mapping[PolicyMatrixKey, ProcessingPolicy]:
@@ -197,8 +144,6 @@ def _freeze_policy_matrix(value: object) -> Mapping[PolicyMatrixKey, ProcessingP
             raw_event_type,
             max_length=_MAX_EVENT_TYPE_LENGTH,
         )
-        if exact_raw_event_type == "read_flag_change":
-            raise ValueError("raw read_flag_change is contract-invalid")
         key = (
             _require_source(source),
             exact_raw_event_type,
@@ -208,59 +153,25 @@ def _freeze_policy_matrix(value: object) -> Mapping[PolicyMatrixKey, ProcessingP
             raise ValueError("event policy matrix keys must be unique")
         frozen[key] = _require_policy(raw_policy)
     if frozenset(frozen) != _REQUIRED_POLICY_MATRIX_KEYS:
-        raise ValueError(
-            "event policy matrix must contain the exact seven supported keys"
-        )
+        raise ValueError("event policy matrix must contain the exact sync keys")
     if any(
         frozen[key] is not ProcessingPolicy.METADATA_ONLY
         for key in _METADATA_POLICY_KEYS
     ):
         raise ValueError("update and delete policies must be METADATA_ONLY")
-    return MappingProxyType(frozen)
-
-
-def _validate_scope_policy_matrix(
-    canonical_key: str,
-    event_policy_matrix: Mapping[PolicyMatrixKey, ProcessingPolicy],
-) -> None:
-    new_mail_policy = event_policy_matrix[_WEBHOOK_NEW_MAIL_KEY]
-    sync_create_policy = event_policy_matrix[_SYNC_CREATE_KEY]
-    created_policy = event_policy_matrix[_WEBHOOK_CREATED_KEY]
-    if new_mail_policy is not sync_create_policy:
-        raise ValueError("NewMailEvent and Sync create policies must be equivalent")
-    if new_mail_policy not in _CREATE_POLICIES:
+    if frozen[_SYNC_CREATE_KEY] not in _CREATE_POLICIES:
         raise ValueError("create policy must be FULL, ARCHIVE, or IGNORED")
-    if canonical_key == "SENT":
-        if (
-            new_mail_policy is not ProcessingPolicy.ARCHIVE
-            or created_policy is not ProcessingPolicy.ARCHIVE
-        ):
-            raise ValueError("SENT create policies must be ARCHIVE")
-    elif canonical_key == "DRAFTS":
-        if (
-            new_mail_policy is not ProcessingPolicy.IGNORED
-            or created_policy is not ProcessingPolicy.IGNORED
-        ):
-            raise ValueError("DRAFTS create policies must be IGNORED")
-    elif canonical_key == "ARCHIVE":
-        if new_mail_policy is not ProcessingPolicy.ARCHIVE:
-            raise ValueError("ARCHIVE create policies must be ARCHIVE")
-        if created_policy is not ProcessingPolicy.IGNORED:
-            raise ValueError("CreatedEvent must be IGNORED outside SENT")
-    elif created_policy is not ProcessingPolicy.IGNORED:
-        raise ValueError("CreatedEvent must be IGNORED outside SENT")
+    return MappingProxyType(frozen)
 
 
 def _folder_scope_config_hash(
     canonical_key: str,
-    webhook_ids: Iterable[str],
     sync_folder: str,
     event_policy_matrix: Mapping[PolicyMatrixKey, ProcessingPolicy],
 ) -> str:
     canonical = {
         "schema_version": _FOLDER_SCOPE_CONFIG_SCHEMA_VERSION,
         "canonical_key": canonical_key,
-        "webhook_ids": sorted(webhook_ids),
         "sync_folder": sync_folder,
         "event_policy_matrix": [
             {
@@ -291,10 +202,9 @@ def _folder_scope_config_hash(
 
 @dataclass(frozen=True, slots=True)
 class FolderScope:
-    """One immutable configured folder scope shared by all ingress transports."""
+    """One immutable folder scope for Exchange ``sync_state`` polling."""
 
     canonical_key: str
-    webhook_ids: Iterable[str]
     sync_folder: str
     event_policy_matrix: Mapping[PolicyMatrixKey, ProcessingPolicy]
     config_hash: str
@@ -304,29 +214,24 @@ class FolderScope:
         cls,
         *,
         canonical_key: str,
-        webhook_ids: Iterable[str],
         sync_folder: str,
         event_policy_matrix: Mapping[PolicyMatrixKey, ProcessingPolicy],
     ) -> FolderScope:
         if cls is not FolderScope:
             raise ValueError("configured must be called on exact FolderScope")
         frozen_canonical_key = require_canonical_folder_key(canonical_key)
-        frozen_webhook_ids = _freeze_webhook_ids(webhook_ids)
         frozen_sync_folder = _require_exact_text(
             "sync_folder",
             sync_folder,
             max_length=_MAX_FOLDER_IDENTITY_LENGTH,
         )
         frozen_matrix = _freeze_policy_matrix(event_policy_matrix)
-        _validate_scope_policy_matrix(frozen_canonical_key, frozen_matrix)
         return cls(
             canonical_key=frozen_canonical_key,
-            webhook_ids=frozen_webhook_ids,
             sync_folder=frozen_sync_folder,
             event_policy_matrix=frozen_matrix,
             config_hash=_folder_scope_config_hash(
                 frozen_canonical_key,
-                frozen_webhook_ids,
                 frozen_sync_folder,
                 frozen_matrix,
             ),
@@ -338,7 +243,6 @@ class FolderScope:
             "canonical_key",
             require_canonical_folder_key(self.canonical_key),
         )
-        object.__setattr__(self, "webhook_ids", _freeze_webhook_ids(self.webhook_ids))
         object.__setattr__(
             self,
             "sync_folder",
@@ -353,10 +257,6 @@ class FolderScope:
             "event_policy_matrix",
             _freeze_policy_matrix(self.event_policy_matrix),
         )
-        _validate_scope_policy_matrix(
-            self.canonical_key,
-            self.event_policy_matrix,
-        )
         if (
             type(self.config_hash) is not str
             or _SHA256_PATTERN.fullmatch(self.config_hash) is None
@@ -364,7 +264,6 @@ class FolderScope:
             raise ValueError("config_hash must be a lowercase SHA-256 digest")
         expected_hash = _folder_scope_config_hash(
             self.canonical_key,
-            self.webhook_ids,
             self.sync_folder,
             self.event_policy_matrix,
         )
@@ -374,7 +273,7 @@ class FolderScope:
 
 @dataclass(frozen=True, slots=True)
 class PolicySnapshot:
-    """Immutable account snapshot; ambiguity is represented as unready state."""
+    """Immutable polling snapshot; ambiguity is represented as unready state."""
 
     scopes: Iterable[FolderScope]
     refreshed: bool = True
@@ -404,22 +303,19 @@ class PolicySnapshot:
             return False
         canonical_keys: set[str] = set()
         sync_folders: set[str] = set()
-        webhook_ids: set[str] = set()
         for scope in self.scopes:
-            if scope.canonical_key in canonical_keys:
-                return False
-            if scope.sync_folder in sync_folders:
-                return False
-            if webhook_ids.intersection(scope.webhook_ids):
+            if (
+                scope.canonical_key in canonical_keys
+                or scope.sync_folder in sync_folders
+            ):
                 return False
             canonical_keys.add(scope.canonical_key)
             sync_folders.add(scope.sync_folder)
-            webhook_ids.update(scope.webhook_ids)
         return True
 
 
 class ProcessingPolicyResolver:
-    """Resolve exact transport identities without an implicit FULL fallback."""
+    """Resolve only configured sync identities without a FULL fallback."""
 
     @staticmethod
     def _require_snapshot(snapshot: object) -> PolicySnapshot:
@@ -452,21 +348,11 @@ class ProcessingPolicyResolver:
             exact_folder_identity,
             max_length=_MAX_FOLDER_IDENTITY_LENGTH,
         )
-        if resolved_raw_type == "read_flag_change":
-            raise ValueError("raw read_flag_change is contract-invalid")
-
         scope = next(
             (
                 candidate
                 for candidate in available.scopes
-                if (
-                    resolved_source is IngressSource.WEBHOOK
-                    and folder_identity in candidate.webhook_ids
-                )
-                or (
-                    resolved_source is IngressSource.SYNC
-                    and folder_identity == candidate.sync_folder
-                )
+                if folder_identity == candidate.sync_folder
             ),
             None,
         )
@@ -476,3 +362,13 @@ class ProcessingPolicyResolver:
             (resolved_source, resolved_raw_type, resolved_kind),
             ProcessingPolicy.IGNORED,
         )
+
+
+__all__ = [
+    "FolderScope",
+    "PolicyMatrixKey",
+    "PolicySnapshot",
+    "PolicySnapshotUnavailableError",
+    "ProcessingPolicyResolver",
+    "require_canonical_folder_key",
+]

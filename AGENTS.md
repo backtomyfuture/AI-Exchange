@@ -26,7 +26,7 @@ docker compose up -d qdrant postgres
 
 ### LangGraph checkpoint migration gotcha
 
-`langgraph-checkpoint-postgres` v3.0.4 uses `CREATE INDEX CONCURRENTLY` in migrations 6–8. The explicit bootstrap command handles the required autocommit behavior. Bootstrap must use the isolated migration-owner Docker secret, never the runtime DSN. Do not execute this command until the Task 1B0-B catalog role verifier and the separate DBA ownership-transfer checkpoint have passed:
+`langgraph-checkpoint-postgres` v3.0.4 uses `CREATE INDEX CONCURRENTLY` in migrations 6–8. The explicit bootstrap command handles the required autocommit behavior. Bootstrap must use the isolated migration-owner Docker secret, never the runtime DSN:
 
 ```bash
 docker compose --profile migration run --rm database-bootstrap
@@ -36,7 +36,7 @@ Once the tables exist, subsequent `checkpointer.setup()` calls are no-ops.
 
 ### Environment setup
 
-Local Python and production Compose now share one minimal `.env`. Copy `.env.example` to `.env`, fill only its 17 integration/model values, then run `.venv/bin/python scripts/configure_deployment.py`; database identities, security tokens, DSNs, limits, and advanced deployment state are generated under ignored `secrets/`. Compose still injects an explicit runtime allowlist, and migration/maintenance credentials never enter the application container. Use `PYTHON_DOTENV_DISABLED=1` when a test must be isolated from the local deployment configuration.
+Local Python and production Compose now share one minimal `.env`. Copy `.env.example` to `.env`, fill only its 16 integration/model values, then run `.venv/bin/python scripts/configure_deployment.py --project-name ai-exchange-greenfield`; database identities, security tokens, DSNs, limits, and advanced deployment state are generated under ignored `secrets/`. Compose still injects an explicit runtime allowlist, and migration/maintenance credentials never enter the application container. Use `PYTHON_DOTENV_DISABLED=1` when a test must be isolated from the local deployment configuration.
 
 ### Common commands
 
@@ -49,7 +49,7 @@ Local Python and production Compose now share one minimal `.env`. Copy `.env.exa
 
 ### Notes
 
-- Lark WS will fail to connect with placeholder credentials — this is expected and does not block the health check or webhook processing.
+- Lark WS will fail to connect with placeholder credentials — this is expected and does not block the health check or polling startup.
 - Exchange API calls will fail without valid `EXCHANGE_API_URL`/`EXCHANGE_API_KEY` — also expected in dev; the folder-cache init is wrapped in a try/except.
 - Tests are heavily mocked and do **not** require running Docker services.
 - `Settings` uses `SecretStr` for sensitive fields; access via `resolve_secret()` helper for mock compatibility.

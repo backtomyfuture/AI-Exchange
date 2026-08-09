@@ -1,23 +1,23 @@
 # Tier 1 路由设计 v1.0
 
-本文是 Tier 1（`skills_registry/` 声明式确定性路由）的权威设计规范。它取代此前分散在
+本文是 Tier 1（`tier1_rules/` 声明式确定性路由）的权威设计规范。它取代此前分散在
 `route`/`priority`/`card_type`/`action` 等松散字段上的隐性约定。实现（JSON Schema、
 registry compiler、evaluator、fixture runner）必须以本文为准；本文与代码冲突时，先
 更新本文再改代码。
 
 ## 1. 范围边界
 
-这一版只重做 Tier 1 的匹配、路由、审计和向下游 handoff 的接口。以下明确不在本版范围内，
-留作独立后续阶段：
+这一版定义 Tier 1 的匹配、路由、审计和向下游 handoff 接口。Tier 2、Tier 3 和逐邮件
+决策持久化已经通过统一 `RouteDecision` 接入。以下仍不在范围内：
 
-- Tier 2 / Tier 3 / RAG / 风格记忆 / LLM 行为；
+- 风格记忆学习与 LLM 个性化训练；
 - drafter 端可插拔模板引擎、知识范围（knowledge scope）机制；
 - 基于目录的身份解析器（`identity_id`）和外部域可信等级；
 - Intake Guard（Tier 0）的检测逻辑本体，只预留输入占位；
 - 飞书卡片的权限受控下钻查看器；
-- 新的逐邮件路由审计持久化表。
+- Intake Guard 的检测逻辑本体。
 
-31 条现有 `skills_registry` 规则视为冻结候选，全部按第 9 节的分类法重新评审，不自动迁移。
+旧的 `skills_registry` 可执行 handler 与兼容运行时已删除；迁移结论由 Git 历史保存。
 
 ## 2. 决策模型
 

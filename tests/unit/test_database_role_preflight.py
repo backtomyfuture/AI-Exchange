@@ -99,34 +99,6 @@ def test_role_snapshots_prove_all_identities_have_no_role_memberships():
     }
 
 
-def test_legacy_relation_access_sql_expands_one_manifest_revision_aware() -> None:
-    module = _module()
-    manifest = module.RUNTIME_RELATION_ACCESS
-    explicit_manifests = {
-        "20260710_0002": {
-            name: access
-            for name, access in manifest.items()
-            if name not in module.PHASE2_RELATIONS
-        },
-        "20260713_0004": manifest,
-        "20260713_0005": manifest,
-    }
-
-    legacy_sql = module._relation_access_contract_sql(
-        "schema_oid",
-        "role_oid",
-        manifest,
-    )
-    explicit_sql = module._relation_access_contract_sql(
-        "schema_oid",
-        "role_oid",
-        manifest,
-        manifests_by_revision=explicit_manifests,
-    )
-
-    assert legacy_sql == explicit_sql
-
-
 def test_role_test_dsn_preserves_admin_transport_parameters():
     from tests.integration.conftest import PostgresDatabaseFactory
 
@@ -637,6 +609,36 @@ async def test_checkpoint_auditor_cuts_off_driver_error_and_private_values(caplo
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_auditor_rejects_missing_catalog_snapshot(caplog):
+    module = importlib.import_module("src.db.auditor")
+    cursor = AsyncMock()
+    cursor.fetchone.return_value = None
+    connection = AsyncMock()
+    connection.__aenter__.return_value = connection
+    connection.execute.return_value = cursor
+
+    with (
+        patch.object(
+            module.psycopg.AsyncConnection,
+            "connect",
+            new=AsyncMock(return_value=connection),
+        ),
+        caplog.at_level("ERROR", logger="src.db.auditor"),
+        pytest.raises(module.CheckpointAuditorRoleError),
+    ):
+        await module.require_checkpoint_auditor_database_role(
+            AUDITOR_ROLE,
+            expected_auditor_role=AUDITOR_ROLE,
+            expected_runtime_role="runtime_user",
+            expected_migration_role="migration_owner",
+            expected_maintenance_role="maintenance_user",
+            target_schema="public",
+        )
+
+    assert "failed_invariants=snapshot_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["migration", "runtime", "maintenance"])
 @pytest.mark.parametrize(
     (
@@ -803,7 +805,6 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
     role_gate = AsyncMock(side_effect=[None, postflight_error])
     schema_contract = AsyncMock()
     access_contract = AsyncMock()
-    empty_inbox_gate = AsyncMock()
 
     with (
         patch.object(
@@ -815,7 +816,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         patch.object(
             bootstrap_module,
             "get_current_database_revision",
-            new=AsyncMock(side_effect=["20260710_0003", "20260713_0004"]),
+            new=AsyncMock(side_effect=[None, "20260808_0001"]),
         ),
         patch.object(
             bootstrap_module,
@@ -832,11 +833,6 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             "require_database_schema_contract",
             new=schema_contract,
         ),
-        patch.object(
-            bootstrap_module,
-            "_require_empty_event_inbox_for_0004",
-            new=empty_inbox_gate,
-        ),
         pytest.raises(module.DatabaseRoleError, match="database_role_preflight_failed"),
     ):
         await bootstrap_module.bootstrap_database(
@@ -849,10 +845,6 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         )
 
     assert role_gate.await_count == 2
-    empty_inbox_gate.assert_awaited_once_with(
-        MIGRATION_DSN,
-        target_schema="public",
-    )
     checkpoint_migrations.assert_awaited_once_with(MIGRATION_DSN, "public")
     access_contract.assert_awaited_once_with(
         MIGRATION_DSN,
@@ -860,7 +852,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
         runtime_role="runtime_user",
         maintenance_role="maintenance_user",
         auditor_role=AUDITOR_ROLE,
-        business_revision="20260713_0004",
+        business_revision="20260808_0001",
     )
     assert schema_contract.await_args_list == [
         (
@@ -868,8 +860,8 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             {
                 "target_schema": "public",
                 "require_complete": False,
-                "require_business_complete": True,
-                "expected_revision": "20260710_0003",
+                "require_business_complete": False,
+                "expected_revision": None,
             },
         ),
         (
@@ -877,15 +869,7 @@ async def test_bootstrap_rechecks_role_boundary_after_all_schema_writes():
             {
                 "target_schema": "public",
                 "require_complete": True,
-                "expected_revision": "20260710_0003",
-            },
-        ),
-        (
-            (MIGRATION_DSN,),
-            {
-                "target_schema": "public",
-                "require_complete": True,
-                "expected_revision": "20260713_0004",
+                "expected_revision": "20260808_0001",
             },
         ),
     ]

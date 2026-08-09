@@ -13,6 +13,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -62,21 +63,26 @@ class CompiledArtifact:
     rules: List[CompiledRule] = field(default_factory=list)
     warnings: List[CompileIssue] = field(default_factory=list)
 
-    def to_json_dict(self) -> dict:
+    def executable_payload(self) -> dict:
+        """Return the complete deterministic payload covered by ``digest``."""
         return {
             "schema_version": self.schema_version,
             "fingerprint_version": self.fingerprint_version,
-            "digest": self.digest,
             "rules": [
                 {
-                    "rule_id": c.manifest.rule_id,
-                    "rule_version": c.manifest.rule_version,
-                    "route": c.manifest.decision.route.value,
+                    "manifest": c.manifest.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
                     "action_fingerprint": c.action_fingerprint,
                 }
                 for c in self.rules
             ],
         }
+
+    def to_json_dict(self) -> dict:
+        return {**self.executable_payload(), "digest": self.digest}
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,64 @@ class CompilationFailure:
 
 def _canonical_json(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def _parse_validity_timestamp(value: Optional[str], *, field_name: str) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name}_invalid") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _check_validity(
+    rule: RuleManifest,
+    *,
+    now: datetime,
+) -> tuple[List[CompileIssue], List[CompileIssue]]:
+    errors: List[CompileIssue] = []
+    warnings: List[CompileIssue] = []
+    try:
+        expires_at = _parse_validity_timestamp(
+            rule.validity.expires_at,
+            field_name="expires_at",
+        )
+        effective_from = _parse_validity_timestamp(
+            rule.validity.effective_from,
+            field_name="effective_from",
+        )
+    except ValueError as exc:
+        return [CompileIssue(rule.rule_id, str(exc), "validity timestamp is invalid")], []
+    if effective_from is not None and expires_at is not None and effective_from >= expires_at:
+        errors.append(
+            CompileIssue(
+                rule.rule_id,
+                "validity_window_invalid",
+                "validity.effective_from must precede validity.expires_at",
+            )
+        )
+    if expires_at is not None:
+        if expires_at <= now:
+            errors.append(
+                CompileIssue(
+                    rule.rule_id,
+                    "rule_expired",
+                    "enabled rule is expired and cannot enter an artifact",
+                )
+            )
+        elif expires_at - now <= timedelta(days=30):
+            warnings.append(
+                CompileIssue(
+                    rule.rule_id,
+                    "rule_expires_soon",
+                    "enabled rule expires within 30 days",
+                )
+            )
+    return errors, warnings
 
 
 def _fixture_to_view(raw: Dict) -> EmailView:
@@ -306,6 +370,7 @@ def compile_registry(
     *,
     internal_email_domains: Sequence[str] = (),
     me_email: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> Union[CompiledArtifact, CompilationFailure]:
     """Validate every rule file under ``rule_dir`` as one atomic unit.
 
@@ -318,6 +383,7 @@ def compile_registry(
     it has no effect on schema, regex-safety, or static-overlap checks.
     """
     rule_dir = Path(rule_dir)
+    now = datetime.now(UTC) if now is None else now.astimezone(UTC)
     errors: List[CompileIssue] = []
     warnings: List[CompileIssue] = []
     enabled_rules: List[RuleManifest] = []
@@ -337,6 +403,9 @@ def compile_registry(
 
     errors.extend(_check_duplicate_ids(enabled_rules))
     for rule in enabled_rules:
+        validity_errors, validity_warnings = _check_validity(rule, now=now)
+        errors.extend(validity_errors)
+        warnings.extend(validity_warnings)
         regex_issues = _check_regex_safety(rule)
         errors.extend(regex_issues)
         errors.extend(_check_external_recipients(rule, internal_email_domains))
@@ -365,9 +434,11 @@ def compile_registry(
         "fingerprint_version": FINGERPRINT_VERSION,
         "rules": [
             {
-                "rule_id": c.manifest.rule_id,
-                "rule_version": c.manifest.rule_version,
-                "route": c.manifest.decision.route.value,
+                "manifest": c.manifest.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
                 "action_fingerprint": c.action_fingerprint,
             }
             for c in compiled_rules
@@ -413,3 +484,68 @@ def write_artifact(artifact: CompiledArtifact, output_dir: Union[Path, str]) -> 
     pointer_path = output_dir / "current.json"
     _atomic_write(pointer_path, _canonical_json({"digest": artifact.digest, "path": artifact_path.name}))
     return artifact_path
+
+
+def load_artifact(
+    output_dir: Union[Path, str],
+    *,
+    expected_digest: str,
+    now: Optional[datetime] = None,
+) -> CompiledArtifact:
+    """Load the selected executable artifact and fail hard on any mismatch."""
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        raise ValueError("artifact_digest_invalid")
+    output_dir = Path(output_dir)
+    try:
+        pointer = json.loads((output_dir / "current.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError("artifact_pointer_invalid") from None
+    expected_path = f"{expected_digest}.json"
+    if pointer != {"digest": expected_digest, "path": expected_path}:
+        raise ValueError("artifact_pointer_mismatch")
+    try:
+        raw = json.loads((output_dir / expected_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError("artifact_payload_invalid") from None
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema_version",
+        "fingerprint_version",
+        "rules",
+        "digest",
+    }:
+        raise ValueError("artifact_payload_invalid")
+    if raw.get("digest") != expected_digest:
+        raise ValueError("artifact_digest_mismatch")
+    executable = {key: raw[key] for key in ("schema_version", "fingerprint_version", "rules")}
+    actual_digest = hashlib.sha256(_canonical_json(executable).encode("utf-8")).hexdigest()
+    if actual_digest != expected_digest:
+        raise ValueError("artifact_digest_mismatch")
+    if raw["schema_version"] != SCHEMA_VERSION or raw["fingerprint_version"] != FINGERPRINT_VERSION:
+        raise ValueError("artifact_version_unsupported")
+    if not isinstance(raw["rules"], list):
+        raise ValueError("artifact_payload_invalid")
+
+    current = datetime.now(UTC) if now is None else now.astimezone(UTC)
+    compiled_rules: List[CompiledRule] = []
+    for item in raw["rules"]:
+        if not isinstance(item, dict) or set(item) != {"manifest", "action_fingerprint"}:
+            raise ValueError("artifact_payload_invalid")
+        try:
+            manifest = RuleManifest.model_validate(item["manifest"])
+        except ValidationError:
+            raise ValueError("artifact_manifest_invalid") from None
+        if manifest.status is not RuleStatus.ENABLED:
+            raise ValueError("artifact_manifest_invalid")
+        validity_errors, _ = _check_validity(manifest, now=current)
+        if validity_errors:
+            raise ValueError(validity_errors[0].code)
+        fingerprint = compute_action_fingerprint(manifest.decision)
+        if item["action_fingerprint"] != fingerprint:
+            raise ValueError("artifact_fingerprint_mismatch")
+        compiled_rules.append(CompiledRule(manifest=manifest, action_fingerprint=fingerprint))
+    return CompiledArtifact(
+        schema_version=SCHEMA_VERSION,
+        fingerprint_version=FINGERPRINT_VERSION,
+        digest=expected_digest,
+        rules=compiled_rules,
+    )

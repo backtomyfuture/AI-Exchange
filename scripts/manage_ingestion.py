@@ -36,7 +36,7 @@ from src.ingestion.runtime_authority import (  # noqa: E402
 )
 from src.ingestion.runtime_capability import (  # noqa: E402
     CAPABILITY_CHAIN_ROOT_HASH,
-    PHASE2_SCHEMA_REVISION,
+    POLLING_SCHEMA_REVISION,
     RuntimeCapabilityManifest,
     RuntimeCapabilityStage,
 )
@@ -108,7 +108,6 @@ def _policy_snapshot(path_value: str) -> PolicySnapshot:
         for raw_scope in raw_scopes:
             if type(raw_scope) is not dict or set(raw_scope) != {
                 "canonical_key",
-                "webhook_ids",
                 "sync_folder",
                 "event_policy_matrix",
             }:
@@ -136,7 +135,6 @@ def _policy_snapshot(path_value: str) -> PolicySnapshot:
             scopes.append(
                 FolderScope.configured(
                     canonical_key=raw_scope["canonical_key"],
-                    webhook_ids=raw_scope["webhook_ids"],
                     sync_folder=raw_scope["sync_folder"],
                     event_policy_matrix=matrix,
                 )
@@ -165,8 +163,8 @@ def _runtime_contract(
     policy_hash = canonical_policy_manifest(snapshot).hash
     try:
         capability = RuntimeCapabilityManifest(
-            stage=RuntimeCapabilityStage.PHASE2_INGESTION,
-            schema_revision=PHASE2_SCHEMA_REVISION,
+            stage=RuntimeCapabilityStage.POLLING_INGESTION,
+            schema_revision=POLLING_SCHEMA_REVISION,
             schema_digest=value["schema_digest"],
             protocol_version=value["protocol_version"],
             minimum_build_id=value["build_id"],

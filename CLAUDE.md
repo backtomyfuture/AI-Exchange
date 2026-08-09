@@ -21,7 +21,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 1. `PollingRuntime` 使用 Exchange `sync_state` 拉取增量，并先写入 PostgreSQL
    Durable Inbox；
 2. 同进程的 `DurableInboxWorker` 领取持久化事件；
-3. `LegacyProcessingAdapter` 调用当前邮件处理实现；
+3. `EmailProcessingAdapter` 在 fenced external-effect 边界内调用邮件处理流水线；
 4. LangGraph 执行分类、检索、草稿、审核和发送；
 5. 飞书 WebSocket 接收审批动作并恢复对应 Checkpoint。
 
@@ -47,10 +47,10 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 - `src/ingestion/repository.py`：Inbox 持久化和租约；
 - `src/ingestion/worker.py`：领取、续租、重试和完成；
 - `src/ingestion/runtime.py`：唯一运行时装配；
-- `src/ingestion/legacy_adapter.py`：持久化 Worker 到邮件处理实现的 Adapter。
+- `src/ingestion/email_pipeline.py`：持久化 Worker 到邮件处理流水线的 Adapter。
 
 `src/ingestion/__init__.py` 不再做重型再导出。调用者必须从拥有类型或行为的 module
-直接导入，避免导入 models 时加载 cold-start、sync 和 repository 实现。
+直接导入，避免导入 models 时加载运行时或 repository 实现。
 
 轮询完成一页 `sync_state` 的提交只表示变化已进入 Inbox，不表示 Qdrant、草稿、飞书
 卡片或发送已经成功。排障必须逐阶段验证。
@@ -73,8 +73,8 @@ Retriever 完成 Tier 2 后，才在未命中时调用 `apply_tier3_fallback()`�
 - Tier 2 放弃时 Tier 3 只调用一次；
 - 后续节点不得覆盖最终路由决策。
 
-`skills_registry/` 是生产 Skill 注册表。示例、演示或含虚构收件人的 Skill 不得进入
-该目录。
+`tier1_rules/` 是唯一生产规则注册表。候选规则位于生产目录之外，只有人工审核并显式
+提升后才可进入；运行时只加载 SHA-256 固定的完整制品。
 
 ### 3.3 Qdrant、PST 与 Skill Discovery
 
@@ -105,8 +105,8 @@ RAG 使用的同一 Qdrant `emails` 集合。PST 原始邮件只有进入 Qdrant
 - Preference Memory：用户修改、拒绝、长度、语气和收件人偏好；
 - Style Profile：从用户真实发件中提炼的版本化写作风格。
 
-读取逻辑存在并不代表学习闭环已经运行。新增学习逻辑时必须有明确触发器、持久化
-位置、数据版本、回滚方式和离线评估。
+读取逻辑存在并不代表学习闭环已经运行。默认 `MEMORY_LEARNING_ENABLED=false`；新增学习
+逻辑必须有明确触发器、持久化位置、数据版本、回滚方式和离线评估。
 
 ### 3.5 LangGraph 与 Checkpointer
 
@@ -147,8 +147,8 @@ Provider interface，不得重新增加 `src.utils.llm_factory` 兼容壳。OAut
 
 ```bash
 cp .env.example .env
-.venv/bin/python scripts/configure_deployment.py
-.venv/bin/python scripts/deploy_system.py check
+.venv/bin/python scripts/configure_deployment.py --project-name ai-exchange-greenfield
+.venv/bin/python scripts/deploy_system.py check --project-name ai-exchange-greenfield
 ```
 
 数据库角色、DSN、令牌、ContentStore key、运行限额和部署状态生成到忽略版本控制的
@@ -184,7 +184,7 @@ secret，并遵循 `deploy/README.md` 的角色和所有权检查。
 - 删除 module 前验证生产可达性、动态导入、运维入口、数据迁移职责和测试职责；
 - 测试通过 module 的 interface 验证行为，不为已删除的兼容壳保留专属测试；
 - Qdrant、邮件处理和审批变更必须使用现实 payload shape 做 E2E 验证；
-- Phase 2 PostgreSQL Gate 全绿才允许合并 PR；gate 红时先修绿再合并，不得把已知
+- PostgreSQL Gate 全绿才允许合并 PR；gate 红时先修绿再合并，不得把已知
   失败当作"与本次改动无关"跳过；
 - `ruff` 和全量测试通过不等于运行态正确，部署后还要验证 Compose、`/health`、
   `/ready`、日志和逐阶段处理结果。
@@ -193,7 +193,7 @@ secret，并遵循 `deploy/README.md` 的角色和所有权检查。
 
 - `src/ingestion/`：Durable Inbox、租约、策略和运行时；
 - `src/router/`：Tiered Router；
-- `skills_registry/`：生产 YAML/handler Skill；
+- `tier1_rules/`：生产声明式规则；
 - `src/skills_discovery/`：离线模式分析和候选规则；
 - `src/memory/`：Preference、Experience、Style；
 - `src/graph/`、`src/nodes/`：LangGraph 工作流；

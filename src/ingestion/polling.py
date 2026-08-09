@@ -140,7 +140,7 @@ def _checkpoint_from_row(row: object) -> tuple[PollingCursorCheckpoint, str]:
         raise PollingCursorUnavailable() from None
     if status == "active" and checkpoint.cursor is not None:
         return checkpoint, status
-    if status == "cold_start_pending" and checkpoint.cursor is None:
+    if status == "baselining" and checkpoint.cursor is None:
         return checkpoint, status
     raise PollingCursorUnavailable()
 
@@ -536,9 +536,9 @@ class PollingIngress:
             raise RuntimeError("polling_cursor_checkpoint_invalid")
 
         if checkpoint.cursor is None:
-            # The current Gateway fully consumes its internal Exchange paging
-            # before returning a final state.  Fresh storage therefore creates
-            # one boundary from this complete, deliberately discarded snapshot.
+            # The Gateway fully consumes its internal Exchange paging before
+            # returning a final state. Fresh storage therefore creates one
+            # baseline boundary from this deliberately discarded snapshot.
             page = await self._fetch_page(None, discard_items=True)
             await self._cursor_store.commit_activation_boundary(
                 checkpoint,

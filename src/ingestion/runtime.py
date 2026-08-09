@@ -10,27 +10,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import RFC_4122, UUID, uuid4
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from src.domain.email_state import PipelineGenerationState
 from src.ingestion.models import (
-    ChangeKind,
     InboxStats,
-    IngressReceipt,
-    IngressSource,
     NormalizedIngressEvent,
-    PipelineGeneration,
-    ProcessingPolicy,
 )
-from src.ingestion.policy import FolderScope, PolicySnapshot, ProcessingPolicyResolver
+from src.ingestion.policy import PolicySnapshot, ProcessingPolicyResolver
 from src.ingestion.runtime_authority import (
     GREENFIELD_PIPELINE_NAME,
     RuntimeAuthority,
@@ -40,15 +33,11 @@ from src.ingestion.runtime_authority import (
     RuntimeInstanceLease,
     RuntimeInstanceLifecycle,
     RuntimeInstanceRepository,
-    canonical_policy_manifest,
-    require_phase2_ingress_authority,
+    RuntimeManifestRepository,
+    RuntimeUnavailableError,
+    require_polling_ingress_authority,
 )
-from src.ingestion.runtime_capability import (
-    RuntimeCapabilityManifest,
-    RuntimeCapabilityStage,
-)
-from src.ingestion.repository import GreenfieldWebhookWriter, InboxRepository
-from src.ingestion.webhook import WebhookIngressService, WebhookIngressUnavailable
+from src.ingestion.repository import InboxRepository
 
 
 logger = logging.getLogger(__name__)
@@ -58,24 +47,6 @@ _RECOVERY_BATCH_LIMIT = 500
 _MIN_RECOVERY_INTERVAL_SECONDS = 30.0
 _RECOVERY_LEASE_MULTIPLIER = 2.0
 _PROCESS_CONTROL_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-_CAPABILITY_SQL = (
-    "SELECT stage, schema_revision, schema_digest::text AS schema_digest, "
-    "protocol_version, minimum_build_id, config_hash::text AS config_hash, "
-    "adapter_hash::text AS adapter_hash, "
-    "policy_manifest_hash::text AS policy_manifest_hash, "
-    "evidence_manifest_hash::text AS evidence_manifest_hash, "
-    "predecessor_hash::text AS predecessor_hash "
-    "FROM public.pipeline_runtime_capabilities "
-    "WHERE capability_hash = %s AND policy_manifest_hash = %s"
-)
-_SCOPES_SQL = (
-    "SELECT canonical_key, webhook_ids, sync_folder, event_policy_matrix, "
-    "scope_hash::text AS scope_hash, "
-    "policy_manifest_hash::text AS policy_manifest_hash "
-    "FROM public.pipeline_folder_scopes "
-    "WHERE account_id = %s AND initialization_id = %s "
-    "ORDER BY canonical_key"
-)
 
 
 def _raise_if_current_task_cancelled(error: BaseException) -> None:
@@ -84,10 +55,6 @@ def _raise_if_current_task_cancelled(error: BaseException) -> None:
     current = asyncio.current_task()
     if current is not None and current.cancelling():
         raise error
-
-
-class RuntimeUnavailableError(RuntimeError):
-    """Safe fixed-token failure for an unavailable greenfield runtime."""
 
 
 class RuntimeShutdownError(RuntimeError):
@@ -147,14 +114,6 @@ class _InstancePort(Protocol):
     async def drain(self, lease: RuntimeInstanceLease) -> RuntimeInstanceLease: ...
 
 
-class _WebhookWriterPort(Protocol):
-    async def insert(
-        self,
-        lease: RuntimeInstanceLease,
-        event: NormalizedIngressEvent,
-    ) -> IngressReceipt: ...
-
-
 class _InboxRecoveryPort(Protocol):
     async def recover_expired_leases(self, limit: int) -> int: ...
 
@@ -201,165 +160,6 @@ def _require_uuid4(value: object) -> str:
     return value
 
 
-def _row_mapping(
-    row: object,
-    columns: tuple[str, ...],
-    *,
-    error: str,
-) -> dict[str, object]:
-    if isinstance(row, Mapping):
-        if set(row) != set(columns):
-            raise RuntimeUnavailableError(error)
-        return {column: row[column] for column in columns}
-    if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
-        if len(row) != len(columns):
-            raise RuntimeUnavailableError(error)
-        return dict(zip(columns, row, strict=True))
-    raise RuntimeUnavailableError(error)
-
-
-def _policy_matrix_from_database(
-    value: object,
-) -> dict[tuple[IngressSource, str, ChangeKind], ProcessingPolicy]:
-    if not isinstance(value, Mapping):
-        raise RuntimeUnavailableError("manifest_unavailable")
-    matrix: dict[tuple[IngressSource, str, ChangeKind], ProcessingPolicy] = {}
-    try:
-        for key, raw_policy in value.items():
-            if type(key) is not str:
-                raise ValueError
-            source_text, raw_event_type, kind_text = key.split(":", 2)
-            matrix[
-                (IngressSource(source_text), raw_event_type, ChangeKind(kind_text))
-            ] = ProcessingPolicy(raw_policy)
-    except (TypeError, ValueError):
-        raise RuntimeUnavailableError("manifest_unavailable") from None
-    return matrix
-
-
-class RuntimeManifestRepository:
-    """Load and revalidate the immutable capability and policy DB facts."""
-
-    def __init__(self, pool: Any) -> None:
-        self._pool = pool
-
-    async def load(
-        self,
-        authority: RuntimeAuthority,
-    ) -> tuple[RuntimeContract, PolicySnapshot]:
-        exact_authority = require_phase2_ingress_authority(authority)
-        capability_columns = (
-            "stage",
-            "schema_revision",
-            "schema_digest",
-            "protocol_version",
-            "minimum_build_id",
-            "config_hash",
-            "adapter_hash",
-            "policy_manifest_hash",
-            "evidence_manifest_hash",
-            "predecessor_hash",
-        )
-        scope_columns = (
-            "canonical_key",
-            "webhook_ids",
-            "sync_folder",
-            "event_policy_matrix",
-            "scope_hash",
-            "policy_manifest_hash",
-        )
-        try:
-            async with self._pool.connection() as connection:
-                capability_cursor = await connection.execute(
-                    _CAPABILITY_SQL,
-                    (
-                        exact_authority.capability_hash,
-                        exact_authority.policy_manifest_hash,
-                    ),
-                )
-                capability_row = await capability_cursor.fetchone()
-                if capability_row is None:
-                    raise RuntimeUnavailableError("manifest_unavailable")
-                material = _row_mapping(
-                    capability_row,
-                    capability_columns,
-                    error="manifest_unavailable",
-                )
-                scopes_cursor = await connection.execute(
-                    _SCOPES_SQL,
-                    (
-                        exact_authority.account_id,
-                        exact_authority.initialization_id,
-                    ),
-                )
-                scope_rows = await scopes_cursor.fetchall()
-
-            capability = RuntimeCapabilityManifest(
-                stage=material["stage"],
-                schema_revision=material["schema_revision"],
-                schema_digest=material["schema_digest"],
-                protocol_version=material["protocol_version"],
-                minimum_build_id=material["minimum_build_id"],
-                config_hash=material["config_hash"],
-                adapter_hash=material["adapter_hash"],
-                policy_manifest_hash=material["policy_manifest_hash"],
-                evidence_manifest_hash=material["evidence_manifest_hash"],
-                predecessor_hash=material["predecessor_hash"],
-            )
-            if (
-                capability.stage is not RuntimeCapabilityStage.PHASE2_INGESTION
-                or capability.capability_hash != exact_authority.capability_hash
-            ):
-                raise RuntimeUnavailableError("manifest_unavailable")
-
-            scopes: list[FolderScope] = []
-            for row in scope_rows:
-                scope = _row_mapping(row, scope_columns, error="manifest_unavailable")
-                if (
-                    scope["policy_manifest_hash"]
-                    != exact_authority.policy_manifest_hash
-                ):
-                    raise RuntimeUnavailableError("manifest_unavailable")
-                configured = FolderScope.configured(
-                    canonical_key=scope["canonical_key"],
-                    webhook_ids=scope["webhook_ids"],
-                    sync_folder=scope["sync_folder"],
-                    event_policy_matrix=_policy_matrix_from_database(
-                        scope["event_policy_matrix"]
-                    ),
-                )
-                if configured.config_hash != scope["scope_hash"]:
-                    raise RuntimeUnavailableError("manifest_unavailable")
-                scopes.append(configured)
-            snapshot = PolicySnapshot(scopes=tuple(scopes))
-            manifest = canonical_policy_manifest(snapshot)
-            if (
-                manifest.hash != exact_authority.policy_manifest_hash
-                or capability.policy_manifest_hash != manifest.hash
-            ):
-                raise RuntimeUnavailableError("manifest_unavailable")
-            contract = RuntimeContract(
-                schema_revision=capability.schema_revision,
-                schema_digest=capability.schema_digest,
-                protocol_version=capability.protocol_version,
-                build_id=capability.minimum_build_id,
-                config_hash=capability.config_hash,
-                capability_manifest=capability,
-            )
-            if (
-                contract.schema_revision != exact_authority.schema_revision
-                or contract.protocol_version != exact_authority.protocol_version
-                or contract.build_id != exact_authority.build_id
-                or contract.config_hash != exact_authority.config_hash
-            ):
-                raise RuntimeUnavailableError("manifest_unavailable")
-            return contract, snapshot
-        except RuntimeUnavailableError:
-            raise
-        except (KeyError, TypeError, ValueError, psycopg.Error):
-            raise RuntimeUnavailableError("manifest_unavailable") from None
-
-
 @dataclass(slots=True)
 class _SessionState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -369,113 +169,11 @@ class _SessionState:
     rejected_count: int = 0
 
 
-class _FrozenSnapshotProvider:
-    def __init__(self, account_id: int, snapshot: PolicySnapshot) -> None:
-        self._account_id = account_id
-        self._snapshot = snapshot
-
-    async def get_ready_snapshot(self, account_id: int) -> PolicySnapshot:
-        if account_id != self._account_id:
-            raise WebhookIngressUnavailable()
-        return self._snapshot
-
-
-class _RuntimeOwnershipView:
-    def __init__(self, account_id: int, repository: _AuthorityPort) -> None:
-        self._account_id = account_id
-        self._repository = repository
-
-    async def current_ingress(self, account_id: int) -> PipelineGeneration | None:
-        if account_id != self._account_id:
-            return None
-        authority = await self._repository.get(account_id)
-        if (
-            type(authority) is not RuntimeAuthority
-            or authority.state is not RuntimeAuthorityState.INGEST_ONLY
-        ):
-            return None
-        return PipelineGeneration(
-            account_id=authority.account_id,
-            generation=authority.generation,
-            pipeline_name=authority.pipeline_name,
-            state=PipelineGenerationState.CURRENT_INGRESS,
-            fencing_token=authority.fencing_token,
-        )
-
-
-class _SessionBoundWebhookInbox:
-    def __init__(
-        self,
-        state: _SessionState,
-        writer: _WebhookWriterPort,
-        renewer: _LeaseRenewerPort,
-    ) -> None:
-        self._state = state
-        self._writer = writer
-        self._renewer = renewer
-
-    def disable(self) -> None:
-        self._state.accepting = False
-
-    async def wait_idle(self) -> None:
-        async with self._state.lock:
-            return
-
-    async def insert(
-        self,
-        event: NormalizedIngressEvent,
-        generation: int,
-        fencing_token: int,
-    ) -> IngressReceipt:
-        if not self._state.accepting:
-            raise WebhookIngressUnavailable()
-        async with self._state.lock:
-            lease = self._state.lease
-            if (
-                not self._state.accepting
-                or type(lease) is not RuntimeInstanceLease
-                or lease.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
-                or generation != lease.generation
-                or fencing_token != lease.fencing_token
-            ):
-                raise WebhookIngressUnavailable()
-            try:
-                current = await self._renewer(
-                    lease,
-                    self._state.accepted_count,
-                    self._state.rejected_count,
-                )
-                if (
-                    not self._state.accepting
-                    or type(current) is not RuntimeInstanceLease
-                    or current.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
-                    or current.session_id != lease.session_id
-                    or current.generation != lease.generation
-                    or current.fencing_token != lease.fencing_token
-                    or current.authority_epoch != lease.authority_epoch
-                    or current.capability_hash != lease.capability_hash
-                    or current.lease_version != lease.lease_version + 1
-                    or current.accepted_count != self._state.accepted_count
-                    or current.rejected_count != self._state.rejected_count
-                ):
-                    raise WebhookIngressUnavailable()
-                self._state.lease = current
-                receipt = await self._writer.insert(current, event)
-            except BaseException:
-                self._state.rejected_count += 1
-                raise
-            if type(receipt) is not IngressReceipt:
-                self._state.rejected_count += 1
-                raise WebhookIngressUnavailable()
-            self._state.accepted_count += 1
-            return receipt
-
-
 class _SessionBoundPollingCommitter:
-    """Serialize polling-page commits with the Web session heartbeat.
+    """Serialize polling-page commits with the runtime session heartbeat.
 
-    The Gateway request happens before this object is entered.  Once a page is
-    ready to persist, it renews the same ``web`` lease and holds the shared
+    The Exchange request happens before this object is entered. Once a page is
+    ready to persist, it renews the same runtime lease and holds the shared
     session lock until the database's fenced, one-page transaction returns.
     """
 
@@ -568,7 +266,6 @@ class IngestionRuntime:
         authority_repository: _AuthorityPort,
         manifest_repository: _ManifestPort,
         instance_repository: _InstancePort,
-        webhook_writer: _WebhookWriterPort,
         instance_id: str,
         session_id: str,
         lease_seconds: int,
@@ -605,7 +302,6 @@ class IngestionRuntime:
             (instance_repository, "register"),
             (instance_repository, "heartbeat"),
             (instance_repository, "drain"),
-            (webhook_writer, "insert"),
         ):
             if not callable(getattr(dependency, method, None)):
                 raise ValueError("runtime dependency is invalid")
@@ -645,12 +341,6 @@ class IngestionRuntime:
         self._polling_runtime: _PollingRuntimePort | None = None
         self._fail_stop = fail_stop
         self._state = _SessionState() if session_state is None else session_state
-        self._webhook_inbox = _SessionBoundWebhookInbox(
-            self._state,
-            webhook_writer,
-            self._renew_webhook_lease,
-        )
-        self._service: WebhookIngressService | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._recovery_task: asyncio.Task[None] | None = None
         self._pool_open = False
@@ -726,14 +416,6 @@ class IngestionRuntime:
     def lease(self) -> RuntimeInstanceLease | None:
         return self._state.lease
 
-    @property
-    def webhook_inbox(self) -> _SessionBoundWebhookInbox:
-        return self._webhook_inbox
-
-    @property
-    def webhook_ingress_service(self) -> WebhookIngressService | None:
-        return self._service
-
     async def start(self) -> None:
         if self._started or self._stopped:
             raise RuntimeUnavailableError("runtime_not_startable")
@@ -741,7 +423,7 @@ class IngestionRuntime:
             self._pool_open_attempted = True
             await self._pool.open()
             self._pool_open = True
-            authority = require_phase2_ingress_authority(
+            authority = require_polling_ingress_authority(
                 await self._authority_repository.get(self._account_id)
             )
             contract, snapshot = await self._manifest_repository.load(authority)
@@ -766,22 +448,11 @@ class IngestionRuntime:
             self._state.rejected_count = lease.rejected_count
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(),
-                name="greenfield-web-session-heartbeat",
-            )
-            self._service = WebhookIngressService(
-                expected_account_id=self._account_id,
-                snapshot_provider=_FrozenSnapshotProvider(self._account_id, snapshot),
-                policy_resolver=ProcessingPolicyResolver(),
-                ownership_repository=_RuntimeOwnershipView(
-                    self._account_id,
-                    self._authority_repository,
-                ),
-                inbox_repository=self._webhook_inbox,
+                name="greenfield-runtime-session-heartbeat",
             )
             await self._start_processing()
-            # Polling uses the same session-bound intake gate as the retired
-            # Webhook adapter.  It must be open during the baseline cycle,
-            # while public readiness remains false until that cycle completes.
+            # Polling must be able to commit its baseline cursor before public
+            # readiness becomes true, so the runtime session opens first.
             self._state.accepting = True
             await self._start_polling(snapshot)
             if self._heartbeat_task is None or self._heartbeat_task.done():
@@ -949,7 +620,6 @@ class IngestionRuntime:
                 self._pool_open = False
                 self._pool_open_attempted = False
                 self._registered_lease = None
-        self._service = None
 
     async def _stop_polling(self) -> None:
         polling = self._polling_runtime
@@ -965,7 +635,7 @@ class IngestionRuntime:
         except asyncio.CancelledError:
             raise
         except RuntimeUnavailableError as error:
-            logger.critical("Greenfield Web session heartbeat failed closed")
+            logger.critical("Greenfield runtime session heartbeat failed closed")
             if self._fail_stop is not None:
                 reason = (
                     "ingestion_runtime_processing_lost"
@@ -977,26 +647,6 @@ class IngestionRuntime:
                     )
                 )
                 self._fail_stop(reason)
-
-    async def _renew_webhook_lease(
-        self,
-        lease: RuntimeInstanceLease,
-        accepted_count: int,
-        rejected_count: int,
-    ) -> RuntimeInstanceLease:
-        try:
-            return await self._instance_repository.heartbeat(
-                lease,
-                accepted_count,
-                rejected_count,
-                self._lease_seconds,
-            )
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            self._ready = False
-            self._state.accepting = False
-            raise WebhookIngressUnavailable() from None
 
     async def heartbeat_once(self) -> None:
         try:
@@ -1080,6 +730,12 @@ class IngestionRuntime:
             _raise_if_current_task_cancelled(error)
             pass
 
+    async def _wait_for_session_idle(self) -> None:
+        """Wait until an in-flight polling page has left the shared session."""
+
+        async with self._state.lock:
+            return
+
     async def stop(self) -> None:
         if self._stopped:
             self._ready = False
@@ -1097,7 +753,7 @@ class IngestionRuntime:
         if not self._pool_open:
             raise RuntimeShutdownError("shutdown_incomplete")
         self._ready = False
-        self._webhook_inbox.disable()
+        self._state.accepting = False
         cleanup = asyncio.create_task(
             self._finish_stop(),
             name="greenfield-runtime-stop",
@@ -1137,8 +793,8 @@ class IngestionRuntime:
             record_failure("polling_stop", exc)
 
         idle_waiter = asyncio.create_task(
-            self._webhook_inbox.wait_idle(),
-            name="greenfield-webhook-intake-drain",
+            self._wait_for_session_idle(),
+            name="greenfield-polling-session-drain",
         )
         try:
             await asyncio.wait_for(
@@ -1233,7 +889,6 @@ class IngestionRuntime:
             self._pool_open_attempted = False
             self._registered_lease = None
             self._stopped = True
-            self._service = None
         if process_control is not None:
             raise process_control
         if failures:
@@ -1248,10 +903,6 @@ def build_ingestion_runtime(
 ) -> IngestionRuntime:
     """Create the one production runtime around one dedicated business pool."""
 
-    if bool(getattr(settings, "INGESTION_SHADOW_ENABLED", False)):
-        raise ValueError("Phase4-Lite does not permit ingestion Shadow")
-    if bool(getattr(settings, "SYNC_RECONCILIATION_ENABLED", False)):
-        raise ValueError("Phase4-Lite does not permit Sync reconciliation")
     processing_enabled = bool(getattr(settings, "DURABLE_INBOX_ENABLED", False))
     polling_enabled = bool(getattr(settings, "POLLING_ENABLED", False))
     if polling_enabled and not processing_enabled:
@@ -1278,17 +929,17 @@ def build_ingestion_runtime(
     )
     if processing_enabled:
         # Local imports are required: ``init_app`` imports this runtime while
-        # the compatibility adapter reaches ``exchange_service`` and then
+        # the pipeline adapter reaches ``exchange_service`` and then
         # ``init_app`` again.
-        from src.ingestion.legacy_adapter import LegacyProcessingAdapter
+        from src.ingestion.email_pipeline import EmailProcessingAdapter
         from src.ingestion.ownership import PipelineOwnershipRepository
         from src.ingestion.processing import ProcessingAdapterRouter
         from src.ingestion.worker import DurableInboxWorker
 
         inbox_repository = InboxRepository(pool)
-        adapter = LegacyProcessingAdapter(
+        adapter = EmailProcessingAdapter(
             processing_context,
-            legacy_account_id=settings.EXCHANGE_ACCOUNT_ID,
+            account_id=settings.EXCHANGE_ACCOUNT_ID,
         )
         processing_worker = DurableInboxWorker(
             inbox_repository,
@@ -1387,7 +1038,6 @@ def build_ingestion_runtime(
         authority_repository=authority_repository,
         manifest_repository=RuntimeManifestRepository(pool),
         instance_repository=instance_repository,
-        webhook_writer=GreenfieldWebhookWriter(pool),
         instance_id=str(getattr(settings, "INGESTION_INSTANCE_ID", "ai-exchange-web")),
         session_id=session_id,
         lease_seconds=int(getattr(settings, "INGESTION_LEASE_SECONDS", 30)),
@@ -1402,7 +1052,6 @@ def build_ingestion_runtime(
 
 
 __all__ = [
-    "GreenfieldWebhookWriter",
     "IngestionRuntime",
     "RuntimeHealthSnapshot",
     "RuntimeManifestRepository",

@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from itertools import islice
 from typing import Any, Final
 from uuid import RFC_4122, UUID, uuid4
@@ -56,11 +56,6 @@ from src.ingestion.processing import (
     ProcessingReceiptConflict,
     ReplaySafeExternalEffectFailed,
 )
-from src.ingestion.runtime_authority import (
-    RuntimeInstanceLease,
-    RuntimeInstanceLifecycle,
-)
-from src.ingestion.webhook import WebhookIngressUnavailable
 
 
 _DATABASE_EXCEPTIONS = (psycopg.Error, PoolTimeout)
@@ -72,11 +67,6 @@ _MAX_PIPELINES: Final = 64
 _MAX_LEASE_SECONDS: Final = 3600
 _MAX_RETRIES: Final = 5
 _MAX_BACKOFF_SECONDS: Final = 900
-_GREENFIELD_WEBHOOK_SQL: Final = (
-    "SELECT inbox_id, duplicate FROM public.greenfield_insert_webhook_event("
-    + ", ".join(["%s"] * 12)
-    + ")"
-)
 _AUDIT_ACTOR: Final = "inbox_repository"
 _PROCESSING_ATTEMPT_ACTION: Final = "email.processing_attempt"
 _PROCESSING_ATTEMPT_REASON: Final = "email.processing_attempt_authorized"
@@ -99,7 +89,6 @@ _CLAIMABLE_POLICIES = (
 _SUPPRESSED_POLICIES = frozenset(
     {
         ProcessingPolicy.IGNORED,
-        ProcessingPolicy.HISTORICAL_SUPPRESSED,
     }
 )
 _LEASE_OWNERSHIP_STATES = (
@@ -661,9 +650,6 @@ def _source_is_read(event: NormalizedIngressEvent) -> bool | None:
             value = item.get("is_read")
             return value if isinstance(value, bool) else None
         return None
-    if event.source is IngressSource.WEBHOOK:
-        value = event.payload.get("is_read")
-        return value if isinstance(value, bool) else None
     return None
 
 
@@ -942,71 +928,6 @@ def _terminal_action(decision: _FailureDecision) -> str:
     if decision.status is InboxDispositionStatus.MANUAL_REVIEW:
         return "ingress.manual_review"
     return "ingress.dead_letter"
-
-
-class GreenfieldWebhookWriter:
-    """Invoke only the session-fenced greenfield Webhook insert function."""
-
-    def __init__(self, pool: Any) -> None:
-        self._pool = pool
-
-    async def insert(
-        self,
-        lease: RuntimeInstanceLease,
-        event: NormalizedIngressEvent,
-    ) -> IngressReceipt:
-        if type(lease) is not RuntimeInstanceLease:
-            raise ValueError("lease must be exact")
-        if type(event) is not NormalizedIngressEvent:
-            raise ValueError("event must be exact")
-        if (
-            event.source is not IngressSource.WEBHOOK
-            or event.account_id != lease.account_id
-            or lease.lifecycle is not RuntimeInstanceLifecycle.ACTIVE
-        ):
-            raise WebhookIngressUnavailable()
-        params = (
-            event.account_id,
-            lease.session_id,
-            lease.lease_version,
-            event.external_email_id,
-            event.folder,
-            event.raw_event_type,
-            event.kind.value,
-            event.dedupe_key,
-            event.source_version,
-            event.source_event_at,
-            Jsonb(event.payload_for_storage()),
-            event.processing_policy.value,
-        )
-        remaining_seconds = (lease.lease_until - datetime.now(UTC)).total_seconds()
-        if remaining_seconds <= 1.0:
-            raise WebhookIngressUnavailable()
-        try:
-            async with asyncio.timeout(remaining_seconds - 1.0):
-                async with self._pool.connection() as connection:
-                    async with connection.transaction():
-                        cursor = await connection.execute(
-                            _GREENFIELD_WEBHOOK_SQL,
-                            params,
-                        )
-                        row = await cursor.fetchone()
-            inbox_id, duplicate = _exact_row_values(row, ("inbox_id", "duplicate"))
-            return IngressReceipt(inbox_id=str(inbox_id), duplicate=duplicate)
-        except WebhookIngressUnavailable:
-            raise
-        except TimeoutError:
-            raise WebhookIngressUnavailable() from None
-        except psycopg.errors.RaiseException:
-            raise WebhookIngressUnavailable() from None
-        except psycopg.Error as exc:
-            raise DatabaseOperationError(
-                operation="greenfield_insert_webhook_event",
-                retryable=isinstance(exc, psycopg.OperationalError),
-                message="durable webhook persistence failed",
-            ) from None
-        except (TypeError, ValueError):
-            raise WebhookIngressUnavailable() from None
 
 
 class InboxRepository:
@@ -1406,7 +1327,7 @@ class InboxRepository:
         }
         if completion is not None:
             metadata["requested_email_status"] = completion.target_status.value
-            metadata["legacy_outcome"] = completion.legacy_outcome.value
+            metadata["processing_outcome"] = completion.processing_outcome.value
             metadata["completion_safe_error_code"] = completion.safe_error_code
             metadata["completion_safe_error_summary"] = completion.safe_error_summary
         return metadata
@@ -3919,4 +3840,4 @@ class EmailEventTransaction:
             raise _database_error("apply_email_event", error) from None
 
 
-__all__ = ["EmailEventTransaction", "GreenfieldWebhookWriter", "InboxRepository"]
+__all__ = ["EmailEventTransaction", "InboxRepository"]

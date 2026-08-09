@@ -15,8 +15,7 @@ from scripts import prepare_ingestion_manifests as preparer
 
 _REVISION = "1" * 40
 _TREE = "2" * 40
-_WEBHOOK_ID = "AAMkAGI2-real-opaque-inbox-id"
-_BUILD_ID = "release-20260717.1"
+_BUILD_ID = "greenfield-test.1"
 
 
 def _evidence(
@@ -51,7 +50,6 @@ def _write_json(path: Path, value: object, *, indent: int | None = None) -> None
 def _args(evidence_file: Path, output_dir: Path, **overrides: object) -> Namespace:
     values: dict[str, object] = {
         "account_id": 8,
-        "webhook_inbox_id": _WEBHOOK_ID,
         "sync_folder": "INBOX",
         "build_id": _BUILD_ID,
         "release_evidence_file": evidence_file,
@@ -84,7 +82,7 @@ def _prepare(
     return policy, contract, output_dir
 
 
-def test_prepares_exact_seven_item_policy_and_valid_runtime_contract(
+def test_prepares_exact_three_item_polling_policy_and_valid_runtime_contract(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -95,34 +93,9 @@ def test_prepares_exact_seven_item_policy_and_valid_runtime_contract(
     assert len(policy["scopes"]) == 1
     scope = policy["scopes"][0]
     assert scope["canonical_key"] == "INBOX"
-    assert scope["webhook_ids"] == [_WEBHOOK_ID]
     assert scope["sync_folder"] == "INBOX"
-    assert len(scope["event_policy_matrix"]) == 7
+    assert len(scope["event_policy_matrix"]) == 3
     assert scope["event_policy_matrix"] == [
-        {
-            "source": "webhook",
-            "raw_event_type": "NewMailEvent",
-            "change_kind": "create",
-            "processing_policy": "full",
-        },
-        {
-            "source": "webhook",
-            "raw_event_type": "CreatedEvent",
-            "change_kind": "create",
-            "processing_policy": "ignored",
-        },
-        {
-            "source": "webhook",
-            "raw_event_type": "ModifiedEvent",
-            "change_kind": "update",
-            "processing_policy": "metadata_only",
-        },
-        {
-            "source": "webhook",
-            "raw_event_type": "DeletedEvent",
-            "change_kind": "delete",
-            "processing_policy": "metadata_only",
-        },
         {
             "source": "sync",
             "raw_event_type": "create",
@@ -376,7 +349,7 @@ def test_release_evidence_rejects_duplicate_json_keys(tmp_path: Path) -> None:
         preparer._load_release_evidence(evidence_file, build_id=_BUILD_ID)
 
 
-def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
+def test_refuses_stale_evidence_and_manual_hash_arguments(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -393,7 +366,6 @@ def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
     ):
         preparer._prepare_payloads(
             account_id=8,
-            webhook_inbox_id=_WEBHOOK_ID,
             sync_folder="INBOX",
             build_id=_BUILD_ID,
             release_evidence_file=evidence_file,
@@ -404,20 +376,9 @@ def test_refuses_placeholder_id_stale_evidence_and_manual_hash_arguments(
         "_require_clean_git_tree",
         lambda _root: {"revision": _REVISION, "tree": _TREE},
     )
-    with pytest.raises(
-        preparer.ManifestPreparationError,
-        match="webhook_inbox_id_invalid",
-    ):
-        preparer._prepare_payloads(
-            account_id=8,
-            webhook_inbox_id="INBOX",
-            sync_folder="INBOX",
-            build_id=_BUILD_ID,
-            release_evidence_file=evidence_file,
-        )
-
     parser = preparer.build_parser()
     options = {option for action in parser._actions for option in action.option_strings}
+    assert "--webhook-inbox-id" not in options
     assert options.isdisjoint(
         {
             "--schema-digest",
@@ -446,7 +407,6 @@ def test_refuses_a_sync_folder_other_than_the_gateway_inbox(
     ):
         preparer._prepare_payloads(
             account_id=8,
-            webhook_inbox_id=_WEBHOOK_ID,
             sync_folder="Inbox",
             build_id=_BUILD_ID,
             release_evidence_file=evidence_file,

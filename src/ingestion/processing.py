@@ -229,19 +229,19 @@ def _is_async_callable(value: object) -> bool:
 @dataclass(frozen=True, slots=True)
 class ProcessingCompletion:
     target_status: EmailStatus
-    legacy_outcome: ProcessingOutcome
+    processing_outcome: ProcessingOutcome
     safe_error_code: str | None = None
     safe_error_summary: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.target_status) is not EmailStatus:
             raise ValueError("target_status must be an exact EmailStatus")
-        if type(self.legacy_outcome) is not ProcessingOutcome:
-            raise ValueError("legacy_outcome must be an exact ProcessingOutcome")
+        if type(self.processing_outcome) is not ProcessingOutcome:
+            raise ValueError("processing_outcome must be an exact ProcessingOutcome")
         target = self.target_status
-        outcome = self.legacy_outcome
+        outcome = self.processing_outcome
         if (target, outcome) not in _SUCCESS_PAIRS:
-            raise ValueError("processing completion has an invalid legacy mapping")
+            raise ValueError("processing completion has an invalid outcome mapping")
         if target is EmailStatus.MANUAL_REVIEW:
             object.__setattr__(
                 self,
@@ -314,7 +314,7 @@ class ProcessingFinishResult:
 
 
 @dataclass(frozen=True, slots=True)
-class LegacyEffectScope:
+class ProcessingEffectScope:
     account_id: int
     inbox_id: str
     generation: int
@@ -349,7 +349,7 @@ class LegacyEffectScope:
         cls,
         lease: InboxLease,
         application: EmailEventApplication,
-    ) -> LegacyEffectScope:
+    ) -> ProcessingEffectScope:
         if not isinstance(lease, InboxLease):
             raise ValueError("lease must be an InboxLease")
         if not isinstance(application, EmailEventApplication):
@@ -407,12 +407,12 @@ BeforeExternalEffect: TypeAlias = Callable[[str, int, str], Awaitable[None]]
 
 @dataclass(frozen=True, slots=True)
 class ExternalEffectBoundary:
-    scope: LegacyEffectScope
+    scope: ProcessingEffectScope
     callback: BeforeExternalEffect
 
     def __post_init__(self) -> None:
-        if not isinstance(self.scope, LegacyEffectScope):
-            raise ValueError("scope must be a LegacyEffectScope")
+        if not isinstance(self.scope, ProcessingEffectScope):
+            raise ValueError("scope must be a ProcessingEffectScope")
         if not _is_async_callable(self.callback):
             raise ValueError("before_external_effect must be an async callable")
 
@@ -500,7 +500,7 @@ __all__ = [
     "ExternalEffectBoundary",
     "ExternalEffectKind",
     "GuardedExternalEffectFailed",
-    "LegacyEffectScope",
+    "ProcessingEffectScope",
     "ProcessingAdapter",
     "ProcessingAdapterRouter",
     "ProcessingAdapterUnavailable",

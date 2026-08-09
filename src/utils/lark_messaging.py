@@ -41,7 +41,7 @@ class LarkTextReconciliationUnavailable(RuntimeError):
 
 def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
                        classification: dict, pdf_url: str = None,
-                       routing_log: List = None, active_skills: List = None,
+                       routing_log: List = None,
                        *, lark_api_client=None, card_builder=None) -> bool:
     """Send an interactive approval card. Returns True iff Lark accepted the message."""
     if lark_api_client is None:
@@ -62,7 +62,7 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
     try:
         card_content = card_builder.build_approval_card(
             email_id, draft, context, email_data, classification, pdf_url=pdf_url,
-            routing_log=routing_log, active_skills=active_skills,
+            routing_log=routing_log,
         )
 
         request = CreateMessageRequest.builder() \
@@ -95,7 +95,7 @@ def send_approval_card(email_id: str, draft: str, context: List[dict], email_dat
 
 def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
                         classification: dict, pdf_url: str = None,
-                        routing_log: List = None, active_skills: List = None,
+                        routing_log: List = None,
                         *, lark_api_client=None, card_builder=None) -> bool:
     """Send a read-only Lark card. Returns True iff Lark accepted the message."""
     if lark_api_client is None:
@@ -116,7 +116,7 @@ def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
     try:
         card_content = card_builder.build_read_only_card(
             email_id, context, email_data, classification, pdf_url=pdf_url,
-            routing_log=routing_log, active_skills=active_skills,
+            routing_log=routing_log,
         )
 
         request = CreateMessageRequest.builder() \
@@ -154,7 +154,6 @@ def send_manual_review_card(
     classification: dict | None = None,
     pdf_url=None,
     routing_log: List | None = None,
-    active_skills: List | None = None,
     *,
     lark_api_client=None,
     card_builder=None,
@@ -184,7 +183,7 @@ def send_manual_review_card(
     try:
         card_content = card_builder.build_manual_review_card(
             email_id, data, reason, classification=classification, pdf_url=pdf_url,
-            routing_log=routing_log, active_skills=active_skills,
+            routing_log=routing_log,
         )
     except Exception as exc:
         logger.error(

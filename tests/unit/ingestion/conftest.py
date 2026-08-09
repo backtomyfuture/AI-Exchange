@@ -21,14 +21,14 @@ def ingestion_time() -> datetime:
 def normalized_event(ingestion_time: datetime) -> NormalizedIngressEvent:
     return NormalizedIngressEvent(
         account_id=8,
-        source=IngressSource.WEBHOOK,
-        raw_event_type="NewMailEvent",
+        source=IngressSource.SYNC,
+        raw_event_type="create",
         kind=ChangeKind.CREATE,
         external_email_id="exchange-message-1",
         folder="INBOX",
         source_version="version-1",
         dedupe_key="a" * 64,
-        payload={"routing": {"folder_aliases": ["INBOX"]}},
-        source_event_at=ingestion_time,
+        payload={"cursor": "cursor-1", "change_type": "create", "id": "exchange-message-1", "item": {}},
+        source_event_at=None,
         processing_policy=ProcessingPolicy.FULL,
     )

@@ -61,7 +61,6 @@ def _pipeline_result(need_reply=True, priority="P1", intent="审批"):
         "context": [],
         "email": {"id": "msg-c1", "subject": "s"},
         "routing_log": [],
-        "active_skills": [],
     }
 
 
@@ -444,7 +443,6 @@ async def test_ai_graph_seed_and_resource_updates_share_the_same_email_lock():
         "draft_cc": [],
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
         "attachment_tokens": [],
         "pdf_token": None,
     }
@@ -1045,7 +1043,6 @@ async def test_process_email_skips_mark_read_when_dispatch_fails(ctx):
         "draft_id": "msg-fail",
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
         "draft_to": [],
         "draft_cc": [],
     }
@@ -1080,7 +1077,6 @@ async def test_process_email_marks_read_only_after_successful_dispatch(ctx):
         "draft_id": "msg-ok",
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
         "draft_to": [],
         "draft_cc": [],
     }

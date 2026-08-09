@@ -1,13 +1,20 @@
 """Tier 1 v1 registry compiler tests (docs/tier1-routing-design.md §6, §7)."""
 import json
 import textwrap
+from datetime import UTC, datetime
+
+import pytest
 
 from src.router.tier1.compiler import (
     CompilationFailure,
     CompiledArtifact,
     compile_registry,
+    load_artifact,
     write_artifact,
 )
+from src.router.tier1.decision import build_tier1_decision
+from src.router.tier1.dsl import EmailView
+from src.router.tier1.schema import CanonicalRoute
 
 
 def _write(tmp_path, name, content):
@@ -59,6 +66,97 @@ def test_write_artifact_switches_pointer_atomically(tmp_path):
     pointer = json.loads((out_dir / "current.json").read_text())
     assert pointer["digest"] == artifact.digest
     assert pointer["path"] == path.name
+
+
+def test_artifact_is_complete_executable_and_digest_verified(tmp_path):
+    _write(
+        tmp_path,
+        "r1.yaml",
+        """
+        rule_id: RULE-EXECUTABLE-001
+        rule_version: 1
+        status: enabled
+        owner: team-x
+        match:
+          anchor: {any: [{field: sender.address, op: eq, value: a@example.com}]}
+        decision: {route: read_only}
+        governance:
+          positive_cases: [{case_id: p1, email: {sender: {address: a@example.com}}}]
+        """,
+    )
+    artifact = compile_registry(tmp_path, now=datetime(2026, 8, 9, tzinfo=UTC))
+    assert isinstance(artifact, CompiledArtifact)
+    path = write_artifact(artifact, tmp_path / "artifacts")
+
+    raw = json.loads(path.read_text())
+    assert raw["rules"][0]["manifest"]["match"]["anchor"]["any"][0] == {
+        "field": "sender.address",
+        "op": "eq",
+        "value": "a@example.com",
+    }
+
+    loaded = load_artifact(
+        tmp_path / "artifacts",
+        expected_digest=artifact.digest,
+        now=datetime(2026, 8, 9, tzinfo=UTC),
+    )
+    decision = build_tier1_decision(
+        [compiled.manifest for compiled in loaded.rules],
+        EmailView(sender_address="a@example.com"),
+    )
+    assert decision.route is CanonicalRoute.READ_ONLY
+
+    raw["rules"][0]["manifest"]["owner"] = "tampered"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="artifact_digest_mismatch"):
+        load_artifact(
+            tmp_path / "artifacts",
+            expected_digest=artifact.digest,
+            now=datetime(2026, 8, 9, tzinfo=UTC),
+        )
+
+
+def test_expired_enabled_rule_blocks_artifact_and_near_expiry_warns(tmp_path):
+    _write(
+        tmp_path,
+        "expired.yaml",
+        """
+        rule_id: RULE-EXPIRED-001
+        rule_version: 1
+        status: enabled
+        owner: team-x
+        validity: {expires_at: '2026-08-08'}
+        match:
+          anchor: {any: [{field: sender.address, op: eq, value: old@example.com}]}
+        decision: {route: read_only}
+        governance:
+          positive_cases: [{case_id: p1, email: {sender: {address: old@example.com}}}]
+        """,
+    )
+    result = compile_registry(tmp_path, now=datetime(2026, 8, 9, tzinfo=UTC))
+    assert isinstance(result, CompilationFailure)
+    assert any(issue.code == "rule_expired" for issue in result.errors)
+
+    (tmp_path / "expired.yaml").unlink()
+    _write(
+        tmp_path,
+        "near.yaml",
+        """
+        rule_id: RULE-NEAR-001
+        rule_version: 1
+        status: enabled
+        owner: team-x
+        validity: {expires_at: '2026-08-20'}
+        match:
+          anchor: {any: [{field: sender.address, op: eq, value: near@example.com}]}
+        decision: {route: read_only}
+        governance:
+          positive_cases: [{case_id: p1, email: {sender: {address: near@example.com}}}]
+        """,
+    )
+    result = compile_registry(tmp_path, now=datetime(2026, 8, 9, tzinfo=UTC))
+    assert isinstance(result, CompiledArtifact)
+    assert any(issue.code == "rule_expires_soon" for issue in result.warnings)
 
 
 def test_duplicate_rule_id_is_hard_error(tmp_path):

@@ -138,7 +138,7 @@ async def retrieve_context(
             tier2_delta = await engine.apply_tier2_hits(local_state, results)
             if not isinstance(tier2_delta, dict):
                 raise RuntimeError("tier2_delta_invalid")
-            if tier2_delta.get("active_skills"):
+            if tier2_delta.get("route_decision"):
                 routing_delta = dict(tier2_delta)
                 routing_delta.setdefault("routing_stage", "tier2")
             else:
@@ -146,14 +146,11 @@ async def retrieve_context(
                 if not isinstance(tier3_delta, dict):
                     raise RuntimeError("tier3_delta_invalid")
                 if tier3_delta.get("next_step") == "manual_review":
-                    return build_manual_review_delta(
-                        state,
-                        tier3_delta.get("safe_error_summary"),
-                    )
+                    return sanitize_graph_delta(state, tier3_delta)
                 routing_delta = dict(tier3_delta)
                 routing_delta.setdefault(
                     "routing_stage",
-                    "tier3" if routing_delta.get("active_skills") else "none",
+                    "tier3" if routing_delta.get("route_decision") else "none",
                 )
     except Exception as exc:
         logger.error(
@@ -169,7 +166,7 @@ async def retrieve_context(
     if experience_hints:
         metadata["experience_hints"] = experience_hints
 
-    # Priority 4: thread summary (Phase 3)
+    # Priority 4: thread summary (Approval)
     if results:
         try:
             thread_summary = await _generate_thread_summary(results, subject)
@@ -189,7 +186,7 @@ async def retrieve_context(
     if style_guidance:
         metadata["style_guidance"] = style_guidance
 
-    # Priority 6: user preference hints (Phase 2)
+    # Priority 6: user preference hints (Polling)
     preference_hints = await _retrieve_user_preferences(subject, sender)
     if preference_hints:
         metadata["preference_hints"] = preference_hints
@@ -243,7 +240,7 @@ async def retrieve_context(
             merged = dict(updates.get("metadata") or {})
             merged.update(v)
             updates["metadata"] = merged
-        elif k in {"active_skills", "routing_log", "tool_calls"}:
+        elif k in {"routing_log", "tool_calls"}:
             updates[k] = _merge_unique(state.get(k), v)
         else:
             updates[k] = v

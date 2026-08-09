@@ -19,7 +19,6 @@ from src.config import Settings, resolve_secret
 _SAFE_SECRET_VALUES = {
     "POSTGRES_PASSWORD": "Db9!F4m2Q7w8Z1x6",
     "EXCHANGE_API_KEY": "Exch8Q2w7V4m9N6k3P1z",
-    "EXCHANGE_WEBHOOK_SECRET": "Hook7M4x9K2v8Q6p3N1w",
     "LARK_APP_SECRET": "Lark6V9m2Q4x8N1k7P3w",
     "LARK_ENCRYPT_KEY": "Encrypt4N8v2K7m9Q1x6P3w",
     "CONTENT_STORE_KEY": base64.b64encode(b"k" * 32).decode("ascii"),
@@ -52,8 +51,6 @@ def _secure_production_settings(**overrides: Any) -> Settings:
         "POSTGRES_MIGRATION_OWNER_ROLE": "ai_exchange_migration_owner",
         "DATABASE_ROLE_SEPARATION_REQUIRED": True,
         "DURABLE_INBOX_ENABLED": True,
-        "INGESTION_SHADOW_ENABLED": False,
-        "SYNC_RECONCILIATION_ENABLED": False,
         "POLLING_ENABLED": True,
         "INGESTION_INSTANCE_ID": "ai-exchange-web",
         "EXCHANGE_API_URL": "https://exchange.internal.company/api/v1/exchange/emails",
@@ -61,9 +58,6 @@ def _secure_production_settings(**overrides: Any) -> Settings:
         "EXCHANGE_ACCOUNT_ID": 8,
         "EXCHANGE_SSL_VERIFY": True,
         "EXCHANGE_CA_FILE": "",
-        "EXCHANGE_WEBHOOK_SECRET": SecretStr(
-            _SAFE_SECRET_VALUES["EXCHANGE_WEBHOOK_SECRET"]
-        ),
         "LARK_APP_ID": "cli_runtime_app",
         "LARK_APP_SECRET": SecretStr(_SAFE_SECRET_VALUES["LARK_APP_SECRET"]),
         "LARK_ENCRYPT_KEY": SecretStr(_SAFE_SECRET_VALUES["LARK_ENCRYPT_KEY"]),
@@ -88,30 +82,30 @@ def test_exchange_tls_verification_defaults_to_true(monkeypatch: pytest.MonkeyPa
     assert settings.EXCHANGE_SSL_VERIFY is True
 
 
-def test_production_polling_does_not_require_a_retired_webhook_secret():
+def test_production_polling_requires_no_retired_webhook_secret():
     validate_runtime_security = _load_runtime_validator()
-    settings = _secure_production_settings(EXCHANGE_WEBHOOK_SECRET=SecretStr(""))
+    settings = _secure_production_settings()
 
     validate_runtime_security(settings)
 
 
-def test_phase_2_ingestion_flags_default_to_disabled(
+def test_polling_and_memory_flags_default_to_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     for field_name in (
         "DURABLE_INBOX_ENABLED",
-        "INGESTION_SHADOW_ENABLED",
-        "SYNC_RECONCILIATION_ENABLED",
         "POLLING_ENABLED",
+        "MEMORY_LEARNING_ENABLED",
     ):
         monkeypatch.delenv(field_name, raising=False)
 
     settings = Settings(_env_file=None)
 
     assert settings.DURABLE_INBOX_ENABLED is False
-    assert settings.INGESTION_SHADOW_ENABLED is False
-    assert settings.SYNC_RECONCILIATION_ENABLED is False
     assert settings.POLLING_ENABLED is False
+    assert settings.MEMORY_LEARNING_ENABLED is False
+    assert not hasattr(settings, "INGESTION_SHADOW_ENABLED")
+    assert not hasattr(settings, "SYNC_RECONCILIATION_ENABLED")
 
 
 def test_secure_production_baseline_is_accepted():
@@ -127,12 +121,10 @@ def test_secure_production_baseline_is_accepted():
     ("field_name", "unsafe_value"),
     [
         ("DURABLE_INBOX_ENABLED", False),
-        ("INGESTION_SHADOW_ENABLED", True),
-        ("SYNC_RECONCILIATION_ENABLED", True),
         ("POLLING_ENABLED", False),
     ],
 )
-def test_production_accepts_only_the_phase4_lite_runtime_mode(
+def test_production_accepts_only_the_polling_runtime_mode(
     field_name: str,
     unsafe_value: bool,
 ) -> None:
@@ -356,7 +348,6 @@ def test_development_mode_does_not_apply_production_only_rejections():
         POSTGRES_USER="user",
         POSTGRES_PASSWORD=SecretStr("password"),
         EXCHANGE_SSL_VERIFY=False,
-        EXCHANGE_WEBHOOK_SECRET=SecretStr(""),
         CONTENT_STORE_KEY=SecretStr(""),
         LARK_ALLOWED_OPEN_IDS="",
         METRICS_TOKEN=SecretStr(""),
@@ -448,7 +439,6 @@ def test_security_credentials_are_secretstr_fields():
     secret_fields = (
         "POSTGRES_PASSWORD",
         "EXCHANGE_API_KEY",
-        "EXCHANGE_WEBHOOK_SECRET",
         "LARK_APP_SECRET",
         "LARK_ENCRYPT_KEY",
         "CONTENT_STORE_KEY",

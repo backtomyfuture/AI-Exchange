@@ -357,8 +357,6 @@ def test_approval_wrapper_schedules_resume_only_for_winner(monkeypatch):
         coroutine.close()
 
     monkeypatch.setattr(lark_app, "safe_async_run", capture)
-    monkeypatch.setattr(lark_app, "_is_explicit_test_card", lambda _id: False)
-
     assert lark_app.process_approval("mail-action", "user-a") is True
     assert lark_app.process_approval("mail-action", "user-b") is False
     assert len(scheduled) == 1

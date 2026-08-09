@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare deterministic Phase 4-Lite greenfield initialization manifests."""
+"""Prepare deterministic polling-only greenfield initialization manifests."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from src.ingestion.runtime_authority import (  # noqa: E402
 )
 from src.ingestion.runtime_capability import (  # noqa: E402
     CAPABILITY_CHAIN_ROOT_HASH,
-    PHASE2_SCHEMA_REVISION,
+    POLLING_SCHEMA_REVISION,
     RuntimeCapabilityManifest,
     RuntimeCapabilityStage,
 )
@@ -48,37 +48,7 @@ _BUILD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}\Z", re.ASCII)
 _GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_PLACEHOLDER_WEBHOOK_IDS: Final = frozenset(
-    {
-        "inbox",
-        "your_inbox_id",
-        "your-inbox-id",
-        "placeholder",
-        "replace_me",
-        "replace-me",
-    }
-)
-
 _POLICY_ENTRIES: Final = (
-    (IngressSource.WEBHOOK, "NewMailEvent", ChangeKind.CREATE, ProcessingPolicy.FULL),
-    (
-        IngressSource.WEBHOOK,
-        "CreatedEvent",
-        ChangeKind.CREATE,
-        ProcessingPolicy.IGNORED,
-    ),
-    (
-        IngressSource.WEBHOOK,
-        "ModifiedEvent",
-        ChangeKind.UPDATE,
-        ProcessingPolicy.METADATA_ONLY,
-    ),
-    (
-        IngressSource.WEBHOOK,
-        "DeletedEvent",
-        ChangeKind.DELETE,
-        ProcessingPolicy.METADATA_ONLY,
-    ),
     (IngressSource.SYNC, "create", ChangeKind.CREATE, ProcessingPolicy.FULL),
     (
         IngressSource.SYNC,
@@ -94,10 +64,10 @@ _POLICY_ENTRIES: Final = (
     ),
 )
 
-_SCHEMA_HASH_DOMAIN: Final = b"ai-exchange-phase4-lite-schema-source-v1\x00"
-_ADAPTER_HASH_DOMAIN: Final = b"ai-exchange-phase4-lite-adapter-source-v1\x00"
-_CONFIG_HASH_DOMAIN: Final = b"ai-exchange-phase4-lite-runtime-config-v1\x00"
-_EVIDENCE_HASH_DOMAIN: Final = b"ai-exchange-phase4-lite-release-evidence-v1\x00"
+_SCHEMA_HASH_DOMAIN: Final = b"ai-exchange-polling-schema-source-v1\x00"
+_ADAPTER_HASH_DOMAIN: Final = b"ai-exchange-polling-adapter-source-v1\x00"
+_CONFIG_HASH_DOMAIN: Final = b"ai-exchange-polling-runtime-config-v1\x00"
+_EVIDENCE_HASH_DOMAIN: Final = b"ai-exchange-polling-release-evidence-v1\x00"
 
 
 class ManifestPreparationError(RuntimeError):
@@ -149,13 +119,6 @@ def _require_build_id(value: object) -> str:
     if type(value) is not str or _BUILD_ID.fullmatch(value) is None:
         raise ManifestPreparationError("build_id_invalid")
     return value
-
-
-def _require_webhook_id(value: object) -> str:
-    exact = _require_text("webhook_inbox_id", value, maximum=512)
-    if len(exact.encode("utf-8")) < 8 or exact.casefold() in _PLACEHOLDER_WEBHOOK_IDS:
-        raise ManifestPreparationError("webhook_inbox_id_invalid")
-    return exact
 
 
 def _read_regular_file(path: Path, *, maximum: int, error: str) -> bytes:
@@ -360,16 +323,13 @@ def _committed_tree_manifest(
     }
 
 
-def _policy_payload(
-    webhook_inbox_id: str, sync_folder: str
-) -> tuple[dict[str, object], PolicySnapshot]:
+def _policy_payload(sync_folder: str) -> tuple[dict[str, object], PolicySnapshot]:
     matrix = {
         (source, event_type, kind): policy
         for source, event_type, kind, policy in _POLICY_ENTRIES
     }
     scope = FolderScope.configured(
         canonical_key=_CANONICAL_FOLDER_KEY,
-        webhook_ids=(webhook_inbox_id,),
         sync_folder=sync_folder,
         event_policy_matrix=matrix,
     )
@@ -380,7 +340,6 @@ def _policy_payload(
         "scopes": [
             {
                 "canonical_key": _CANONICAL_FOLDER_KEY,
-                "webhook_ids": [webhook_inbox_id],
                 "sync_folder": sync_folder,
                 "event_policy_matrix": [
                     {
@@ -400,14 +359,12 @@ def _policy_payload(
 def _prepare_payloads(
     *,
     account_id: int,
-    webhook_inbox_id: str,
     sync_folder: str,
     build_id: str,
     release_evidence_file: Path,
     project_root: Path = PROJECT_ROOT,
 ) -> tuple[dict[str, object], dict[str, object]]:
     exact_account_id = _require_account_id(account_id)
-    exact_webhook_id = _require_webhook_id(webhook_inbox_id)
     exact_sync_folder = _require_text("sync_folder", sync_folder, maximum=512)
     if exact_sync_folder != _GATEWAY_POLLING_FOLDER:
         raise ManifestPreparationError("sync_folder_must_be_gateway_inbox")
@@ -420,13 +377,13 @@ def _prepare_payloads(
     if evidence["source_revision"] != git_identity["revision"]:
         raise ManifestPreparationError("release_evidence_source_mismatch")
 
-    policy, snapshot = _policy_payload(exact_webhook_id, exact_sync_folder)
+    policy, snapshot = _policy_payload(exact_sync_folder)
     policy_hash = canonical_policy_manifest(snapshot).hash
     schema_manifest = _committed_tree_manifest(
         git_identity,
         kind="greenfield_schema",
         fixed={
-            "schema_revision": PHASE2_SCHEMA_REVISION,
+            "schema_revision": POLLING_SCHEMA_REVISION,
             "protocol_version": _PROTOCOL_VERSION,
         },
     )
@@ -444,14 +401,10 @@ def _prepare_payloads(
         "folder_scope": {
             "canonical_key": _CANONICAL_FOLDER_KEY,
             "sync_folder": exact_sync_folder,
-            "webhook_ids": [exact_webhook_id],
         },
         "features": {
             "durable_inbox_enabled": True,
-            "ingestion_shadow_enabled": False,
             "polling_enabled": True,
-            "sync_reconciliation_enabled": False,
-            "webhook_primary": False,
         },
         "topology": {
             "exchange_accounts": 1,
@@ -469,8 +422,8 @@ def _prepare_payloads(
         "evidence_manifest_hash": _domain_hash(_EVIDENCE_HASH_DOMAIN, evidence),
     }
     capability = RuntimeCapabilityManifest(
-        stage=RuntimeCapabilityStage.PHASE2_INGESTION,
-        schema_revision=PHASE2_SCHEMA_REVISION,
+        stage=RuntimeCapabilityStage.POLLING_INGESTION,
+        schema_revision=POLLING_SCHEMA_REVISION,
         schema_digest=contract["schema_digest"],  # type: ignore[arg-type]
         protocol_version=_PROTOCOL_VERSION,
         minimum_build_id=exact_build_id,
@@ -481,7 +434,7 @@ def _prepare_payloads(
         predecessor_hash=CAPABILITY_CHAIN_ROOT_HASH,
     )
     RuntimeContract(
-        schema_revision=PHASE2_SCHEMA_REVISION,
+        schema_revision=POLLING_SCHEMA_REVISION,
         schema_digest=capability.schema_digest,
         protocol_version=capability.protocol_version,
         build_id=capability.minimum_build_id,
@@ -565,7 +518,6 @@ def _write_output_directory(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--account-id", required=True, type=int)
-    parser.add_argument("--webhook-inbox-id", required=True)
     parser.add_argument("--sync-folder", required=True)
     parser.add_argument("--build-id", required=True)
     parser.add_argument("--release-evidence-file", required=True, type=Path)
@@ -576,7 +528,6 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, object]:
     policy, contract = _prepare_payloads(
         account_id=args.account_id,
-        webhook_inbox_id=args.webhook_inbox_id,
         sync_folder=args.sync_folder,
         build_id=args.build_id,
         release_evidence_file=args.release_evidence_file,

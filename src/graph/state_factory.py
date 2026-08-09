@@ -28,8 +28,6 @@ MAX_CONTEXT_SUMMARIES = 5
 MAX_CONTEXT_SNIPPET_BYTES = 384
 MAX_ROUTING_LOGS = 8
 MAX_ROUTING_LOG_BYTES = 256
-MAX_ACTIVE_SKILLS = 16
-MAX_SKILL_BYTES = 128
 _ROUTING_STAGES = frozenset({"pending", "tier1", "tier2", "tier3", "none"})
 MAX_METADATA_TEXT_BYTES = 1_024
 # The visual summary is drafting context, not a transcript.  Keep enough room
@@ -386,6 +384,16 @@ def _sanitize_review_result(value: object) -> dict[str, Any] | None:
     return result
 
 
+def _sanitize_route_decision(value: object) -> dict[str, Any]:
+    from src.router.decision import RouteDecision
+
+    try:
+        decision = RouteDecision.model_validate(value)
+    except Exception:
+        raise ValueError("invalid_route_decision") from None
+    return decision.model_dump(mode="json")
+
+
 def _sanitize_tool_calls(value: object) -> list[dict[str, str]]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
@@ -484,12 +492,6 @@ def sanitize_graph_delta(
                 max_item_bytes=MAX_RECIPIENT_BYTES,
                 reject_excess=True,
             )
-    if "active_skills" in delta:
-        result["active_skills"] = cap_string_list(
-            delta["active_skills"],
-            max_items=MAX_ACTIVE_SKILLS,
-            max_item_bytes=MAX_SKILL_BYTES,
-        )
     if "routing_log" in delta:
         result["routing_log"] = cap_string_list(
             delta["routing_log"],
@@ -501,6 +503,8 @@ def sanitize_graph_delta(
         if type(stage) is not str or stage not in _ROUTING_STAGES:
             raise ValueError("invalid_routing_stage")
         result["routing_stage"] = stage
+    if "route_decision" in delta:
+        result["route_decision"] = _sanitize_route_decision(delta["route_decision"])
     if "priority_level" in delta and type(delta["priority_level"]) is int:
         result["priority_level"] = max(0, min(delta["priority_level"], 10))
     if "system_prompt_modifier" in delta:
@@ -675,7 +679,6 @@ def build_initial_graph_state(
         "draft_id": None,
         "draft_to": recipients["draft_to"],
         "draft_cc": recipients["draft_cc"],
-        "active_skills": [],
         "routing_log": [],
         "priority_level": 0,
         "system_prompt_modifier": None,

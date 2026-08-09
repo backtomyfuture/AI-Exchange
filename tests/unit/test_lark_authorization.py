@@ -185,54 +185,6 @@ def test_unlisted_card_operator_is_rejected_before_state_or_action(
     reply.assert_not_called()
 
 
-def test_unlisted_operator_cannot_use_debug_test_card(monkeypatch):
-    email_id = "test_push_unauthorized"
-    state = SimpleNamespace(
-        values={
-            "email": {"id": email_id, "subject": "test"},
-            "status": "pending",
-        }
-    )
-
-    class TrackingStore(dict):
-        reads = 0
-
-        def __contains__(self, key):
-            self.reads += 1
-            return super().__contains__(key)
-
-        def __getitem__(self, key):
-            self.reads += 1
-            return super().__getitem__(key)
-
-    store = TrackingStore({email_id: state})
-    graph = SimpleNamespace(
-        aget_state=MagicMock(
-            side_effect=AssertionError("unauthorized_graph_lookup")
-        )
-    )
-    database = MagicMock()
-
-    monkeypatch.setattr(
-        lark_app,
-        "get_settings",
-        lambda: _settings(allowed="ou_allowed", debug=True),
-    )
-    monkeypatch.setattr(lark_app, "_mock_store", store)
-    monkeypatch.setattr(lark_app, "graph", graph)
-    monkeypatch.setattr(lark_app, "db_manager", database)
-
-    response = lark_app.handle_card_action(
-        _card_event("mark_read", email_id=email_id)
-    )
-
-    assert _toast_type(response) in {"error", "warning"}
-    assert state.values["status"] == "pending"
-    assert store.reads == 0
-    graph.aget_state.assert_not_called()
-    assert database.method_calls == []
-
-
 def test_unlisted_p2p_sender_is_rejected_before_dispatch_or_reply(
     monkeypatch,
 ):

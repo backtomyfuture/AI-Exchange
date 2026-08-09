@@ -39,7 +39,7 @@ from src.ingestion.processing import (
     ExternalEffectBoundary,
     ExternalEffectKind,
     GuardedExternalEffectFailed,
-    LegacyEffectScope,
+    ProcessingEffectScope,
     ProcessingPolicyRejected,
 )
 
@@ -400,7 +400,7 @@ async def _run_ai_pipeline(
             "context": state_values.get("context_summaries", []),
             "email": projection_email,
             "routing_log": state_values.get("routing_log", []),
-            "active_skills": state_values.get("active_skills", []),
+            "route_decision": state_values.get("route_decision"),
             "approval_status": state_values.get("approval_status", ""),
             "next_step": state_values.get("next_step", ""),
             "safe_error_summary": state_values.get("safe_error_summary"),
@@ -804,6 +804,48 @@ async def _delete_replaced_pdf(
     return reconciled
 
 
+async def _persist_canonical_route_decision(
+    pipeline_result: dict,
+    ctx,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None,
+) -> None:
+    """Persist the final route before the first user-visible side effect."""
+    if _effect_boundary is None:
+        return
+    raw = pipeline_result.get("route_decision")
+    scope = _effect_boundary.scope
+    if raw is None or not callable(
+        getattr(ctx.db_manager, "persist_route_decision", None)
+    ):
+        raise ProcessingPolicyRejected()
+    await ctx.db_manager.persist_route_decision(
+        inbox_id=scope.inbox_id,
+        account_id=scope.account_id,
+        external_email_id=scope.external_email_id,
+        decision_raw=raw,
+    )
+
+
+async def _advance_canonical_handoff(
+    ctx,
+    *,
+    _effect_boundary: ExternalEffectBoundary | None,
+    expected_state: str,
+    next_state: str,
+) -> None:
+    if _effect_boundary is None:
+        return
+    transition = getattr(ctx.db_manager, "advance_handoff_execution", None)
+    if not callable(transition):
+        raise ProcessingPolicyRejected()
+    await transition(
+        inbox_id=_effect_boundary.scope.inbox_id,
+        expected_state=expected_state,
+        next_state=next_state,
+    )
+
+
 async def _dispatch_manual_review_notification(
     email_id: str,
     pipeline_result: dict,
@@ -828,7 +870,11 @@ async def _dispatch_manual_review_notification(
     if not isinstance(classification, dict):
         classification = {}
     routing_log = pipeline_result.get("routing_log", [])
-    active_skills = pipeline_result.get("active_skills", [])
+    await _persist_canonical_route_decision(
+        pipeline_result,
+        ctx,
+        _effect_boundary=_effect_boundary,
+    )
     logger.info(
         "Sending Lark manual-review request: email=%s reason=%s",
         fingerprint_identifier(email_id, namespace="email"),
@@ -882,7 +928,6 @@ async def _dispatch_manual_review_notification(
             classification=classification,
             pdf_url=pdf_stage.url,
             routing_log=routing_log,
-            active_skills=active_skills,
         )
     except Exception:
         if _effect_boundary is not None:
@@ -957,15 +1002,19 @@ async def _dispatch_notification(
     priority = classification.get("priority", "P3")
     intent = classification.get("intent", "Unknown")
     routing_log = pipeline_result.get("routing_log", [])
-    active_skills = pipeline_result.get("active_skills", [])
     email_data = pipeline_result.get("email", {})
     kind = decide_notification_kind(classification, email_data)
+
+    await _persist_canonical_route_decision(
+        pipeline_result,
+        ctx,
+        _effect_boundary=_effect_boundary,
+    )
 
     await ctx.db_manager.update_status(
         email_id,
         None,
         routing_log=routing_log,
-        active_skills=active_skills,
         original_draft=pipeline_result.get("draft", ""),
     )
 
@@ -981,7 +1030,7 @@ async def _dispatch_notification(
         labels_updated = await asyncio.to_thread(
             ctx.email_processor.update_email_labels,
             email_id,
-            active_skills,
+            pipeline_result.get("route_decision"),
             priority,
             intent,
             classification.get("need_reply"),
@@ -1052,7 +1101,6 @@ async def _dispatch_notification(
                 classification=classification,
                 pdf_url=pdf_stage.url,
                 routing_log=routing_log,
-                active_skills=active_skills,
             )
         except Exception:
             if _effect_boundary is not None:
@@ -1155,7 +1203,6 @@ async def _dispatch_notification(
                 classification=classification,
                 pdf_url=pdf_stage.url,
                 routing_log=routing_log,
-                active_skills=active_skills,
             )
         except Exception:
             if _effect_boundary is not None:
@@ -1281,12 +1328,12 @@ async def process_and_archive_email_guarded(
     force_reprocess: bool = False,
     *,
     before_external_effect: BeforeExternalEffect,
-    effect_scope: LegacyEffectScope,
+    effect_scope: ProcessingEffectScope,
 ) -> ProcessingOutcome:
-    """Run the legacy processor with a mandatory fenced external-effect port."""
+    """Run the email processor with a mandatory fenced external-effect port."""
     settings = get_settings()
     if (
-        type(effect_scope) is not LegacyEffectScope
+        type(effect_scope) is not ProcessingEffectScope
         or type(settings.EXCHANGE_ACCOUNT_ID) is not int
         or settings.EXCHANGE_ACCOUNT_ID <= 0
         or effect_scope.account_id != settings.EXCHANGE_ACCOUNT_ID
@@ -2066,6 +2113,12 @@ async def _run_ai_path(
                 )
                 return ProcessingOutcome.FAILED
             notification_committed = True
+            await _advance_canonical_handoff(
+                ctx,
+                _effect_boundary=_effect_boundary,
+                expected_state="planned",
+                next_state="effect_committed",
+            )
             try:
                 manual_persisted = await ctx.db_manager.compare_and_set_manual_review(
                     thread_id,
@@ -2106,6 +2159,12 @@ async def _run_ai_path(
                     kind="manual_review",
                     cause=failure,
                 )
+            await _advance_canonical_handoff(
+                ctx,
+                _effect_boundary=_effect_boundary,
+                expected_state="effect_committed",
+                next_state="completed",
+            )
             try:
                 await _cleanup_graph_drive_files(
                     thread_id,
@@ -2165,6 +2224,13 @@ async def _run_ai_path(
             dispatch_result.get("delivered")
             and dispatch_result.get("kind") in {"approval", "read_only"}
         )
+        if notification_committed:
+            await _advance_canonical_handoff(
+                ctx,
+                _effect_boundary=_effect_boundary,
+                expected_state="planned",
+                next_state="effect_committed",
+            )
         if not dispatch_result.get("delivered"):
             await _cleanup_graph_drive_files(
                 thread_id,
@@ -2187,6 +2253,20 @@ async def _run_ai_path(
                 ctx,
                 **_effect_boundary_kwargs(_effect_boundary),
             )
+            if dispatch_result.get("kind") in {"approval", "read_only"}:
+                await _advance_canonical_handoff(
+                    ctx,
+                    _effect_boundary=_effect_boundary,
+                    expected_state="effect_committed",
+                    next_state="completed",
+                )
+            else:
+                await _advance_canonical_handoff(
+                    ctx,
+                    _effect_boundary=_effect_boundary,
+                    expected_state="planned",
+                    next_state="completed",
+                )
         else:
             logger.warning(
                 "Skipping mark-read after delivery failure: email=%s kind=%s",

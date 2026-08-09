@@ -193,7 +193,7 @@ class LarkCardBuilder:
                 )
                 unresolved_emails.append(email)
 
-        # Phase 2: Exchange contact resolution fallback
+        # Polling: Exchange contact resolution fallback
         if unresolved_emails and self.exchange_client:
             import asyncio
             logger.info(
@@ -464,13 +464,10 @@ class LarkCardBuilder:
     @staticmethod
     def _build_routing_note(
         routing_log: Optional[List[str]] = None,
-        active_skills: Optional[List[str]] = None,
         classification: Optional[dict] = None,
     ) -> List[dict]:
         """Build a compact routing-info note for observability."""
         parts = []
-        if active_skills:
-            parts.append(f"Skills: {', '.join(active_skills)}")
         if routing_log:
             parts.append(" → ".join(routing_log[:4]))
         conf = (classification or {}).get("confidence")
@@ -536,7 +533,6 @@ class LarkCardBuilder:
         feedback_value: str = "",
         pdf_url: str = None,
         routing_log: Optional[List[str]] = None,
-        active_skills: Optional[List[str]] = None,
     ) -> dict:
         """
         Constructs the Lark Card JSON for approval workflow.
@@ -805,7 +801,7 @@ class LarkCardBuilder:
             ]
         })
 
-        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
+        elements.extend(self._build_routing_note(routing_log, classification))
 
         return {"header": header, "elements": elements}
 
@@ -817,7 +813,6 @@ class LarkCardBuilder:
         classification: dict,
         pdf_url: str = None,
         routing_log: Optional[List[str]] = None,
-        active_skills: Optional[List[str]] = None
     ) -> dict:
         """
         构建只读卡片 - 用于重要但不需要回复的邮件。
@@ -976,7 +971,7 @@ class LarkCardBuilder:
             ]
         })
 
-        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
+        elements.extend(self._build_routing_note(routing_log, classification))
 
         return {"header": header, "elements": elements}
 
@@ -988,7 +983,6 @@ class LarkCardBuilder:
         classification: Optional[dict] = None,
         pdf_url: Any = None,
         routing_log: Optional[List[str]] = None,
-        active_skills: Optional[List[str]] = None,
     ) -> dict:
         """
         构建人工复核卡片 - 用于系统安全兜底转人工的邮件。
@@ -1109,7 +1103,7 @@ class LarkCardBuilder:
             ],
         })
 
-        elements.extend(self._build_routing_note(routing_log, active_skills, classification))
+        elements.extend(self._build_routing_note(routing_log, classification))
 
         return {"header": header, "elements": elements}
 

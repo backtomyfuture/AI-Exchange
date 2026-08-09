@@ -1,6 +1,6 @@
 """Transactional pipeline ownership and fencing boundary.
 
-Phase 2 may bootstrap the first generation and quiesce it, but it deliberately
+Polling may bootstrap the first generation and quiesce it, but it deliberately
 has no public generation-switch operation.  The private transaction-bound
 primitives are reserved for the later ActivationService, which must compose
 them with authority, barrier, receipt, and audit facts in one transaction.

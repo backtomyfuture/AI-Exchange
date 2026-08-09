@@ -39,16 +39,13 @@ class ChangeKind(StrEnum):
 
 
 class IngressSource(StrEnum):
-    WEBHOOK = "webhook"
     SYNC = "sync"
-    BACKFILL = "backfill"
 
 
 class ProcessingPolicy(StrEnum):
     FULL = "full"
     ARCHIVE = "archive"
     METADATA_ONLY = "metadata_only"
-    HISTORICAL_SUPPRESSED = "historical_suppressed"
     IGNORED = "ignored"
 
 
@@ -65,14 +62,6 @@ class InboxDispositionStatus(StrEnum):
     RETRY_WAIT = "retry_wait"
     DEAD_LETTER = "dead_letter"
     MANUAL_REVIEW = "manual_review"
-
-
-class SyncCursorStatus(StrEnum):
-    ACTIVE = "active"
-    RESET_REQUIRED = "reset_required"
-    COLD_START_PENDING = "cold_start_pending"
-    BLOCKED_CONTRACT = "blocked_contract"
-    COLD_START_APPLYING = "cold_start_applying"
 
 
 _EnumT = TypeVar("_EnumT", bound=StrEnum)
@@ -617,5 +606,4 @@ __all__ = [
     "ProcessingPolicy",
     "SyncBatch",
     "SyncChange",
-    "SyncCursorStatus",
 ]

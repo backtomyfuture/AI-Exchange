@@ -48,7 +48,10 @@ services:
 
   database-provision:
     profiles: ["database-provision"]
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     command: ["python", "-m", "src.db.provision"]
@@ -95,7 +98,10 @@ services:
 
   database-bootstrap:
     profiles: ["migration"]
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     command: ["python", "-m", "src.db.bootstrap"]
@@ -130,7 +136,10 @@ services:
 
   ingestion-maintenance:
     profiles: ["ingestion-maintenance"]
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/manage_ingestion.py"]
@@ -165,7 +174,10 @@ services:
 
   checkpoint-maintenance:
     profiles: ["checkpoint-maintenance"]
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
@@ -203,7 +215,10 @@ services:
 
   checkpoint-maintenance-execute:
     profiles: ["checkpoint-maintenance-execute"]
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: "no"
     entrypoint: ["python", "scripts/checkpoint_cleanup.py"]
@@ -241,7 +256,10 @@ services:
       - backend
 
   ai-assistant-service:
-    build: .
+    build:
+      context: .
+      args:
+        TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
     image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
     restart: always
     command: python -m src.main
@@ -273,6 +291,9 @@ services:
       DURABLE_INBOX_ENABLED: "true"
       POLLING_ENABLED: "true"
       POLLING_INTERVAL_SECONDS: "60"
+      MEMORY_LEARNING_ENABLED: "false"
+      TIER1_ARTIFACT_DIR: /app/tier1_artifacts
+      TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
       EXCHANGE_SSL_VERIFY: "true"
       EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}

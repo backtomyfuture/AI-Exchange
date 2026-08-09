@@ -24,13 +24,13 @@ from src.exchange_service import (
 from src.ingestion.processing import (
     ExternalEffectBoundary,
     GuardedExternalEffectFailed,
-    LegacyEffectScope,
+    ProcessingEffectScope,
 )
 from src.storage import ContentRef
 
 
-def _scope(email_id: str = "message-1") -> LegacyEffectScope:
-    return LegacyEffectScope(
+def _scope(email_id: str = "message-1") -> ProcessingEffectScope:
+    return ProcessingEffectScope(
         account_id=8,
         inbox_id=str(uuid4()),
         generation=3,
@@ -68,7 +68,6 @@ def _pipeline_result(*, need_reply: bool) -> dict[str, object]:
         "context": [],
         "email": {"id": "message-1", "subject": "subject"},
         "routing_log": [],
-        "active_skills": [],
     }
 
 

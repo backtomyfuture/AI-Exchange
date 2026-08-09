@@ -38,7 +38,6 @@ def configure_completed_graph(mock_context, email_data, *, classification, event
         "draft_id": None,
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
         "draft_to": [],
         "draft_cc": [],
     }
@@ -82,7 +81,6 @@ async def test_process_flow_new_email(mock_context):
         "draft_id": "msg_1",
         "context_summaries": [],
         "routing_log": [],
-        "active_skills": [],
         "draft_to": [],
         "draft_cc": [],
     }

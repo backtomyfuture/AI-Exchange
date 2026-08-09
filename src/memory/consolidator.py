@@ -17,10 +17,16 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src.config import get_settings
+
 
 logger = logging.getLogger(__name__)
 
 EXPERIENCE_COLLECTION = "email_experience"
+
+
+def _memory_learning_enabled() -> bool:
+    return bool(getattr(get_settings(), "MEMORY_LEARNING_ENABLED", False))
 
 _CONSOLIDATE_TOOL = [
     {
@@ -93,6 +99,15 @@ class MemoryConsolidator:
         Returns:
             Dict with keys 'insights_count', 'summary', 'stored'.
         """
+        if not _memory_learning_enabled():
+            logger.info("Memory consolidation skipped: Memory Learning is disabled.")
+            return {
+                "insights_count": 0,
+                "summary": "Memory Learning is disabled",
+                "stored": False,
+                "disabled": True,
+            }
+
         records = await self._fetch_recent_records(days)
         if len(records) < min_records:
             logger.info(

@@ -143,7 +143,7 @@ async def categorize_email(
     for key in (
         "routing_log",
         "routing_stage",
-        "active_skills",
+        "route_decision",
         "system_prompt_modifier",
         "priority_level",
         "draft_to",

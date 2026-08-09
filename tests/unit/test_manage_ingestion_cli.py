@@ -7,14 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from scripts import manage_ingestion
+from src.ingestion.runtime_capability import POLLING_SCHEMA_REVISION
 
 
 def _policy() -> dict[str, object]:
     entries = (
-        ("webhook", "NewMailEvent", "create", "full"),
-        ("webhook", "CreatedEvent", "create", "ignored"),
-        ("webhook", "ModifiedEvent", "update", "metadata_only"),
-        ("webhook", "DeletedEvent", "delete", "metadata_only"),
         ("sync", "create", "create", "full"),
         ("sync", "update", "update", "metadata_only"),
         ("sync", "delete", "delete", "metadata_only"),
@@ -24,8 +21,7 @@ def _policy() -> dict[str, object]:
         "scopes": [
             {
                 "canonical_key": "INBOX",
-                "webhook_ids": ["INBOX"],
-                "sync_folder": "Inbox",
+                "sync_folder": "INBOX",
                 "event_policy_matrix": [
                     {
                         "source": source,
@@ -113,7 +109,7 @@ async def test_initialize_dry_run_validates_exact_files_without_database_io(
     output = json.loads(capsys.readouterr().out)
     assert output["account_id"] == 8
     assert output["dry_run"] is True
-    assert output["schema_revision"] == "20260716_0006"
+    assert output["schema_revision"] == POLLING_SCHEMA_REVISION
     assert output["scope_count"] == 1
     assert len(output["capability_hash"]) == 64
     assert len(output["policy_manifest_hash"]) == 64

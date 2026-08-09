@@ -15,8 +15,6 @@ async def test_shared_runtime_boundary_maps_all_security_identity_fields() -> No
     settings = SimpleNamespace(
         database_url="postgresql://runtime:PRIVATE@db/email",
         DURABLE_INBOX_ENABLED=True,
-        INGESTION_SHADOW_ENABLED=True,
-        SYNC_RECONCILIATION_ENABLED=False,
         DATABASE_ROLE_SEPARATION_REQUIRED=True,
         POSTGRES_USER="runtime_user",
         POSTGRES_MIGRATION_OWNER_ROLE="migration_owner",
@@ -31,8 +29,6 @@ async def test_shared_runtime_boundary_maps_all_security_identity_fields() -> No
     gate.assert_awaited_once_with(
         settings.database_url,
         durable_inbox_enabled=True,
-        ingestion_shadow_enabled=True,
-        sync_reconciliation_enabled=False,
         role_separation_required=True,
         expected_runtime_role="runtime_user",
         expected_migration_role="migration_owner",
@@ -51,8 +47,6 @@ async def test_shared_runtime_boundary_defaults_fail_closed_identity_to_empty() 
     gate.assert_awaited_once_with(
         settings.database_url,
         durable_inbox_enabled=False,
-        ingestion_shadow_enabled=False,
-        sync_reconciliation_enabled=False,
         role_separation_required=False,
         expected_runtime_role="",
         expected_migration_role="",

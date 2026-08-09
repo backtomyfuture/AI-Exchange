@@ -17,12 +17,13 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import sql
 
 from src.db.access_contract import (
-    AUDITOR_ROUTINE_EXECUTE_BY_REVISION,
-    AUDITOR_RELATION_ACCESS_BY_REVISION,
-    MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION,
-    MAINTENANCE_RELATION_ACCESS_BY_REVISION,
-    RUNTIME_ROUTINE_EXECUTE_BY_REVISION,
-    RUNTIME_RELATION_ACCESS_BY_REVISION,
+    AUDITOR_RELATION_ACCESS,
+    AUDITOR_ROUTINE_EXECUTE,
+    DATABASE_REVISION,
+    MAINTENANCE_RELATION_ACCESS,
+    MAINTENANCE_ROUTINE_EXECUTE,
+    RUNTIME_RELATION_ACCESS,
+    RUNTIME_ROUTINE_EXECUTE,
     RelationAccess,
     RoutineAccess,
 )
@@ -194,27 +195,6 @@ def _upgrade_business_schema(dsn: str) -> None:
     config = Config(str(ALEMBIC_CONFIG_PATH))
     config.set_main_option("sqlalchemy.url", dsn.replace("%", "%%"))
     command.upgrade(config, "head")
-
-
-async def _require_empty_event_inbox_for_0004(
-    dsn: str,
-    *,
-    target_schema: str,
-) -> None:
-    """Fail closed before the policy CHECK migration scans a live Inbox."""
-
-    async with await psycopg.AsyncConnection.connect(dsn) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                sql.SQL("SELECT EXISTS (SELECT 1 FROM {}.event_inbox LIMIT 1)").format(
-                    sql.Identifier(target_schema)
-                )
-            )
-            row = await cursor.fetchone()
-    if row is None or not isinstance(row[0], bool):
-        raise RuntimeError("event_inbox_preflight_unavailable_for_0004_migration")
-    if row[0]:
-        raise RuntimeError("event_inbox_not_empty_for_0004_migration")
 
 
 async def _revoke_relation_access(
@@ -408,23 +388,13 @@ async def _apply_database_access_contract(
     business_revision: str | None = None,
 ) -> None:
     selected_revision = business_revision or await get_current_database_revision(dsn)
-    if (
-        selected_revision not in RUNTIME_RELATION_ACCESS_BY_REVISION
-        or selected_revision not in MAINTENANCE_RELATION_ACCESS_BY_REVISION
-        or selected_revision not in AUDITOR_RELATION_ACCESS_BY_REVISION
-        or selected_revision not in RUNTIME_ROUTINE_EXECUTE_BY_REVISION
-        or selected_revision not in MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION
-        or selected_revision not in AUDITOR_ROUTINE_EXECUTE_BY_REVISION
-    ):
+    if selected_revision != DATABASE_REVISION:
         raise RuntimeError("Database access contract revision is unavailable")
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
         for role, manifest in (
-            (runtime_role, RUNTIME_RELATION_ACCESS_BY_REVISION[selected_revision]),
-            (
-                maintenance_role,
-                MAINTENANCE_RELATION_ACCESS_BY_REVISION[selected_revision],
-            ),
-            (auditor_role, AUDITOR_RELATION_ACCESS_BY_REVISION[selected_revision]),
+            (runtime_role, RUNTIME_RELATION_ACCESS),
+            (maintenance_role, MAINTENANCE_RELATION_ACCESS),
+            (auditor_role, AUDITOR_RELATION_ACCESS),
         ):
             await _revoke_relation_access(
                 conn,
@@ -438,12 +408,9 @@ async def _apply_database_access_contract(
                 manifest=manifest,
             )
         routine_manifests = (
-            (runtime_role, RUNTIME_ROUTINE_EXECUTE_BY_REVISION[selected_revision]),
-            (
-                maintenance_role,
-                MAINTENANCE_ROUTINE_EXECUTE_BY_REVISION[selected_revision],
-            ),
-            (auditor_role, AUDITOR_ROUTINE_EXECUTE_BY_REVISION[selected_revision]),
+            (runtime_role, RUNTIME_ROUTINE_EXECUTE),
+            (maintenance_role, MAINTENANCE_ROUTINE_EXECUTE),
+            (auditor_role, AUDITOR_ROUTINE_EXECUTE),
         )
         await _revoke_routine_access(
             conn,
@@ -699,15 +666,9 @@ async def bootstrap_database(
     )
     _require_checkpoint_migration_manifest()
     preexisting_revision = await get_current_database_revision(dsn)
-    known_preexisting_revision = preexisting_revision in {
-        "20260710_0002",
-        "20260710_0003",
-        "20260713_0004",
-        "20260713_0005",
-        "20260716_0006",
-        "20260728_0007",
-        "20260805_0008",
-    }
+    if preexisting_revision not in {None, DATABASE_REVISION}:
+        raise RuntimeError("greenfield_database_required")
+    known_preexisting_revision = preexisting_revision == DATABASE_REVISION
     await require_database_schema_contract(
         dsn,
         target_schema=target_schema,
@@ -726,14 +687,9 @@ async def bootstrap_database(
             require_complete=True,
             expected_revision=preexisting_revision,
         )
-    if preexisting_revision == "20260710_0003":
-        await _require_empty_event_inbox_for_0004(
-            dsn,
-            target_schema=target_schema,
-        )
     await asyncio.to_thread(_upgrade_business_schema, dsn)
     business_revision = await get_current_database_revision(dsn)
-    if business_revision is None or "," in business_revision:
+    if business_revision != DATABASE_REVISION:
         raise RuntimeError("Business schema revision is unavailable after bootstrap")
     if not known_preexisting_revision:
         checkpoint_count = await _apply_checkpoint_migrations(dsn, target_schema)

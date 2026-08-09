@@ -275,7 +275,11 @@ def _render_env(values: dict[str, str]) -> str:
     return "".join(f"{key}={value}\n" for key, value in values.items())
 
 
-def configure_deployment(root: Path) -> ConfigurationResult:
+def configure_deployment(
+    root: Path,
+    *,
+    project_name: str | None = None,
+) -> ConfigurationResult:
     """Migrate a legacy `.env` and create all non-user-managed deployment state."""
 
     root = root.resolve()
@@ -396,16 +400,23 @@ def configure_deployment(root: Path) -> ConfigurationResult:
         advanced_path.unlink(missing_ok=True)
 
     project_path = secrets_dir / "compose_project_name"
-    project_name = _existing_private(project_path)
-    if project_name is None:
+    existing_project_name = _existing_private(project_path)
+    if project_name is not None:
+        if _PROJECT_NAME.fullmatch(project_name) is None:
+            raise _reject("deployment_project_name_invalid")
+        if existing_project_name != project_name:
+            _write_private(project_path, project_name)
+    elif existing_project_name is None:
         match = _PROJECT_COMMENT.search(raw_env)
-        project_name = match.group(1) if match else "ai-exchange"
+        project_name = match.group(1) if match else "ai-exchange-greenfield"
         if _PROJECT_NAME.fullmatch(project_name) is None:
             raise _reject("deployment_project_name_invalid")
         _write_private(project_path, project_name)
         generated += 1
-    elif _PROJECT_NAME.fullmatch(project_name) is None:
+    elif _PROJECT_NAME.fullmatch(existing_project_name) is None:
         raise _reject("deployment_project_name_invalid")
+    else:
+        project_name = existing_project_name
 
     user_values = {key: legacy.get(key, "") for key in USER_ENV_KEYS}
     _write_private(

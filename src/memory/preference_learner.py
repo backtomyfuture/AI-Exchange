@@ -21,6 +21,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 PREFERENCES_COLLECTION = "user_preferences"
@@ -95,6 +97,10 @@ class UserPreferenceLearner:
         Returns:
             Dict with keys ``preferences_count`` and ``stored``.
         """
+        if not _memory_learning_enabled():
+            logger.info("Preference learning skipped: Memory Learning is disabled.")
+            return {"preferences_count": 0, "stored": False, "disabled": True}
+
         modified_drafts = await self._fetch_modified_drafts(days)
         rejections = await self._fetch_rejections(days)
 
@@ -388,3 +394,7 @@ class UserPreferenceLearner:
                 type(exc).__name__,
             )
             return False
+
+
+def _memory_learning_enabled() -> bool:
+    return bool(getattr(get_settings(), "MEMORY_LEARNING_ENABLED", False))

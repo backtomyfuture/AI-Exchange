@@ -14,7 +14,6 @@ from src.safety.input_limits import (
 
 def test_input_limits_have_locked_defaults():
     assert InputLimits() == InputLimits(
-        webhook_bytes=1_048_576,
         exchange_response_bytes=67_108_864,
         body_bytes=10_485_760,
         attachment_count=20,
@@ -224,7 +223,6 @@ def test_valid_encoded_and_metadata_only_attachments_remain_compatible():
 @pytest.mark.parametrize(
     "field_name",
     [
-        "WEBHOOK_MAX_BYTES",
         "EXCHANGE_RESPONSE_MAX_BYTES",
         "EMAIL_BODY_MAX_BYTES",
         "EMAIL_ATTACHMENT_MAX_COUNT",

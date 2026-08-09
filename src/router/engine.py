@@ -1,398 +1,377 @@
+"""One canonical routing module for deterministic, historical and model tiers."""
+
+from __future__ import annotations
+
+import json
 import logging
-from collections import Counter
-from copy import deepcopy
-from typing import List, Dict, Any, Iterable, Tuple
+import re
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
 from src.config import get_settings
 from src.graph.state import AgentState
-from src.router.tier1_reflex import Tier1ReflexRouter
-from src.router.manager import get_skill_manager
-from src.safety.model_budget import (
-    ModelInputTooLarge,
-    enforce_model_input_budget,
-    token_budget_from_settings,
+from src.router.decision import (
+    DecisionOutcome,
+    RouteDecision,
+    RouteProvenance,
+    RouteTier,
 )
-from src.safety.manual_review import (
-    build_manual_review_delta,
-    manual_review_classification,
-)
+from src.router.tier1.compiler import CompiledArtifact, CompilationFailure, compile_registry
+from src.router.tier1.decision import EvaluationOutcome, build_tier1_decision
+from src.router.tier1.dsl import EmailView
+from src.router.tier1.fingerprint import compute_action_fingerprint
+from src.router.tier1.schema import CanonicalRoute, Decision
+from src.safety.model_budget import enforce_model_input_budget, token_budget_from_settings
+
 
 logger = logging.getLogger(__name__)
 
-# Tier 2 voting thresholds - tuned conservatively to avoid mis-activations.
-TIER2_MIN_HITS = 2          # Skill must appear in at least N similar past emails.
-TIER2_MIN_RATIO = 0.5       # And in at least 50% of the inspected hits.
+TIER2_MIN_HITS = 2
+TIER2_MIN_RATIO = 0.5
+_MAILBOX_ADDRESS = re.compile(r"email_address='([^']+)'", re.IGNORECASE)
+
+
+class _Tier3Result(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    route: CanonicalRoute
+    params: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason_code: str = Field(min_length=1, max_length=128)
+
+
+def _address(value: object) -> str:
+    text = str(value or "").strip()
+    match = _MAILBOX_ADDRESS.search(text)
+    return (match.group(1) if match else text).strip()
+
+
+def _addresses(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [_address(value)] if value else []
+    if not isinstance(value, Iterable) or isinstance(value, (bytes, bytearray, Mapping)):
+        return []
+    return [_address(item) for item in value if str(item or "").strip()]
+
+
+def _email_view(email: Mapping[str, Any]) -> EmailView:
+    body = str(email.get("body") or "")
+    return EmailView(
+        sender_address=_address(email.get("sender")),
+        to_addresses=_addresses(email.get("to")),
+        cc_addresses=_addresses(email.get("cc")),
+        subject=str(email.get("subject") or ""),
+        body_current_text=body,
+        body_full_text=body,
+    )
+
+
+def _classification_for(decision: RouteDecision) -> dict[str, Any]:
+    route = decision.route
+    if route is CanonicalRoute.REPLY:
+        return {"need_reply": True, "action": "reply"}
+    if route is CanonicalRoute.FORWARD:
+        return {"need_reply": True, "action": "forward"}
+    if route is CanonicalRoute.READ_ONLY:
+        return {"need_reply": False, "action": "read_only"}
+    if route is CanonicalRoute.NO_ACTION:
+        return {"need_reply": False, "action": "no_action"}
+    if route is CanonicalRoute.MANUAL_REVIEW:
+        return {"need_reply": False, "action": "manual_review"}
+    return {}
+
+
+def _decision_delta(decision: RouteDecision) -> AgentState:
+    stage = decision.provenance.tier.value
+    delta: AgentState = {
+        "route_decision": decision.model_dump(mode="json"),
+        "routing_stage": stage,
+        "routing_log": [f"{stage} route={decision.route.value if decision.route else 'abstain'}"],
+        "classification": _classification_for(decision),
+    }
+    if decision.route is CanonicalRoute.FORWARD:
+        delta["draft_to"] = list(decision.params["fixed_recipients"])
+        delta["draft_cc"] = list(decision.params.get("cc", []))
+    if decision.route is CanonicalRoute.MANUAL_REVIEW:
+        delta["next_step"] = "manual_review"
+        delta["approval_status"] = "manual_review"
+        delta["safe_error_summary"] = decision.reason_code
+    return delta
+
+
+def _default_artifact() -> CompiledArtifact:
+    settings = get_settings()
+    domains = tuple(
+        item.strip()
+        for item in str(settings.INTERNAL_EMAIL_DOMAINS or "").split(",")
+        if item.strip()
+    ) or ("tianjin-air.com", "hnair.com", "hnaaviation.com")
+    result = compile_registry(
+        "tier1_rules",
+        internal_email_domains=domains,
+        me_email=str(settings.EXCHANGE_ACCOUNT_EMAIL or "").strip()
+        or "q-fu@tianjin-air.com",
+    )
+    if isinstance(result, CompilationFailure):
+        raise RuntimeError("tier1_artifact_unavailable")
+    return result
+
 
 class RoutingEngine:
-    """
-    分层路由引擎：协调 T1, T2, T3 决策过程。
-    """
-    def __init__(self):
-        self.t1_router = Tier1ReflexRouter()
-        self.skill_manager = get_skill_manager()
+    """Deep module whose interface returns exactly one :class:`RouteDecision`."""
+
+    def __init__(
+        self,
+        *,
+        artifact: CompiledArtifact | None = None,
+        me_email: str | None = None,
+    ) -> None:
+        self.artifact = artifact or _default_artifact()
+        configured_me = str(get_settings().EXCHANGE_ACCOUNT_EMAIL or "").strip()
+        self.me_email = me_email if me_email is not None else configured_me
 
     async def execute_router(self, state: AgentState) -> AgentState:
-        """
-        执行 Tier 1 路由生命周期。
-
-        Tier 2 必须等待检索结果，Tier 3 只能在 Tier 2 未形成结论后执行；
-        两者由 ``retrieve_context`` 通过 ``apply_tier3_fallback`` 串行调用。
-        """
-        email = state.get("email", {})
-        routing_log: List[str] = list(state.get("routing_log") or [])
-        active_skills: List[str] = list(state.get("active_skills") or [])
-        existing_skills = set(active_skills)
-
-        # --- Stage 1: Tier 1 (Reflex Layer) ---
-        t1_matches = self.t1_router.route(email)
-        if t1_matches:
-            routing_log.append(f"Tier 1 Match: {t1_matches}")
-            for sid in t1_matches:
-                if sid not in existing_skills and sid not in active_skills:
-                    active_skills.append(sid)
-
-            # 立即执行匹配的 Skill 逻辑
-            state = await self._apply_skills(state, t1_matches)
-            state["routing_log"] = routing_log
-            state["active_skills"] = active_skills
-            state["routing_stage"] = "tier1"
-            return state
-
-        routing_log.append("Tier 1 No match, awaiting Tier 2")
-        state["routing_log"] = routing_log
-        state["active_skills"] = active_skills
-        state["routing_stage"] = "pending"
-        return state
-
-    def _tier2_route(
-        self,
-        hits: Iterable[Dict[str, Any]],
-        existing_skills: Iterable[str],
-        skills: Dict[str, Any] | None = None,
-        min_hits: int = TIER2_MIN_HITS,
-        min_ratio: float = TIER2_MIN_RATIO,
-    ) -> List[str]:
-        """
-        Tier 2: 基于历史 RAG hit 的标签做投票激活。
-
-        - 每条 hit 的 ``payload['active_skills']`` 视为一票。
-        - 同一邮件 (chunk 多条) 的同一标签按 ``hit['id']`` 去重，避免重复加权。
-        - 仅在某个 skill 的命中次数 >= ``min_hits`` 且占比 >= ``min_ratio`` 时激活。
-        - 已激活的 skill 不再回投。
-        - 若 ``skills`` 注册表给出，则过滤未知 ID。
-        """
-        existing = set(existing_skills or [])
-        valid_pool = set(skills.keys()) if skills else None
-
-        seen_pairs: set[Tuple[str, str]] = set()
-        skill_counter: Counter = Counter()
-        valid_emails: set[str] = set()
-
-        for hit in hits or []:
-            if not isinstance(hit, dict):
-                continue
-            email_id = str(hit.get("id") or hit.get("email_id") or "")
-            past_skills = hit.get("active_skills") or []
-            if not past_skills:
-                continue
-            valid_emails.add(email_id or id(hit))
-            for sid in past_skills:
-                if not isinstance(sid, str) or not sid:
-                    continue
-                if sid in existing:
-                    continue
-                if valid_pool is not None and sid not in valid_pool:
-                    continue
-                key = (email_id or str(id(hit)), sid)
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                skill_counter[sid] += 1
-
-        total_emails = max(1, len(valid_emails))
-        chosen: List[str] = []
-        for sid, count in skill_counter.most_common():
-            if count < min_hits:
-                continue
-            if (count / total_emails) < min_ratio:
-                continue
-            chosen.append(sid)
-        if chosen:
-            logger.info(
-                "Tier 2 activated %s from %d labelled hits (counter=%s)",
-                chosen,
-                total_emails,
-                dict(skill_counter),
+        email = state.get("email") or {}
+        tier1 = build_tier1_decision(
+            [compiled.manifest for compiled in self.artifact.rules],
+            _email_view(email),
+            me_email=self.me_email or None,
+        )
+        provenance = RouteProvenance(
+            tier=RouteTier.TIER1,
+            source_version="tier1-artifact-v1",
+            artifact_digest=self.artifact.digest,
+            rule_ids=[ref.rule_id for ref in tier1.matched_rules],
+            confidence=1.0 if tier1.outcome is EvaluationOutcome.MATCHED else None,
+        )
+        if tier1.outcome is EvaluationOutcome.ABSTAIN:
+            decision = RouteDecision(
+                outcome=DecisionOutcome.ABSTAIN,
+                route=None,
+                provenance=provenance,
             )
-        return chosen
+            return {
+                **state,
+                "route_decision": decision.model_dump(mode="json"),
+                "routing_log": [*(state.get("routing_log") or []), "tier1 route=abstain"],
+                "routing_stage": "pending",
+            }
+
+        if tier1.outcome is EvaluationOutcome.MATCHED:
+            selected = next(
+                compiled
+                for compiled in self.artifact.rules
+                if compiled.action_fingerprint == tier1.selected_action_fingerprint
+            )
+            route = selected.manifest.decision.route
+            params = selected.manifest.decision.typed_params.model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+            reason = (
+                params.get("reason_code")
+                or selected.manifest.decision.business_flow_id
+                or selected.manifest.rule_id
+            )
+            outcome = DecisionOutcome.MATCHED
+        else:
+            route = CanonicalRoute.MANUAL_REVIEW
+            params = {
+                "reason_code": (
+                    "tier1_conflict"
+                    if tier1.outcome is EvaluationOutcome.CONFLICT
+                    else "tier1_indeterminate"
+                )
+            }
+            reason = params["reason_code"]
+            outcome = (
+                DecisionOutcome.CONFLICT
+                if tier1.outcome is EvaluationOutcome.CONFLICT
+                else DecisionOutcome.ERROR
+            )
+        decision = RouteDecision(
+            outcome=outcome,
+            route=route,
+            params=params,
+            provenance=provenance,
+            reason_code=reason,
+            selected_action_fingerprint=tier1.selected_action_fingerprint,
+            candidate_actions=[
+                {
+                    "fingerprint": item.fingerprint,
+                    "rule_ids": item.rule_ids,
+                    "route": item.route.value,
+                }
+                for item in tier1.candidate_actions
+            ],
+        )
+        delta = _decision_delta(decision)
+        return {**state, **delta, "routing_log": [*(state.get("routing_log") or []), *delta["routing_log"]]}
+
+    @staticmethod
+    def _decision_from_hit(hit: Mapping[str, Any]) -> RouteDecision | None:
+        raw = hit.get("route_decision")
+        payload = hit.get("payload")
+        if raw is None and isinstance(payload, Mapping):
+            raw = payload.get("route_decision")
+        try:
+            decision = RouteDecision.model_validate(raw)
+        except Exception:
+            return None
+        if decision.outcome is not DecisionOutcome.MATCHED or decision.route is None:
+            return None
+        return decision
 
     async def apply_tier2_hits(
         self,
         state: AgentState,
-        hits: Iterable[Dict[str, Any]],
+        hits: Iterable[dict[str, Any]],
     ) -> AgentState:
-        """
-        Public Tier 2 entry called by retriever_node after Qdrant search.
-
-        Activates voted skills and runs their handlers. Returns a transient,
-        local-only outcome which retriever_node projects into bounded State.
-        """
-        skills = self.skill_manager.get_all_skills()
-        existing = state.get("active_skills") or []
-        chosen = self._tier2_route(hits, existing, skills)
-        if not chosen:
+        by_digest: dict[str, RouteDecision] = {}
+        evidence: dict[str, list[str]] = {}
+        seen: set[tuple[str, str]] = set()
+        total_ids: set[str] = set()
+        for position, hit in enumerate(hits or []):
+            if not isinstance(hit, Mapping):
+                continue
+            email_id = str(hit.get("id") or hit.get("email_id") or position)
+            total_ids.add(email_id)
+            decision = self._decision_from_hit(hit)
+            if decision is None:
+                continue
+            action = Decision(route=decision.route, params=decision.params)
+            fingerprint = compute_action_fingerprint(action)
+            if (email_id, fingerprint) in seen:
+                continue
+            seen.add((email_id, fingerprint))
+            by_digest[fingerprint] = decision
+            evidence.setdefault(fingerprint, []).append(email_id)
+        denominator = max(1, len(total_ids))
+        eligible = {
+            fingerprint: ids
+            for fingerprint, ids in evidence.items()
+            if len(ids) >= TIER2_MIN_HITS and len(ids) / denominator >= TIER2_MIN_RATIO
+        }
+        if not eligible:
             return {}
-        before = deepcopy(dict(state))
-        new_state = await self._apply_skills(before, chosen)
-        return self._project_skill_delta(
-            before,
-            new_state,
-            chosen,
-            routing_log=f"Tier 2 Match: {chosen}",
-            routing_stage="tier2",
+        if len(eligible) > 1:
+            conflict = RouteDecision(
+                outcome=DecisionOutcome.CONFLICT,
+                route=CanonicalRoute.MANUAL_REVIEW,
+                params={"reason_code": "tier2_conflict"},
+                provenance=RouteProvenance(
+                    tier=RouteTier.TIER2,
+                    source_version="routing-label-v1",
+                    evidence_ids=sorted({item for ids in eligible.values() for item in ids})[:16],
+                ),
+                reason_code="tier2_conflict",
+                candidate_actions=[{"fingerprint": fp, "evidence_ids": ids} for fp, ids in eligible.items()],
+            )
+            return _decision_delta(conflict)
+        fingerprint, ids = next(iter(eligible.items()))
+        historical = by_digest[fingerprint]
+        decision = RouteDecision(
+            outcome=DecisionOutcome.MATCHED,
+            route=historical.route,
+            params=historical.params,
+            provenance=RouteProvenance(
+                tier=RouteTier.TIER2,
+                source_version="routing-label-v1",
+                evidence_ids=ids[:16],
+                confidence=len(ids) / denominator,
+            ),
+            reason_code="historical_consensus",
+            selected_action_fingerprint=fingerprint,
         )
+        return _decision_delta(decision)
 
     async def apply_tier3_fallback(self, state: AgentState) -> AgentState:
-        """Run Tier 3 only after a completed Tier 2 miss.
-
-        This is the second public routing seam.  Keeping it separate from the
-        Tier-1 entry prevents a model call from racing ahead of historical
-        evidence and makes the call order observable in tests.
-        """
-
-        skills = self.skill_manager.get_all_skills()
-        if not skills:
-            return {
-                "routing_log": ["Tier 3 Skipped: No skills registered"],
-                "routing_stage": "none",
-            }
-        try:
-            chosen = await self._tier3_llm_route(state, skills)
-        except ModelInputTooLarge:
-            return build_manual_review_delta(
-                {},
-                "router_input_too_large",
-                classification=manual_review_classification("router_input_too_large"),
-            )
-        except Exception as exc:
-            logger.error(
-                "Tier 3 LLM routing unavailable: error_type=%s",
-                type(exc).__name__,
-            )
-            return build_manual_review_delta(
-                {},
-                "router_model_failed",
-                classification=manual_review_classification("router_model_failed"),
-            )
-        if not chosen:
-            return {
-                "routing_log": ["Tier 3 LLM No match"],
-                "routing_stage": "none",
-            }
-        before = deepcopy(dict(state))
-        new_state = await self._apply_skills(before, chosen)
-        return self._project_skill_delta(
-            before,
-            new_state,
-            chosen,
-            routing_log=f"Tier 3 LLM Match: {chosen}",
-            routing_stage="tier3",
+        email = state.get("email") or {}
+        prompt = (
+            "Classify this email into exactly one route. Return strict JSON with keys "
+            "route, params, confidence, reason_code. Routes: reply, forward, read_only, "
+            "no_action, manual_review. Forward params require fixed_recipients. "
+            f"Subject: {str(email.get('subject') or '')[:500]}\n"
+            f"Sender: {_address(email.get('sender'))[:320]}\n"
+            f"Body: {str(email.get('body') or '')[:2000]}"
         )
-
-    @staticmethod
-    def _project_skill_delta(
-        before: AgentState,
-        new_state: AgentState,
-        chosen: List[str],
-        *,
-        routing_log: str,
-        routing_stage: str,
-    ) -> AgentState:
-        """Project skill mutations into the bounded state fields owned by routing."""
-
-        delta: Dict[str, Any] = {
-            "active_skills": chosen,
-            "routing_log": [routing_log],
-            "routing_stage": routing_stage,
-        }
-        for key in (
-            "classification",
-            "metadata",
-            "system_prompt_modifier",
-            "priority_level",
-        ):
-            if key in new_state and new_state.get(key) != before.get(key):
-                delta[key] = deepcopy(new_state[key])
-
-        new_tool_calls = new_state.get("tool_calls") or []
-        old_tool_calls = before.get("tool_calls") or []
-        if len(new_tool_calls) > len(old_tool_calls):
-            delta["tool_calls"] = deepcopy(new_tool_calls[len(old_tool_calls):])
-
-        routed_email = new_state.get("email")
-        previous_email = before.get("email")
-        if isinstance(routed_email, dict):
-            previous_email = previous_email if isinstance(previous_email, dict) else {}
-            for field in ("draft_to", "draft_cc"):
-                if (
-                    field in routed_email
-                    and routed_email.get(field) != previous_email.get(field)
-                ):
-                    delta[field] = deepcopy(routed_email[field])
-        fixed_draft = new_state.get("draft")
-        if isinstance(fixed_draft, str) and fixed_draft != before.get("draft"):
-            delta["_draft_content"] = fixed_draft
-        return delta
-
-    async def _tier3_llm_route(self, state: AgentState, skills: Dict[str, Any] = None) -> List[str]:
-        """
-        Tier 3: 基于 Skill 描述的 LLM 路由。
-        根据邮件内容，让 LLM 从可用 Skill 中选择最合适的技能。
-        """
         try:
-            from src.providers.factory import get_llm_for_role
-            
-            if skills is None:
-                skills = self.skill_manager.get_all_skills()
-            if not skills:
-                return []
-            
-            skill_descriptions = []
-            for skill_id, skill in skills.items():
-                desc = getattr(skill.manifest, 'description', skill_id)
-                skill_descriptions.append(f"- {skill_id}: {desc}")
-            
-            email = state.get("email", {})
-            subject = email.get('subject', '')
-            body = email.get('body', '')[:500] if email.get('body') else ''
-            
-            prompt = f"""根据以下邮件内容，从可用技能中选择最合适的（可多选，用逗号分隔，无匹配返回 NONE）:
-
-邮件主题: {subject}
-邮件正文: {body}
-
-可用技能:
-{chr(10).join(skill_descriptions)}
-
-请只输出技能 ID，例如: skill_vip_handling, skill_project_tracker
-如果没有合适的技能，请返回: NONE"""
-
+            settings = get_settings()
             enforce_model_input_budget(
                 "router",
                 prompt,
-                budget=token_budget_from_settings(get_settings()),
+                budget=token_budget_from_settings(settings),
             )
-            llm = get_llm_for_role("router", temperature=0)
-            response = await llm.ainvoke(prompt)
-            
-            raw_content = getattr(response, "content", None)
-            if not isinstance(raw_content, str):
-                raise RuntimeError("router_schema_invalid")
-            content = raw_content.strip()
-            if content.upper() == "NONE":
-                logger.info("Tier 3 LLM: No matching skill found")
-                return []
-            if not content:
-                raise RuntimeError("router_schema_invalid")
-            
-            # 解析 LLM 返回的技能 ID 列表
-            matched_ids = [s.strip() for s in content.split(",") if s.strip()]
-            if (
-                not matched_ids
-                or any(skill_id.upper() == "NONE" for skill_id in matched_ids)
-                or any(skill_id not in skills for skill_id in matched_ids)
-            ):
-                raise RuntimeError("router_schema_invalid")
-            
-            valid_ids = list(dict.fromkeys(matched_ids))
-            logger.info("Tier 3 LLM matched skill count=%d", len(valid_ids))
-            return valid_ids
-            
-        except ModelInputTooLarge:
-            raise
+            from src.providers.factory import get_llm_for_role
+
+            response = await get_llm_for_role("router", temperature=0).ainvoke(prompt)
+            content = getattr(response, "content", None)
+            if not isinstance(content, str):
+                raise ValueError("router_schema_invalid")
+            parsed = _Tier3Result.model_validate(json.loads(content))
+            Decision(route=parsed.route, params=parsed.params)
+            decision = RouteDecision(
+                outcome=DecisionOutcome.MATCHED,
+                route=parsed.route,
+                params=parsed.params,
+                provenance=RouteProvenance(
+                    tier=RouteTier.TIER3,
+                    source_version="router-model-v1",
+                    confidence=parsed.confidence,
+                ),
+                reason_code=parsed.reason_code,
+            )
         except Exception as exc:
-            logger.error(
-                "Tier 3 LLM routing failed: error_type=%s",
-                type(exc).__name__,
+            logger.error("Tier 3 routing failed: error_type=%s", type(exc).__name__)
+            decision = RouteDecision(
+                outcome=DecisionOutcome.ERROR,
+                route=CanonicalRoute.MANUAL_REVIEW,
+                params={"reason_code": "router_model_failed"},
+                provenance=RouteProvenance(
+                    tier=RouteTier.TIER3,
+                    source_version="router-model-v1",
+                ),
+                reason_code="router_model_failed",
             )
-            raise RuntimeError("router_model_failed") from None
+        return _decision_delta(decision)
 
-    async def _apply_skills(self, state: AgentState, skill_ids: List[str]) -> AgentState:
-        """
-        执行 Skill 处理器并合并状态（使用不可变方式）
-        """
-        # 解析依赖顺序
-        from src.router.dependency import resolve_skill_order
-        
-        dependency_graph = {}
-        for sid in skill_ids:
-            skill = self.skill_manager.get_skill(sid)
-            if skill and hasattr(skill.manifest, 'depends_on') and skill.manifest.depends_on:
-                dependency_graph[sid] = skill.manifest.depends_on
-        
-        ordered_skills = resolve_skill_order(skill_ids, dependency_graph)
-        
-        # Skill handlers historically mutate nested classification/email values.
-        # A deep copy keeps those mutations local and makes before/after projection
-        # deterministic.
-        new_state = deepcopy(dict(state))
-        
-        for sid in ordered_skills:
-            skill = self.skill_manager.get_skill(sid)
-            if skill is None:
-                logger.error("Configured skill is unavailable: skill=%s", sid)
-                raise RuntimeError("router_skill_failed")
-            try:
-                candidate_state = deepcopy(new_state)
-                update = await skill.execute(candidate_state)
-                if not isinstance(update, dict):
-                    raise TypeError("invalid_skill_update")
-                # 不可变合并：创建新字典而非修改原字典
-                for key, val in update.items():
-                    if (
-                        isinstance(val, dict)
-                        and key in candidate_state
-                        and isinstance(candidate_state[key], dict)
-                    ):
-                        candidate_state[key] = {
-                            **candidate_state[key],
-                            **val,
-                        }
-                    else:
-                        candidate_state[key] = val
-                new_state = candidate_state
-                logger.info("Applied skill logic: skill=%s", sid)
-            except Exception as exc:
-                logger.error(
-                    "Skill execution failed: skill=%s error_type=%s",
-                    sid,
-                    type(exc).__name__,
-                )
-                raise RuntimeError("router_skill_failed") from None
-        return new_state
+    def dry_run(self, subject: str, sender: str, body: str = "") -> dict[str, Any]:
+        tier1 = build_tier1_decision(
+            [compiled.manifest for compiled in self.artifact.rules],
+            _email_view({"subject": subject, "sender": sender, "body": body}),
+            me_email=self.me_email or None,
+        )
+        return {
+            "artifact_digest": self.artifact.digest,
+            "outcome": tier1.outcome.value,
+            "route": tier1.route.value if tier1.route else None,
+            "matched_rule_ids": [item.rule_id for item in tier1.matched_rules],
+        }
 
 
-    def dry_run(self, subject: str, sender: str, body: str = "") -> Dict[str, Any]:
-        """Simulate routing without executing skills. Returns the decision report."""
-        email = {"subject": subject, "sender": sender, "body": body}
-        report: Dict[str, Any] = {"tier1": [], "tier3_candidates": [], "skills_available": []}
-
-        t1_matches = self.t1_router.route(email)
-        report["tier1"] = t1_matches or []
-
-        skills = self.skill_manager.get_all_skills()
-        for sid, skill in skills.items():
-            desc = getattr(skill.manifest, "description", sid)
-            report["skills_available"].append(f"{sid}: {desc}")
-
-        return report
+_routing_engine: RoutingEngine | None = None
 
 
-# 全局单例 - 避免每封邮件都重新加载 Skills 和初始化路由器
-_routing_engine = None
+def configure_routing_engine(engine: RoutingEngine) -> None:
+    global _routing_engine
+    if _routing_engine is not None:
+        raise RuntimeError("routing_engine_already_configured")
+    _routing_engine = engine
+
 
 def get_routing_engine() -> RoutingEngine:
-    """获取 RoutingEngine 全局单例"""
     global _routing_engine
     if _routing_engine is None:
         _routing_engine = RoutingEngine()
     return _routing_engine
+
+
+__all__ = [
+    "RoutingEngine",
+    "TIER2_MIN_HITS",
+    "TIER2_MIN_RATIO",
+    "configure_routing_engine",
+    "get_routing_engine",
+]

@@ -80,7 +80,7 @@ def _resolve(view: EmailView, field_name: str) -> Union[str, List[str], _Unknown
 # ---------------------------------------------------------------------------
 # $ME placeholder: an address anchor/condition value can be the literal string
 # "$ME", resolved lazily against the caller-supplied ``me_email`` at match
-# time (mirrors the legacy ``src/router/tier1_reflex.py`` behaviour). This
+# time. This
 # keeps ``EmailView``/rule manifests portable and config-independent; only the
 # evaluation entry points below accept ``me_email``. A rule that references
 # "$ME" while no ``me_email`` was supplied resolves to UNKNOWN, not a silent

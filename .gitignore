@@ -12,6 +12,7 @@ venv/
 ENV/
 .coverage*
 .pytest_cache/
+*.egg-info/
 
 # Local data (Databases)
 postgres_data/
@@ -37,6 +38,4 @@ artifacts/
 
 # Real deployment manifests and operator release metadata are local-only.
 deploy/*/
-!deploy/webhook-tls/
-!deploy/webhook-tls/nginx.conf
 deploy/*.json

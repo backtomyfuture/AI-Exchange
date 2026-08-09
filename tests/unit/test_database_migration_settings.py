@@ -252,7 +252,7 @@ def test_bootstrap_cli_uses_only_the_dedicated_migration_settings(tmp_path: Path
         expected_auditor_role="checkpoint_auditor",
         target_schema="public",
     )
-    bootstrap = AsyncMock(return_value={"alembic": "20260710_0002", "checkpoint": 9})
+    bootstrap = AsyncMock(return_value={"alembic": "20260808_0001", "checkpoint": 9})
 
     with (
         patch.object(

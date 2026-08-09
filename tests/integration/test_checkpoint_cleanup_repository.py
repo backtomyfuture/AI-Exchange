@@ -12,6 +12,7 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.db.bootstrap import bootstrap_database
+from src.db.schema import EXPECTED_DATABASE_REVISION
 from src.db.maintenance_fence import (
     CHECKPOINT_MAINTENANCE_LOCK_KEY,
     RuntimeCheckpointMaintenanceFence,
@@ -232,7 +233,7 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 
     assert [candidate.thread_id for candidate in snapshot.candidates] == ["old-sent"]
     assert snapshot.candidates[0].updated_at.tzinfo is not None
-    assert snapshot.alembic_revision == "20260805_0008"
+    assert snapshot.alembic_revision == EXPECTED_DATABASE_REVISION
     assert snapshot.checkpoint_revision == len(AsyncPostgresSaver.MIGRATIONS) - 1
     assert len(snapshot.database_fingerprint) == 64
     assert snapshot.database_timezone
@@ -244,12 +245,12 @@ async def test_scan_selects_only_strictly_old_terminal_rows(checkpoint_schema):
 @pytest.mark.parametrize(
     "revision",
     [
-        "20260710_0002",
-        "20260710_0003",
-        "20260713_0004",
-        "20260713_0005",
+        "obsolete-v1",
+        "obsolete-v2",
+        "unknown-v1",
+        "unknown-v2",
     ],
-    ids=["0002-metadata", "0003-metadata", "0004-metadata", "0005-metadata"],
+    ids=["obsolete-v1", "obsolete-v2", "unknown-v1", "unknown-v2"],
 )
 async def test_scan_rejects_predecessor_business_revisions(
     checkpoint_schema,
@@ -271,9 +272,9 @@ async def test_scan_rejects_predecessor_business_revisions(
 @pytest.mark.parametrize(
     "revisions",
     [
-        ("20260710_0001",),
-        ("20260710_9999",),
-        ("20260710_0002", "20260710_0003"),
+        ("obsolete-v0",),
+        ("unknown-v99",),
+        ("obsolete-v1", "obsolete-v2"),
     ],
     ids=["incompatible", "unknown", "multiple-heads"],
 )

@@ -6,8 +6,6 @@ It does not create backups and it does not authorize or perform deletion by itse
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import re
 from base64 import b64decode, urlsafe_b64encode
@@ -22,19 +20,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
-HMAC_BACKUP_RECEIPT_VERSION = 1
-# Backward-compatible alias for existing v1 tests and external signers.
-BACKUP_RECEIPT_VERSION = HMAC_BACKUP_RECEIPT_VERSION
 ED25519_BACKUP_RECEIPT_VERSION = 2
 ED25519_SIGNATURE_ALGORITHM = "Ed25519"
 BACKUP_RECEIPT_SCOPE = "full_database"
 BACKUP_RECEIPT_STATUS = "completed"
 MAX_BACKUP_RECEIPT_BYTES = 16 * 1024
-MIN_HMAC_KEY_BYTES = 32
 ED25519_KEY_BYTES = 32
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_HMAC_REQUIRED_FIELDS = frozenset(
+_BASE_REQUIRED_FIELDS = frozenset(
     {
         "version",
         "plan_id",
@@ -49,7 +43,7 @@ _HMAC_REQUIRED_FIELDS = frozenset(
         "signature",
     }
 )
-_ED25519_REQUIRED_FIELDS = _HMAC_REQUIRED_FIELDS | {"signature_algorithm"}
+_ED25519_REQUIRED_FIELDS = _BASE_REQUIRED_FIELDS | {"signature_algorithm"}
 _ED25519_SIGNATURE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{86}$")
 _SAFE_ERROR_CODES = frozenset(
     {
@@ -146,12 +140,6 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
             raise _DuplicateJsonKey
         result[key] = value
     return result
-
-
-def _validate_hmac_key(key: bytes) -> bytes:
-    if type(key) is not bytes or len(key) < MIN_HMAC_KEY_BYTES:
-        raise BackupReceiptError("backup_receipt_key_invalid")
-    return key
 
 
 def _validate_ed25519_key_material(key: bytes) -> bytes:
@@ -337,98 +325,6 @@ def _validate_claims(
     )
 
 
-class HmacBackupReceiptVerifier:
-    """Authenticate legacy v1 HMAC receipts for non-production compatibility."""
-
-    __slots__ = ("_key",)
-
-    def __init__(self, key: bytes) -> None:
-        self._key = _validate_hmac_key(key)
-
-    def verify(
-        self,
-        receipt: str | bytes,
-        *,
-        expected_plan_id: str,
-        expected_database_fingerprint: str,
-        expected_alembic_revision: str,
-        expected_checkpoint_revision: int,
-        plan_created_at: datetime,
-    ) -> VerifiedBackupReceipt:
-        expected_plan = _validate_digest(
-            expected_plan_id,
-            "backup_receipt_plan_invalid",
-        )
-        expected_database = _validate_digest(
-            expected_database_fingerprint,
-            "backup_receipt_database_invalid",
-        )
-        expected_alembic = _validate_identifier(
-            expected_alembic_revision,
-            "backup_receipt_alembic_revision_invalid",
-        )
-        expected_checkpoint = _validate_checkpoint_revision(
-            expected_checkpoint_revision
-        )
-        created_at = _require_aware_utc(
-            plan_created_at,
-            "backup_receipt_plan_created_at_invalid",
-        )
-
-        payload, raw = _parse_receipt(receipt)
-        (
-            plan_id,
-            database_fingerprint,
-            alembic_revision,
-            checkpoint_revision,
-            backup_id,
-            completed_at,
-            manifest_sha256,
-            signature,
-        ) = _validate_claims(
-            payload,
-            expected_version=BACKUP_RECEIPT_VERSION,
-            required_fields=_HMAC_REQUIRED_FIELDS,
-        )
-
-        if raw != _canonical_json(payload):
-            raise BackupReceiptError("backup_receipt_not_canonical")
-
-        unsigned_payload = dict(payload)
-        del unsigned_payload["signature"]
-        expected_signature = hmac.new(
-            self._key,
-            _canonical_json(unsigned_payload),
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(signature, expected_signature):
-            raise BackupReceiptError("backup_receipt_signature_invalid")
-
-        if plan_id != expected_plan:
-            raise BackupReceiptError("backup_receipt_plan_mismatch")
-        if database_fingerprint != expected_database:
-            raise BackupReceiptError("backup_receipt_database_mismatch")
-        if alembic_revision != expected_alembic:
-            raise BackupReceiptError("backup_receipt_alembic_revision_mismatch")
-        if checkpoint_revision != expected_checkpoint:
-            raise BackupReceiptError("backup_receipt_checkpoint_revision_mismatch")
-        if completed_at < created_at:
-            raise BackupReceiptError("backup_receipt_completed_before_plan")
-
-        return VerifiedBackupReceipt(
-            version=BACKUP_RECEIPT_VERSION,
-            plan_id=plan_id,
-            database_fingerprint=database_fingerprint,
-            alembic_revision=alembic_revision,
-            checkpoint_revision=checkpoint_revision,
-            backup_id=backup_id,
-            completed_at=completed_at,
-            scope=BACKUP_RECEIPT_SCOPE,
-            manifest_sha256=manifest_sha256,
-            status=BACKUP_RECEIPT_STATUS,
-        )
-
-
 class Ed25519BackupReceiptVerifier:
     """Authenticate v2 receipts with an external signer's Ed25519 public key."""
 
@@ -522,64 +418,6 @@ class Ed25519BackupReceiptVerifier:
             manifest_sha256=manifest_sha256,
             status=BACKUP_RECEIPT_STATUS,
         )
-
-
-def create_signed_backup_receipt(
-    *,
-    key: bytes,
-    plan_id: str,
-    database_fingerprint: str,
-    alembic_revision: str,
-    checkpoint_revision: int,
-    backup_id: str,
-    completed_at: datetime,
-    manifest_sha256: str,
-) -> str:
-    """Create a legacy v1 HMAC receipt for compatibility and tests.
-
-    This pure helper signs caller-supplied backup facts. It performs no I/O and
-    deliberately has no capability to create or inspect a database backup. New
-    production integrations must use the Ed25519 v2 signer/verifier boundary.
-    """
-
-    signing_key = _validate_hmac_key(key)
-    validated_plan_id = _validate_digest(plan_id, "backup_receipt_plan_invalid")
-    validated_database = _validate_digest(
-        database_fingerprint,
-        "backup_receipt_database_invalid",
-    )
-    validated_alembic = _validate_identifier(
-        alembic_revision,
-        "backup_receipt_alembic_revision_invalid",
-    )
-    validated_checkpoint = _validate_checkpoint_revision(checkpoint_revision)
-    validated_backup_id = _validate_identifier(
-        backup_id,
-        "backup_receipt_backup_id_invalid",
-    )
-    if not isinstance(manifest_sha256, str) or not _SHA256_PATTERN.fullmatch(
-        manifest_sha256
-    ):
-        raise BackupReceiptError("backup_receipt_manifest_invalid")
-
-    payload: dict[str, object] = {
-        "version": BACKUP_RECEIPT_VERSION,
-        "plan_id": validated_plan_id,
-        "database_fingerprint": validated_database,
-        "alembic_revision": validated_alembic,
-        "checkpoint_revision": validated_checkpoint,
-        "backup_id": validated_backup_id,
-        "completed_at": _format_utc_timestamp(completed_at),
-        "scope": BACKUP_RECEIPT_SCOPE,
-        "manifest_sha256": manifest_sha256,
-        "status": BACKUP_RECEIPT_STATUS,
-    }
-    payload["signature"] = hmac.new(
-        signing_key,
-        _canonical_json(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    return _canonical_json(payload).decode("utf-8")
 
 
 def create_ed25519_signed_backup_receipt(

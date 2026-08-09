@@ -1,4 +1,4 @@
-"""One-shot PostgreSQL cluster provisioning for a fresh Phase4-Lite deployment.
+"""One-shot PostgreSQL cluster provisioning for a fresh polling deployment.
 
 This is deliberately separate from schema bootstrap.  It is the only container
 that receives the PostgreSQL administrator credential and it refuses to operate
