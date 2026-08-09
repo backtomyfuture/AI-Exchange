@@ -44,7 +44,7 @@ from src.safety.approval_claim import (
 )
 from src.safety.input_limits import input_limits_from_settings
 from src.safety.manual_review import build_manual_review_delta
-from src.safety.recipients import normalize_recipient_address
+from src.safety.recipients import resolve_recipients
 from src.security.auth import is_lark_operator_allowed
 from src.security.redaction import fingerprint_identifier
 from src.utils.lark_recipient_editor import (
@@ -1954,63 +1954,17 @@ async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -
     if not isinstance(draft, str) or not draft.strip():
         return await fail_closed("empty_draft")
 
-    from lark_oapi.api.contact.v3 import GetUserRequest
-
-    async def resolve_recipient(recipient: object) -> str | None:
-        if recipient is None:
-            return None
-        value = str(recipient).strip()
-        if "open_id=" in value:
-            open_id = value.replace("open_id=", "").strip()
-            if not open_id or not lark_api_client:
-                return None
-            try:
-                request = (
-                    GetUserRequest.builder()
-                    .user_id(open_id)
-                    .user_id_type("open_id")
-                    .build()
-                )
-                response = await asyncio.to_thread(
-                    lark_api_client.contact.v3.user.get,
-                    request,
-                )
-                if response.success() and response.data and response.data.user:
-                    resolved = (
-                        response.data.user.enterprise_email
-                        or response.data.user.email
-                    )
-                    return normalize_recipient_address(resolved)
-            except Exception as exc:
-                logger.error(
-                    "Draft recipient resolution failed: error_type=%s",
-                    type(exc).__name__,
-                )
-            return None
-        if "email_address=" in value:
-            match = re.search(r"email_address=['\"](.*?)['\"]", value)
-            return (
-                normalize_recipient_address(match.group(1))
-                if match
-                else None
-            )
-        return normalize_recipient_address(value)
-
     raw_to = state.values.get("draft_to") or []
     raw_cc = state.values.get("draft_cc") or []
-    if not isinstance(raw_to, (list, tuple)) or not isinstance(
+    resolved = await resolve_recipients(
+        raw_to,
         raw_cc,
-        (list, tuple),
-    ):
+        lark_client=lark_api_client,
+    )
+    if resolved is None:
         return await fail_closed("recipient_resolution_failed")
-    final_to = [await resolve_recipient(recipient) for recipient in raw_to]
-    final_cc = [await resolve_recipient(recipient) for recipient in raw_cc]
-    if (
-        not final_to
-        or any(recipient is None for recipient in final_to)
-        or any(recipient is None for recipient in final_cc)
-    ):
-        return await fail_closed("recipient_resolution_failed")
+    final_to = list(resolved.to)
+    final_cc = list(resolved.cc)
 
     subject = "Re: " + str(email_data.get("subject", ""))
     body = draft + "<br><br>--<br>AI Generated Draft"

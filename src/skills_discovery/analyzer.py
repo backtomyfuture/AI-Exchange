@@ -17,6 +17,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.skills_discovery.declarative import candidate_is_runtime_executable
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +58,6 @@ class DiscoveredPattern:
     sample_count: int = 0
     suggested_priority: str = "P2"
     suggested_need_reply: bool = True
-    suggested_tone: str = ""
     example_subjects: list[str] = field(default_factory=list)
     example_senders: list[str] = field(default_factory=list)
     confidence: float = 0.0
@@ -80,6 +81,21 @@ class EmailRecord:
     body_preview: str = ""
     in_reply_to: str = ""
     thread_id: str = ""
+
+
+def retain_runtime_candidates(
+    patterns: list[DiscoveredPattern],
+) -> list[DiscoveredPattern]:
+    """Keep only patterns that the current declarative Tier 1 matcher can compile."""
+    executable: list[DiscoveredPattern] = []
+    for pattern in patterns:
+        if not candidate_is_runtime_executable(pattern):
+            logger.info(
+                "Dropped non-executable discovery candidate",
+            )
+            continue
+        executable.append(pattern)
+    return executable
 
 
 class EmailHistoryCollector:
@@ -561,10 +577,9 @@ class PatternAnalyzer:
 7. **sample_count**: 匹配该模式的邮件数量
 8. **suggested_priority**: 建议的优先级 (P0/P1/P2/P3)
 9. **suggested_need_reply**: 是否需要回复 (true/false)
-10. **suggested_tone**: 建议的回复语气 (可选)
-11. **example_subjects**: 2-3 个匹配该模式的示例主题
-12. **suggested_action**: 可选；历史记录显示呈阅/转发行为时填写 "forward"。允许提出可能有价值的推测，因为候选不会自动启用，操作者会逐项确认或修改。
-13. **suggested_forward_to**: 可选；仅当 suggested_action 为 "forward" 时填写推测或观察到的固定收件人邮箱数组。它只是待确认建议，不要把它表述为已获批准。
+10. **example_subjects**: 2-3 个匹配该模式的示例主题
+11. **suggested_action**: 可选；历史记录显示呈阅/转发行为时填写 "forward"。允许提出可能有价值的推测，因为候选不会自动启用，操作者会逐项确认或修改。
+12. **suggested_forward_to**: 可选；仅当 suggested_action 为 "forward" 时填写推测或观察到的固定收件人邮箱数组。它只是待确认建议，不要把它表述为已获批准。
 
 请以 JSON 数组格式输出，不要包含其他内容。"""
 
@@ -643,14 +658,13 @@ class PatternAnalyzer:
                 sample_count=max(0, int(self._as_float(item.get("sample_count", 0)))),
                 suggested_priority=item.get("suggested_priority", "P2"),
                 suggested_need_reply=self._as_bool(item.get("suggested_need_reply", True)),
-                suggested_tone=item.get("suggested_tone", ""),
                 example_subjects=self._as_string_list(item.get("example_subjects", [])),
                 example_senders=self._as_string_list(item.get("example_senders", [])),
                 confidence=min(1.0, self._as_float(item.get("sample_count", 0)) / 10),
                 suggested_action=suggested_action,
                 suggested_forward_to=forward_to,
             ))
-        return patterns
+        return retain_runtime_candidates(patterns)
 
     @staticmethod
     def _as_float(value: Any) -> float:
@@ -913,4 +927,4 @@ class PatternAnalyzer:
                 example_subjects=[t["subject"] for t in high_depth[:3]],
             ))
 
-        return patterns
+        return retain_runtime_candidates(patterns)

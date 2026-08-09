@@ -29,6 +29,7 @@ from src.router.tier1.dsl import (
     normalize_address,
 )
 from src.router.tier1.fingerprint import FINGERPRINT_VERSION, compute_action_fingerprint
+from src.router.tier1.validity import parse_validity_timestamp
 from src.router.tier1.schema import (
     SCHEMA_VERSION,
     AnchorGroup,
@@ -95,16 +96,7 @@ def _canonical_json(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
-def _parse_validity_timestamp(value: Optional[str], *, field_name: str) -> Optional[datetime]:
-    if value is None:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        raise ValueError(f"{field_name}_invalid") from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+_parse_validity_timestamp = parse_validity_timestamp
 
 
 def _check_validity(

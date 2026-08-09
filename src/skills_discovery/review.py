@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -20,7 +21,9 @@ from typing import Any, Mapping, Sequence
 from src.router.tier1.dsl import EmailView, RuleEvalStatus, evaluate_match
 from src.router.tier1.schema import AnchorGroup, ConditionNode
 from src.skills_discovery.analyzer import DiscoveredPattern, EmailRecord, PatternAnalyzer
-from src.skills_discovery.declarative import candidate_match
+from src.skills_discovery.declarative import candidate_is_runtime_executable, candidate_match
+
+logger = logging.getLogger(__name__)
 
 REVIEW_SCHEMA_VERSION = 1
 VALID_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
@@ -39,7 +42,6 @@ EDITABLE_CANDIDATE_FIELDS = frozenset({
     "condition_logic",
     "suggested_priority",
     "suggested_need_reply",
-    "suggested_tone",
     "suggested_action",
     "suggested_forward_to",
 })
@@ -133,7 +135,6 @@ class CandidateReviewItem:
     condition_logic: str
     suggested_priority: str
     suggested_need_reply: bool
-    suggested_tone: str
     suggested_action: str | None
     suggested_forward_to: list[str]
     discovery_reply_rate: float
@@ -161,7 +162,6 @@ class CandidateReviewItem:
             condition_logic=pattern.condition_logic,
             suggested_priority=pattern.suggested_priority,
             suggested_need_reply=pattern.suggested_need_reply,
-            suggested_tone=pattern.suggested_tone,
             suggested_action=pattern.suggested_action,
             suggested_forward_to=list(pattern.suggested_forward_to),
             discovery_reply_rate=pattern.reply_rate,
@@ -183,7 +183,6 @@ class CandidateReviewItem:
             sample_count=self.discovery_sample_count,
             suggested_priority=self.suggested_priority,
             suggested_need_reply=self.suggested_need_reply,
-            suggested_tone=self.suggested_tone,
             example_subjects=list(self.example_subjects),
             example_senders=list(self.example_senders),
             confidence=self.confidence,
@@ -225,7 +224,6 @@ class CandidateReviewItem:
                 condition_logic=str(value.get("condition_logic", "and")),
                 suggested_priority=str(value.get("suggested_priority", "P2")),
                 suggested_need_reply=bool(value.get("suggested_need_reply", True)),
-                suggested_tone=str(value.get("suggested_tone", "")),
                 suggested_action=(
                     str(value["suggested_action"])
                     if value.get("suggested_action") is not None
@@ -406,11 +404,6 @@ def validate_candidate_for_promotion(candidate: CandidateReviewItem) -> list[str
             issues.extend(_validate_condition(condition, index))
     if not isinstance(candidate.suggested_need_reply, bool):
         issues.append("是否需要回复必须为布尔值")
-    if not isinstance(candidate.suggested_tone, str):
-        issues.append("语气指令必须为文本")
-    elif len(candidate.suggested_tone) > 500:
-        issues.append("语气指令不能超过 500 个字符")
-
     action = candidate.suggested_action
     if action is not None and not isinstance(action, str):
         issues.append("声明式动作必须是文本")
@@ -467,6 +460,11 @@ def create_candidate_review(
     """Create a durable, read-only review artifact for discovered patterns."""
     candidates = []
     for pattern in patterns:
+        if not candidate_is_runtime_executable(pattern):
+            logger.info(
+                "Skipped non-executable discovery candidate",
+            )
+            continue
         provisional = CandidateReviewItem.from_pattern(
             pattern,
             validation=TimeSplitValidation(0, 0, 0, None),
@@ -601,7 +599,6 @@ def render_review(review: CandidateReview) -> str:
                 "建议结果："
                 f"优先级={candidate.suggested_priority}，"
                 f"需要回复={candidate.suggested_need_reply}，"
-                f"语气={candidate.suggested_tone or '无'}，"
                 f"动作={candidate.suggested_action or '无'}，"
                 f"固定收件人={candidate.suggested_forward_to or '无'}"
             ),

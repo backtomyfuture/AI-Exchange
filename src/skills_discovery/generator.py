@@ -48,7 +48,6 @@ def _as_candidate(pattern: DiscoveredPattern, skill_id: str) -> CandidateReviewI
         condition_logic=pattern.condition_logic,
         suggested_priority=pattern.suggested_priority,
         suggested_need_reply=pattern.suggested_need_reply,
-        suggested_tone=pattern.suggested_tone,
         suggested_action=pattern.suggested_action,
         suggested_forward_to=list(pattern.suggested_forward_to),
         discovery_reply_rate=pattern.reply_rate,

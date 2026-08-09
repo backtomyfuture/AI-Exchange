@@ -6,12 +6,14 @@ Tier 1) — see the design doc §2.2 for why the two must not be merged.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
 from src.router.tier1.dsl import EmailView, RuleEvalStatus, evaluate_match
 from src.router.tier1.fingerprint import compute_action_fingerprint
 from src.router.tier1.schema import CanonicalRoute, RuleManifest
+from src.router.tier1.validity import is_rule_active
 
 
 class EvaluationOutcome(str, Enum):
@@ -60,20 +62,27 @@ def evaluate_rule(rule: RuleManifest, view: EmailView, *, me_email: Optional[str
 
 
 def build_tier1_decision(
-    rules: List[RuleManifest], view: EmailView, *, me_email: Optional[str] = None
+    rules: List[RuleManifest],
+    view: EmailView,
+    *,
+    me_email: Optional[str] = None,
+    decision_time: Optional[datetime] = None,
 ) -> Tier1Decision:
     """Evaluate every rule in ``rules`` against ``view`` and aggregate per the
     invariants table in design doc §2.2.
 
-    Callers must pass only the currently activated (already atomically
-    compiled) ``enabled`` ruleset — this function performs no lifecycle or
-    activation filtering of its own. ``me_email`` resolves any ``$ME``
-    placeholder referenced by a rule's anchor/conditions (design doc's
-    identity-dependent rules, e.g. "I am a direct recipient").
+    The caller supplies one ``decision_time`` for the email. Lifecycle
+    eligibility is evaluated here so a long-lived process stops using an
+    expired rule without reloading its immutable artifact. ``me_email``
+    resolves any ``$ME`` placeholder referenced by a rule's anchor/conditions
+    (design doc's identity-dependent rules, e.g. "I am a direct recipient").
     """
+    current_time = decision_time or datetime.now(UTC)
     matched: List[RuleManifest] = []
     indeterminate: List[RuleManifest] = []
     for rule in rules:
+        if not is_rule_active(rule, current_time):
+            continue
         status = evaluate_rule(rule, view, me_email=me_email)
         if status is RuleEvalStatus.MATCHED:
             matched.append(rule)

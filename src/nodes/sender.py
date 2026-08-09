@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Sequence
 
 from langchain_core.runnables import RunnableConfig
@@ -18,7 +17,7 @@ from src.safety.approval_claim import (
     move_to_manual_review,
 )
 from src.safety.manual_review import build_manual_review_delta
-from src.safety.recipients import normalize_recipient_address
+from src.safety.recipients import resolve_recipients
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +35,6 @@ async def send_final_email(
     del config
     if state.get("approval_status", "pending") != "approved":
         return sanitize_graph_delta(state, {"next_step": "approval"})
-
-    from lark_oapi.api.contact.v3 import GetUserRequest
 
     from src.init_app import get_app_context
     import src.utils.lark_app as lark_app
@@ -82,78 +79,18 @@ async def send_final_email(
     if not isinstance(draft, str) or not draft.strip():
         return await fail_before_send("empty_draft")
 
-    async def resolve_recipient(recipient: object) -> str | None:
-        if recipient is None:
-            return None
-        try:
-            value = str(recipient).strip()
-        except Exception as exc:
-            logger.error(
-                "Recipient conversion failed: error_type=%s",
-                type(exc).__name__,
-            )
-            return None
-        if not value:
-            return None
-        if "open_id=" in value:
-            open_id = value.replace("open_id=", "").strip()
-            client = lark_app.lark_api_client
-            if not open_id or not client:
-                logger.warning("Lark recipient resolution unavailable")
-                return None
-            try:
-                request = (
-                    GetUserRequest.builder()
-                    .user_id(open_id)
-                    .user_id_type("open_id")
-                    .build()
-                )
-                response = await asyncio.to_thread(
-                    client.contact.v3.user.get,
-                    request,
-                )
-                if response.success() and response.data and response.data.user:
-                    resolved = (
-                        response.data.user.enterprise_email
-                        or response.data.user.email
-                    )
-                    return normalize_recipient_address(resolved)
-                logger.warning("Lark recipient resolution returned no email")
-                return None
-            except Exception as exc:
-                logger.error(
-                    "Lark recipient resolution failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                return None
-
-        if "email_address=" in value:
-            match = re.search(r"email_address=['\"](.*?)['\"]", value)
-            if not match or not match.group(1).strip():
-                return None
-            return normalize_recipient_address(match.group(1))
-        return normalize_recipient_address(value)
-
     raw_to = state.get("draft_to") or []
     raw_cc = state.get("draft_cc") or []
-    if not isinstance(raw_to, Sequence) or isinstance(raw_to, (str, bytes)):
-        return await fail_before_send("recipient_resolution_failed")
-    if not isinstance(raw_cc, Sequence) or isinstance(raw_cc, (str, bytes)):
-        return await fail_before_send("recipient_resolution_failed")
-
-    resolved_to = [await resolve_recipient(recipient) for recipient in raw_to]
-    resolved_cc = [await resolve_recipient(recipient) for recipient in raw_cc]
-    if (
-        not resolved_to
-        or any(recipient is None for recipient in resolved_to)
-        or any(recipient is None for recipient in resolved_cc)
-    ):
+    resolved = await resolve_recipients(
+        raw_to,
+        raw_cc,
+        lark_client=lark_app.lark_api_client,
+    )
+    if resolved is None:
         return await fail_before_send("recipient_resolution_failed")
 
-    final_to = _deduplicate([recipient for recipient in resolved_to if recipient])
-    final_cc = _deduplicate([recipient for recipient in resolved_cc if recipient])
-    if not final_to:
-        return await fail_before_send("recipient_resolution_failed")
+    final_to = list(resolved.to)
+    final_cc = list(resolved.cc)
 
     action = (state.get("classification") or {}).get("action", "reply")
     if action not in {"reply", "forward"}:

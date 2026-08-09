@@ -1,18 +1,27 @@
 """Tier 1 decision aggregation tests (docs/tier1-routing-design.md §2.2)."""
+from datetime import UTC, datetime
+
 from src.router.tier1.decision import DecisionOrigin, EvaluationOutcome, build_tier1_decision
 from src.router.tier1.dsl import UNKNOWN, EmailView
 from src.router.tier1.schema import CanonicalRoute, RuleManifest
 
 
-def _rule(rule_id, sender, route="read_only", params=None, business_flow_id=None):
+def _rule(
+    rule_id,
+    sender,
+    route="read_only",
+    params=None,
+    business_flow_id=None,
+    validity=None,
+):
     governance = {"positive_cases": [{"case_id": "p1", "email": {"sender": {"address": sender}}}]}
-    validity = {}
+    validity = dict(validity or {})
     if route == "no_action":
         governance["negative_cases"] = [
             {"case_id": "n1", "email": {"sender": {"address": "other1@example.com"}}},
             {"case_id": "n2", "email": {"sender": {"address": "other2@example.com"}}},
         ]
-        validity["expires_at"] = "2099-01-01"
+        validity.setdefault("expires_at", "2099-01-01")
     payload = {
         "rule_id": rule_id,
         "rule_version": 1,
@@ -132,3 +141,40 @@ def test_me_placeholder_threaded_through_to_dsl():
     # not a silent NOT_MATCHED/ABSTAIN.
     decision_no_me = build_tier1_decision([rule], view_direct)
     assert decision_no_me.outcome is EvaluationOutcome.ERROR
+
+
+def test_rule_is_not_active_before_effective_from():
+    rule = _rule(
+        "RULE-D-011",
+        "future@example.com",
+        validity={"effective_from": "2026-08-10T00:00:00Z"},
+    )
+    decision = build_tier1_decision(
+        [rule],
+        EmailView(sender_address="future@example.com"),
+        decision_time=datetime(2026, 8, 9, 23, 59, tzinfo=UTC),
+    )
+    assert decision.outcome is EvaluationOutcome.ABSTAIN
+
+
+def test_rule_stops_matching_at_expiry_without_reloading_rules():
+    rule = _rule(
+        "RULE-D-012",
+        "expiring@example.com",
+        validity={"expires_at": "2026-08-10T00:00:00Z"},
+    )
+    view = EmailView(sender_address="expiring@example.com")
+
+    before_expiry = build_tier1_decision(
+        [rule],
+        view,
+        decision_time=datetime(2026, 8, 9, 23, 59, 59, tzinfo=UTC),
+    )
+    at_expiry = build_tier1_decision(
+        [rule],
+        view,
+        decision_time=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+
+    assert before_expiry.outcome is EvaluationOutcome.MATCHED
+    assert at_expiry.outcome is EvaluationOutcome.ABSTAIN
