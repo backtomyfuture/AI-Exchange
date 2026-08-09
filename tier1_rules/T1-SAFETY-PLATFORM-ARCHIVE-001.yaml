@@ -1,6 +1,6 @@
 schema_version: 1
 rule_id: T1-SAFETY-PLATFORM-ARCHIVE-001
-rule_version: 1
+rule_version: 2
 status: enabled
 owner: mailbox-owner
 purpose: >
@@ -13,7 +13,7 @@ purpose: >
 
 validity:
   effective_from: "2025-01-01T00:00:00Z"
-  expires_at: "2026-06-01T00:00:00Z"
+  expires_at: "2027-02-05T00:00:00Z"
 
 match:
   anchor:
@@ -30,6 +30,7 @@ decision:
 
 governance:
   criticality: P3
+  owner_reviewed_at: "2026-08-09T00:00:00Z"
   positive_cases:
     - case_id: from-safety-platform
       email:

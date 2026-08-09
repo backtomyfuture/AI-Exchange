@@ -24,7 +24,7 @@ An explicitly enabled, operator-initiated analysis that derives Preference Memor
 _Avoid_: Automatic adaptation, implicit profiling
 
 **Discovered Skill Candidate**:
-A proposed Declarative Tier 1 Skill inferred from Historical Email, which may include a proposed forward action and fixed recipient. It remains outside `skills_registry` and does not participate in email processing until manually promoted.
+A proposed Declarative Tier 1 Skill inferred from Historical Email, which may include a proposed forward action and fixed recipient. It remains outside `tier1_rules` and does not participate in email processing until manually promoted.
 _Avoid_: Enabled Skill, automatic rule
 
 **Time-Split Validation**:
@@ -56,7 +56,7 @@ An operator's explicit selection of a reviewed, time-split-validated Discovered 
 _Avoid_: Auto-confirmation, discovery run, separate promotion CLI
 
 **Skill Promotion Conflict**:
-A promotion attempt whose target skill ID already exists in `skills_registry`. It stops and is shown to the operator; it never overwrites or merges the existing rule automatically.
+A promotion attempt whose target rule ID already exists in `tier1_rules`. It stops and is shown to the operator; it never overwrites or merges the existing rule automatically.
 _Avoid_: Silent overwrite, automatic merge
 
 **Skill Activation**:

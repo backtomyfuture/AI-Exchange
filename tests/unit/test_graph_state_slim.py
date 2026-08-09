@@ -196,7 +196,6 @@ def test_graph_delta_caps_model_values_and_rejects_oversized_human_values():
                 "unknown": "drop-me",
             },
             "routing_log": ["route" * 1_000] * 100,
-            "active_skills": ["skill" * 100] * 100,
             "draft_to": [f"recipient-{i}@example.com" for i in range(10)],
             "metadata": {
                 "review_count": 1,
@@ -215,14 +214,12 @@ def test_graph_delta_caps_model_values_and_rejects_oversized_human_values():
     assert set(delta) == {
         "classification",
         "routing_log",
-        "active_skills",
         "draft_to",
         "metadata",
     }
     assert len(delta["classification"]["summary"].encode("utf-8")) <= 512
     assert len(delta["classification"]["reasoning"].encode("utf-8")) <= 512
     assert len(delta["routing_log"]) <= 8
-    assert len(delta["active_skills"]) <= 16
     assert len(delta["draft_to"]) <= 10
     assert set(delta["metadata"]) == {
         "review_count",

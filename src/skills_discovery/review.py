@@ -3,7 +3,8 @@
 Discovery is deliberately a read-only operation.  This module persists a local
 review artifact so an operator can inspect and edit the proposed declarative
 rule in a conversation before the separate *implementation API* writes it into
-``skills_registry``.  It never loads, reloads, or sends anything itself.
+the production ``tier1_rules`` directory. It never loads, reloads, or sends
+anything itself.
 """
 
 from __future__ import annotations
@@ -16,16 +17,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from src.router.tier1_reflex import (
-    SUPPORTED_CONDITION_OPERATORS,
-    SUPPORTED_CONDITION_TYPES,
-    conditions_match_email,
-)
+from src.router.tier1.dsl import EmailView, RuleEvalStatus, evaluate_match
+from src.router.tier1.schema import AnchorGroup, ConditionNode
 from src.skills_discovery.analyzer import DiscoveredPattern, EmailRecord, PatternAnalyzer
+from src.skills_discovery.declarative import candidate_match
 
 REVIEW_SCHEMA_VERSION = 1
 VALID_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
 VALID_ACTIONS = frozenset({"forward"})
+SUPPORTED_CONDITION_TYPES = frozenset(
+    {"sender_match", "to_match", "cc_match", "subject_match", "body_match"}
+)
+SUPPORTED_CONDITION_OPERATORS = frozenset({"eq", "contains", "regex", "in"})
 _SKILL_ID_RE = re.compile(r"^skill_[a-z0-9][a-z0-9_]{0,79}$")
 EDITABLE_CANDIDATE_FIELDS = frozenset({
     "skill_id",
@@ -53,7 +56,7 @@ class CandidateSelectionError(CandidateReviewError):
 def suggested_skill_id(name: str) -> str:
     """Create a stable, readable default target ID for a candidate.
 
-    The legacy generator used Python's process-randomized ``hash()``, which
+    Earlier prototypes used Python's process-randomized ``hash()``, which
     made non-ASCII target IDs change across runs.  A short SHA-256 suffix gives
     repeatable collision resistance while leaving ASCII names recognizable.
     """
@@ -309,16 +312,34 @@ def replay_candidate(
     """Replay a candidate over the newest held-out records using live matcher code."""
     analyzer = PatternAnalyzer(list(validation_records), my_email=my_email)
     received = [record for record in validation_records if record.message_type != "sent"]
-    matches = [
-        record
-        for record in received
-        if conditions_match_email(
-            _record_email(record),
-            candidate.conditions,
-            candidate.condition_logic,
-            me_email=my_email or None,
+    try:
+        anchor_raw, conditions_raw = candidate_match(candidate)
+        anchor = AnchorGroup.model_validate(anchor_raw)
+        conditions = (
+            ConditionNode.model_validate(conditions_raw)
+            if conditions_raw is not None
+            else None
         )
-    ]
+    except Exception:
+        matches = []
+    else:
+        matches = []
+        for record in received:
+            view = EmailView(
+                sender_address=record.sender,
+                to_addresses=list(record.to),
+                cc_addresses=list(record.cc),
+                subject=record.subject,
+                body_current_text=record.body_preview,
+                body_full_text=record.body_preview,
+            )
+            if evaluate_match(
+                anchor,
+                conditions,
+                view,
+                me_email=my_email or None,
+            ) is RuleEvalStatus.MATCHED:
+                matches.append(record)
     replied_count = sum(1 for record in matches if analyzer.was_replied(record))
     return TimeSplitValidation(
         held_out_records=len(validation_records),
@@ -420,6 +441,18 @@ def validate_candidate_for_promotion(candidate: CandidateReviewItem) -> list[str
         ):
             issues.append("固定收件人必须是长度不超过 320 字节的非空文本")
             break
+        if "@" not in recipient or any(character in recipient for character in "*?"):
+            issues.append("固定收件人必须是精确邮箱地址")
+            break
+    try:
+        candidate_match(candidate)
+    except ValueError as exc:
+        code = str(exc)
+        messages = {
+            "candidate_anchor_required": "至少需要一个精确地址锚点",
+            "candidate_mixed_or_unsupported": "地址锚点与正文条件不能使用 or 混合",
+        }
+        issues.append(messages.get(code, f"候选无法转换为 Tier1 v1: {code}"))
     return issues
 
 

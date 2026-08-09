@@ -1,14 +1,10 @@
 """Tier 1 v1 rule manifest schema.
 
-Strict, versioned pydantic models for the declarative Tier 1 registry defined in
-``docs/tier1-routing-design.md``. This schema is independent from the legacy
-``src/router/base.py`` manifest (``SkillTrigger``/``AutoOutcome``) used by the
-currently running production router; the two coexist until the 31 frozen
-``skills_registry/`` candidates are individually migrated (see
-``docs/tier1-routing-design.md`` §10).
+Strict, versioned pydantic models for the sole declarative Tier 1 registry
+defined in ``docs/tier1-routing-design.md``.
 
 ``model_config = ConfigDict(extra="forbid")`` on every model enforces §9 of the
-design doc: an unknown or legacy field (``need_reply``, ``card_type``,
+design doc: an unknown or retired field (``need_reply``, ``card_type``,
 ``priority``, ``action``, ``forward_to``, ``tone_instruction``, ...) fails
 validation loudly instead of being silently ignored.
 """

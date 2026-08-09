@@ -41,6 +41,6 @@ business-namespaced `reason_code`, kept separate from the existing system
 activation, plus the normal Git/PR review of that YAML change — no new database
 approval-record table. This version does not introduce a directory-backed identity
 resolver, an Intake Guard detection layer, a card drill-down viewer, or a new
-per-message routing-audit table; those remain explicitly deferred, and the 31 existing
-`skills_registry` candidates must be re-reviewed under the migration taxonomy in
-`docs/tier1-routing-design.md` rather than auto-migrated.
+per-message routing-audit table in this ADR. The later greenfield implementation added
+immutable `tier1_decisions` plus mutable `handoff_executions`; the retired executable
+registry is no longer part of the runtime.

@@ -355,15 +355,7 @@ async def test_tier3_router_budgets_prompt_with_all_skill_descriptions():
         provider_calls += 1
         return SimpleNamespace(content="NONE")
 
-    engine = object.__new__(RoutingEngine)
-    skills = {
-        "budget-skill-one": SimpleNamespace(
-            manifest=SimpleNamespace(description="budget-description-one")
-        ),
-        "budget-skill-two": SimpleNamespace(
-            manifest=SimpleNamespace(description="budget-description-two")
-        ),
-    }
+    engine = RoutingEngine()
     state = {
         "email": {
             "subject": "budget-router-subject",
@@ -378,15 +370,13 @@ async def test_tier3_router_budgets_prompt_with_all_skill_descriptions():
         "src.router.engine.enforce_model_input_budget",
         side_effect=_reject_and_capture(captured),
     ):
-        with pytest.raises(ModelInputTooLarge):
-            await engine._tier3_llm_route(state, skills)
+        result = await engine.apply_tier3_fallback(state)
 
     assert captured["role"] == "router"
     assert "budget-router-subject" in captured["value"]
     assert "budget-router-body" in captured["value"]
-    assert "budget-skill-one: budget-description-one" in captured["value"]
-    assert "budget-skill-two: budget-description-two" in captured["value"]
     assert provider_calls == 0
+    assert result["next_step"] == "manual_review"
 
 
 @pytest.mark.asyncio

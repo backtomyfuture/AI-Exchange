@@ -8,7 +8,8 @@ The normal flow is deliberately two conversational phases:
 2. after an operator explicitly selects/edits candidates in a conversation,
    use this same tool's promotion mode with that selection artifact.
 
-Discovery never writes ``skills_registry`` and has no auto-confirm option.
+Discovery writes only ``status: proposed`` candidate YAML outside production
+and has no auto-confirm option.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ from src.skills_discovery.generator import (  # noqa: E402
     SkillPromotionConflict,
     SkillPromotionValidationError,
     promote_selected_candidates,
+    write_proposed_candidates,
 )
 from src.skills_discovery.review import (  # noqa: E402
     CandidateReviewError,
@@ -130,7 +132,7 @@ async def run_discovery(
     print("\n📊 历史邮件 Skill 候选发现")
     print(f"   数据源: {source}")
     print(f"   LLM 分析: {'是（默认）' if use_llm else '否（启发式）'}")
-    print("   结果仅为候选，不会写入 skills_registry。")
+    print("   结果仅为候选，不会写入生产 tier1_rules。")
 
     print("\n⏳ 正在收集邮件数据...")
     if source == "pst" and pst_path:
@@ -182,7 +184,10 @@ async def run_discovery(
     )
     print("\n" + render_review(review))
     output = write_review(review, review_output or _default_review_output())
+    candidate_dir = output.parent / f"{output.stem}-candidates"
+    write_proposed_candidates(review.candidates, candidate_dir)
     print(f"\n✅ 已写入候选审阅文件：{output}")
+    print(f"   Tier1 v1 proposed 候选：{candidate_dir}")
     print("   请在对话中明确选择候选并按需编辑全部字段；选择后才会提升，并在计划重启后生效。")
     return output
 
@@ -198,7 +203,7 @@ def run_promotion(
     review_path: str | Path,
     selections_path: str | Path,
     *,
-    registry_path: str = "skills_registry",
+    registry_path: str = "tier1_rules",
 ) -> list[str]:
     """Apply explicit conversational selections and create declarative rules."""
     review = load_review(review_path)
@@ -263,8 +268,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--registry-path",
-        default="skills_registry",
-        help="仅提升模式使用的目标注册表路径（默认：skills_registry）",
+        default="tier1_rules",
+        help="仅提升模式使用的生产规则路径（默认：tier1_rules）",
     )
     args = parser.parse_args()
 

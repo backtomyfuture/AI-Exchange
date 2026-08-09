@@ -21,7 +21,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 1. `PollingRuntime` 使用 Exchange `sync_state` 拉取增量，并先写入 PostgreSQL
    Durable Inbox；
 2. 同进程的 `DurableInboxWorker` 领取持久化事件；
-3. `LegacyProcessingAdapter` 调用当前邮件处理实现；
+3. `EmailProcessingAdapter` 在 fenced external-effect 边界内调用邮件处理流水线；
 4. LangGraph 执行分类、检索、草稿、审核和发送；
 5. 飞书 WebSocket 接收审批动作并恢复对应 Checkpoint。
 
@@ -47,7 +47,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 - `src/ingestion/repository.py`：Inbox 持久化和租约；
 - `src/ingestion/worker.py`：领取、续租、重试和完成；
 - `src/ingestion/runtime.py`：唯一运行时装配；
-- `src/ingestion/legacy_adapter.py`：持久化 Worker 到邮件处理实现的 Adapter。
+- `src/ingestion/email_pipeline.py`：持久化 Worker 到邮件处理流水线的 Adapter。
 
 `src/ingestion/__init__.py` 不再做重型再导出。调用者必须从拥有类型或行为的 module
 直接导入，避免导入 models 时加载运行时或 repository 实现。
@@ -73,8 +73,8 @@ Retriever 完成 Tier 2 后，才在未命中时调用 `apply_tier3_fallback()`�
 - Tier 2 放弃时 Tier 3 只调用一次；
 - 后续节点不得覆盖最终路由决策。
 
-`skills_registry/` 是生产 Skill 注册表。示例、演示或含虚构收件人的 Skill 不得进入
-该目录。
+`tier1_rules/` 是唯一生产规则注册表。候选规则位于生产目录之外，只有人工审核并显式
+提升后才可进入；运行时只加载 SHA-256 固定的完整制品。
 
 ### 3.3 Qdrant、PST 与 Skill Discovery
 
@@ -193,7 +193,7 @@ secret，并遵循 `deploy/README.md` 的角色和所有权检查。
 
 - `src/ingestion/`：Durable Inbox、租约、策略和运行时；
 - `src/router/`：Tiered Router；
-- `skills_registry/`：生产 YAML/handler Skill；
+- `tier1_rules/`：生产声明式规则；
 - `src/skills_discovery/`：离线模式分析和候选规则；
 - `src/memory/`：Preference、Experience、Style；
 - `src/graph/`、`src/nodes/`：LangGraph 工作流；

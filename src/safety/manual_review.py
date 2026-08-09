@@ -4,6 +4,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from src.graph.state_factory import sanitize_graph_delta
+from src.router.decision import (
+    DecisionOutcome,
+    RouteDecision,
+    RouteProvenance,
+    RouteTier,
+)
+from src.router.tier1.schema import CanonicalRoute
 
 
 MANUAL_REVIEW_CODES = frozenset(
@@ -112,6 +119,19 @@ def build_manual_review_delta(
         "next_step": "manual_review",
         "safe_error_summary": safe_code,
     }
+    existing_decision = state.get("route_decision")
+    if existing_decision is None:
+        existing_decision = RouteDecision(
+            outcome=DecisionOutcome.ERROR,
+            route=CanonicalRoute.MANUAL_REVIEW,
+            params={"reason_code": safe_code},
+            provenance=RouteProvenance(
+                tier=RouteTier.SYSTEM,
+                source_version="manual-review-v1",
+            ),
+            reason_code=safe_code,
+        ).model_dump(mode="json")
+    delta["route_decision"] = existing_decision
     if classification is not None:
         delta["classification"] = dict(classification)
     if review_result is not None:

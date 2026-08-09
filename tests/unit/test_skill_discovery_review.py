@@ -157,7 +157,7 @@ def test_forward_candidate_writes_manifest_only_after_explicit_selection(tmp_pat
     review = create_candidate_review(
         [_pattern(
             suggested_action="forward",
-            suggested_forward_to=["open_id=leader"],
+            suggested_forward_to=["leader@example.com"],
             suggested_need_reply=True,
         )],
         training_records=[],
@@ -175,17 +175,17 @@ def test_forward_candidate_writes_manifest_only_after_explicit_selection(tmp_pat
 
     paths = promote_selected_candidates(selected, registry_path=str(tmp_path))
 
-    skill_dir = Path(paths[0])
-    assert (skill_dir / "manifest.yaml").exists()
-    assert not (skill_dir / "handler.py").exists()
-    manifest = yaml.safe_load((skill_dir / "manifest.yaml").read_text())
-    assert manifest["auto_outcome"]["action"] == "forward"
-    assert manifest["auto_outcome"]["forward_to"] == ["open_id=leader"]
+    rule_path = Path(paths[0])
+    assert rule_path.suffix == ".yaml"
+    manifest = yaml.safe_load(rule_path.read_text())
+    assert manifest["status"] == "enabled"
+    assert manifest["decision"]["route"] == "forward"
+    assert manifest["decision"]["params"]["fixed_recipients"] == ["leader@example.com"]
 
 
 def test_existing_target_conflict_stops_entire_selected_batch(tmp_path: Path):
-    existing = tmp_path / "skill_auto_existing"
-    existing.mkdir()
+    existing = tmp_path / "skill_auto_existing.yaml"
+    existing.write_text("existing")
     review = create_candidate_review(
         [_pattern(id="discovered_001"), _pattern(id="discovered_002", name="另一条规则")],
         training_records=[],

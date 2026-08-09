@@ -125,9 +125,6 @@ async def test_categorizer_token_overflow_requires_manual_review(graph_node_harn
 async def test_tier3_router_failure_requires_manual_review():
     raw_error = "router-timeout-private-detail"
     engine = RoutingEngine()
-    skill = SimpleNamespace(manifest=SimpleNamespace(description="route mail"))
-    engine.t1_router.route = MagicMock(return_value=[])
-    engine.skill_manager.get_all_skills = MagicMock(return_value={"skill_x": skill})
     model = SimpleNamespace(ainvoke=AsyncMock(side_effect=TimeoutError(raw_error)))
     state = {
         "email": {
@@ -137,7 +134,6 @@ async def test_tier3_router_failure_requires_manual_review():
             "body": "body",
         },
         "classification": {},
-        "active_skills": [],
         "routing_log": [],
         "metadata": {},
     }
@@ -399,9 +395,6 @@ async def test_categorizer_rejects_coerced_decision_types(
 @pytest.mark.parametrize("content", ["", "unknown_skill", "NONE, skill_x"])
 async def test_tier3_invalid_decision_requires_manual_review(content):
     engine = RoutingEngine()
-    skill = SimpleNamespace(manifest=SimpleNamespace(description="route mail"))
-    engine.t1_router.route = MagicMock(return_value=[])
-    engine.skill_manager.get_all_skills = MagicMock(return_value={"skill_x": skill})
     model = SimpleNamespace(
         ainvoke=AsyncMock(return_value=SimpleNamespace(content=content))
     )
@@ -422,9 +415,6 @@ async def test_tier3_invalid_decision_requires_manual_review(content):
 @pytest.mark.asyncio
 async def test_large_router_failure_still_returns_bounded_manual_delta():
     engine = RoutingEngine()
-    skill = SimpleNamespace(manifest=SimpleNamespace(description="route mail"))
-    engine.t1_router.route = MagicMock(return_value=[])
-    engine.skill_manager.get_all_skills = MagicMock(return_value={"skill_x": skill})
     model = SimpleNamespace(ainvoke=AsyncMock(side_effect=TimeoutError("private")))
     state = {
         "email": {"id": "router-large", "subject": "Q", "body": "b" * 20_000},
@@ -561,42 +551,3 @@ async def test_tier2_skill_failure_requires_manual_review(graph_node_harness):
 
     _assert_manual_review(result, raw_error)
 
-
-@pytest.mark.asyncio
-async def test_missing_configured_skill_is_not_silently_ignored():
-    engine = RoutingEngine()
-    engine.skill_manager.get_skill = MagicMock(return_value=None)
-
-    with pytest.raises(RuntimeError, match="router_skill_failed"):
-        await engine._apply_skills(
-            {"email": {"id": "missing-skill"}},
-            ["missing_skill"],
-        )
-
-
-@pytest.mark.asyncio
-async def test_later_skill_failure_does_not_leak_earlier_partial_update():
-    engine = RoutingEngine()
-    original = {
-        "email": {"id": "partial-skill"},
-        "metadata": {"original": True},
-    }
-    first = SimpleNamespace(
-        manifest=SimpleNamespace(depends_on=[]),
-        execute=AsyncMock(return_value={"metadata": {"partial": True}}),
-    )
-    second = SimpleNamespace(
-        manifest=SimpleNamespace(depends_on=[]),
-        execute=AsyncMock(side_effect=RuntimeError("PRIVATE-SKILL-FAILURE")),
-    )
-    engine.skill_manager.get_skill = MagicMock(
-        side_effect=lambda skill_id: {"first": first, "second": second}.get(skill_id)
-    )
-
-    with pytest.raises(RuntimeError, match="router_skill_failed"):
-        await engine._apply_skills(original, ["first", "second"])
-
-    assert original == {
-        "email": {"id": "partial-skill"},
-        "metadata": {"original": True},
-    }
