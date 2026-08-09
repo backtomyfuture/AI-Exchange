@@ -41,11 +41,16 @@ def test_runtime_contract_exposes_only_the_polling_ingress_writer() -> None:
 def test_relation_and_trigger_contracts_have_no_retired_ingress_shape() -> None:
     relations = set(access_contract.POLLING_RELATIONS)
     trigger_functions = set(access_contract.TRIGGER_FUNCTIONS)
+    foreign_keys = {spec.name for spec in access_contract.FOREIGN_KEY_SPECS}
 
     assert {"event_inbox", "sync_cursors", "pipeline_folder_scopes"} <= relations
     assert not {"cold_start_command_receipts", "sync_cold_start_plans"} & relations
     assert not any("webhook" in name or "cold_start" in name for name in trigger_functions)
     assert "reject_tier1_decisions_mutation" in trigger_functions
+    assert {
+        "fk_tier1_decisions_inbox",
+        "fk_handoff_executions_decision",
+    } <= foreign_keys
     assert set(access_contract.TRIGGER_FUNCTION_SOURCE_SHA256) == set(
         access_contract.TRIGGER_FUNCTION_SEARCH_PATH
     )

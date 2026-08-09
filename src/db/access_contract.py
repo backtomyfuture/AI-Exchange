@@ -645,6 +645,22 @@ FOREIGN_KEY_SPECS: Final = (
         "f",
     ),
     ForeignKeySpec(
+        "fk_tier1_decisions_inbox",
+        "tier1_decisions",
+        ("inbox_id",),
+        "event_inbox",
+        ("id",),
+        "s",
+    ),
+    ForeignKeySpec(
+        "fk_handoff_executions_decision",
+        "handoff_executions",
+        ("inbox_id",),
+        "tier1_decisions",
+        ("inbox_id",),
+        "s",
+    ),
+    ForeignKeySpec(
         "fk_pipeline_folder_scopes_initialization",
         "pipeline_folder_scopes",
         ("initialization_id", "account_id", "policy_manifest_hash"),
