@@ -10,7 +10,6 @@ import yaml
 from src.skills_discovery.analyzer import DiscoveredPattern, EmailRecord
 from src.skills_discovery.generator import (
     SkillPromotionConflict,
-    SkillPromotionValidationError,
     promote_selected_candidates,
 )
 from src.skills_discovery.review import (
@@ -54,7 +53,6 @@ def _pattern(**overrides) -> DiscoveredPattern:
         "sample_count": 8,
         "suggested_priority": "P2",
         "suggested_need_reply": True,
-        "suggested_tone": "简洁专业",
         "confidence": 0.8,
     }
     base.update(overrides)
@@ -212,14 +210,11 @@ def test_existing_target_conflict_stops_entire_selected_batch(tmp_path: Path):
     assert not (tmp_path / "skill_auto_new_rule").exists()
 
 
-def test_unsupported_condition_can_be_reviewed_but_not_promoted(tmp_path: Path):
+def test_unsupported_condition_is_not_emitted_as_a_candidate(tmp_path: Path):
     review = create_candidate_review(
         [_pattern(conditions=[{"type": "thread_depth", "operator": "gte", "value": "3"}])],
         training_records=[],
         validation_records=[],
         source="qdrant",
     )
-    selected = apply_conversational_selections(review, [{"candidate_id": "discovered_001"}])
-
-    with pytest.raises(SkillPromotionValidationError, match="不受运行时支持"):
-        promote_selected_candidates(selected, registry_path=str(tmp_path))
+    assert review.candidates == []

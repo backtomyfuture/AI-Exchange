@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -134,10 +135,12 @@ class RoutingEngine:
 
     async def execute_router(self, state: AgentState) -> AgentState:
         email = state.get("email") or {}
+        decision_time = datetime.now(UTC)
         tier1 = build_tier1_decision(
             [compiled.manifest for compiled in self.artifact.rules],
             _email_view(email),
             me_email=self.me_email or None,
+            decision_time=decision_time,
         )
         provenance = RouteProvenance(
             tier=RouteTier.TIER1,
@@ -338,10 +341,12 @@ class RoutingEngine:
         return _decision_delta(decision)
 
     def dry_run(self, subject: str, sender: str, body: str = "") -> dict[str, Any]:
+        decision_time = datetime.now(UTC)
         tier1 = build_tier1_decision(
             [compiled.manifest for compiled in self.artifact.rules],
             _email_view({"subject": subject, "sender": sender, "body": body}),
             me_email=self.me_email or None,
+            decision_time=decision_time,
         )
         return {
             "artifact_digest": self.artifact.digest,

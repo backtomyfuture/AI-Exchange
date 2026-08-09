@@ -368,7 +368,11 @@ class TestPatternAnalyzer:
             assert p.sample_count >= 3
             assert p.conditions
             # 有 my_email 时步骤4生成 combined（发件人+TO），无 my_email 时生成 sender_match
-            assert p.trigger_type in ("sender_match", "combined", "to_match", "recipient_role", "thread_depth")
+            assert p.trigger_type in ("sender_match", "combined", "to_match", "recipient_role")
+            assert any(
+                condition.get("type") in {"sender_match", "to_match", "cc_match"}
+                for condition in p.conditions
+            )
 
     def test_heuristic_with_few_records(self):
         records = _make_records(n_received=2, n_sent=0)
@@ -406,12 +410,14 @@ class TestPatternAnalyzer:
                 "name": "财务邮件处理",
                 "description": "处理财务相关邮件",
                 "trigger_type": "subject_match",
-                "conditions": [{"type": "subject_match", "operator": "regex", "value": "发票|报销"}],
+                "conditions": [
+                    {"type": "sender_match", "operator": "eq", "value": "finance@example.com"},
+                    {"type": "subject_match", "operator": "regex", "value": "发票|报销"},
+                ],
                 "reply_rate": 0.8,
                 "sample_count": 15,
                 "suggested_priority": "P1",
                 "suggested_need_reply": True,
-                "suggested_tone": "专业正式",
                 "example_subjects": ["发票审批 #1", "Q4报销单"],
             }
         ]
@@ -420,7 +426,7 @@ class TestPatternAnalyzer:
         assert len(patterns) == 1
         assert patterns[0].name == "财务邮件处理"
         assert patterns[0].suggested_priority == "P1"
-        assert patterns[0].conditions[0]["type"] == "subject_match"
+        assert patterns[0].conditions[1]["type"] == "subject_match"
 
 
 class TestEmailHistoryCollector:
@@ -668,8 +674,8 @@ class TestEnhancedHeuristic:
         if cc_patterns:
             assert not cc_patterns[0].suggested_need_reply
 
-    def test_heuristic_discovers_thread_patterns(self):
-        """高深度+参与度的线程应生成 thread_depth 模式。"""
+    def test_heuristic_drops_thread_patterns_without_runtime_anchor(self):
+        """线程统计保留在分析层，但不可执行的 thread_depth 不应成为 Candidate。"""
         records = []
         for i in range(6):
             is_sent = i % 2 == 1
@@ -695,8 +701,7 @@ class TestEnhancedHeuristic:
         analyzer = PatternAnalyzer(records, my_email="me@corp.com")
         patterns = analyzer._discover_heuristic()
 
-        thread_patterns = [p for p in patterns if p.trigger_type == "thread_depth"]
-        assert len(thread_patterns) > 0
+        assert all(p.trigger_type != "thread_depth" for p in patterns)
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +731,7 @@ class TestParseLLMEnhanced:
         patterns = analyzer._parse_llm_patterns(raw)
         assert patterns[0].condition_logic == "and"
 
-    def test_parse_condition_logic_or(self):
+    def test_parse_condition_logic_or_without_address_anchor_is_dropped(self):
         records = _make_records()
         analyzer = PatternAnalyzer(records)
 
@@ -745,7 +750,53 @@ class TestParseLLMEnhanced:
             "suggested_need_reply": True,
         }]
         patterns = analyzer._parse_llm_patterns(raw)
-        assert patterns[0].condition_logic == "or"
+        assert patterns == []
+
+    def test_parse_empty_content_condition_is_dropped(self):
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "空正文条件",
+            "description": "无有效条件值",
+            "trigger_type": "combined",
+            "conditions": [
+                {"type": "sender_match", "operator": "eq", "value": "sender@example.com"},
+                {"type": "body_match", "operator": "contains", "value": ""},
+            ],
+        }]
+
+        assert analyzer._parse_llm_patterns(raw) == []
+
+    def test_parse_unsupported_runtime_operator_is_dropped(self):
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "线程条件",
+            "description": "当前 Tier 1 不支持的条件操作符",
+            "trigger_type": "combined",
+            "conditions": [
+                {"type": "sender_match", "operator": "eq", "value": "sender@example.com"},
+                {"type": "subject_match", "operator": "gte", "value": "3"},
+            ],
+        }]
+
+        assert analyzer._parse_llm_patterns(raw) == []
+
+    def test_parse_unsupported_action_is_dropped(self):
+        records = _make_records()
+        analyzer = PatternAnalyzer(records)
+
+        raw = [{
+            "name": "未知动作",
+            "description": "当前 runtime 没有该动作",
+            "trigger_type": "sender_match",
+            "conditions": [{"type": "sender_match", "operator": "eq", "value": "sender@example.com"}],
+            "suggested_action": "archive",
+        }]
+
+        assert analyzer._parse_llm_patterns(raw) == []
 
     def test_parse_default_condition_logic_is_and(self):
         """LLM 未返回 condition_logic 时默认为 and。"""
@@ -962,9 +1013,7 @@ class TestRoleBasedHeuristic:
         patterns = analyzer._discover_heuristic()
         fyi = [p for p in patterns if p.trigger_type == "combined"
                and any(c.get("type") == "subject_match" for c in p.conditions)]
-        assert len(fyi) >= 1
-        assert fyi[0].suggested_need_reply is False
-        assert fyi[0].suggested_priority == "P3"
+        assert fyi == []
 
     def test_group_pattern_generated(self):
         """群组收件邮件应生成 to_match 类型的 P3 规则。"""

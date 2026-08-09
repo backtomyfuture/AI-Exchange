@@ -17,6 +17,9 @@ _CONTENT_FIELDS = {
     "subject_match": "subject",
     "body_match": "body.current_text",
 }
+_ADDRESS_OPERATORS = frozenset({"eq", "in", "contains"})
+_CONTENT_OPERATORS = frozenset({"eq", "contains", "regex", "in"})
+_VALID_PRIORITIES = frozenset({"P0", "P1", "P2", "P3"})
 
 
 def _values(condition: Mapping[str, Any]) -> list[str]:
@@ -28,7 +31,17 @@ def _values(condition: Mapping[str, Any]) -> list[str]:
 
 def _address_leaf(condition: Mapping[str, Any]) -> dict[str, Any]:
     field = _ADDRESS_FIELDS[str(condition["type"])]
+    operator = str(condition.get("operator") or "contains")
+    if operator not in _ADDRESS_OPERATORS:
+        raise ValueError("candidate_address_operator_unsupported")
+    raw_value = condition.get("value")
+    if operator == "in" and not isinstance(raw_value, list):
+        raise ValueError("candidate_condition_value_shape")
+    if operator != "in" and isinstance(raw_value, list):
+        raise ValueError("candidate_condition_value_shape")
     values = _values(condition)
+    if not values:
+        raise ValueError("candidate_condition_value_required")
     if field == "sender.address":
         return (
             {"field": field, "op": "eq", "value": values[0]}
@@ -41,7 +54,16 @@ def _address_leaf(condition: Mapping[str, Any]) -> dict[str, Any]:
 def _content_leaf(condition: Mapping[str, Any]) -> dict[str, Any]:
     field = _CONTENT_FIELDS[str(condition["type"])]
     operator = str(condition.get("operator") or "contains")
+    if operator not in _CONTENT_OPERATORS:
+        raise ValueError("candidate_content_operator_unsupported")
+    raw_value = condition.get("value")
+    if operator == "in" and not isinstance(raw_value, list):
+        raise ValueError("candidate_condition_value_shape")
+    if operator != "in" and isinstance(raw_value, list):
+        raise ValueError("candidate_condition_value_shape")
     values = _values(condition)
+    if not values:
+        raise ValueError("candidate_condition_value_required")
     if operator == "in":
         operator = "contains_any"
     if operator in {"contains_any"}:
@@ -74,6 +96,44 @@ def candidate_match(candidate: Any) -> tuple[dict[str, Any], dict[str, Any] | No
     if content:
         conditions = {"all": content}
     return {anchor_key: anchors}, conditions
+
+
+def candidate_is_runtime_executable(candidate: Any) -> bool:
+    """Check the effective candidate fields accepted by the current runtime.
+
+    Discovery intentionally does not validate operator-facing metadata such as
+    the eventual Skill ID, but it must not emit an action that the declarative
+    manifest cannot execute or promote. Trigger conversion and route shape are
+    therefore checked together at this seam.
+    """
+    try:
+        candidate_match(candidate)
+        if candidate.suggested_priority not in _VALID_PRIORITIES:
+            return False
+        if not isinstance(candidate.suggested_need_reply, bool):
+            return False
+        action = candidate.suggested_action
+        if action not in {None, "forward"}:
+            return False
+        forward_to = candidate.suggested_forward_to
+        if not isinstance(forward_to, list):
+            return False
+        if action == "forward":
+            if not candidate.suggested_need_reply or not forward_to:
+                return False
+            if any(
+                not isinstance(recipient, str)
+                or not recipient.strip()
+                or "@" not in recipient
+                or any(character in recipient for character in "*?")
+                for recipient in forward_to
+            ):
+                return False
+        elif forward_to:
+            return False
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _positive_fixture(anchor: dict[str, Any], conditions: dict[str, Any] | None) -> dict[str, Any]:
@@ -149,4 +209,8 @@ def manifest_for_candidate(
     return RuleManifest.model_validate(raw)
 
 
-__all__ = ["candidate_match", "manifest_for_candidate"]
+__all__ = [
+    "candidate_is_runtime_executable",
+    "candidate_match",
+    "manifest_for_candidate",
+]

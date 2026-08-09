@@ -40,7 +40,7 @@ The shared Qdrant corpus of Historical Email used to retrieve relevant prior exa
 _Avoid_: Discovery-only corpus, separate historical index
 
 **Declarative Tier 1 Skill**:
-A production routing rule represented by bounded data rather than executable `handler.py`. It may match emails and specify priority, whether a response is needed, a forward action with fixed recipients, or a tone directive; it only prepares a routing or approval plan and never sends email.
+A production routing rule represented by bounded data rather than executable `handler.py`. It may match emails and specify priority, whether a response is needed, or a forward action with fixed recipients; it only prepares a routing or approval plan and never sends email.
 _Avoid_: Generated code, automatic sending
 
 **Proposed Forward Target**:
@@ -48,7 +48,7 @@ A forward action and fixed recipient inferred from Historical Email as part of a
 _Avoid_: Approved recipient, automatic forwarding
 
 **Candidate Review**:
-The conversational presentation of every field that would become part of a Declarative Tier 1 Skill: triggers, priority, reply requirement, tone, action, and fixed recipients. The operator may edit those fields before selection, and promotion uses exactly the reviewed values.
+The conversational presentation of every field that would become part of a Declarative Tier 1 Skill: triggers, priority, reply requirement, action, and fixed recipients. The operator may edit those fields before selection, and promotion uses exactly the reviewed values.
 _Avoid_: Hidden inference, name-only confirmation
 
 **Skill Promotion**:
