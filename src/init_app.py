@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from psycopg_pool import AsyncConnectionPool
@@ -152,6 +153,11 @@ class AppContext:
         if self.db_manager:
             await self.db_manager.open()
             recovered = await self.db_manager.recover_incomplete_approval_states()
+            durable_recovery = getattr(
+                self.db_manager, "recover_durable_handoff_states", None
+            )
+            if inspect.iscoroutinefunction(durable_recovery):
+                recovered += await durable_recovery()
             if recovered:
                 logger.warning(
                     "Quarantined incomplete approval/send states: count=%s",

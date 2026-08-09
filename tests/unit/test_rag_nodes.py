@@ -1,12 +1,11 @@
 import pytest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from src.graph.state import AgentState
 from src.nodes.retriever_node import retrieve_context
 from src.nodes.drafter import generate_draft
 
 @pytest.fixture
-def mock_state(graph_node_harness) -> AgentState:
+def mock_state(graph_node_harness, route_decision_factory) -> AgentState:
     return graph_node_harness.state(
         {
             "id": "rag-mail",
@@ -22,6 +21,7 @@ def mock_state(graph_node_harness) -> AgentState:
             "reasoning": "询问会议安排"
         },
         context=[],
+        route_decision=route_decision_factory("reply"),
     )
 
 @pytest.mark.asyncio
@@ -35,17 +35,11 @@ async def test_retrieve_context(
     mock_instance.search.return_value = [
         {"sender": "boss@example.com", "subject": "上次会议纪要", "body": "这是上次会议的纪要..."}
     ]
-    router = SimpleNamespace(
-        apply_tier2_hits=AsyncMock(return_value={}),
-        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
-    )
-
-    with patch("src.nodes.retriever_node.get_routing_engine", return_value=router):
-        new_state = await retrieve_context(mock_state, graph_node_harness.dependencies)
+    new_state = await retrieve_context(mock_state, graph_node_harness.dependencies)
 
     assert len(new_state["context_summaries"]) == 1
     assert new_state["context_summaries"][0]["subject"] == "上次会议纪要"
-    assert new_state["next_step"] == "drafter"
+    assert "next_step" not in new_state
     mock_instance.search.assert_called()
 
 @pytest.mark.asyncio

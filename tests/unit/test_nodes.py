@@ -5,11 +5,16 @@ from src.nodes import categorizer, drafter
 
 
 @pytest.mark.asyncio
-async def test_categorize_email_success(mock_env, graph_node_harness):
+async def test_categorize_email_success(
+    mock_env,
+    graph_node_harness,
+    route_decision_factory,
+):
     """Test successful email categorization."""
     state = graph_node_harness.state(
         {"id": "node-category", "subject": "Q", "body": "Context"},
         classification={},
+        route_decision=route_decision_factory("reply"),
     )
 
     def fake_retry_decorator(**_kwargs):
@@ -28,10 +33,7 @@ async def test_categorize_email_success(mock_env, graph_node_harness):
 
         return _decorator
 
-    routing_engine = MagicMock()
-    routing_engine.execute_router = AsyncMock(side_effect=lambda routed: routed)
     with (
-        patch("src.nodes.categorizer.get_routing_engine", return_value=routing_engine),
         patch("src.providers.factory.get_llm_for_role", return_value=MagicMock()),
         patch(
             "src.nodes.categorizer.with_llm_retry",
@@ -45,18 +47,20 @@ async def test_categorize_email_success(mock_env, graph_node_harness):
 
     assert result["classification"]["priority"] == "P1"
     assert result["classification"]["need_reply"] is True
-    assert result["next_step"] == "rag_search"
+    assert "next_step" not in result
 
 
 @pytest.mark.asyncio
 async def test_generate_forward_draft_uses_store_not_feedback_state(
     mock_env,
     graph_node_harness,
+    route_decision_factory,
 ):
     """Forward draft text is durable and Graph receives only its identifier."""
     state = graph_node_harness.state(
         {"id": "node-forward", "subject": "Test"},
         classification={"action": "forward"},
+        route_decision=route_decision_factory("forward"),
     )
 
     with patch("src.providers.factory.get_llm_for_role"):

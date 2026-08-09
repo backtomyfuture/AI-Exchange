@@ -8,6 +8,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.graph.dependencies import GraphDependencies
+from src.router.decision import (
+    DecisionOutcome,
+    RouteDecision,
+    RouteProvenance,
+    RouteTier,
+)
 from src.utils import lark_app
 
 
@@ -115,11 +121,34 @@ def _state() -> SimpleNamespace:
     )
 
 
-def _event(action: str, *, options=None, form_value=None) -> SimpleNamespace:
+def _reply_decision() -> dict:
+    return RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route="reply",
+        params={},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER3,
+            source_version="card-cas-test-v1",
+            confidence=1.0,
+        ),
+        reason_code="reply_test",
+        handoff_profile_id="generic_reply_v1",
+    ).model_dump(mode="json")
+
+
+def _event(
+    action: str,
+    *,
+    options=None,
+    form_value=None,
+    binding: dict | None = None,
+) -> SimpleNamespace:
+    value = {"action": action, "id": "mail-action"}
+    value.update(binding or {})
     return SimpleNamespace(
         event=SimpleNamespace(
             action=SimpleNamespace(
-                value={"action": action, "id": "mail-action"},
+                value=value,
                 options=options,
                 option=None,
                 form_value=form_value or {},
@@ -265,9 +294,79 @@ async def test_body_edit_after_approval_has_no_graph_write(action_runtime):
     )
 
     assert saved is False
-    assert drafts.conditional_saves == [("mail-action", "TOO-LATE-DRAFT")]
+    assert drafts.conditional_saves == []
     graph.aget_state.assert_not_awaited()
     graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_kind", ["draft", "recipient"])
+async def test_exact_edit_replay_reprojects_the_same_durable_successor(
+    action_runtime,
+    monkeypatch,
+    edit_kind,
+):
+    db, drafts, state, graph = action_runtime
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    state.values.update(
+        inbox_id=inbox_id,
+        payload_revision=1,
+        payload_digest="a" * 64,
+        route_decision=_reply_decision(),
+    )
+    successor = {
+        "inbox_id": inbox_id,
+        "payload_revision": 2,
+        "payload_digest": "b" * 64,
+    }
+    append = AsyncMock(return_value=successor)
+    monkeypatch.setattr(lark_app, "_append_current_payload_revision", append)
+
+    if edit_kind == "draft":
+        drafts.save_draft_if_status = AsyncMock(side_effect=[False, True])
+        first = await lark_app._process_modification_action(
+            "mail-action",
+            "RECOVERED-DRAFT",
+            inbox_id=inbox_id,
+            payload_revision=1,
+            payload_digest="a" * 64,
+        )
+        second = await lark_app._process_modification_action(
+            "mail-action",
+            "RECOVERED-DRAFT",
+            inbox_id=inbox_id,
+            payload_revision=1,
+            payload_digest="a" * 64,
+        )
+    else:
+        graph.aupdate_state.side_effect = [RuntimeError("projection failed"), None]
+        first = await lark_app._update_recipient_field_if_waiting(
+            "mail-action",
+            {"draft_to": ["recovered@example.com"]},
+            inbox_id=inbox_id,
+            payload_revision=1,
+            payload_digest="a" * 64,
+        )
+        second = await lark_app._update_recipient_field_if_waiting(
+            "mail-action",
+            {"draft_to": ["recovered@example.com"]},
+            inbox_id=inbox_id,
+            payload_revision=1,
+            payload_digest="a" * 64,
+        )
+
+    assert first is True
+    assert second is True
+    assert append.await_count == 2
+    assert {
+        call.kwargs["expected_payload_revision"]
+        for call in append.await_args_list
+    } == {1}
+    expected_graph_updates = 1 if edit_kind == "draft" else 2
+    assert graph.aupdate_state.await_count == expected_graph_updates
+    final_delta = graph.aupdate_state.await_args.args[1]
+    assert final_delta["payload_revision"] == 2
+    assert final_delta["payload_digest"] == "b" * 64
 
 
 @pytest.mark.asyncio
@@ -331,6 +430,166 @@ async def test_recipient_mutation_after_approval_is_rejected(action_runtime):
     assert saved is False
     graph.aget_state.assert_not_awaited()
     graph.aupdate_state.assert_not_awaited()
+
+
+def test_stale_durable_card_edit_is_rejected_before_any_projection_write(
+    action_runtime,
+    monkeypatch,
+):
+    db, drafts, state, graph = action_runtime
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    state.values.update(
+        inbox_id=inbox_id,
+        payload_revision=2,
+        payload_digest="b" * 64,
+    )
+    db.is_current_payload_revision = AsyncMock(return_value=False)
+    hydrate = AsyncMock()
+    monkeypatch.setattr(lark_app, "_hydrate_lark_projection", hydrate)
+
+    result = lark_app.handle_card_action(
+        _event(
+            "form_submit_draft",
+            form_value={"draft_input": "STALE-DRAFT"},
+            binding={
+                "inbox_id": inbox_id,
+                "payload_revision": 1,
+                "payload_digest": "a" * 64,
+            },
+        )
+    )
+
+    assert result["toast"]["type"] == "error"
+    assert drafts.conditional_saves == []
+    hydrate.assert_not_awaited()
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "form_submit_draft",
+        "select_to",
+        "save_to",
+        "select_cc",
+        "save_cc",
+        "search_to",
+        "search_cc",
+    ],
+)
+def test_bound_callback_cannot_fall_back_when_graph_projection_is_unbound(
+    action_runtime,
+    monkeypatch,
+    action,
+):
+    db, drafts, _state_value, graph = action_runtime
+    patch_card = MagicMock()
+    schedule = MagicMock()
+    monkeypatch.setattr(lark_app, "update_card_ui", patch_card)
+    monkeypatch.setattr(lark_app, "safe_async_run", schedule)
+
+    result = lark_app.handle_card_action(
+        _event(
+            action,
+            options=["recipient-user"],
+            form_value={
+                "draft_input": "BOUND-DRAFT",
+                "to_search_keyword": "recipient",
+                "cc_search_keyword": "recipient",
+                "to_new": ["recipient-user"],
+                "cc_new": ["recipient-user"],
+            },
+            binding={
+                "inbox_id": "00000000-0000-4000-8000-000000000123",
+                "payload_revision": 1,
+                "payload_digest": "a" * 64,
+            },
+        )
+    )
+
+    assert result["toast"]["type"] == "error"
+    assert drafts.conditional_saves == []
+    assert db.transitions == []
+    assert db.metadata_updates == []
+    graph.aupdate_state.assert_not_awaited()
+    patch_card.assert_not_called()
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "current_results",
+    [
+        [True, False],
+        [True, True, False],
+    ],
+    ids=["advanced-before-search-lock", "advanced-before-final-card-patch"],
+)
+async def test_durable_recipient_search_never_patches_an_advanced_revision(
+    action_runtime,
+    monkeypatch,
+    current_results,
+):
+    db, drafts, state, graph = action_runtime
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    state.values.update(
+        inbox_id=inbox_id,
+        payload_revision=0,
+        payload_digest="0" * 64,
+        recipient_ui={},
+    )
+    db.is_current_payload_revision = AsyncMock(side_effect=current_results)
+    db.get_current_payload_revision_snapshot = AsyncMock(
+        return_value={
+            "revision": 1,
+            "payload_digest": "a" * 64,
+            "draft_content": "CURRENT-DRAFT",
+            "to_recipients": ["recipient@example.com"],
+            "cc_recipients": [],
+        }
+    )
+    monkeypatch.setattr(
+        lark_app,
+        "hydrate_email_from_state",
+        AsyncMock(return_value={"subject": "subject"}),
+    )
+    patch_card = MagicMock()
+    monkeypatch.setattr(lark_app, "update_card_ui", patch_card)
+    builder = SimpleNamespace(
+        search_person_picker_candidates=MagicMock(return_value=["candidate-user"]),
+        build_approval_card=MagicMock(return_value={"card": "search-result"}),
+    )
+    monkeypatch.setattr(lark_app, "card_builder", builder)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(lark_app, "worker_loop", loop)
+    tasks = []
+
+    def schedule(coroutine):
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        tasks.append(future)
+        return future
+
+    monkeypatch.setattr(lark_app, "safe_async_run", schedule)
+
+    result = await asyncio.to_thread(
+        lark_app.handle_card_action,
+        _event(
+            "search_to",
+            form_value={"to_search_keyword": "candidate"},
+            binding={
+                "inbox_id": inbox_id,
+                "payload_revision": 1,
+                "payload_digest": "a" * 64,
+            },
+        )
+    )
+    assert result["toast"]["type"] == "info"
+    assert len(tasks) == 1
+    await asyncio.wrap_future(tasks[0])
+
+    patch_card.assert_not_called()
+    graph.aupdate_state.assert_not_awaited()
+    assert drafts.conditional_saves == []
 
 
 def _close_and_return(
@@ -397,6 +656,63 @@ async def test_scheduled_approval_resume_failure_moves_runtime_state_to_manual(
 
 
 @pytest.mark.asyncio
+async def test_durable_approval_resume_failure_remains_recoverable(
+    action_runtime,
+):
+    db, _drafts, state, graph = action_runtime
+    state.values["inbox_id"] = "00000000-0000-4000-8000-000000000123"
+    db.status = "approved"
+    graph.ainvoke.side_effect = RuntimeError("PRIVATE-ASYNC-FAILURE")
+    config = {"configurable": {"thread_id": "mail-action"}}
+
+    await lark_app._resume_graph_then_cleanup(
+        "mail-action",
+        state,
+        config,
+        preserve_durable_approval=True,
+    )
+
+    assert db.status == "approved"
+    assert db.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_exact_durable_approval_replay_retries_graph_projection(
+    action_runtime,
+    monkeypatch,
+):
+    _db, _drafts, state, graph = action_runtime
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    state.values["inbox_id"] = inbox_id
+    durable_db = SimpleNamespace(
+        get_handoff_run=AsyncMock(return_value={"version": 5}),
+        approve_payload_revision=AsyncMock(return_value={"schema_version": 1}),
+    )
+    graph.aupdate_state.side_effect = [RuntimeError("projection failed"), None]
+    monkeypatch.setattr(lark_app, "db_manager", durable_db)
+
+    first = await lark_app._process_approval_action(
+        "mail-action",
+        "operator",
+        inbox_id=inbox_id,
+        payload_revision=3,
+        payload_digest="c" * 64,
+    )
+    second = await lark_app._process_approval_action(
+        "mail-action",
+        "operator",
+        inbox_id=inbox_id,
+        payload_revision=3,
+        payload_digest="c" * 64,
+    )
+
+    assert first is None
+    assert second is not None
+    assert durable_db.approve_payload_revision.await_count == 2
+    assert graph.aupdate_state.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_approval_claim_commit_then_raise_is_not_misattributed_or_resumed(
     action_runtime,
     monkeypatch,
@@ -433,7 +749,7 @@ async def test_draft_claim_commit_then_raise_never_starts_remote_save(
 
     claimed = await lark_app._claim_draft_save_action("mail-action")
 
-    assert claimed is False
+    assert claimed is None
     assert db.status == "saving_draft"
     assert db.error_message is None
 

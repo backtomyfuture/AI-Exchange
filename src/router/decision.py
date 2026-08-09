@@ -46,7 +46,11 @@ class RouteProvenance(BaseModel):
 
 
 class RouteDecision(BaseModel):
-    """The sole routing value downstream callers may treat as authoritative."""
+    """The final routing value downstream callers may treat as authoritative.
+
+    Tier abstention is an evaluation result, not a route.  It must never enter
+    this model or the durable decision table.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -57,16 +61,18 @@ class RouteDecision(BaseModel):
     reason_code: str | None = Field(default=None, max_length=128)
     selected_action_fingerprint: str | None = Field(
         default=None,
-        pattern=r"^sha256:[0-9a-f]{64}$",
+        pattern=r"^sha256:(?:v2:)?[0-9a-f]{64}$",
+    )
+    handoff_profile_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]*_v[1-9][0-9]*$",
     )
     candidate_actions: list[dict[str, Any]] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def _validate_route_and_params(self) -> "RouteDecision":
         if self.outcome is DecisionOutcome.ABSTAIN:
-            if self.route is not None or self.params:
-                raise ValueError("abstain decision cannot contain route or params")
-            return self
+            raise ValueError("abstain is not a final route decision")
         if self.route is None:
             raise ValueError("non-abstain decision requires route")
         Decision(route=self.route, params=self.params)
@@ -75,6 +81,10 @@ class RouteDecision(BaseModel):
                 raise ValueError("conflict/error decisions require manual_review")
             if not self.reason_code:
                 raise ValueError("conflict/error decisions require reason_code")
+        # Profile-less writing decisions remain readable as v1 historical
+        # labels. New finalization always expands them to a generic profile.
+        if self.route not in {CanonicalRoute.REPLY, CanonicalRoute.FORWARD} and self.handoff_profile_id is not None:
+            raise ValueError("non-writing routes cannot contain handoff_profile_id")
         return self
 
     def canonical_digest(self) -> str:

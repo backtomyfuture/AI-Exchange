@@ -23,6 +23,7 @@ from src.ingestion.models import (
     PipelineGeneration,
 )
 from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
+from src.intake_guard import IntakeDecision
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -232,6 +233,7 @@ class ProcessingCompletion:
     processing_outcome: ProcessingOutcome
     safe_error_code: str | None = None
     safe_error_summary: str | None = None
+    intake_decision: IntakeDecision | None = None
 
     def __post_init__(self) -> None:
         if type(self.target_status) is not EmailStatus:
@@ -263,6 +265,8 @@ class ProcessingCompletion:
             )
         elif self.safe_error_code is not None or self.safe_error_summary is not None:
             raise ValueError("successful processing completion cannot contain an error")
+        if self.intake_decision is not None and type(self.intake_decision) is not IntakeDecision:
+            raise ValueError("intake_decision must be an exact IntakeDecision")
 
     @classmethod
     def waiting_approval(cls) -> ProcessingCompletion:
@@ -273,20 +277,21 @@ class ProcessingCompletion:
         return cls(EmailStatus.NOTIFIED_READONLY, ProcessingOutcome.PROCESSED)
 
     @classmethod
-    def no_action(cls) -> ProcessingCompletion:
-        return cls(EmailStatus.NO_ACTION, ProcessingOutcome.PROCESSED)
+    def no_action(cls, *, intake_decision: IntakeDecision | None = None) -> ProcessingCompletion:
+        return cls(EmailStatus.NO_ACTION, ProcessingOutcome.PROCESSED, intake_decision=intake_decision)
 
     @classmethod
     def archived(cls) -> ProcessingCompletion:
         return cls(EmailStatus.ARCHIVED, ProcessingOutcome.ARCHIVED)
 
     @classmethod
-    def manual_review(cls) -> ProcessingCompletion:
+    def manual_review(cls, *, intake_decision: IntakeDecision | None = None) -> ProcessingCompletion:
         return cls(
             EmailStatus.MANUAL_REVIEW,
             ProcessingOutcome.MANUAL_REVIEW,
             safe_error_code="processing.manual_review",
             safe_error_summary="Processing requires manual review",
+            intake_decision=intake_decision,
         )
 
 
@@ -324,6 +329,11 @@ class ProcessingEffectScope:
     expected_email_version: int
     event_dedupe_key: str
     external_email_id: str
+    execution_epoch: int = 0
+    authority_epoch: int = 1
+    capability_hash: str = "0" * 64
+    lease_session_id: str = "00000000-0000-4000-8000-000000000001"
+    lease_owner: str = "test-worker"
 
     def __post_init__(self) -> None:
         _require_bigint("account_id", self.account_id, minimum=1)
@@ -343,6 +353,18 @@ class ProcessingEffectScope:
             self.external_email_id,
             max_length=1024,
         )
+        _require_bigint("execution_epoch", self.execution_epoch)
+        _require_bigint("authority_epoch", self.authority_epoch, minimum=1)
+        if not isinstance(self.capability_hash, str) or _SHA256.fullmatch(
+            self.capability_hash
+        ) is None:
+            raise ValueError("capability_hash must be a lowercase SHA-256 digest")
+        object.__setattr__(
+            self,
+            "lease_session_id",
+            _require_uuid("lease_session_id", self.lease_session_id),
+        )
+        _require_text("lease_owner", self.lease_owner, max_length=128)
 
     @classmethod
     def from_processing(
@@ -364,6 +386,11 @@ class ProcessingEffectScope:
             expected_email_version=application.version,
             event_dedupe_key=lease.event.dedupe_key,
             external_email_id=lease.event.external_email_id,
+            execution_epoch=lease.execution_epoch,
+            authority_epoch=lease.authority_epoch,
+            capability_hash=lease.capability_hash,
+            lease_session_id=lease.lease_session_id,
+            lease_owner=lease.lease_owner,
         )
 
     def target_hash(
@@ -385,6 +412,11 @@ class ProcessingEffectScope:
             "expected_email_version": self.expected_email_version,
             "event_dedupe_key": self.event_dedupe_key,
             "external_email_id": self.external_email_id,
+            "execution_epoch": self.execution_epoch,
+            "authority_epoch": self.authority_epoch,
+            "capability_hash": self.capability_hash,
+            "lease_session_id": self.lease_session_id,
+            "lease_owner": self.lease_owner,
             "kind": resolved_kind.value,
             "ordinal": ordinal,
             "target": target,

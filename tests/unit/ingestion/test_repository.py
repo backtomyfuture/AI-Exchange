@@ -85,6 +85,35 @@ class _DelegatingPool:
         return _AsyncContext(self.connection_value)
 
 
+class _StaticRowCursor:
+    def __init__(self, row=None) -> None:
+        self._row = row
+
+    async def fetchone(self):
+        return self._row
+
+
+class _QuarantineReleaseConnection(_DelegatingConnection):
+    def __init__(self, external_email_id: str) -> None:
+        super().__init__()
+        self.external_email_id = external_email_id
+        self.executions: list[tuple[str, object]] = []
+
+    async def execute(self, statement, params=None):
+        rendered = (
+            statement.as_string() if hasattr(statement, "as_string") else str(statement)
+        )
+        self.statements.append(rendered)
+        self.executions.append((rendered, params))
+        if "SELECT i.external_email_id" in rendered:
+            return _StaticRowCursor((self.external_email_id,))
+        if 'UPDATE "public"."emails"' in rendered:
+            return _StaticRowCursor((str(uuid4()),))
+        if 'UPDATE "public"."event_inbox"' in rendered:
+            return _StaticRowCursor((1,))
+        return _StaticRowCursor()
+
+
 class _InsertSpy:
     def __init__(self, receipt: IngressReceipt) -> None:
         self.receipt = receipt
@@ -604,6 +633,36 @@ async def test_pool_owned_insert_only_delegates_after_configuring_transaction(
         "pg_catalog.set_config('statement_timeout', %s, true), "
         "pg_catalog.set_config('idle_in_transaction_session_timeout', %s, true)",
     ]
+
+
+@pytest.mark.asyncio
+async def test_initial_quarantine_release_advances_epoch_zero_without_replacing_owner():
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    connection = _QuarantineReleaseConnection("external-mail-id")
+    repository = InboxRepository(_DelegatingPool(connection))
+
+    released_epoch = await repository.release_intake_quarantine(
+        inbox_id=inbox_id,
+        expected_execution_epoch=0,
+        actor="operator",
+        reason="reviewed safe for processing",
+    )
+
+    assert released_epoch == 1
+    email_update = next(
+        statement
+        for statement, _params in connection.executions
+        if 'UPDATE "public"."emails"' in statement
+    )
+    inbox_update = next(
+        statement
+        for statement, _params in connection.executions
+        if 'UPDATE "public"."event_inbox"' in statement
+    )
+    assert "processing_execution_epoch=%s" in email_update
+    assert "owner_generation" not in email_update
+    assert "owner_fencing_token" not in email_update
+    assert "execution_epoch=%s, attempts=0" in inbox_update
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from itertools import islice
@@ -28,13 +29,20 @@ MAX_CONTEXT_SUMMARIES = 5
 MAX_CONTEXT_SNIPPET_BYTES = 384
 MAX_ROUTING_LOGS = 8
 MAX_ROUTING_LOG_BYTES = 256
-_ROUTING_STAGES = frozenset({"pending", "tier1", "tier2", "tier3", "none"})
+_ROUTING_STAGES = frozenset(
+    {"pending", "tier1", "tier2", "tier3", "system", "none"}
+)
 MAX_METADATA_TEXT_BYTES = 1_024
 # The visual summary is drafting context, not a transcript.  Keep enough room
 # for the rest of the LangGraph checkpoint (routing, context and review state).
 MAX_IMAGE_ANALYSIS_BYTES = 1_024
 MAX_REVIEW_TEXT_BYTES = 512
 MAX_TOKENS = 32
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 _REF_FIELDS = frozenset({"account_id", "object_id", "key_version", "sha256"})
 _EMAIL_METADATA_CAPS = {
@@ -505,6 +513,44 @@ def sanitize_graph_delta(
         result["routing_stage"] = stage
     if "route_decision" in delta:
         result["route_decision"] = _sanitize_route_decision(delta["route_decision"])
+    if "handoff_plan" in delta:
+        from src.handoff.models import HandoffPlan
+
+        raw_plan = delta["handoff_plan"]
+        result["handoff_plan"] = (
+            None
+            if raw_plan is None
+            else HandoffPlan.model_validate(raw_plan).model_dump(mode="json")
+        )
+    for field in ("handoff_plan_digest", "evidence_pack_digest"):
+        if field in delta:
+            digest = delta[field]
+            if digest is not None and (
+                type(digest) is not str or _SHA256.fullmatch(digest) is None
+            ):
+                raise ValueError(f"invalid_{field}")
+            result[field] = digest
+    if "inbox_id" in delta:
+        inbox_id = delta["inbox_id"]
+        if inbox_id is not None and (
+            type(inbox_id) is not str or _UUID.fullmatch(inbox_id) is None
+        ):
+            raise ValueError("invalid_inbox_id")
+        result["inbox_id"] = inbox_id
+    if "payload_revision" in delta:
+        revision = delta["payload_revision"]
+        if revision is not None and (
+            type(revision) is not int or revision <= 0
+        ):
+            raise ValueError("invalid_payload_revision")
+        result["payload_revision"] = revision
+    if "payload_digest" in delta:
+        digest = delta["payload_digest"]
+        if digest is not None and (
+            type(digest) is not str or _SHA256.fullmatch(digest) is None
+        ):
+            raise ValueError("invalid_payload_digest")
+        result["payload_digest"] = digest
     if "priority_level" in delta and type(delta["priority_level"]) is int:
         result["priority_level"] = max(0, min(delta["priority_level"], 10))
     if "system_prompt_modifier" in delta:
@@ -672,7 +718,6 @@ def build_initial_graph_state(
     }
     state: dict[str, Any] = {
         "email_id": email_id,
-        "email": email_metadata,
         "content_ref": content_ref_to_json(ref),
         "classification": {},
         "context_summaries": [],
@@ -680,6 +725,7 @@ def build_initial_graph_state(
         "draft_to": recipients["draft_to"],
         "draft_cc": recipients["draft_cc"],
         "routing_log": [],
+        "routing_stage": "pending",
         "priority_level": 0,
         "system_prompt_modifier": None,
         "tool_calls": [],
@@ -692,5 +738,7 @@ def build_initial_graph_state(
         "safe_error_summary": None,
         "recipient_ui": {},
     }
+    if email_metadata:
+        state["email"] = email_metadata
     ensure_state_size(state)
     return state

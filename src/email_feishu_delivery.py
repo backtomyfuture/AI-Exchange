@@ -13,6 +13,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -21,9 +22,14 @@ from src.graph.dependencies import GraphDependencies
 from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import MAX_TOKENS, sanitize_graph_delta
 from src.ingestion.processing import ExternalEffectBoundary, ExternalEffectKind
+from src.router.decision import RouteDecision
 from src.safety.attachments import AttachmentPolicy
 from src.safety.input_limits import input_limits_from_settings
 from src.safety.manual_review import normalize_manual_review_code
+from src.safety.recipients import (
+    ResolvedRecipients,
+    recipients_follow_route,
+)
 from src.utils.email_attachments import select_business_attachments
 from src.utils.lark_pdf_flow import PdfFlowOutcome
 
@@ -109,6 +115,9 @@ class ApprovalRequest:
     draft: str
     context: tuple[Mapping[str, Any], ...]
     routing_log: tuple[object, ...]
+    inbox_id: str | None = None
+    payload_revision: int | None = None
+    payload_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +139,7 @@ PdfGenerator = Callable[..., Awaitable[object]]
 CardSender = Callable[[EmailDeliveryRequest, str], LarkCardDelivery | bool]
 DriveUpload = Callable[[str, bytes, int], object]
 DriveDelete = Callable[[str], bool]
+RecipientResolver = Callable[[object, object], Awaitable[ResolvedRecipients | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +164,7 @@ class EmailFeishuDelivery:
         send_card: CardSender,
         upload_file: DriveUpload,
         delete_file: DriveDelete,
+        resolve_approval_recipients: RecipientResolver | None = None,
     ) -> None:
         self._database = database
         self._graph = graph
@@ -162,6 +173,7 @@ class EmailFeishuDelivery:
         self._send_card = send_card
         self._upload_file = upload_file
         self._delete_file = delete_file
+        self._resolve_approval_recipients = resolve_approval_recipients
 
     async def deliver(
         self,
@@ -181,6 +193,13 @@ class EmailFeishuDelivery:
         )
         config = {"configurable": {"thread_id": request.email_id}}
         state = await self._graph.aget_state(config)
+        if isinstance(request, ApprovalRequest) and effect_boundary is not None:
+            request = await self._freeze_approval_payload(
+                request,
+                state,
+                config,
+                effect_boundary,
+            )
 
         await self._authorize(
             effect_boundary,
@@ -326,6 +345,78 @@ class EmailFeishuDelivery:
             record_card_dispatch(kind.value, delivered)
         except Exception:
             pass
+
+    async def _freeze_approval_payload(
+        self,
+        request: ApprovalRequest,
+        state: object,
+        config: Mapping[str, object],
+        effect_boundary: ExternalEffectBoundary,
+    ) -> ApprovalRequest:
+        """Append and bind the exact payload shown by the approval card."""
+        values = getattr(state, "values", None)
+        if not isinstance(values, Mapping):
+            raise RuntimeError("approval_checkpoint_unavailable")
+        inbox_id = request.inbox_id
+        if inbox_id != effect_boundary.scope.inbox_id:
+            raise RuntimeError("approval_inbox_mismatch")
+        if self._resolve_approval_recipients is None:
+            raise RuntimeError("approval_recipient_resolver_unavailable")
+        decision = RouteDecision.model_validate(values.get("route_decision"))
+        if decision.params.get("include_attachments", False):
+            raise RuntimeError("unbound_forward_attachments")
+        resolved = await self._resolve_approval_recipients(
+            request.email_data.get("draft_to") or values.get("draft_to") or [],
+            request.email_data.get("draft_cc") or values.get("draft_cc") or [],
+        )
+        if resolved is None or not await recipients_follow_route(
+            decision,
+            request.email_data,
+            resolved,
+        ):
+            raise RuntimeError("recipient_policy_mismatch")
+        run = await self._database.get_handoff_run(inbox_id)
+        if not run or not run.get("evidence_digest"):
+            raise RuntimeError("durable_handoff_unavailable")
+        revision = await self._database.create_payload_revision(
+            inbox_id=inbox_id,
+            expected_version=int(run["version"]),
+            expected_payload_revision=None,
+            expected_payload_digest=None,
+            payload={
+                "decision_digest": decision.canonical_digest(),
+                "plan_digest": values.get("handoff_plan_digest"),
+                "evidence_digest": values.get("evidence_pack_digest"),
+                "draft_digest": hashlib.sha256(request.draft.encode("utf-8")).hexdigest(),
+                "draft_content": request.draft,
+                "draft_ref": {"draft_id": values.get("draft_id")},
+                "to": list(resolved.to),
+                "cc": list(resolved.cc),
+                "attachment_refs": [],
+                "attachment_digests": [],
+                "external_recipient_acknowledged": True,
+                "editor": "system",
+                "edited_at": datetime.now(UTC),
+            },
+        )
+        binding = await self._database.get_payload_revision_binding(
+            inbox_id=inbox_id,
+            revision=revision,
+        )
+        if binding is None:
+            raise RuntimeError("payload_binding_unavailable")
+        await self._graph.aupdate_state(
+            config,
+            {
+                "payload_revision": revision,
+                "payload_digest": binding["payload_digest"],
+            },
+        )
+        return replace(
+            request,
+            payload_revision=revision,
+            payload_digest=str(binding["payload_digest"]),
+        )
 
     @staticmethod
     async def _authorize(
@@ -883,6 +974,7 @@ def build_email_feishu_delivery(
         deliver_read_only_card,
     )
     from src.utils.lark_pdf_flow import generate_and_upload_pdf
+    from src.safety.recipients import resolve_recipients
 
     def upload_file(name: str, content: bytes, size: int) -> object:
         return upload_file_to_drive(
@@ -911,6 +1003,16 @@ def build_email_feishu_delivery(
             delete_fn=delete_fn,
         )
 
+    async def resolve_approval_recipients(
+        raw_to: object,
+        raw_cc: object,
+    ) -> ResolvedRecipients | None:
+        return await resolve_recipients(
+            raw_to,
+            raw_cc,
+            lark_client=lark_api_client,
+        )
+
     def send_card(request: EmailDeliveryRequest, pdf_url: str) -> LarkCardDelivery:
         if isinstance(request, ApprovalRequest):
             result = deliver_approval_card(
@@ -921,6 +1023,9 @@ def build_email_feishu_delivery(
                 dict(request.classification),
                 pdf_url=pdf_url,
                 routing_log=list(request.routing_log),
+                inbox_id=request.inbox_id,
+                payload_revision=request.payload_revision,
+                payload_digest=request.payload_digest,
                 lark_api_client=lark_api_client,
                 card_builder=card_builder,
             )
@@ -962,4 +1067,5 @@ def build_email_feishu_delivery(
         send_card=send_card,
         upload_file=upload_file,
         delete_file=delete_file,
+        resolve_approval_recipients=resolve_approval_recipients,
     )

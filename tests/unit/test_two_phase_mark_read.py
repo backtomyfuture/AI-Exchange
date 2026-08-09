@@ -13,6 +13,13 @@ from src.email_feishu_delivery import (
     EmailDeliveryOutcome,
 )
 from src.exchange_service import CleanupHandleSnapshot, _run_ai_path
+from src.router.decision import (
+    DecisionOutcome,
+    RouteDecision,
+    RouteProvenance,
+    RouteTier,
+)
+from src.router.tier1.schema import CanonicalRoute
 from src.storage import ContentRef
 
 
@@ -48,7 +55,35 @@ def _projection(email_id: str, *, need_reply: bool = True) -> dict[str, object]:
     }
 
 
-async def _run_with_projection(ctx, email_id: str, projection: dict[str, object]):
+def _route_decision(route: CanonicalRoute) -> RouteDecision:
+    return RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=route,
+        params=(
+            {"reason_code": "intentional_skip"}
+            if route is CanonicalRoute.NO_ACTION
+            else {}
+        ),
+        provenance=RouteProvenance(
+            tier=RouteTier.SYSTEM,
+            source_version="two-phase-mark-read-test",
+        ),
+    )
+
+
+async def _run_with_projection(
+    ctx,
+    email_id: str,
+    projection: dict[str, object],
+    *,
+    route: CanonicalRoute = CanonicalRoute.REPLY,
+):
+    decision = _route_decision(route)
+    projection = {
+        **projection,
+        "route_decision": decision.model_dump(mode="json"),
+    }
+    engine = SimpleNamespace(resolve_route=AsyncMock(return_value=decision))
     with patch(
         "src.exchange_service._snapshot_cleanup_handles",
         new=AsyncMock(return_value=CleanupHandleSnapshot()),
@@ -58,6 +93,12 @@ async def _run_with_projection(ctx, email_id: str, projection: dict[str, object]
     ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
         "src.exchange_service._run_ai_pipeline",
         new=AsyncMock(return_value=projection),
+    ), patch(
+        "src.exchange_service._routing_evidence_hits",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "src.exchange_service.get_routing_engine",
+        return_value=engine,
     ):
         return await _run_ai_path(
             email_id,
@@ -108,6 +149,7 @@ async def test_known_delivery_failure_leaves_exchange_unread():
         ctx,
         email_id,
         _projection(email_id, need_reply=False),
+        route=CanonicalRoute.READ_ONLY,
     )
 
     assert outcome is ProcessingOutcome.FAILED
@@ -141,7 +183,12 @@ async def test_intentional_skip_marks_exchange_read_without_constructing_deliver
         "intent": "垃圾邮件",
     }
 
-    outcome = await _run_with_projection(ctx, email_id, projection)
+    outcome = await _run_with_projection(
+        ctx,
+        email_id,
+        projection,
+        route=CanonicalRoute.NO_ACTION,
+    )
 
     assert outcome is ProcessingOutcome.PROCESSED
     ctx.email_feishu_delivery.deliver.assert_not_awaited()

@@ -26,7 +26,8 @@ from src.safety.manual_review import (
 )
 from src.utils.email_body_projection import project_email_body_for_model
 from src.utils.retry_decorator import with_llm_retry
-from src.router.engine import get_routing_engine
+from src.router.decision import RouteDecision
+from src.router.engine import classification_for_route
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,8 @@ async def categorize_email(
     dependencies: GraphDependencies,
 ) -> AgentState:
     """
-    分类节点：先执行路由引擎（Tier 1/2/3），再根据邮件内容进行优先级和意图分类。
+    展示分类节点。规范路由必须在进入图之前已经确定并持久化。
     """
-    # Step 0: Execute Routing Engine (Tier 1/2/3)
     email = await hydrate_email_from_state(state, dependencies)
     body_projection = project_email_body_for_model(
         email.get("body", ""),
@@ -114,47 +114,27 @@ async def categorize_email(
     # against recursively quoted history can reactivate a request that the
     # sender has already completed, rejected, or merely forwarded for reading.
     email["body"] = body_projection.current_text
-    local_state = deepcopy(dict(state))
-    local_state["email"] = email
 
-    engine = get_routing_engine()
-    try:
-        routed_state = await engine.execute_router(local_state)
-    except Exception as exc:
-        logger.error(
-            "Routing execution failed: error_type=%s",
-            type(exc).__name__,
-        )
+    raw_decision = state.get("route_decision")
+    if raw_decision is None:
         code = "router_execution_failed"
         return build_manual_review_delta(
             state,
             code,
             classification=manual_review_classification(code),
         )
-    if routed_state.get("next_step") == "manual_review":
-        safe_code = routed_state.get("safe_error_summary")
+    try:
+        decision = RouteDecision.model_validate(raw_decision)
+    except Exception:
+        code = "router_execution_failed"
         return build_manual_review_delta(
             state,
-            safe_code,
-            classification=manual_review_classification(safe_code),
+            code,
+            classification=manual_review_classification(code),
         )
 
-    routing_updates = {}
-    for key in (
-        "routing_log",
-        "routing_stage",
-        "route_decision",
-        "system_prompt_modifier",
-        "priority_level",
-        "draft_to",
-        "draft_cc",
-        "metadata",
-        "tool_calls",
-    ):
-        if key in routed_state and routed_state.get(key) != state.get(key):
-            routing_updates[key] = routed_state[key]
-
-    current_classification = deepcopy(routed_state.get("classification", {}))
+    current_classification = deepcopy(state.get("classification", {}))
+    current_classification.update(classification_for_route(decision))
     if current_classification.get("action") in ["forward", "transfer"]:
         logger.info(f"Skipping LLM Categorization due to existing action: {current_classification.get('action')}")
 
@@ -174,21 +154,8 @@ async def categorize_email(
             current_classification["reasoning"] = "系统规则自动触发转发"
 
         updates = {
-            "next_step": "drafter",
             "classification": current_classification,
-            **routing_updates,
         }
-        routed_email = routed_state.get("email")
-        if isinstance(routed_email, dict):
-            for field in ("draft_to", "draft_cc"):
-                if field in routed_email:
-                    updates[field] = routed_email[field]
-        fixed_draft = routed_state.get("draft")
-        if isinstance(fixed_draft, str):
-            updates["draft_id"] = await dependencies.drafts.save_draft(
-                state["email_id"],
-                fixed_draft,
-            )
         return sanitize_graph_delta(state, updates)
 
     subject = email.get("subject", "")
@@ -206,7 +173,7 @@ async def categorize_email(
     parser = JsonOutputParser(pydantic_object=EmailClassification)
 
     experience_ctx = ""
-    experience_hints = (routed_state.get("metadata") or {}).get("experience_hints", [])
+    experience_hints = (state.get("metadata") or {}).get("experience_hints", [])
     if experience_hints:
         hint_lines = []
         for h in experience_hints[:3]:
@@ -272,27 +239,25 @@ async def categorize_email(
             merged_classification.update(current_classification)
         logger.info("Classification completed successfully")
     except ModelInputTooLarge:
-        code = "categorizer_input_too_large"
-        return build_manual_review_delta(
-            state,
-            code,
-            classification=manual_review_classification(code),
-        )
+        merged_classification = current_classification
+        merged_classification.setdefault("priority", "P1")
+        merged_classification.setdefault("intent", "通知")
+        merged_classification.setdefault("summary", "邮件内容需按既定路由处理")
+        merged_classification.setdefault("reasoning", "categorizer_input_too_large")
+        merged_classification.setdefault("confidence", 0.0)
     except Exception as exc:
         logger.error(
             "Classification failed; manual review required: error_type=%s",
             type(exc).__name__,
         )
-        code = "categorizer_model_failed"
-        return build_manual_review_delta(
-            state,
-            code,
-            classification=manual_review_classification(code),
-        )
+        merged_classification = current_classification
+        merged_classification.setdefault("priority", "P1")
+        merged_classification.setdefault("intent", "通知")
+        merged_classification.setdefault("summary", "邮件内容需按既定路由处理")
+        merged_classification.setdefault("reasoning", "categorizer_model_failed")
+        merged_classification.setdefault("confidence", 0.0)
 
-    updates = {
-        "classification": merged_classification,
-        "next_step": "rag_search" if merged_classification.get("need_reply") else "end",
-    }
-    updates.update(routing_updates)
-    return sanitize_graph_delta(state, updates)
+    return sanitize_graph_delta(
+        state,
+        {"classification": merged_classification},
+    )

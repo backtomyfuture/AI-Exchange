@@ -1,4 +1,4 @@
-# Tier 1 路由设计 v1.0
+# Tier 1 与安全交接设计 v2.0
 
 本文是 Tier 1（`tier1_rules/` 声明式确定性路由）的权威设计规范。它取代此前分散在
 `route`/`priority`/`card_type`/`action` 等松散字段上的隐性约定。实现（JSON Schema、
@@ -7,15 +7,15 @@ registry compiler、evaluator、fixture runner）必须以本文为准；本文�
 
 ## 1. 范围边界
 
-这一版定义 Tier 1 的匹配、路由、审计和向下游 handoff 接口。Tier 2、Tier 3 和逐邮件
-决策持久化已经通过统一 `RouteDecision` 接入。以下仍不在范围内：
+这一版定义从 Intake Guard 到安全发送的完整控制面：Tier 0 入口判定、Tier 1–3 规范
+路由、路由持久化、版本化 handoff profile、写作证据、草稿审批 revision 和执行门禁。
+以下仍不在范围内：
 
 - 风格记忆学习与 LLM 个性化训练；
-- drafter 端可插拔模板引擎、知识范围（knowledge scope）机制；
-- 基于目录的身份解析器（`identity_id`）和外部域可信等级；
-- Intake Guard（Tier 0）的检测逻辑本体，只预留输入占位；
+- 允许规则动态加载任意 Python handler、URL 或脚本；
+- 基于目录的通用身份解析器（`identity_id`）和外部域可信等级；
 - 飞书卡片的权限受控下钻查看器；
-- Intake Guard 的检测逻辑本体。
+- 无人工确认的自动发送。
 
 旧的 `skills_registry` 可执行 handler 与兼容运行时已删除；迁移结论由 Git 历史保存。
 
@@ -31,6 +31,7 @@ ExecutionState:    pending | preparing | awaiting_approval | awaiting_review
 ```
 
 `CanonicalRoute` 曾用名 `skip` 现改为 `no_action`，避免被误读为"跳过 Tier 1、继续下一层"。
+`abstain` 只存在于单层求值过程中，不能进入最终 `RouteDecision` 或持久化决策表。
 
 语义边界：
 
@@ -41,15 +42,21 @@ ExecutionState:    pending | preparing | awaiting_approval | awaiting_review
 - 下游执行失败（例如草稿生成失败）只改变 `ExecutionState=failed`，绝不触发 Tier 2/3
   重新分类，也不改变已持久化的 `tier1_decision`。
 
-### 2.2 `tier1_decision`（不可变）与 `handoff_execution`（可变）
+### 2.2 `RouteDecision`（不可变）与 handoff（可变）
 
-Tier 1 的产出拆成两个独立对象，职责不混用：
+Tier 1、Tier 2、Tier 3 最终只产生一个 `RouteDecision`。历史表名
+`tier1_decisions` 保存的是这个跨层规范决策，不表示它只可能来自 Tier 1。决策必须在
+profile、RAG、模型、LangGraph checkpoint 和用户可见副作用之前持久化，并在写入和恢复
+读取时重新验证 inbox lease、generation/fencing token、execution/authority epoch、
+capability hash、lease session/owner 及邮件 identity/version。
+
+路由与后续交接拆成两个独立对象，职责不混用：
 
 ```yaml
-tier1_decision:                 # 不可变；先持久化，再创建 handoff
+route_decision:                 # 不可变；先持久化，再创建 handoff
   decision_id: opaque-id
-  outcome: matched | abstain | conflict | error
-  route: reply | forward | read_only | no_action | manual_review | null
+  outcome: matched | conflict | error
+  route: reply | forward | read_only | no_action | manual_review
   decision_origin: rule_declared | runtime_conflict | runtime_indeterminate | runtime_error
 
   matched_rules:                 # []
@@ -72,22 +79,25 @@ tier1_decision:                 # 不可变；先持久化，再创建 handoff
   ruleset_revision: <git-derived revision id>
   git_commit: <sha>
   registry_artifact_digest: <sha256>
-  fingerprint_version: 1
+  fingerprint_version: 1 | 2
+  handoff_profile_id: generic_reply_v1 | null
   engine_version: <string>
   normalizer_version: <string>
   parser_version: <string>
   message_snapshot_hash: <ContentStore sha256 引用>
 
-handoff_execution:               # 可变；由 drafter/卡片/审批/发送流程维护
-  state: pending | preparing | awaiting_approval | awaiting_review
-       | approved | completed | failed | cancelled
+handoff_run:                     # 可变；由 profile/证据/审批/发送流程维护
+  state: planned | evidence_ready | manual_review | approval_pending
+       | approved | executing | completed | failed
+  decision_digest: <RouteDecision canonical digest>
+  plan_digest: <HandoffPlan canonical digest>
+  evidence_digest: <EvidencePack canonical digest> | null
 ```
 
 不变量：
 
 | outcome | route | candidate_actions | selected_action_fingerprint |
 |---|---|---|---|
-| `abstain` | `null` | `[]` | `null` |
 | `matched`（含规则主动声明的 `manual_review`） | 非空 | 恰一个 fingerprint | 非空 |
 | `conflict` | `manual_review` | ≥2 个不同 fingerprint | `null` |
 | `error` | `manual_review` | — | `null` |
@@ -97,41 +107,43 @@ handoff_execution:               # 可变；由 drafter/卡片/审批/发送流�
 `system_isolated`（生产环境不存在"隔离坏规则、其余继续跑"的机制，见 §7）；改用
 `decision_origin: runtime_conflict | runtime_indeterminate | runtime_error`。
 
-### 2.3 route 专属状态迁移表
+### 2.3 route 专属交付
 
 ```
-reply / forward: pending → preparing → awaiting_approval → approved
-                  → completed | failed | cancelled
-read_only:        pending → preparing → completed | failed
-no_action:        pending → completed
-manual_review:     pending → preparing → awaiting_review
-                  → completed | cancelled | failed
+reply / forward: handoff planned → evidence_ready → approval_pending
+                 → approved → executing → completed | failed
+read_only:        只读通知交付，失败不改变 route
+no_action:        审计完成，不产生用户可见交付
+manual_review:    durable handoff disposition=manual_review，进入人工判断
 ```
 
-`manual_review` 使用独立的 `awaiting_review`，不复用 `awaiting_approval`——二者的业务
-含义不同（人工判断 vs 人工审批一份已生成的草稿/转发计划）。
+`manual_review` 不复用 draft approval——二者的业务含义不同（人工判断 vs 人工审批一份
+已生成的草稿/转发计划）。Graph 的 `next_step` 只是内部调度提示，用户可见交付只根据
+immutable route 与 durable handoff disposition 决定。
 
-崩溃恢复后必须能够重建同一个 `tier1_decision`（`decision_id` 不变），不允许用新的
-enabled ruleset 对同一封已决策的邮件重新分类。
+崩溃恢复后必须读回同一个 `RouteDecision`，不允许用新的 enabled ruleset 对同一封已
+决策的邮件重新分类。profile、证据或草稿失败只能把 durable handoff disposition 转为
+`manual_review`，不能返回 Tier 2/3 重猜。
 
-## 3. `decision.params` 与 `action_fingerprint`
+## 3. `decision.params`、handoff profile 与 `action_fingerprint`
 
 ```yaml
 decision:
   route: <CanonicalRoute>
   business_flow_id: ticket_policy     # 非权威审计标签，不进入 fingerprint
+  handoff_profile_id: generic_reply_v1 # reply/forward 的版本化写作合同
   params: <按 route 类型的 schema 校验>
 ```
 
 `business_flow_id`（曾称 `workflow_id`）**只用于审计和分组**，不驱动任何执行分支，因此
-不参与冲突判定。只有当某个字段将来真正决定执行语义（用哪张卡片、进入哪个审批队列、用
-哪个 drafter、哪个模板、哪个知识范围）时，才新增一个权威字段
-`handoff_profile_id` 并把它纳入 fingerprint——这一版没有这类字段，因为 drafter 尚未
-引入可插拔模板机制（见 §1 范围边界）。
+不参与冲突判定。`handoff_profile_id` 决定版本化的写作合同，属于权威动作的一部分，
+因此进入 v2 fingerprint。未显式声明 profile 的新 `reply`/`forward` 决策分别展开为
+`generic_reply_v1`/`generic_forward_v1`；旧的 v1 历史标签仍按 v1 fingerprint 读取，
+不会静默改写。
 
 ```
-fingerprint_version = 1
-action_fingerprint  = sha256(canonical_json({ route, params: normalized_params }))
+fingerprint_version = 1: sha256(canonical_json({ route, params }))
+fingerprint_version = 2: sha256(canonical_json({ route, params, handoff_profile_id }))
 ```
 
 Canonicalization 规则（编译期在原子激活流水线中统一执行,见 §7）：
@@ -143,7 +155,27 @@ Canonicalization 规则（编译期在原子激活流水线中统一执行,见 �
 5. 固定的 JSON 序列化格式（无多余空白，键顺序确定）；
 6. 记录 `fingerprint_version`，未来算法变化时递增,不静默改变旧记录的含义。
 
-### 3.1 各 route 的 params
+### 3.1 Profile、计划与证据
+
+`HandoffProfile` 是代码注册表中的只读、版本化合同，不能由 YAML 指向任意模块或网络
+地址。它只声明允许的 evidence source、writer mode、固定 prompt modifier 或 fixed
+draft。每次执行将 profile 展开成不可变 `HandoffPlan`，再由封闭的
+`EvidenceAdapterRegistry` 生成 `EvidencePack`。当前注册源只有：
+
+- `mail_thread`：同线程历史邮件；
+- `semantic_history`：Qdrant 历史邮件；
+- `exchange_contact`：使用现有 Exchange 凭据解析发件人目录身份。
+
+每个外部证据源调用前都必须重新经过当前 lease/effect fence。required source 缺失或任一
+授权失败会 fail closed 到 handoff `manual_review`；optional source 自身不可用可以省略，
+但不得吞掉授权失败。EvidencePack 只能编码写作事实，不能编码或改写 route、profile、
+收件人。
+
+新增简单业务规则只需要新增 `tier1_rules/*.yaml`；新增写作合同需要在 profile 注册表中
+加入新版本 ID；新增外部系统需要实现一个类型化、只读 adapter 并加入封闭 allowlist，
+不能恢复每规则 `handler.py`。
+
+### 3.2 各 route 的 params
 
 | route | 必需 params | 可选/说明 |
 |---|---|---|
@@ -158,7 +190,7 @@ Canonicalization 规则（编译期在原子激活流水线中统一执行,见 �
 至少 1 个 `positive_cases`、至少 2 个 `negative_cases`；这些字段不放进
 `decision.params`，因为它们不是执行参数，是治理元数据。
 
-### 3.2 外部收件人判据
+### 3.3 外部收件人判据
 
 新增静态配置 `INTERNAL_EMAIL_DOMAINS`（逗号分隔的内部域名列表，编译期读取，零网络
 依赖）。`forward.fixed_recipients` 中任一地址的域名不在该列表内即视为外部收件人。
@@ -170,7 +202,7 @@ Canonicalization 规则（编译期在原子激活流水线中统一执行,见 �
 判定：它只解析已经带 `open_id=` 前缀的运行时字符串,不适用于编译期的裸地址列表，且会让
 registry 编译依赖一次实时飞书接口调用。
 
-### 3.3 `reason_code` 命名空间
+### 3.4 `reason_code` 命名空间
 
 规则声明的业务 `reason_code`（`no_action`/`manual_review` 使用）与系统故障码
 `safety.manual_review.MANUAL_REVIEW_CODES` 是两个独立命名空间。审计记录里通过
@@ -328,8 +360,9 @@ raw YAML → compile/validate → immutable artifact（含 digest）→ atomic p
 
 "验证记录"就是规则 YAML 里的 `governance.positive_cases`/`negative_cases`
 （引用 Git 版本化的 fixture），每次计划重启的原子激活流水线都会重新跑一遍;
-"human review 通过"就是这条 YAML 改动本身经过正常的 Git/PR 审核，不建独立的数据库
-审批记录表（呼应 §1 的范围边界：这一版不新增持久化表）。
+"human review 通过"就是这条 YAML 改动本身经过正常的 Git/PR 审核。运行时逐邮件路由、
+handoff、payload revision 和 approved envelope 使用 greenfield baseline 中的独立持久化表；
+它们不是规则发布审批表。
 
 ## 8. Fixture 验证：两层
 
@@ -373,8 +406,8 @@ overlap_candidates / failure_cost / validity / final_decision
 ```
 
 `migration_status: pending_target_layer | already_supported | explicitly_deferred`
-是必填字段——`MOVE_TO_INTAKE_GUARD`/`MOVE_TO_TIER2` 只是迁移结论，不代表当前系统
-已经具备对应能力（Intake Guard 这一版只有占位 seam，见 §1）。缺少这个字段容易出现
+是必填字段——`MOVE_TO_INTAKE_GUARD`/`MOVE_TO_TIER2` 只是迁移结论，不代表目标层已覆盖
+该条规则；必须用当前 Intake Guard policy 或 Historical Route Consensus 回放验证。缺少这个字段容易出现
 "旧规则退休了、文档说移到 Tier 2、但 Tier 2 这一版没改、实际产生无人处理的覆盖缺口"。
 
 切换前必须产出覆盖清单，每条旧规则归入且仅归入一类：
@@ -385,15 +418,29 @@ overlap_candidates / failure_cost / validity / final_decision
 - 明确退休且业务 owner 接受；
 - 暂缓迁移（`explicitly_deferred`，不得删除旧行为）。
 
-## 11. 已知延后事项
+## 11. Intake Guard、审批冻结与执行门禁
 
-以下明确不在这一版实现,留作独立后续阶段，不代表已经具备能力：
+Intake Guard 在 durable inbox 归一化/去重后、Tier 1–3 前运行，只能返回：
 
-- 身份解析器/目录集成（`identity_id`、外部域可信等级）；
-- Intake Guard 的实际检测逻辑（自动回复/NDR/循环检测/敏感度标签）——幂等诉求已由
-  现有 Durable Inbox `dedupe_key` 和 `CommandReceipt` idempotency key 满足;
-- 飞书卡片的权限受控下钻查看器（卡片这一版只加安全字段：`rule_id`/`version`、冲突
-  字段、`safe_code`、opaque message id）；
-- 逐邮件路由审计的独立持久化表（这一版先用 `AgentState` 有界字段随现有
-  `routing_log`/`classification`/checkpoint 流转）；
-- 跨规则复用的命名 address group 注册表（先用 `anchor.any` 内联地址列表）。
+- `pass`：允许进入路由和 Qdrant；
+- `suppress`：高置信自动回复或明确邮件循环，审计后结束；
+- `quarantine`：NDR、敏感度/保密标签、解析异常，等待人工释放。
+
+Tier 0 `suppress` 表示系统入口不应处理；Tier 1 `no_action` 表示邮件已被业务政策识别但
+无需业务动作，两者使用独立 durable audit。quarantine release 追加 `intake_releases`
+记录并创建更高 execution epoch 的新 attempt，绝不覆盖旧 decision。营销邮件、newsletter
+和 `List-Unsubscribe` 不属于 Tier 0 的模糊垃圾邮件识别。
+
+Draft Approval 卡片绑定完整的 immutable payload revision：decision/plan/evidence digest、
+draft、To/Cc 和 attachment manifest。任何编辑都追加新 revision，使旧卡片 action 失效。
+durable approval 在一个事务中锁定 handoff、payload 与邮件审计状态，验证 revision/digest
+后创建 append-only `ApprovedExecutionEnvelope`。sender 不读取 checkpoint 中可变 draft 或
+收件人，只消费该 envelope，并在 Exchange effect 前经过确定性 `ExecutionGate` 与一次性
+execution claim。门禁只能阻止并转人工，不能改写已批准内容或重新路由。
+
+现有 reviewer 是 Draft Quality Gate：可根据原邮件和 EvidencePack 判断 ready/rewrite/
+manual review，但不能改变 route/profile/recipients。人工审批后的 Execution Gate 完全确定
+性运行，不是 Tier 4。
+
+仍延后的事项：通用 `identity_id` 目录层、外部域可信等级、飞书权限受控下钻查看器、
+跨规则复用的命名 address group，以及无人工确认的自动发送。

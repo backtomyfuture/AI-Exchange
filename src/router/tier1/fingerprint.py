@@ -23,7 +23,7 @@ from src.router.tier1.schema import (
     ReplyParams,
 )
 
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 
 
 def _canonical_json(payload: Dict[str, Any]) -> str:
@@ -60,8 +60,21 @@ def canonicalize_params(route: CanonicalRoute, typed_params: Any) -> Dict[str, A
     raise ValueError(f"unsupported route {route!r}")  # unreachable given the CanonicalRoute enum
 
 
-def compute_action_fingerprint(decision: Decision) -> str:
+def compute_action_fingerprint(
+    decision: Decision,
+    *,
+    handoff_profile_id: str | None = None,
+    fingerprint_version: int | None = None,
+) -> str:
     normalized = canonicalize_params(decision.route, decision.typed_params)
     payload = {"route": decision.route.value, "params": normalized}
+    profile_id = handoff_profile_id or decision.handoff_profile_id
+    version = fingerprint_version or (2 if profile_id else 1)
+    if version == 2:
+        if not profile_id:
+            raise ValueError("v2 action fingerprint requires handoff_profile_id")
+        payload["handoff_profile_id"] = profile_id
+    elif version != 1:
+        raise ValueError(f"unsupported fingerprint version: {version}")
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-    return f"sha256:{digest}"
+    return f"sha256:v2:{digest}" if version == 2 else f"sha256:{digest}"

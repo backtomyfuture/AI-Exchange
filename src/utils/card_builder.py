@@ -114,6 +114,14 @@ class LarkCardBuilder:
         self._user_cache: Dict[str, Dict[str, str]] = {}
 
     @staticmethod
+    def _approval_action_value(
+        action: str,
+        email_id: str,
+        binding: dict[str, object],
+    ) -> dict[str, object]:
+        return {"action": action, "id": email_id, **binding}
+
+    @staticmethod
     def _normalize_pdf_url(pdf_url: Any) -> Optional[str]:
         """Support both string URL and {'url': ..., 'file_token': ...} payload."""
         if not pdf_url:
@@ -533,6 +541,10 @@ class LarkCardBuilder:
         feedback_value: str = "",
         pdf_url: str = None,
         routing_log: Optional[List[str]] = None,
+        *,
+        inbox_id: str | None = None,
+        payload_revision: int | None = None,
+        payload_digest: str | None = None,
     ) -> dict:
         """
         Constructs the Lark Card JSON for approval workflow.
@@ -606,6 +618,26 @@ class LarkCardBuilder:
             to_external_input = "; ".join(self._collect_external_emails_from_recipients(draft_to_list))
         if not cc_external_input:
             cc_external_input = "; ".join(self._collect_external_emails_from_recipients(draft_cc_list))
+
+        inbox_id = inbox_id or email_data.get("_approval_inbox_id")
+        payload_revision = payload_revision or email_data.get("_approval_payload_revision")
+        payload_digest = payload_digest or email_data.get("_approval_payload_digest")
+        action_binding: dict[str, object] = {}
+        if inbox_id is not None:
+            if not (
+                isinstance(payload_revision, int)
+                and payload_revision > 0
+                and isinstance(payload_digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", payload_digest)
+                and isinstance(inbox_id, str)
+                and re.fullmatch(r"[0-9a-f-]{36}", inbox_id)
+            ):
+                raise ValueError("invalid_durable_card_binding")
+            action_binding = {
+                "inbox_id": inbox_id,
+                "payload_revision": payload_revision,
+                "payload_digest": payload_digest,
+            }
 
         to_existing_candidates = self._collect_open_ids_from_recipients(draft_to_list, user_map)
         for uid in self._collect_open_ids_from_recipients(original_to_list, user_map):
@@ -755,7 +787,8 @@ class LarkCardBuilder:
             new_selected=to_new_selected,
             search_hint=to_search_hint,
             external_input=to_external_input,
-            is_editing=(edit_field == "to")
+            is_editing=(edit_field == "to"),
+            action_binding=action_binding,
         ))
 
         # 抄送人部分
@@ -766,7 +799,8 @@ class LarkCardBuilder:
             new_selected=cc_new_selected,
             search_hint=cc_search_hint,
             external_input=cc_external_input,
-            is_editing=(edit_field == "cc")
+            is_editing=(edit_field == "cc"),
+            action_binding=action_binding,
         ))
 
         elements.append({"tag": "hr"})
@@ -774,19 +808,26 @@ class LarkCardBuilder:
         # 草稿正文部分
         elements.extend(self._build_draft_section(
             email_id, draft, feedback_value,
-            is_editing=(edit_field == "draft")
+            is_editing=(edit_field == "draft"),
+            action_binding=action_binding,
         ))
 
         elements.append({"tag": "hr"})
+
+        approval_value = self._approval_action_value(
+            "approve", email_id, action_binding
+        )
 
         # Action buttons
         elements.append({
             "tag": "action",
             "actions": [
                 {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 批准转发" if is_forward else "✅ 批准发送"},
-                 "type": "primary", "value": {"action": "approve", "id": email_id}},
+                 "type": "primary", "value": approval_value},
                 {"tag": "button", "text": {"tag": "plain_text", "content": "💾 存为草稿"},
-                 "type": "default", "value": {"action": "save_draft_only", "id": email_id}},
+                 "type": "default", "value": self._approval_action_value(
+                     "save_draft_only", email_id, action_binding
+                 )},
                 {
                     "tag": "select_static",
                     "placeholder": {"tag": "plain_text", "content": "🛑 拒绝..."},
@@ -796,7 +837,9 @@ class LarkCardBuilder:
                         {"text": {"tag": "plain_text", "content": "无需回复"}, "value": "no_reply_needed"},
                         {"text": {"tag": "plain_text", "content": "其他原因"}, "value": "other"},
                     ],
-                    "value": {"action": "reject_with_reason", "id": email_id},
+                    "value": self._approval_action_value(
+                        "reject_with_reason", email_id, action_binding
+                    ),
                 },
             ]
         })
@@ -1286,10 +1329,12 @@ class LarkCardBuilder:
         new_selected: Optional[List[str]] = None,
         search_hint: str = "",
         external_input: str = "",
-        is_editing: bool = False
+        is_editing: bool = False,
+        action_binding: Optional[dict[str, object]] = None,
     ) -> List[dict]:
         """Build recipient section with inline edit button"""
         elements = []
+        binding = action_binding or {}
         
         if is_editing:
             selected_open_ids = self._collect_open_ids_from_recipients(recipients, user_map)
@@ -1348,7 +1393,9 @@ class LarkCardBuilder:
                                 "type": "default",
                                 "action_type": "form_submit",
                                 "name": f"Button_search_{field_type}",
-                                "value": {"action": f"search_{field_type}", "id": email_id}
+                                "value": self._approval_action_value(
+                                    f"search_{field_type}", email_id, binding
+                                ),
                             }
                         ]
                     },
@@ -1402,7 +1449,9 @@ class LarkCardBuilder:
                                 "type": "primary",
                                 "action_type": "form_submit",
                                 "name": f"Button_submit_{field_type}",
-                                "value": {"action": f"save_{field_type}", "id": email_id}
+                                "value": self._approval_action_value(
+                                    f"save_{field_type}", email_id, binding
+                                ),
                             }
                         ]
                     },
@@ -1415,7 +1464,9 @@ class LarkCardBuilder:
                                 "tag": "button",
                                 "text": {"tag": "plain_text", "content": "✕ 取消"},
                                 "type": "default",
-                                "value": {"action": "cancel_edit", "id": email_id},
+                                "value": self._approval_action_value(
+                                    "cancel_edit", email_id, binding
+                                ),
                                 "name": f"Button_cancel_{field_type}"
                             }
                         ]
@@ -1520,7 +1571,9 @@ class LarkCardBuilder:
                     "text": {"tag": "plain_text", "content": "✏️"},
                     "type": "text",
                     "size": "small",
-                    "value": {"action": f"edit_{field_type}", "id": email_id}
+                    "value": self._approval_action_value(
+                        f"edit_{field_type}", email_id, binding
+                    ),
                 }]
             })
             
@@ -1539,10 +1592,12 @@ class LarkCardBuilder:
         email_id: str,
         draft: str,
         feedback_value: str,
-        is_editing: bool = False
+        is_editing: bool = False,
+        action_binding: Optional[dict[str, object]] = None,
     ) -> List[dict]:
         """Build draft content section with inline edit button"""
         elements = []
+        binding = action_binding or {}
         
         if is_editing:
             # 编辑模式：使用 form + input（按官方文档格式）
@@ -1584,7 +1639,9 @@ class LarkCardBuilder:
                                         "type": "primary",
                                         "action_type": "form_submit",
                                         "name": "Button_submit",
-                                        "value": {"action": "form_submit_draft", "id": email_id}
+                                        "value": self._approval_action_value(
+                                            "form_submit_draft", email_id, binding
+                                        ),
                                     }
                                 ]
                             },
@@ -1597,7 +1654,9 @@ class LarkCardBuilder:
                                         "tag": "button",
                                         "text": {"tag": "plain_text", "content": "✕ 取消"},
                                         "type": "default",
-                                        "value": {"action": "cancel_edit", "id": email_id},
+                                        "value": self._approval_action_value(
+                                            "cancel_edit", email_id, binding
+                                        ),
                                         "name": "Button_cancel"
                                     }
                                 ]
@@ -1622,7 +1681,9 @@ class LarkCardBuilder:
                          "text": {"tag": "plain_text", "content": "✏️ 编辑"},
                          "type": "text",
                          "size": "small",
-                         "value": {"action": "edit_draft", "id": email_id}
+                         "value": self._approval_action_value(
+                             "edit_draft", email_id, binding
+                         ),
                      }]}
                 ]
             })

@@ -1,18 +1,13 @@
 import pytest
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from src.nodes.retriever_node import retrieve_context
 
 
-def _router_without_matches() -> SimpleNamespace:
-    return SimpleNamespace(
-        apply_tier2_hits=AsyncMock(return_value={}),
-        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
-    )
-
-
 @pytest.mark.asyncio
-async def test_thread_context_fetched_first(graph_node_harness):
+async def test_thread_context_fetched_first(
+    graph_node_harness,
+    route_decision_factory,
+):
     """When thread_id is present, search_by_thread is called first."""
     mock_retriever = MagicMock()
     mock_retriever.search_by_thread.return_value = [
@@ -32,14 +27,12 @@ async def test_thread_context_fetched_first(graph_node_harness):
             "conversation_id": "conv-123",
         },
         context=[],
+        route_decision=route_decision_factory("reply"),
     )
 
     with patch(
         "src.nodes.retriever_node.get_retriever",
         return_value=mock_retriever,
-    ), patch(
-        "src.nodes.retriever_node.get_routing_engine",
-        return_value=_router_without_matches(),
     ), patch(
         "src.nodes.retriever_node._generate_thread_summary",
         new=AsyncMock(return_value="deterministic thread summary"),
@@ -56,7 +49,10 @@ async def test_thread_context_fetched_first(graph_node_harness):
 
 
 @pytest.mark.asyncio
-async def test_no_thread_id_falls_back_to_semantic(graph_node_harness):
+async def test_no_thread_id_falls_back_to_semantic(
+    graph_node_harness,
+    route_decision_factory,
+):
     """Without thread_id, only semantic search is used."""
     mock_retriever = MagicMock()
     mock_retriever.search.return_value = [{"id": "s1", "text": "semantic"}]
@@ -69,14 +65,12 @@ async def test_no_thread_id_falls_back_to_semantic(graph_node_harness):
             "sender": "x@y.com",
         },
         context=[],
+        route_decision=route_decision_factory("reply"),
     )
 
     with patch(
         "src.nodes.retriever_node.get_retriever",
         return_value=mock_retriever,
-    ), patch(
-        "src.nodes.retriever_node.get_routing_engine",
-        return_value=_router_without_matches(),
     ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 

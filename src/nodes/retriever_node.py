@@ -1,7 +1,5 @@
 import asyncio
 import logging
-from copy import deepcopy
-
 from src.config import get_settings
 from src.graph.dependencies import GraphDependencies
 from src.graph.state import AgentState
@@ -10,7 +8,6 @@ from src.graph.state_factory import (
     hydrate_email_from_state,
     sanitize_graph_delta,
 )
-from src.router.engine import get_routing_engine
 from src.safety.attachments import AttachmentPolicy
 from src.safety.input_limits import input_limits_from_settings
 from src.safety.model_budget import (
@@ -19,21 +16,13 @@ from src.safety.model_budget import (
     token_budget_from_settings,
 )
 from src.safety.manual_review import build_manual_review_delta
+from src.router.decision import RouteDecision
+from src.router.tier1.schema import CanonicalRoute
 from src.utils import image_analyzer
 from src.utils.email_body_projection import project_email_body_for_model
 from src.utils.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
-
-
-def _merge_unique(existing: object, incoming: object) -> list:
-    result = list(existing) if isinstance(existing, list) else []
-    if not isinstance(incoming, list):
-        return result
-    for item in incoming:
-        if item not in result:
-            result.append(item)
-    return result
 
 
 def _visual_analysis_inputs(email: object) -> list[dict[str, str]]:
@@ -78,10 +67,19 @@ async def retrieve_context(
     dependencies: GraphDependencies,
 ) -> AgentState:
     """
-    检索节点：线程检索 → 语义检索 → Tier 2 标签投票 → 经验记忆 → 线程摘要 → 风格指导，
+    检索节点：写作证据 → 经验记忆 → 线程摘要 → 风格指导。
+
+    Production supplies a persisted final route before this node. This node
+    can enrich writing evidence but cannot select or change that route.
     全程使用 ``asyncio.to_thread`` 避免阻塞事件循环。
     """
     email = await hydrate_email_from_state(state, dependencies)
+    try:
+        decision = RouteDecision.model_validate(state.get("route_decision"))
+    except Exception:
+        return build_manual_review_delta(state, "router_execution_failed")
+    if decision.route not in {CanonicalRoute.REPLY, CanonicalRoute.FORWARD}:
+        return {}
     body_projection = project_email_body_for_model(
         email.get("body", ""),
         unique_body=email.get("unique_body"),
@@ -90,8 +88,6 @@ async def retrieve_context(
     # recursively quoted history here would vote on an older task instead of
     # the sender's latest update.
     email["body"] = body_projection.current_text
-    local_state = deepcopy(dict(state))
-    local_state["email"] = email
     subject = email.get("subject", "")
     body = email.get("body", "")
     sender = email.get("sender", "")
@@ -101,8 +97,21 @@ async def retrieve_context(
     retriever = get_retriever()
     results = []
 
-    # Priority 1: same-thread context
-    if thread_id:
+    precomputed_evidence = bool(state.get("evidence_pack_digest"))
+    if precomputed_evidence:
+        results = [
+            {
+                "id": item.get("id"),
+                "sender": item.get("sender", ""),
+                "subject": item.get("subject", ""),
+                "body": item.get("snippet", ""),
+            }
+            for item in state.get("context_summaries", [])
+            if isinstance(item, dict)
+        ]
+
+    # Priority 1: same-thread writing context
+    if not precomputed_evidence and thread_id:
         thread_results = await asyncio.to_thread(
             retriever.search_by_thread,
             thread_id=thread_id,
@@ -113,7 +122,7 @@ async def retrieve_context(
 
     # Priority 2: semantic search (fill remaining slots)
     remaining = max(0, 5 - len(results))
-    if remaining > 0:
+    if not precomputed_evidence and remaining > 0:
         query_text = f"Subject: {subject}\nBody: {body[:500]}"
         semantic_results = await asyncio.to_thread(
             retriever.search,
@@ -127,40 +136,13 @@ async def retrieve_context(
             if r.get("id") not in seen_ids:
                 results.append(r)
 
-    # Priority 2b: Tier 2 semantic routing - vote on past similar emails' labels.
-    routing_delta: dict = {}
-    try:
-        engine = get_routing_engine()
-        routing_stage = state.get("routing_stage", "pending")
-        if routing_stage == "tier1":
-            routing_delta = {"routing_stage": "tier1"}
-        else:
-            tier2_delta = await engine.apply_tier2_hits(local_state, results)
-            if not isinstance(tier2_delta, dict):
-                raise RuntimeError("tier2_delta_invalid")
-            if tier2_delta.get("route_decision"):
-                routing_delta = dict(tier2_delta)
-                routing_delta.setdefault("routing_stage", "tier2")
-            else:
-                tier3_delta = await engine.apply_tier3_fallback(local_state)
-                if not isinstance(tier3_delta, dict):
-                    raise RuntimeError("tier3_delta_invalid")
-                if tier3_delta.get("next_step") == "manual_review":
-                    return sanitize_graph_delta(state, tier3_delta)
-                routing_delta = dict(tier3_delta)
-                routing_delta.setdefault(
-                    "routing_stage",
-                    "tier3" if routing_delta.get("route_decision") else "none",
-                )
-    except Exception as exc:
-        logger.error(
-            "Layered routing failed; manual review required: error_type=%s",
-            type(exc).__name__,
-        )
-        return build_manual_review_delta(state, "router_skill_failed")
-
-    # Priority 3: experience memory (Tier 2 enhancement)
-    experience_hints = await _retrieve_experience(subject, body, sender)
+    # Legacy enrichment remains available only when no durable profile has
+    # already constrained the evidence sources for this handoff.
+    experience_hints = (
+        []
+        if precomputed_evidence
+        else await _retrieve_experience(subject, body, sender)
+    )
 
     metadata = dict(state.get("metadata") or {})
     if experience_hints:
@@ -171,40 +153,48 @@ async def retrieve_context(
         try:
             thread_summary = await _generate_thread_summary(results, subject)
         except ModelInputTooLarge:
-            return build_manual_review_delta(state, "summary_input_too_large")
+            logger.warning("Thread summary skipped: reason=input_too_large")
+            thread_summary = ""
         except Exception as exc:
             logger.error(
-                "Thread summary unavailable; manual review required: error_type=%s",
+                "Thread summary unavailable; continuing without it: error_type=%s",
                 type(exc).__name__,
             )
-            return build_manual_review_delta(state, "summary_model_failed")
+            thread_summary = ""
         if thread_summary:
             metadata["thread_summary"] = thread_summary
 
     # Priority 5: style guidance (Phase 5)
-    style_guidance = await _retrieve_style_guidance(sender)
+    style_guidance = (
+        ""
+        if precomputed_evidence
+        else await _retrieve_style_guidance(sender)
+    )
     if style_guidance:
         metadata["style_guidance"] = style_guidance
 
     # Priority 6: user preference hints (Polling)
-    preference_hints = await _retrieve_user_preferences(subject, sender)
+    preference_hints = (
+        []
+        if precomputed_evidence
+        else await _retrieve_user_preferences(subject, sender)
+    )
     if preference_hints:
         metadata["preference_hints"] = preference_hints
 
-    if (state.get("classification") or {}).get("need_reply") is True:
-        image_email = await hydrate_email_for_image_analysis(state, dependencies)
-        image_inputs = _visual_analysis_inputs(image_email)
-        if image_inputs:
-            try:
-                image_analysis = await image_analyzer.analyze_images(image_inputs)
-            except Exception as exc:
-                logger.warning(
-                    "Visual summary unavailable: error_type=%s",
-                    type(exc).__name__,
-                )
-                image_analysis = "图片分析暂不可用，请查看原始邮件图片。"
-            if image_analysis:
-                metadata["image_analysis"] = image_analysis
+    image_email = await hydrate_email_for_image_analysis(state, dependencies)
+    image_inputs = _visual_analysis_inputs(image_email)
+    if image_inputs:
+        try:
+            image_analysis = await image_analyzer.analyze_images(image_inputs)
+        except Exception as exc:
+            logger.warning(
+                "Visual summary unavailable: error_type=%s",
+                type(exc).__name__,
+            )
+            image_analysis = "图片分析暂不可用，请查看原始邮件图片。"
+        if image_analysis:
+            metadata["image_analysis"] = image_analysis
 
     context_summaries = []
     for result in results[:5]:
@@ -219,31 +209,9 @@ async def retrieve_context(
             }
         )
 
-    updates: dict = {
-        "context_summaries": context_summaries,
-        "next_step": "drafter",
-    }
+    updates: dict = {"context_summaries": context_summaries}
     if metadata:
         updates["metadata"] = metadata
-
-    fixed_draft = routing_delta.pop("_draft_content", None)
-    if isinstance(fixed_draft, str):
-        updates["draft_id"] = await dependencies.drafts.save_draft(
-            state["email_id"],
-            fixed_draft,
-        )
-
-    # List fields have replacement semantics. Merge and de-duplicate explicitly
-    # before the common byte/item caps are applied.
-    for k, v in routing_delta.items():
-        if k == "metadata" and isinstance(v, dict):
-            merged = dict(updates.get("metadata") or {})
-            merged.update(v)
-            updates["metadata"] = merged
-        elif k in {"routing_log", "tool_calls"}:
-            updates[k] = _merge_unique(state.get(k), v)
-        else:
-            updates[k] = v
 
     return sanitize_graph_delta(state, updates)
 

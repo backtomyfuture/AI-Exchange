@@ -14,6 +14,7 @@ from src.email_feishu_delivery import (
 from src.exchange_service import CleanupHandleSnapshot, _run_ai_path, process_and_archive_email
 from src.graph.builder import build_graph
 from src.graph.state_factory import sanitize_graph_delta
+from src.router.decision import RouteDecision
 from src.storage import ContentRef
 
 
@@ -131,6 +132,7 @@ async def test_graph_routes_drafter_manual_review_without_reviewer(
 async def test_compiled_reviewer_manual_route_never_reaches_sender(
     graph_node_harness,
     monkeypatch,
+    route_decision_factory,
 ):
     sender_called = False
 
@@ -181,6 +183,7 @@ async def test_compiled_reviewer_manual_route_never_reaches_sender(
     state = graph_node_harness.state(
         {"id": email_id, "subject": "subject", "body": "body"}
     )
+    state["route_decision"] = route_decision_factory("reply")
 
     interrupted = await graph.ainvoke(state, config=config)
     snapshot = await graph.aget_state(config)
@@ -214,7 +217,9 @@ def _run_path_context(email_id: str) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read():
+async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read(
+    route_decision_factory,
+):
     email_id = "manual-service"
     ctx = _run_path_context(email_id)
     ctx.email_feishu_delivery.deliver.return_value = EmailDeliveryOutcome(
@@ -222,6 +227,7 @@ async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read(
         EmailDeliveryDisposition.CONFIRMED,
         pdf_token="review-pdf",
     )
+    route_decision = route_decision_factory("reply")
     projection = {
         "classification": {},
         "draft": "",
@@ -230,7 +236,13 @@ async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read(
         "routing_log": [],
         "next_step": "manual_review",
         "safe_error_summary": "categorizer_model_failed",
+        "route_decision": route_decision,
     }
+    routing_engine = SimpleNamespace(
+        resolve_route=AsyncMock(
+            return_value=RouteDecision.model_validate(route_decision)
+        ),
+    )
 
     with patch(
         "src.exchange_service._snapshot_cleanup_handles",
@@ -241,6 +253,10 @@ async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read(
     ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
         "src.exchange_service._run_ai_pipeline",
         new=AsyncMock(return_value=projection),
+    ), patch(
+        "src.exchange_service.get_routing_engine", return_value=routing_engine
+    ), patch(
+        "src.exchange_service._routing_evidence_hits", new=AsyncMock(return_value=[])
     ), patch("src.exchange_service._mark_email_read", new=AsyncMock()) as mark_read:
         outcome = await _run_ai_path(
             email_id,

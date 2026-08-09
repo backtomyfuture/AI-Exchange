@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+
+from src.router.decision import RouteDecision
+from src.router.tier1.schema import CanonicalRoute
 
 
 logger = logging.getLogger(__name__)
@@ -208,9 +211,47 @@ async def resolve_recipients(
     return ResolvedRecipients(to=final_to, cc=final_cc)
 
 
+async def recipients_follow_route(
+    decision: RouteDecision,
+    email_data: Mapping[str, object],
+    recipients: ResolvedRecipients,
+    *,
+    lark_client: object | None = None,
+) -> bool:
+    """Validate one resolved recipient set against route-owned policy.
+
+    Recipient edits are part of the approval payload, but they never acquire
+    authority to reinterpret the immutable route decision.
+    """
+    final_to = list(recipients.to)
+    final_cc = list(recipients.cc)
+    if decision.route is CanonicalRoute.REPLY:
+        mode = decision.params.get("reply_mode")
+        if mode is None:
+            return bool(final_to)
+        source = await resolve_recipients(
+            [email_data.get("sender")],
+            email_data.get("cc") or [],
+            lark_client=lark_client,
+        )
+        if source is None:
+            return False
+        expected_cc = [] if mode == "sender_only" else list(source.cc)
+        return final_to == list(source.to) and final_cc == expected_cc
+    if decision.route is CanonicalRoute.FORWARD:
+        if decision.params.get("allow_recipient_edit", True):
+            return bool(final_to)
+        return (
+            final_to == list(decision.params.get("fixed_recipients") or [])
+            and final_cc == list(decision.params.get("cc") or [])
+        )
+    return False
+
+
 __all__ = [
     "ResolvedRecipients",
     "normalize_recipient_address",
+    "recipients_follow_route",
     "resolve_recipient",
     "resolve_recipients",
 ]

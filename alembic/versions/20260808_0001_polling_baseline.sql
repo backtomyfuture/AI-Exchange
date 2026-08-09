@@ -2371,6 +2371,14 @@ CREATE FUNCTION public.reject_tier1_decisions_mutation() RETURNS trigger
             RAISE EXCEPTION 'canonical route decisions are append-only';
         END
         $$;
+CREATE FUNCTION public.reject_durable_artifact_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'public'
+    AS $$
+        BEGIN
+            RAISE EXCEPTION 'durable artifact history is append-only';
+        END
+        $$;
 CREATE FUNCTION public.reject_pipeline_folder_scopes_mutation() RETURNS trigger
     LANGUAGE plpgsql
     SET search_path TO 'pg_catalog'
@@ -2521,6 +2529,7 @@ CREATE TABLE public.emails_log (
     final_draft text,
     draft_diff text,
     approver_user_id text,
+    approval_at timestamp with time zone,
     rejection_reason text,
     error_message text,
     content_ref jsonb,
@@ -2584,7 +2593,7 @@ CREATE TABLE public.tier1_decisions (
     decision_digest character(64) NOT NULL,
     decision_json jsonb NOT NULL,
     outcome text NOT NULL,
-    route text,
+    route text NOT NULL,
     tier text NOT NULL,
     artifact_digest character(64),
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -2593,9 +2602,64 @@ CREATE TABLE public.tier1_decisions (
     CONSTRAINT ck_tier1_decisions_digest CHECK ((decision_digest)::text ~ '^[0-9a-f]{64}$'::text),
     CONSTRAINT ck_tier1_decisions_external_email CHECK ((btrim(external_email_id) <> ''::text) AND (char_length(external_email_id) <= 1024)),
     CONSTRAINT ck_tier1_decisions_json CHECK ((jsonb_typeof(decision_json) = 'object'::text) AND (octet_length((decision_json)::text) <= 16384)),
-    CONSTRAINT ck_tier1_decisions_outcome CHECK (outcome = ANY (ARRAY['matched'::text, 'abstain'::text, 'conflict'::text, 'error'::text])),
-    CONSTRAINT ck_tier1_decisions_route CHECK ((route IS NULL) OR (route = ANY (ARRAY['reply'::text, 'forward'::text, 'read_only'::text, 'no_action'::text, 'manual_review'::text]))),
+    CONSTRAINT ck_tier1_decisions_outcome CHECK (outcome = ANY (ARRAY['matched'::text, 'conflict'::text, 'error'::text])),
+    CONSTRAINT ck_tier1_decisions_route CHECK (route = ANY (ARRAY['reply'::text, 'forward'::text, 'read_only'::text, 'no_action'::text, 'manual_review'::text])),
     CONSTRAINT ck_tier1_decisions_tier CHECK (tier = ANY (ARRAY['tier1'::text, 'tier2'::text, 'tier3'::text, 'system'::text]))
+);
+CREATE TABLE public.intake_decisions (
+    inbox_id uuid NOT NULL, execution_epoch bigint NOT NULL, external_email_id text NOT NULL,
+    decision_json jsonb NOT NULL, decision_digest character(64) NOT NULL,
+    disposition text NOT NULL, reason_code text NOT NULL, policy_version text NOT NULL,
+    snapshot_digest character(64) NOT NULL, created_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_intake_decisions PRIMARY KEY (inbox_id, execution_epoch),
+    CONSTRAINT ck_intake_execution_epoch CHECK (execution_epoch >= 0),
+    CONSTRAINT ck_intake_disposition CHECK (disposition IN ('pass','suppress','quarantine')),
+    CONSTRAINT ck_intake_digests CHECK (decision_digest::text ~ '^[0-9a-f]{64}$' AND snapshot_digest::text ~ '^[0-9a-f]{64}$')
+);
+CREATE TABLE public.intake_releases (
+    id uuid NOT NULL, inbox_id uuid NOT NULL, prior_execution_epoch bigint NOT NULL,
+    new_execution_epoch bigint NOT NULL, actor text NOT NULL, reason text NOT NULL,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_intake_releases PRIMARY KEY (id),
+    CONSTRAINT ck_intake_release_epoch CHECK (new_execution_epoch > prior_execution_epoch)
+);
+CREATE TABLE public.handoff_runs (
+    inbox_id uuid NOT NULL, decision_digest character(64) NOT NULL,
+    plan_json jsonb NOT NULL, plan_digest character(64) NOT NULL,
+    evidence_json jsonb, evidence_digest character(64), state text NOT NULL DEFAULT 'planned',
+    payload_revision bigint, version bigint NOT NULL DEFAULT 0,
+    execution_claimed_at timestamptz, execution_claim_id uuid,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_handoff_runs PRIMARY KEY (inbox_id),
+    CONSTRAINT ck_handoff_run_state CHECK (state IN ('planned','evidence_ready','manual_review','approval_pending','approved','rejected','draft_saving','draft_saved','executing','completed','failed')),
+    CONSTRAINT ck_handoff_run_version CHECK (version >= 0),
+    CONSTRAINT ck_handoff_run_digests CHECK (decision_digest::text ~ '^[0-9a-f]{64}$' AND plan_digest::text ~ '^[0-9a-f]{64}$' AND (evidence_digest IS NULL OR evidence_digest::text ~ '^[0-9a-f]{64}$'))
+);
+CREATE TABLE public.execution_payload_revisions (
+    inbox_id uuid NOT NULL, revision bigint NOT NULL, decision_digest character(64) NOT NULL,
+    payload_digest character(64) NOT NULL,
+    plan_digest character(64) NOT NULL, evidence_digest character(64) NOT NULL,
+    draft_digest character(64) NOT NULL, draft_content text, draft_ref jsonb,
+    to_recipients jsonb NOT NULL, cc_recipients jsonb NOT NULL,
+    attachment_refs jsonb NOT NULL, attachment_digests jsonb NOT NULL,
+    external_recipient_acknowledged boolean NOT NULL DEFAULT false,
+    editor text NOT NULL, edited_at timestamptz NOT NULL,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_execution_payload_revisions PRIMARY KEY (inbox_id, revision),
+    CONSTRAINT ck_payload_revision CHECK (revision > 0),
+    CONSTRAINT ck_payload_digest CHECK (payload_digest::text ~ '^[0-9a-f]{64}$')
+);
+CREATE TABLE public.approved_execution_envelopes (
+    inbox_id uuid NOT NULL, payload_revision bigint NOT NULL,
+    payload_digest character(64) NOT NULL,
+    envelope_json jsonb NOT NULL, envelope_digest character(64) NOT NULL,
+    decision_digest character(64) NOT NULL, plan_digest character(64) NOT NULL,
+    evidence_digest character(64) NOT NULL, draft_digest character(64) NOT NULL,
+    approver text NOT NULL, approved_at timestamptz NOT NULL,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT pk_approved_execution_envelopes PRIMARY KEY (inbox_id, payload_revision),
+    CONSTRAINT ck_approved_envelope_payload_digest CHECK (payload_digest::text ~ '^[0-9a-f]{64}$')
 );
 CREATE TABLE public.handoff_executions (
     inbox_id uuid NOT NULL,
@@ -2890,6 +2954,7 @@ CREATE INDEX ix_pipeline_runtime_instances_lease ON public.pipeline_runtime_inst
 CREATE INDEX ix_sync_cursors_status_attempt ON public.sync_cursors USING btree (status, last_attempt_at);
 CREATE UNIQUE INDEX uq_pipeline_current_ingress ON public.pipeline_ownership USING btree (account_id) WHERE (state = 'current_ingress'::text);
 CREATE UNIQUE INDEX uq_pipeline_runtime_instances_live_identity ON public.pipeline_runtime_instances USING btree (account_id, workload, instance_id) WHERE (lifecycle <> 'draining'::text);
+CREATE UNIQUE INDEX uq_approved_execution_envelopes_inbox ON public.approved_execution_envelopes USING btree (inbox_id);
 CREATE TRIGGER trg_audit_events_guard_row BEFORE DELETE OR UPDATE ON public.audit_events FOR EACH ROW EXECUTE FUNCTION public.reject_audit_events_mutation();
 CREATE TRIGGER trg_audit_events_guard_truncate BEFORE TRUNCATE ON public.audit_events FOR EACH STATEMENT EXECUTE FUNCTION public.reject_audit_events_mutation();
 CREATE CONSTRAINT TRIGGER trg_emails_runtime_identity AFTER INSERT OR UPDATE ON public.emails DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.guard_emails_runtime_identity();
@@ -2910,6 +2975,14 @@ CREATE TRIGGER trg_pipeline_runtime_instances_guard_row BEFORE INSERT OR DELETE 
 CREATE TRIGGER trg_pipeline_runtime_instances_guard_truncate BEFORE TRUNCATE ON public.pipeline_runtime_instances FOR EACH STATEMENT EXECUTE FUNCTION public.guard_pipeline_runtime_instances();
 CREATE TRIGGER trg_tier1_decisions_guard_row BEFORE DELETE OR UPDATE ON public.tier1_decisions FOR EACH ROW EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
 CREATE TRIGGER trg_tier1_decisions_guard_truncate BEFORE TRUNCATE ON public.tier1_decisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
+CREATE TRIGGER trg_intake_decisions_guard_row BEFORE DELETE OR UPDATE ON public.intake_decisions FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_intake_decisions_guard_truncate BEFORE TRUNCATE ON public.intake_decisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_intake_releases_guard_row BEFORE DELETE OR UPDATE ON public.intake_releases FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_intake_releases_guard_truncate BEFORE TRUNCATE ON public.intake_releases FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_payload_revisions_guard_row BEFORE DELETE OR UPDATE ON public.execution_payload_revisions FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_payload_revisions_guard_truncate BEFORE TRUNCATE ON public.execution_payload_revisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_approved_envelopes_guard_row BEFORE DELETE OR UPDATE ON public.approved_execution_envelopes FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_approved_envelopes_guard_truncate BEFORE TRUNCATE ON public.approved_execution_envelopes FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
 ALTER TABLE ONLY public.audit_events
     ADD CONSTRAINT fk_audit_events_email FOREIGN KEY (account_id, email_id) REFERENCES public.emails(account_id, id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.emails
@@ -2926,6 +2999,11 @@ ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT fk_event_inbox_runtime_capability FOREIGN KEY (capability_hash) REFERENCES public.pipeline_runtime_capabilities(capability_hash) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.tier1_decisions
     ADD CONSTRAINT fk_tier1_decisions_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+ALTER TABLE ONLY public.intake_decisions ADD CONSTRAINT fk_intake_decisions_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.intake_releases ADD CONSTRAINT fk_intake_releases_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.handoff_runs ADD CONSTRAINT fk_handoff_runs_decision FOREIGN KEY (inbox_id) REFERENCES public.tier1_decisions(inbox_id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.execution_payload_revisions ADD CONSTRAINT fk_payload_revision_handoff FOREIGN KEY (inbox_id) REFERENCES public.handoff_runs(inbox_id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.approved_execution_envelopes ADD CONSTRAINT fk_approved_envelope_payload FOREIGN KEY (inbox_id, payload_revision) REFERENCES public.execution_payload_revisions(inbox_id, revision) ON DELETE RESTRICT;
 ALTER TABLE ONLY public.handoff_executions
     ADD CONSTRAINT fk_handoff_executions_decision FOREIGN KEY (inbox_id) REFERENCES public.tier1_decisions(inbox_id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.pipeline_folder_scopes

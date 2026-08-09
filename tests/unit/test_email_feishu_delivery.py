@@ -11,6 +11,14 @@ from src.email_feishu_delivery import (
     ManualReviewNotificationRequest,
     ReadNotificationRequest,
 )
+from src.router.decision import (
+    DecisionOutcome,
+    RouteDecision,
+    RouteProvenance,
+    RouteTier,
+)
+from src.router.tier1.schema import CanonicalRoute
+from src.safety.recipients import ResolvedRecipients
 
 
 @pytest.mark.asyncio
@@ -241,6 +249,122 @@ async def test_approval_confirms_delivery_and_persists_its_status():
     assert outcome.disposition is EmailDeliveryDisposition.CONFIRMED
     assert seen_request.draft == "请审批这份回复"
     database.update_status.assert_awaited_once_with(email_id, "waiting_approval")
+
+
+@pytest.mark.asyncio
+async def test_durable_approval_freezes_revision_before_rendering_card():
+    email_id = "email-durable-approval"
+    inbox_id = "00000000-0000-4000-8000-000000000123"
+    plan_digest = "1" * 64
+    evidence_digest = "2" * 64
+    payload_digest = "3" * 64
+    decision = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.REPLY,
+        params={},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER3,
+            source_version="router-model-v1",
+        ),
+        handoff_profile_id="generic_reply_v1",
+    )
+    values = {
+        "attachment_tokens": [],
+        "pdf_token": None,
+        "route_decision": decision.model_dump(mode="json"),
+        "handoff_plan_digest": plan_digest,
+        "evidence_pack_digest": evidence_digest,
+        "draft_id": email_id,
+        "draft_to": ["recipient@example.com"],
+        "draft_cc": [],
+    }
+
+    async def get_state(_config):
+        return SimpleNamespace(values=dict(values), next=())
+
+    async def update_state(_config, delta, **_kwargs):
+        values.update(delta)
+
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(side_effect=get_state)
+    graph.aupdate_state = AsyncMock(side_effect=update_state)
+    database = AsyncMock()
+    database.get_handoff_run = AsyncMock(
+        return_value={
+            "state": "evidence_ready",
+            "version": 1,
+            "evidence_digest": evidence_digest,
+        }
+    )
+    database.create_payload_revision = AsyncMock(return_value=1)
+    database.get_payload_revision_binding = AsyncMock(
+        return_value={
+            "inbox_id": inbox_id,
+            "payload_revision": 1,
+            "payload_digest": payload_digest,
+        }
+    )
+    database.advance_handoff_execution = AsyncMock()
+    resolver = AsyncMock(
+        return_value=ResolvedRecipients(
+            to=("recipient@example.com",),
+            cc=(),
+        )
+    )
+    seen_request = None
+
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/pdf", "file_token": "pdf-token"}
+
+    def send_card(request, _pdf_url):
+        nonlocal seen_request
+        seen_request = request
+        return LarkCardDelivery(accepted=True, outcome_known=True)
+
+    boundary = SimpleNamespace(
+        scope=SimpleNamespace(inbox_id=inbox_id),
+        before=AsyncMock(),
+    )
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=send_card,
+        upload_file=MagicMock(),
+        delete_file=MagicMock(return_value=True),
+        resolve_approval_recipients=resolver,
+    )
+
+    outcome = await delivery.deliver(
+        ApprovalRequest(
+            email_id=email_id,
+            email_data={
+                "id": email_id,
+                "sender": "sender@example.com",
+                "attachments": [],
+                "draft_to": ["recipient@example.com"],
+                "draft_cc": [],
+            },
+            classification={"need_reply": True},
+            draft="frozen approved draft",
+            context=(),
+            routing_log=(),
+            inbox_id=inbox_id,
+        ),
+        effect_boundary=boundary,
+    )
+
+    assert outcome.disposition is EmailDeliveryDisposition.CONFIRMED
+    assert seen_request.payload_revision == 1
+    assert seen_request.payload_digest == payload_digest
+    frozen = database.create_payload_revision.await_args.kwargs["payload"]
+    assert frozen["decision_digest"] == decision.canonical_digest()
+    assert frozen["plan_digest"] == plan_digest
+    assert frozen["evidence_digest"] == evidence_digest
+    assert frozen["to"] == ["recipient@example.com"]
+    assert values["payload_revision"] == 1
+    assert values["payload_digest"] == payload_digest
 
 
 @pytest.mark.asyncio

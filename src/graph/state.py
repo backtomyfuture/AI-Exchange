@@ -20,6 +20,12 @@ class AgentState(TypedDict, total=False):
     routing_log: list[str]
     routing_stage: str
     route_decision: dict[str, Any]
+    handoff_plan: dict[str, Any] | None
+    handoff_plan_digest: str | None
+    evidence_pack_digest: str | None
+    inbox_id: str | None
+    payload_revision: int | None
+    payload_digest: str | None
     priority_level: int
     system_prompt_modifier: str | None
     tool_calls: list[dict[str, str]]

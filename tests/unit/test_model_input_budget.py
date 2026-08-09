@@ -93,6 +93,7 @@ def _oversize_provider(role: str) -> RunnableLambda:
 @pytest.mark.asyncio
 async def test_categorizer_budgets_complete_rendered_messages_before_retry(
     graph_node_harness,
+    route_decision_factory,
 ):
     captured: dict = {}
     provider_calls = 0
@@ -122,11 +123,10 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
                 }
             ]
         },
+        route_decision=route_decision_factory("reply"),
     )
-    router = MagicMock()
-    router.execute_router = AsyncMock(return_value=state)
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
+    with patch(
         "src.providers.factory.get_llm_for_role",
         return_value=RunnableLambda(provider),
     ), patch(
@@ -151,8 +151,9 @@ async def test_categorizer_budgets_complete_rendered_messages_before_retry(
     assert "priority" in captured["value"]
     assert provider_calls == 0
     mock_acquire.assert_not_awaited()
-    assert result["next_step"] == "manual_review"
-    assert result["safe_error_summary"] == "categorizer_input_too_large"
+    assert "next_step" not in result
+    assert result["classification"]["reasoning"] == "categorizer_input_too_large"
+    assert result["classification"]["need_reply"] is True
 
 
 @pytest.mark.asyncio
@@ -382,14 +383,14 @@ async def test_tier3_router_budgets_prompt_with_all_skill_descriptions():
 @pytest.mark.asyncio
 async def test_categorizer_fallback_does_not_swallow_model_input_too_large(
     graph_node_harness,
+    route_decision_factory,
 ):
     state = graph_node_harness.state(
         {"id": "oversize-category", "subject": "subject", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
-    router = MagicMock()
-    router.execute_router = AsyncMock(return_value=state)
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
+    with patch(
         "src.providers.factory.get_llm_for_role",
         return_value=_oversize_provider("categorizer"),
     ), patch(
@@ -398,8 +399,9 @@ async def test_categorizer_fallback_does_not_swallow_model_input_too_large(
     ):
         result = await categorize_email(state, graph_node_harness.dependencies)
 
-    assert result["next_step"] == "manual_review"
-    assert result["safe_error_summary"] == "categorizer_input_too_large"
+    assert "next_step" not in result
+    assert result["classification"]["reasoning"] == "categorizer_input_too_large"
+    assert result["classification"]["need_reply"] is True
 
 
 @pytest.mark.asyncio

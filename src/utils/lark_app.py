@@ -6,6 +6,7 @@ import html
 import hashlib
 import hmac
 import threading
+from datetime import UTC, datetime
 from concurrent.futures import (
     CancelledError as FutureCancelledError,
     Future as ConcurrentFuture,
@@ -29,10 +30,13 @@ from src.graph.dependencies import GraphDependencies
 from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import (
     hydrate_draft_from_state,
+    hydrate_email_from_state,
     hydrate_graph_content,
     sanitize_graph_delta,
     truncate_utf8,
 )
+from src.router.decision import RouteDecision
+from src.router.tier1.schema import CanonicalRoute
 from src.safety.approval_claim import (
     claim_approval,
     claim_draft_save,
@@ -44,7 +48,7 @@ from src.safety.approval_claim import (
 )
 from src.safety.input_limits import input_limits_from_settings
 from src.safety.manual_review import build_manual_review_delta
-from src.safety.recipients import resolve_recipients
+from src.safety.recipients import recipients_follow_route, resolve_recipients
 from src.security.auth import is_lark_operator_allowed
 from src.security.redaction import fingerprint_identifier
 from src.utils.lark_recipient_editor import (
@@ -84,6 +88,31 @@ ALLOWED_CARD_ACTIONS = frozenset(
         "view_original",
         "view_original_pdf",
         "mark_read",
+        "edit_to",
+        "edit_cc",
+        "edit_draft",
+        "select_to",
+        "select_cc",
+        "save_to",
+        "search_to",
+        "search_cc",
+        "save_cc",
+        "save_draft",
+        "submit",
+        "Button_submit",
+        "form_submit_draft",
+        "cancel_edit",
+        "modify",
+        "save_modification",
+        "cancel_modification",
+    }
+)
+DURABLE_BOUND_CARD_ACTIONS = frozenset(
+    {
+        "approve",
+        "reject",
+        "reject_with_reason",
+        "save_draft_only",
         "edit_to",
         "edit_cc",
         "edit_draft",
@@ -173,6 +202,21 @@ def _valid_lark_identifier(value: object) -> bool:
 
 def _rejected_card_action(content: str = "无权执行该操作") -> dict[str, Any]:
     return {"toast": {"type": "error", "content": content}}
+
+
+def _valid_durable_card_binding(
+    inbox_id: object,
+    payload_revision: object,
+    payload_digest: object,
+) -> bool:
+    return bool(
+        isinstance(inbox_id, str)
+        and re.fullmatch(r"[0-9a-f-]{36}", inbox_id)
+        and isinstance(payload_revision, int)
+        and payload_revision > 0
+        and isinstance(payload_digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", payload_digest)
+    )
 
 
 def verify_lark_signature(timestamp: str, nonce: str, body: str, signature: str) -> bool:
@@ -288,6 +332,90 @@ async def _hydrate_lark_projection(state) -> tuple[dict[str, Any], str]:
         email_data[f"draft_{field}_new_selected"] = list(ui.get("selected") or [])
         email_data[f"draft_{field}_external_input"] = ui.get("external_input", "")
         email_data[f"draft_{field}_search_hint"] = ui.get("search_hint", "")
+    if values.get("inbox_id") is not None:
+        email_data["_approval_inbox_id"] = values.get("inbox_id")
+        email_data["_approval_payload_revision"] = values.get("payload_revision")
+        email_data["_approval_payload_digest"] = values.get("payload_digest")
+    return email_data, draft
+
+
+async def _hydrate_current_durable_payload_projection(
+    state: Any,
+    *,
+    reconcile_projection: bool = True,
+) -> tuple[dict[str, Any], str]:
+    """Render the current immutable payload even when graph projection lagged."""
+    values = state.values
+    inbox_id = values.get("inbox_id")
+    if inbox_id is None:
+        return await _hydrate_lark_projection(state)
+    snapshot = await db_manager.get_current_payload_revision_snapshot(
+        inbox_id=str(inbox_id)
+    )
+    if not snapshot:
+        raise ValueError("current_payload_unavailable")
+    revision = int(snapshot["revision"])
+    payload_digest = str(snapshot["payload_digest"])
+    draft = snapshot.get("draft_content")
+    if not isinstance(draft, str) or not draft.strip():
+        raise ValueError("current_payload_draft_unavailable")
+    email_data = await hydrate_email_from_state(
+        values,
+        _require_graph_dependencies(),
+    )
+    email_data["draft_to"] = list(snapshot.get("to_recipients") or [])
+    email_data["draft_cc"] = list(snapshot.get("cc_recipients") or [])
+    email_data["_approval_inbox_id"] = str(inbox_id)
+    email_data["_approval_payload_revision"] = revision
+    email_data["_approval_payload_digest"] = payload_digest
+
+    projection_is_current = (
+        values.get("payload_revision") == revision
+        and values.get("payload_digest") == payload_digest
+    )
+    if projection_is_current:
+        recipient_ui = values.get("recipient_ui") or {}
+        for field in ("to", "cc"):
+            ui = recipient_ui.get(field) if isinstance(recipient_ui, dict) else None
+            if not isinstance(ui, dict):
+                continue
+            email_data[f"draft_{field}_options"] = list(ui.get("options") or [])
+            email_data[f"draft_{field}_new_selected"] = list(ui.get("selected") or [])
+            email_data[f"draft_{field}_external_input"] = ui.get(
+                "external_input", ""
+            )
+            email_data[f"draft_{field}_search_hint"] = ui.get("search_hint", "")
+        return email_data, draft
+
+    if not reconcile_projection:
+        return email_data, draft
+
+    # Reconcile only projections. The immutable payload remains authoritative
+    # even if either best-effort write fails or this process is interrupted.
+    try:
+        await _require_graph_dependencies().drafts.save_draft_if_status(
+            str(values["email_id"]), draft
+        )
+        config = {"configurable": {"thread_id": values["email_id"]}}
+        await graph.aupdate_state(
+            config,
+            _bounded_human_update(
+                state,
+                {
+                    "draft_id": values["email_id"],
+                    "draft_to": email_data["draft_to"],
+                    "draft_cc": email_data["draft_cc"],
+                    "recipient_ui": {},
+                    "payload_revision": revision,
+                    "payload_digest": payload_digest,
+                },
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Durable payload projection reconciliation failed: error_type=%s",
+            type(exc).__name__,
+        )
     return email_data, draft
 
 
@@ -411,9 +539,16 @@ async def _resume_graph_then_cleanup(
     email_id: str,
     state: Any,
     config: dict[str, Any],
+    *,
+    preserve_durable_approval: bool = False,
 ) -> None:
     """Resume the workflow first, then reconcile action cleanup handles."""
     async def quarantine_resume_failure() -> bool:
+        if preserve_durable_approval:
+            logger.warning(
+                "Durable approval remains recoverable after graph resume failure"
+            )
+            return False
         try:
             persisted_status = await db_manager.get_email_status(email_id)
             recovery_codes = {
@@ -641,6 +776,16 @@ def handle_card_action(event):
 
         action_type = data.get("action")
         email_id = data.get("id")
+        inbox_id = data.get("inbox_id")
+        payload_revision = data.get("payload_revision")
+        payload_digest = data.get("payload_digest")
+        callback_has_binding = any(
+            value is not None
+            for value in (inbox_id, payload_revision, payload_digest)
+        )
+        callback_binding_is_valid = _valid_durable_card_binding(
+            inbox_id, payload_revision, payload_digest
+        )
         # open_message_id is likely nested in context for card triggers, checking both
         if hasattr(event.event, "context") and hasattr(event.event.context, "open_message_id"):
              message_id = event.event.context.open_message_id
@@ -657,6 +802,13 @@ def handle_card_action(event):
                 action_type if action_type in ALLOWED_CARD_ACTIONS else "unknown",
             )
             return _rejected_card_action("无效的操作请求")
+
+        if (
+            action_type in DURABLE_BOUND_CARD_ACTIONS
+            and callback_has_binding
+            and not callback_binding_is_valid
+        ):
+            return _rejected_card_action("无效的审批版本")
 
         logger.info(
             "Accepted Lark card action: action=%s email=%s message=%s actor=%s",
@@ -681,6 +833,26 @@ def handle_card_action(event):
              # Ensure we return a properly formatted error response
              return {"toast": {"type": "error", "content": "找不到任务状态或已失效"}}
 
+        durable_inbox_id = state.values.get("inbox_id")
+        if action_type in DURABLE_BOUND_CARD_ACTIONS:
+            graph_is_durable = durable_inbox_id is not None
+            if not (
+                graph_is_durable == callback_binding_is_valid
+                and (
+                    not graph_is_durable
+                    or inbox_id == durable_inbox_id
+                )
+            ):
+                return _rejected_card_action("旧审批卡已失效，请刷新卡片")
+            if graph_is_durable and action_type != "approve" and not safe_async_wait(
+                db_manager.is_current_payload_revision(
+                    inbox_id=inbox_id,
+                    revision=payload_revision,
+                    payload_digest=payload_digest,
+                )
+            ):
+                return _rejected_card_action("审批内容已更新，请使用最新卡片")
+
         if action_type == "view_original":
             return {
                 "toast": {
@@ -698,7 +870,15 @@ def handle_card_action(event):
 
         if action_type in {"approve", "reject", "reject_with_reason"}:
             if action_type == "approve":
-                processed = process_approval(email_id, user_id)
+                if state.values.get("inbox_id") is not None and inbox_id is None:
+                    return _rejected_card_action("旧审批卡已失效，请刷新卡片")
+                processed = process_approval(
+                    email_id,
+                    user_id,
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
+                )
                 processed_text = "已批准"
                 toast_type = "success"
                 toast_content = "审批请求已提交"
@@ -717,6 +897,9 @@ def handle_card_action(event):
                     email_id,
                     user_id,
                     reason=reason_text,
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
                 )
                 processed_text = (
                     f"已拒绝 ({reason_text})" if reason_text else "已拒绝"
@@ -743,7 +926,15 @@ def handle_card_action(event):
             }
 
         if action_type == "save_draft_only":
-            claimed = safe_async_wait(_claim_draft_save_action(email_id))
+            claimed = safe_async_wait(
+                _claim_draft_save_action(
+                    email_id,
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
+                    state=state,
+                )
+            )
             if not claimed:
                 return {
                     "toast": {
@@ -752,7 +943,7 @@ def handle_card_action(event):
                     }
                 }
 
-            operation = _run_claimed_draft_save(email_id)
+            operation = _run_claimed_draft_save(email_id, state, claim=claimed)
             try:
                 safe_async_run(operation)
             except Exception as exc:
@@ -761,14 +952,23 @@ def handle_card_action(event):
                     "Exchange draft scheduling failed: error_type=%s",
                     type(exc).__name__,
                 )
-                safe_async_wait(
-                    move_to_manual_review(
-                        email_id,
-                        db_manager,
-                        expected=frozenset({"saving_draft"}),
-                        code="draft_save_outcome_unknown",
+                if claimed.get("inbox_id") is not None:
+                    safe_async_wait(
+                        db_manager.fail_payload_draft_save(
+                            inbox_id=str(claimed["inbox_id"]),
+                            expected_version=int(claimed["handoff_version"]),
+                            error_code="draft_save_outcome_unknown",
+                        )
                     )
-                )
+                else:
+                    safe_async_wait(
+                        move_to_manual_review(
+                            email_id,
+                            db_manager,
+                            expected=frozenset({"saving_draft"}),
+                            code="draft_save_outcome_unknown",
+                        )
+                    )
                 return {
                     "toast": {
                         "type": "warning",
@@ -811,11 +1011,30 @@ def handle_card_action(event):
                     }
                 }
              
-        email_data, draft = safe_async_wait(_hydrate_lark_projection(state))
+        if durable_inbox_id is not None:
+            email_data, draft = safe_async_wait(
+                _hydrate_current_durable_payload_projection(
+                    state,
+                    reconcile_projection=action_type
+                    not in {"search_to", "search_cc"},
+                )
+            )
+        else:
+            email_data, draft = safe_async_wait(_hydrate_lark_projection(state))
         context_summaries = state.values.get("context_summaries", [])
         classification = state.values.get("classification", {})
         subject = email_data.get("subject", "Email")
         action_card_builder = card_builder
+
+        def refresh_editable_projection():
+            latest_state = get_current_state(email_id)
+            hydrate = (
+                _hydrate_current_durable_payload_projection(latest_state)
+                if durable_inbox_id is not None
+                else _hydrate_lark_projection(latest_state)
+            )
+            latest_email, latest_draft = safe_async_wait(hydrate)
+            return latest_state, latest_email, latest_draft
 
         logger.info(
             "State fetched for card action: email=%s action=%s",
@@ -958,6 +1177,9 @@ def handle_card_action(event):
                 _update_recipient_field_if_waiting(
                     email_id,
                     {"draft_to": new_to},
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
                 )
             )
             if not saved:
@@ -967,7 +1189,7 @@ def handle_card_action(event):
                         "content": "审批状态已变化，收件人未更新",
                     }
                 }
-            email_data["draft_to"] = new_to
+            state, email_data, draft = refresh_editable_projection()
 
             view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
@@ -985,6 +1207,9 @@ def handle_card_action(event):
                 _update_recipient_field_if_waiting(
                     email_id,
                     {"draft_cc": new_cc},
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
                 )
             )
             if not saved:
@@ -994,7 +1219,7 @@ def handle_card_action(event):
                         "content": "审批状态已变化，抄送人未更新",
                     }
                 }
-            email_data["draft_cc"] = new_cc
+            state, email_data, draft = refresh_editable_projection()
 
             view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
             return {
@@ -1029,6 +1254,9 @@ def handle_card_action(event):
                 _update_recipient_field_if_waiting(
                     email_id,
                     {"draft_to": new_to, "recipient_ui": {"to": {}}},
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
                 )
             )
             if not saved:
@@ -1038,7 +1266,7 @@ def handle_card_action(event):
                         "content": "审批状态已变化，收件人未保存",
                     }
                 }
-            email_data["draft_to"] = new_to
+            state, email_data, draft = refresh_editable_projection()
             clear_recipient_edit_temp(email_data, "to")
 
             view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
@@ -1093,6 +1321,18 @@ def handle_card_action(event):
                                 field_type,
                             )
                             return
+                        if durable_inbox_id is not None and not await (
+                            db_manager.is_current_payload_revision(
+                                inbox_id=inbox_id,
+                                revision=payload_revision,
+                                payload_digest=payload_digest,
+                            )
+                        ):
+                            logger.info(
+                                "Dropping result from a stale recipient search: field=%s",
+                                field_type,
+                            )
+                            return
                         latest_state = await graph.aget_state(config)
                         current_ui = (
                             latest_state.values.get("recipient_ui") or {}
@@ -1129,17 +1369,41 @@ def handle_card_action(event):
                                 "search_hint": _next_hint(len(merged_options)),
                             }
                         }
-                        await graph.aupdate_state(
-                            config,
-                            _bounded_human_update(
-                                latest_state,
-                                {"recipient_ui": ui_delta},
-                            ),
-                        )
-                        latest_state = await graph.aget_state(config)
-                        latest_email, latest_draft = await _hydrate_lark_projection(
-                            latest_state
-                        )
+                        if durable_inbox_id is not None:
+                            # Search options are ephemeral UI, not execution
+                            # payload. Never persist them over a newer durable
+                            # revision from another process.
+                            latest_email, latest_draft = (
+                                await _hydrate_current_durable_payload_projection(
+                                    latest_state,
+                                    reconcile_projection=False,
+                                )
+                            )
+                            field_projection = ui_delta[field_type]
+                            latest_email[f"draft_{field_type}_options"] = list(
+                                field_projection["options"]
+                            )
+                            latest_email[f"draft_{field_type}_new_selected"] = list(
+                                field_projection["selected"]
+                            )
+                            latest_email[f"draft_{field_type}_external_input"] = (
+                                field_projection["external_input"]
+                            )
+                            latest_email[f"draft_{field_type}_search_hint"] = (
+                                field_projection["search_hint"]
+                            )
+                        else:
+                            await graph.aupdate_state(
+                                config,
+                                _bounded_human_update(
+                                    latest_state,
+                                    {"recipient_ui": ui_delta},
+                                ),
+                            )
+                            latest_state = await graph.aget_state(config)
+                            latest_email, latest_draft = (
+                                await _hydrate_lark_projection(latest_state)
+                            )
                         latest_classification = latest_state.values.get(
                             "classification",
                             classification,
@@ -1156,6 +1420,18 @@ def handle_card_action(event):
                             latest_classification,
                             edit_field=field_type,
                         )
+                        if durable_inbox_id is not None and not await (
+                            db_manager.is_current_payload_revision(
+                                inbox_id=inbox_id,
+                                revision=payload_revision,
+                                payload_digest=payload_digest,
+                            )
+                        ):
+                            logger.info(
+                                "Dropping recipient search card for advanced revision: field=%s",
+                                field_type,
+                            )
+                            return
                         update_card_ui(message_id, edit_card)
                     logger.info(
                         "Recipient search finished: field=%s keyword_bytes=%d matches=%d",
@@ -1192,6 +1468,9 @@ def handle_card_action(event):
                 _update_recipient_field_if_waiting(
                     email_id,
                     {"draft_cc": new_cc, "recipient_ui": {"cc": {}}},
+                    inbox_id=inbox_id,
+                    payload_revision=payload_revision,
+                    payload_digest=payload_digest,
                 )
             )
             if not saved:
@@ -1201,7 +1480,7 @@ def handle_card_action(event):
                         "content": "审批状态已变化，抄送人未保存",
                     }
                 }
-            email_data["draft_cc"] = new_cc
+            state, email_data, draft = refresh_editable_projection()
             clear_recipient_edit_temp(email_data, "cc")
 
             view_card = action_card_builder.build_approval_card(email_id, draft, context_summaries, email_data, classification, edit_field=None)
@@ -1223,7 +1502,13 @@ def handle_card_action(event):
                         "content": "正文不能为空，未保存修改",
                     }
                 }
-            if not process_modification(email_id, new_draft):
+            if not process_modification(
+                email_id,
+                new_draft,
+                inbox_id=inbox_id,
+                payload_revision=payload_revision,
+                payload_digest=payload_digest,
+            ):
                 return {
                     "toast": {
                         "type": "warning",
@@ -1234,6 +1519,7 @@ def handle_card_action(event):
                 "Draft updated: bytes=%d",
                 len(new_draft.encode("utf-8")),
             )
+            state, email_data, new_draft = refresh_editable_projection()
             view_card = action_card_builder.build_approval_card(email_id, new_draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": "正文已保存"},
@@ -1266,13 +1552,20 @@ def handle_card_action(event):
                         "content": "正文不能为空，未保存修改",
                     }
                 }
-            if not process_modification(email_id, new_draft):
+            if not process_modification(
+                email_id,
+                new_draft,
+                inbox_id=inbox_id,
+                payload_revision=payload_revision,
+                payload_digest=payload_digest,
+            ):
                 return {
                     "toast": {
                         "type": "warning",
                         "content": "审批状态已变化，正文未保存",
                     }
                 }
+            state, email_data, new_draft = refresh_editable_projection()
             view_card = action_card_builder.build_approval_card(email_id, new_draft, context_summaries, email_data, classification, edit_field=None)
             return {
                 "toast": {"type": "success", "content": "修改已保存"},
@@ -1625,6 +1918,25 @@ async def _move_claimed_action_to_manual(
         return
     if not moved or state is None:
         return
+    inbox_id = state.values.get("inbox_id")
+    if inbox_id is not None:
+        try:
+            run = await db_manager.get_handoff_run(inbox_id)
+            if run and run.get("state") in {
+                "planned",
+                "evidence_ready",
+                "approval_pending",
+                "approved",
+            }:
+                await db_manager.transition_handoff_manual_review(
+                    inbox_id=inbox_id,
+                    expected_version=int(run["version"]),
+                )
+        except Exception as exc:
+            logger.error(
+                "Durable handoff recovery failed: error_type=%s",
+                type(exc).__name__,
+            )
     try:
         config = {"configurable": {"thread_id": email_id}}
         update = build_manual_review_delta(
@@ -1660,8 +1972,39 @@ async def _claim_action_safely(
 async def _process_approval_action(
     email_id: str,
     user_id: str,
+    *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
 ) -> tuple[Any, dict[str, Any]] | None:
     async with get_approval_action_lock(email_id):
+        if inbox_id is not None:
+            config = {"configurable": {"thread_id": email_id}}
+            state = await graph.aget_state(config)
+            try:
+                if state.values.get("inbox_id") != inbox_id:
+                    return None
+                run = await db_manager.get_handoff_run(inbox_id)
+                if not run:
+                    return None
+                await db_manager.approve_payload_revision(
+                    inbox_id=inbox_id,
+                    revision=int(payload_revision or 0),
+                    payload_digest=str(payload_digest or ""),
+                    expected_version=int(run["version"]),
+                    approver=user_id,
+                    approved_at=datetime.now(UTC),
+                )
+                await graph.aupdate_state(
+                    config,
+                    _bounded_human_update(state, {"approval_status": "approved"}),
+                )
+                return state, config
+            except Exception as exc:
+                logger.warning(
+                    "Durable approval rejected: error_type=%s", type(exc).__name__
+                )
+                return None
         if not await _claim_action_safely(
             email_id,
             claimed_status="approved",
@@ -1673,6 +2016,11 @@ async def _process_approval_action(
         state = None
         try:
             state = await graph.aget_state(config)
+            # The UI normally rejects an unbound durable card before this
+            # point. Direct/stale callers that bypass it are quarantined after
+            # winning the legacy claim, never resumed as mutable sends.
+            if state.values.get("inbox_id") is not None:
+                raise RuntimeError("durable_approval_binding_required")
             final_draft = await hydrate_draft_from_state(
                 state.values,
                 _require_graph_dependencies(),
@@ -1710,21 +2058,108 @@ async def _process_approval_action(
         return state, config
 
 
-async def _claim_draft_save_action(email_id: str) -> bool:
+async def _claim_draft_save_action(
+    email_id: str,
+    *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
+    state: Any | None = None,
+) -> dict[str, object] | None:
     async with get_approval_action_lock(email_id):
-        return await _claim_action_safely(
-            email_id,
-            claimed_status="saving_draft",
-            operation=lambda: claim_draft_save(email_id, db_manager),
-        )
+        if inbox_id is None:
+            claimed = await _claim_action_safely(
+                email_id,
+                claimed_status="saving_draft",
+                operation=lambda: claim_draft_save(email_id, db_manager),
+            )
+            return {"durable": False} if claimed else None
+        if state is None:
+            state = await graph.aget_state(
+                {"configurable": {"thread_id": email_id}}
+            )
+        durable_inbox_id = state.values.get("inbox_id")
+        if durable_inbox_id is not None:
+            if not (
+                inbox_id == durable_inbox_id
+                and _valid_durable_card_binding(
+                    inbox_id, payload_revision, payload_digest
+                )
+            ):
+                return None
+            try:
+                run = await db_manager.get_handoff_run(inbox_id)
+                if not run:
+                    return None
+                return await db_manager.claim_payload_draft_save(
+                    inbox_id=inbox_id,
+                    revision=payload_revision,
+                    payload_digest=payload_digest,
+                    expected_version=int(run["version"]),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Durable draft-save claim is ambiguous: error_type=%s",
+                    type(exc).__name__,
+                )
+                return None
+        return None
 
 
 async def _process_rejection_action(
     email_id: str,
     user_id: str,
     reason: str = "",
+    *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
 ) -> tuple[Any, dict[str, Any]] | None:
     async with get_approval_action_lock(email_id):
+        config = {"configurable": {"thread_id": email_id}}
+        if inbox_id is not None:
+            state = await graph.aget_state(config)
+            durable_inbox_id = state.values.get("inbox_id")
+            if not (
+                inbox_id == durable_inbox_id
+                and _valid_durable_card_binding(
+                    inbox_id, payload_revision, payload_digest
+                )
+            ):
+                return None
+            try:
+                run = await db_manager.get_handoff_run(inbox_id)
+                if not run or not await db_manager.reject_payload_revision(
+                    inbox_id=inbox_id,
+                    revision=payload_revision,
+                    payload_digest=payload_digest,
+                    expected_version=int(run["version"]),
+                    approver=user_id,
+                    reason=truncate_utf8(reason, max_bytes=512) if reason else "",
+                ):
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "Durable rejection rejected: error_type=%s", type(exc).__name__
+                )
+                return None
+            try:
+                await graph.aupdate_state(
+                    config,
+                    _bounded_human_update(
+                        state,
+                        {"approval_status": "rejected"},
+                    ),
+                )
+            except Exception as exc:
+                # The durable rejection is authoritative.  A graph projection
+                # can be retried without changing that terminal outcome.
+                logger.warning(
+                    "Durable rejection projection failed: error_type=%s",
+                    type(exc).__name__,
+                )
+            return state, config
+
         if not await _claim_action_safely(
             email_id,
             claimed_status="rejected",
@@ -1732,7 +2167,6 @@ async def _process_rejection_action(
         ):
             return None
 
-        config = {"configurable": {"thread_id": email_id}}
         state = None
         try:
             state = await graph.aget_state(config)
@@ -1773,6 +2207,10 @@ async def _process_rejection_action(
 async def _process_modification_action(
     email_id: str,
     new_draft: object,
+    *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
 ) -> bool:
     if not isinstance(new_draft, str) or not new_draft.strip():
         return False
@@ -1783,15 +2221,53 @@ async def _process_modification_action(
 
     async with get_approval_action_lock(email_id):
         dependencies = _require_graph_dependencies()
-        if not await dependencies.drafts.save_draft_if_status(
-            email_id,
-            new_draft,
-        ):
+        if await db_manager.get_email_status(email_id) != "waiting_approval":
             return False
         config = {"configurable": {"thread_id": email_id}}
+        binding: dict[str, object] | None = None
         state = await graph.aget_state(config)
-        update = _bounded_human_update(state, {"draft_id": email_id})
-        await graph.aupdate_state(config, update)
+        state_inbox_id = state.values.get("inbox_id")
+        callback_has_binding = any(
+            value is not None
+            for value in (inbox_id, payload_revision, payload_digest)
+        )
+        if callback_has_binding or state_inbox_id is not None:
+            if not (
+                inbox_id == state_inbox_id
+                and _valid_durable_card_binding(
+                    inbox_id, payload_revision, payload_digest
+                )
+            ):
+                return False
+            binding = await _append_current_payload_revision(
+                state,
+                user_id="lark-editor",
+                expected_payload_revision=payload_revision,
+                expected_payload_digest=payload_digest,
+                draft_override=new_draft,
+            )
+        draft_projected = await dependencies.drafts.save_draft_if_status(
+            email_id,
+            new_draft,
+        )
+        delta: dict[str, object] = {"draft_id": email_id}
+        if binding is not None:
+            delta.update(
+                payload_revision=binding["payload_revision"],
+                payload_digest=binding["payload_digest"],
+            )
+        update = _bounded_human_update(state, delta)
+        try:
+            if not draft_projected:
+                raise RuntimeError("draft_projection_rejected")
+            await graph.aupdate_state(config, update)
+        except Exception as exc:
+            if binding is None:
+                return False
+            logger.warning(
+                "Durable draft projection lagged payload revision: error_type=%s",
+                type(exc).__name__,
+            )
         logger.info(
             "Modification saved: bytes=%d",
             len(new_draft.encode("utf-8")),
@@ -1802,6 +2278,10 @@ async def _process_modification_action(
 async def _update_recipient_field_if_waiting(
     email_id: str,
     delta: dict[str, Any],
+    *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
 ) -> bool:
     allowed_fields = {"draft_to", "draft_cc", "recipient_ui"}
     if not delta or not set(delta).issubset(allowed_fields):
@@ -1811,9 +2291,124 @@ async def _update_recipient_field_if_waiting(
             return False
         config = {"configurable": {"thread_id": email_id}}
         state = await graph.aget_state(config)
-        update = _bounded_human_update(state, delta)
-        await graph.aupdate_state(config, update)
+        try:
+            decision = RouteDecision.model_validate(
+                state.values.get("route_decision")
+            )
+        except Exception:
+            return False
+        if (
+            decision.route is CanonicalRoute.FORWARD
+            and not decision.params.get("allow_recipient_edit", True)
+        ):
+            return False
+        binding: dict[str, object] | None = None
+        state_inbox_id = state.values.get("inbox_id")
+        callback_has_binding = any(
+            value is not None
+            for value in (inbox_id, payload_revision, payload_digest)
+        )
+        if callback_has_binding or state_inbox_id is not None:
+            if not (
+                inbox_id == state_inbox_id
+                and _valid_durable_card_binding(
+                    inbox_id, payload_revision, payload_digest
+                )
+            ):
+                return False
+            binding = await _append_current_payload_revision(
+                state,
+                user_id="lark-editor",
+                expected_payload_revision=payload_revision,
+                expected_payload_digest=payload_digest,
+                recipient_delta=delta,
+            )
+        projection_delta = dict(delta)
+        if binding is not None:
+            projection_delta.update(
+                payload_revision=binding["payload_revision"],
+                payload_digest=binding["payload_digest"],
+            )
+        update = _bounded_human_update(state, projection_delta)
+        try:
+            await graph.aupdate_state(config, update)
+        except Exception as exc:
+            if binding is None:
+                raise
+            logger.warning(
+                "Durable recipient projection lagged payload revision: error_type=%s",
+                type(exc).__name__,
+            )
         return True
+
+
+async def _append_current_payload_revision(
+    state: Any,
+    *,
+    user_id: str,
+    expected_payload_revision: int,
+    expected_payload_digest: str,
+    draft_override: str | None = None,
+    recipient_delta: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Freeze the latest editable projection before any revised card is rendered."""
+    values = dict(state.values)
+    for key, value in (recipient_delta or {}).items():
+        if key in {"draft_to", "draft_cc"}:
+            values[key] = value
+    inbox_id = str(values["inbox_id"])
+    email_data, draft = await hydrate_graph_content(
+        values, _require_graph_dependencies()
+    )
+    if draft_override is not None:
+        draft = draft_override
+    decision = RouteDecision.model_validate(values.get("route_decision"))
+    if decision.params.get("include_attachments", False):
+        raise ValueError("unbound_forward_attachments")
+    resolved = await resolve_recipients(
+        values.get("draft_to") or [],
+        values.get("draft_cc") or [],
+        lark_client=lark_api_client,
+    )
+    if resolved is None or not await recipients_follow_route(
+        decision,
+        email_data,
+        resolved,
+        lark_client=lark_api_client,
+    ):
+        raise ValueError("recipient_policy_mismatch")
+    run = await db_manager.get_handoff_run(inbox_id)
+    if not run:
+        raise ValueError("durable_handoff_unavailable")
+    revision = await db_manager.create_payload_revision(
+        inbox_id=inbox_id,
+        expected_version=int(run["version"]),
+        expected_payload_revision=expected_payload_revision,
+        expected_payload_digest=expected_payload_digest,
+        payload={
+            "decision_digest": decision.canonical_digest(),
+            "plan_digest": values.get("handoff_plan_digest"),
+            "evidence_digest": values.get("evidence_pack_digest"),
+            "draft_digest": hashlib.sha256(draft.encode()).hexdigest(),
+            "draft_content": draft,
+            "draft_ref": {"draft_id": values.get("draft_id")},
+            "to": list(resolved.to), "cc": list(resolved.cc),
+            "attachment_refs": [], "attachment_digests": [],
+            "external_recipient_acknowledged": True,
+            "editor": user_id, "edited_at": datetime.now(UTC),
+        },
+    )
+    binding = await db_manager.get_payload_revision_binding(
+        inbox_id=inbox_id, revision=revision
+    )
+    if binding is None:
+        raise ValueError("payload_binding_unavailable")
+    binding.update(
+        draft_content=draft,
+        to_recipients=list(resolved.to),
+        cc_recipients=list(resolved.cc),
+    )
+    return binding
 
 
 def _schedule_claimed_action_resume(
@@ -1823,7 +2418,16 @@ def _schedule_claimed_action_resume(
     *,
     expected: frozenset[str],
 ) -> bool:
-    resume = _resume_graph_then_cleanup(email_id, state, config)
+    preserve_durable_approval = bool(
+        expected in {frozenset({"approved"}), frozenset({"rejected"})}
+        and state.values.get("inbox_id") is not None
+    )
+    resume = _resume_graph_then_cleanup(
+        email_id,
+        state,
+        config,
+        preserve_durable_approval=preserve_durable_approval,
+    )
     try:
         safe_async_run(resume)
     except Exception as exc:
@@ -1832,19 +2436,35 @@ def _schedule_claimed_action_resume(
             "Action resume scheduling failed: error_type=%s",
             type(exc).__name__,
         )
-        safe_async_wait(
-            _move_claimed_action_to_manual(
-                email_id,
-                state,
-                expected=expected,
+        if not preserve_durable_approval:
+            safe_async_wait(
+                _move_claimed_action_to_manual(
+                    email_id,
+                    state,
+                    expected=expected,
+                )
             )
-        )
         return False
     return True
 
 
-def process_approval(email_id, user_id):
-    handoff = safe_async_wait(_process_approval_action(email_id, user_id))
+def process_approval(
+    email_id,
+    user_id,
+    *,
+    inbox_id=None,
+    payload_revision=None,
+    payload_digest=None,
+):
+    handoff = safe_async_wait(
+        _process_approval_action(
+            email_id,
+            user_id,
+            inbox_id=inbox_id,
+            payload_revision=payload_revision,
+            payload_digest=payload_digest,
+        )
+    )
     if handoff is None:
         return False
     state, config = handoff
@@ -1858,9 +2478,24 @@ def process_approval(email_id, user_id):
     logger.info("Approval processed; resuming graph")
     return True
 
-def process_rejection(email_id, user_id, reason: str = ""):
+def process_rejection(
+    email_id,
+    user_id,
+    reason: str = "",
+    *,
+    inbox_id=None,
+    payload_revision=None,
+    payload_digest=None,
+):
     handoff = safe_async_wait(
-        _process_rejection_action(email_id, user_id, reason)
+        _process_rejection_action(
+            email_id,
+            user_id,
+            reason,
+            inbox_id=inbox_id,
+            payload_revision=payload_revision,
+            payload_digest=payload_digest,
+        )
     )
     if handoff is None:
         return False
@@ -1875,18 +2510,48 @@ def process_rejection(email_id, user_id, reason: str = ""):
     logger.info("Rejection processed; resuming graph")
     return True
     
-def process_modification(email_id, new_draft):
-    return safe_async_wait(_process_modification_action(email_id, new_draft))
+def process_modification(
+    email_id,
+    new_draft,
+    *,
+    inbox_id=None,
+    payload_revision=None,
+    payload_digest=None,
+):
+    return safe_async_wait(
+        _process_modification_action(
+            email_id,
+            new_draft,
+            inbox_id=inbox_id,
+            payload_revision=payload_revision,
+            payload_digest=payload_digest,
+        )
+    )
 
-async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -> bool:
+async def _process_claimed_draft_save(
+    email_id: str,
+    state: Any | None = None,
+    *,
+    claim: dict[str, object] | None = None,
+) -> bool:
+    durable_inbox_id = claim.get("inbox_id") if claim else None
+    durable_version = claim.get("handoff_version") if claim else None
+
     async def fail_closed(code: str) -> bool:
         try:
-            await move_to_manual_review(
-                email_id,
-                db_manager,
-                expected=frozenset({"saving_draft"}),
-                code=code,
-            )
+            if durable_inbox_id is not None and isinstance(durable_version, int):
+                await db_manager.fail_payload_draft_save(
+                    inbox_id=str(durable_inbox_id),
+                    expected_version=durable_version,
+                    error_code=code,
+                )
+            else:
+                await move_to_manual_review(
+                    email_id,
+                    db_manager,
+                    expected=frozenset({"saving_draft"}),
+                    code=code,
+                )
         except Exception as exc:
             logger.error(
                 "Draft-save quarantine failed: error_type=%s",
@@ -1895,22 +2560,28 @@ async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -
         return False
 
     config = {"configurable": {"thread_id": email_id}}
-    try:
-        if state is None:
-            state = await graph.aget_state(config)
-        email_data, draft = await _hydrate_lark_projection(state)
-    except Exception as exc:
-        logger.error(
-            "Exchange draft hydration failed: error_type=%s",
-            type(exc).__name__,
-        )
-        return await fail_closed("approval_handoff_failed")
+    if durable_inbox_id is not None:
+        email_data = {"subject": claim.get("subject") or ""}
+        draft = claim.get("draft_content")
+        raw_to = claim.get("to_recipients") or []
+        raw_cc = claim.get("cc_recipients") or []
+    else:
+        try:
+            if state is None:
+                state = await graph.aget_state(config)
+            email_data, draft = await _hydrate_lark_projection(state)
+        except Exception as exc:
+            logger.error(
+                "Exchange draft hydration failed: error_type=%s",
+                type(exc).__name__,
+            )
+            return await fail_closed("approval_handoff_failed")
+        raw_to = state.values.get("draft_to") or []
+        raw_cc = state.values.get("draft_cc") or []
 
     if not isinstance(draft, str) or not draft.strip():
         return await fail_closed("empty_draft")
 
-    raw_to = state.values.get("draft_to") or []
-    raw_cc = state.values.get("draft_cc") or []
     resolved = await resolve_recipients(
         raw_to,
         raw_cc,
@@ -1948,7 +2619,13 @@ async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -
         return await fail_closed("draft_save_outcome_unknown")
 
     try:
-        completed = await complete_draft_save(email_id, db_manager)
+        if durable_inbox_id is not None and isinstance(durable_version, int):
+            completed = await db_manager.complete_payload_draft_save(
+                inbox_id=str(durable_inbox_id),
+                expected_version=durable_version,
+            )
+        else:
+            completed = await complete_draft_save(email_id, db_manager)
     except Exception as exc:
         logger.error(
             "Draft-save completion outcome is ambiguous: error_type=%s",
@@ -1966,6 +2643,8 @@ async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -
         return await fail_closed("draft_save_outcome_unknown")
 
     try:
+        if state is None:
+            state = await graph.aget_state(config)
         await _cleanup_action_drive_tokens(email_id, state)
     except Exception as exc:
         logger.error(
@@ -1978,18 +2657,27 @@ async def _process_claimed_draft_save(email_id: str, state: Any | None = None) -
 async def _run_claimed_draft_save(
     email_id: str,
     state: Any | None = None,
+    *,
+    claim: dict[str, object] | None = None,
 ) -> bool:
     try:
-        return await _process_claimed_draft_save(email_id, state)
+        return await _process_claimed_draft_save(email_id, state, claim=claim)
     except asyncio.CancelledError:
         logger.warning("Exchange draft save was cancelled")
         try:
-            await move_to_manual_review(
-                email_id,
-                db_manager,
-                expected=frozenset({"saving_draft"}),
-                code="draft_save_outcome_unknown",
-            )
+            if claim and claim.get("inbox_id") is not None:
+                await db_manager.fail_payload_draft_save(
+                    inbox_id=str(claim["inbox_id"]),
+                    expected_version=int(claim["handoff_version"]),
+                    error_code="draft_save_outcome_unknown",
+                )
+            else:
+                await move_to_manual_review(
+                    email_id,
+                    db_manager,
+                    expected=frozenset({"saving_draft"}),
+                    code="draft_save_outcome_unknown",
+                )
         except Exception as exc:
             logger.error(
                 "Cancelled draft-save quarantine failed: error_type=%s",
@@ -1999,9 +2687,10 @@ async def _run_claimed_draft_save(
 
 
 async def process_save_draft(email_id, state=None) -> bool:
-    if not await _claim_draft_save_action(email_id):
+    claim = await _claim_draft_save_action(email_id, state=state)
+    if not claim:
         return False
-    return await _run_claimed_draft_save(email_id, state)
+    return await _run_claimed_draft_save(email_id, state, claim=claim)
 
 async def process_pdf_generation_and_reply(
     email_id,

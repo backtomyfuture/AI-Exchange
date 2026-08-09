@@ -1,6 +1,9 @@
 import asyncio
 from contextlib import ExitStack
 from copy import deepcopy
+from datetime import UTC, datetime
+from hashlib import sha256
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +24,8 @@ from src.graph.state_factory import (
     sanitize_graph_delta,
     serialized_state_size,
 )
+from src.router.decision import RouteDecision
+from src.safety.execution_gate import ApprovedExecutionEnvelope
 from src.storage import ContentRef
 from src.utils import lark_app
 
@@ -124,7 +129,10 @@ def _classification_retry(**_kwargs):
 
 
 @pytest.mark.asyncio
-async def test_recording_saver_observes_real_compiled_flow(monkeypatch):
+async def test_recording_saver_observes_real_compiled_flow(
+    monkeypatch,
+    route_decision_factory,
+):
     monkeypatch.setattr(
         "src.graph.state_factory.get_settings",
         lambda: SimpleNamespace(EXCHANGE_ACCOUNT_ID=8),
@@ -146,17 +154,17 @@ async def test_recording_saver_observes_real_compiled_flow(monkeypatch):
     )
     saver = RecordingInMemorySaver()
     graph = build_graph(checkpointer=saver, dependencies=dependencies)
-    router = MagicMock()
-    router.execute_router = AsyncMock(side_effect=lambda state: state)
+    initial_state = build_initial_graph_state(email, _ref())
+    initial_state["route_decision"] = route_decision_factory("read_only")
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
+    with patch(
         "src.nodes.categorizer.with_llm_retry", side_effect=_classification_retry
     ), patch(
         "src.providers.factory.get_llm_for_role",
         return_value=RunnableLambda(lambda value: value),
     ):
         await graph.ainvoke(
-            build_initial_graph_state(email, _ref()),
+            initial_state,
             config={"configurable": {"thread_id": "checkpoint-mail"}},
         )
 
@@ -244,7 +252,10 @@ def _walk_values(value, seen=None):
 
 
 @pytest.mark.asyncio
-async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
+async def test_compiled_flow_never_checkpoints_complete_content(
+    monkeypatch,
+    route_decision_factory,
+):
     monkeypatch.setattr(
         "src.graph.state_factory.get_settings",
         lambda: SimpleNamespace(EXCHANGE_ACCOUNT_ID=8),
@@ -279,12 +290,8 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
     graph = build_graph(checkpointer=saver, dependencies=dependencies)
     config = {"configurable": {"thread_id": email["id"]}}
 
-    router = MagicMock()
-    router.execute_router = AsyncMock(side_effect=lambda state: state)
-    router.apply_tier2_hits = AsyncMock(return_value={})
-    router.apply_tier3_fallback = AsyncMock(
-        return_value={"routing_stage": "none"}
-    )
+    route_decision = route_decision_factory("reply")
+    inbox_id = "00000000-0000-4000-8000-000000000127"
     retriever = MagicMock()
     retriever.search.return_value = [
         {
@@ -358,9 +365,7 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
 
         return decorator
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
-        "src.nodes.retriever_node.get_routing_engine", return_value=router
-    ), patch(
+    with patch(
         "src.nodes.categorizer.with_llm_retry", side_effect=classification_factory
     ), patch(
         "src.nodes.drafter.with_llm_retry", side_effect=draft_retry
@@ -426,6 +431,7 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
                 email["id"],
                 sender_context,
                 config,
+                durable_context={"route_decision": route_decision},
             )
             assert pipeline_result is not None
             assert pipeline_result["draft"] == second_draft
@@ -450,6 +456,114 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
             assert edited_state.values["draft_id"] == email["id"]
             assert edited_state.values["approval_status"] == "pending"
 
+            decision = RouteDecision.model_validate(
+                edited_state.values["route_decision"]
+            )
+            decision_digest = decision.canonical_digest()
+            plan_digest = "1" * 64
+            evidence_digest = "2" * 64
+            draft_digest = sha256(human_draft.encode()).hexdigest()
+            payload = {
+                "decision_digest": decision_digest,
+                "plan_digest": plan_digest,
+                "evidence_digest": evidence_digest,
+                "draft_digest": draft_digest,
+                "draft_content": human_draft,
+                "draft_ref": {"draft_id": email["id"]},
+                "to": ["recipient@example.com"],
+                "cc": [],
+                "attachment_refs": [],
+                "attachment_digests": [],
+                "external_recipient_acknowledged": True,
+            }
+            payload_digest = sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            envelope = ApprovedExecutionEnvelope(
+                inbox_id=inbox_id,
+                account_id=8,
+                email_id=email["id"],
+                payload_revision=1,
+                payload_digest=payload_digest,
+                route_decision=decision,
+                decision_digest=decision_digest,
+                plan_digest=plan_digest,
+                evidence_digest=evidence_digest,
+                draft_digest=draft_digest,
+                draft_content=human_draft,
+                draft_ref={"draft_id": email["id"]},
+                to=("recipient@example.com",),
+                external_recipient_acknowledged=True,
+                approver="approver-1",
+                approved_at=datetime.now(UTC),
+            )
+            handoff_run = {
+                "state": "approval_pending",
+                "version": 3,
+                "payload_revision": 1,
+                "decision_digest": decision_digest,
+                "plan_digest": plan_digest,
+                "evidence_digest": evidence_digest,
+            }
+
+            async def get_handoff_run(_inbox_id):
+                assert _inbox_id == inbox_id
+                return dict(handoff_run)
+
+            async def approve_payload_revision(**kwargs):
+                assert kwargs["inbox_id"] == inbox_id
+                assert kwargs["revision"] == 1
+                assert kwargs["payload_digest"] == payload_digest
+                handoff_run.update(state="approved", version=4)
+                persisted_status["value"] = "approved"
+
+            async def get_approved_execution_envelope(*, inbox_id, revision):
+                assert (inbox_id, revision) == (handoff_run_id, 1)
+                return {
+                    "envelope": envelope.model_dump(mode="json"),
+                    "envelope_digest": envelope.canonical_digest(),
+                }
+
+            async def claim_execution(**kwargs):
+                assert kwargs["inbox_id"] == inbox_id
+                assert kwargs["expected_version"] == 4
+                handoff_run.update(state="executing", version=5)
+                persisted_status["value"] = "sending"
+                return True
+
+            async def complete_execution(**kwargs):
+                assert kwargs["inbox_id"] == inbox_id
+                assert kwargs["expected_version"] == 5
+                assert kwargs["sent"] is True
+                handoff_run.update(state="completed", version=6)
+                persisted_status["value"] = "sent"
+                return True
+
+            handoff_run_id = inbox_id
+            database.get_handoff_run = AsyncMock(side_effect=get_handoff_run)
+            database.approve_payload_revision = AsyncMock(
+                side_effect=approve_payload_revision
+            )
+            database.get_approved_execution_envelope = AsyncMock(
+                side_effect=get_approved_execution_envelope
+            )
+            database.claim_execution = AsyncMock(side_effect=claim_execution)
+            database.complete_execution = AsyncMock(side_effect=complete_execution)
+            database.transition_handoff_manual_review = AsyncMock(return_value=False)
+            await graph.aupdate_state(
+                config,
+                {
+                    "inbox_id": inbox_id,
+                    "payload_revision": 1,
+                    "payload_digest": payload_digest,
+                },
+            )
+
             loop = asyncio.get_running_loop()
             scheduled = []
 
@@ -466,6 +580,9 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
                     lark_app.process_approval,
                     email["id"],
                     "approver-1",
+                    inbox_id=inbox_id,
+                    payload_revision=1,
+                    payload_digest=payload_digest,
                 )
 
             assert len(scheduled) == 1
@@ -481,18 +598,10 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         email["id"],
         "waiting_approval",
     )
-    sender_context.db_manager.update_status.assert_any_await(
-        email["id"],
-        None,
-        approver_user_id="approver-1",
-        final_draft=human_draft,
-    )
     assert persisted_status["value"] == "sent"
-    assert [
-        call.kwargs["target"]
-        for call in sender_context.db_manager.compare_and_set_status.await_args_list
-        if call.args[0] == email["id"]
-    ] == ["approved", "sending", "sent"]
+    sender_context.db_manager.approve_payload_revision.assert_awaited_once()
+    sender_context.db_manager.claim_execution.assert_awaited_once()
+    sender_context.db_manager.complete_execution.assert_awaited_once()
     sender_context.email_processor.process_sent_email.assert_called_once()
     sent_email = sender_context.email_processor.process_sent_email.call_args.kwargs
     assert body_marker in sent_email["original_email_data"]["body"]

@@ -40,8 +40,52 @@ The shared Qdrant corpus of Historical Email used to retrieve relevant prior exa
 _Avoid_: Discovery-only corpus, separate historical index
 
 **Declarative Tier 1 Skill**:
-A production routing rule represented by bounded data rather than executable `handler.py`. It may match emails and specify priority, whether a response is needed, or a forward action with fixed recipients; it only prepares a routing or approval plan and never sends email.
+A production routing rule represented by bounded data rather than executable `handler.py`. It may match an email and declare one Canonical Route Decision, including a versioned Handoff Profile for a writing route; it never sends email or names arbitrary executable code.
 _Avoid_: Generated code, automatic sending
+
+**Intake Guard**:
+A conservative deterministic gate after durable normalization and deduplication but before business routing, retrieval, or model calls. It returns only pass, suppress, or quarantine; it does not classify business intent or perform fuzzy spam detection.
+_Avoid_: Tier 1 no_action, spam classifier
+
+**Intake Decision**:
+The append-only result of one Intake Guard evaluation for one inbox execution epoch. A quarantine release creates a new execution epoch and release record instead of rewriting the original decision.
+_Avoid_: Retry status, mutable quarantine flag
+
+**Canonical Route Decision**:
+The single immutable answer from Tier 1, Historical Route Consensus, or Tier 3 that states reply, forward, read_only, no_action, or manual_review. It is persisted before profile, retrieval, model, graph, or user-visible effects and cannot be changed by downstream failure.
+_Avoid_: Classification projection, graph next_step
+
+**Historical Route Consensus**:
+Tier 2 voting over immutable Canonical Route Decision labels from distinct Historical Email. It runs only after Tier 1 abstains; duplicate evidence contributes at most one vote, conflicting labels fail closed, and it is separate from writing retrieval.
+_Avoid_: Historical RAG Context, writing style retrieval
+
+**Handoff Profile**:
+A read-only, versioned writing contract selected by a reply or forward Canonical Route Decision. It names only registered evidence sources and a bounded writer mode; it cannot point to arbitrary Python, URLs, credentials, or scripts.
+_Avoid_: Executable Tier 1 handler, RAG result
+
+**Handoff Plan**:
+The immutable per-email expansion of a Handoff Profile, persisted with a canonical digest before evidence collection. It controls which registered evidence sources and writer behavior are permitted without acquiring routing authority.
+_Avoid_: Route decision, mutable graph state
+
+**Evidence Pack**:
+The immutable, digest-addressed facts collected by registered read-only adapters under a Handoff Plan. It may support drafting and draft review but cannot encode or change route, profile, or recipients.
+_Avoid_: Tier 2 vote, prompt-owned facts
+
+**Execution Payload Revision**:
+An append-only frozen approval payload containing the exact decision, plan and evidence bindings, draft, To/Cc recipients, and attachment manifest shown for approval. Any edit creates a new revision and invalidates approval actions bound to an older revision.
+_Avoid_: Mutable checkpoint draft, card display state
+
+**Approved Execution Envelope**:
+The immutable envelope created transactionally when a human approves an exact Execution Payload Revision. The sender may consume this envelope only, never mutable graph draft or recipient fields.
+_Avoid_: Approval status flag, reconstructed send request
+
+**Draft Quality Gate**:
+The pre-approval rule and LLM review of a draft against the original email and Evidence Pack. It may mark the draft ready, request a rewrite, or require manual review, but cannot alter route, profile, or recipients.
+_Avoid_: Tier 4, execution authorization
+
+**Execution Gate**:
+The deterministic validation immediately before an approved external send. It verifies the frozen envelope and digests and may block or require manual review, but never rewrites human-approved content or reroutes the email.
+_Avoid_: LLM reviewer, final routing tier
 
 **Proposed Forward Target**:
 A forward action and fixed recipient inferred from Historical Email as part of a Discovered Skill Candidate. It is only a suggestion until the operator confirms or edits it during Skill Promotion.

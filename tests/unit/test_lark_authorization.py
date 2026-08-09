@@ -249,6 +249,9 @@ def test_allowed_card_operator_reaches_action_once(monkeypatch):
     approval.assert_called_once_with(
         "mail-authorization-test",
         "ou_allowed",
+        inbox_id=None,
+        payload_revision=None,
+        payload_digest=None,
     )
 
 

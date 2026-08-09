@@ -4,12 +4,16 @@ from src.nodes.categorizer import categorize_email
 
 
 @pytest.mark.asyncio
-async def test_categorize_email_retry_logic(graph_node_harness):
+async def test_categorize_email_retry_logic(
+    graph_node_harness,
+    route_decision_factory,
+):
     """
     Test that categorize_email retries on failure.
     """
     state = graph_node_harness.state(
         {"id": "retry-mail", "subject": "Test Retry", "body": "This is a test body."},
+        route_decision=route_decision_factory("reply"),
     )
 
     success_result = {
@@ -21,13 +25,7 @@ async def test_categorize_email_retry_logic(graph_node_harness):
         "confidence": 0.8,
     }
 
-    routing_engine = MagicMock()
-    routing_engine.execute_router = AsyncMock(side_effect=lambda routed: routed)
     with (
-        patch(
-            "src.nodes.categorizer.get_routing_engine",
-            return_value=routing_engine,
-        ),
         patch("src.providers.factory.get_llm_for_role") as mock_create_llm,
         patch("src.nodes.categorizer.ChatPromptTemplate") as mock_prompt_class,
     ):

@@ -53,24 +53,25 @@ def _assert_manual_classification(result: dict, *raw_failures: str) -> None:
     assert "need_reply" not in (result.get("classification") or {})
 
 
-def _identity_router() -> SimpleNamespace:
-    return SimpleNamespace(
-        execute_router=AsyncMock(side_effect=lambda state: state),
-    )
+def _assert_display_fallback(result: dict, *, reason: str, need_reply: bool) -> None:
+    assert "next_step" not in result
+    assert "approval_status" not in result
+    assert result["classification"]["reasoning"] == reason
+    assert result["classification"]["need_reply"] is need_reply
 
 
 @pytest.mark.asyncio
-async def test_categorizer_timeout_requires_manual_review(graph_node_harness):
+async def test_categorizer_timeout_preserves_final_route(
+    graph_node_harness,
+    route_decision_factory,
+):
     raw_error = "categorizer-timeout-private-detail"
     state = graph_node_harness.state(
-        {"id": "categorizer-timeout", "subject": "Q", "body": "body"}
+        {"id": "categorizer-timeout", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
 
-    with patch(
-        "src.nodes.categorizer.get_routing_engine", return_value=_identity_router()
-    ), patch(
-        "src.nodes.categorizer.enforce_model_input_budget"
-    ), patch(
+    with patch("src.nodes.categorizer.enforce_model_input_budget"), patch(
         "src.nodes.categorizer.with_llm_retry",
         side_effect=_retry_outcome(TimeoutError(raw_error)),
     ), patch(
@@ -79,20 +80,25 @@ async def test_categorizer_timeout_requires_manual_review(graph_node_harness):
     ):
         result = await categorize_email(state, graph_node_harness.dependencies)
 
-    _assert_manual_classification(result, raw_error)
+    _assert_display_fallback(
+        result,
+        reason="categorizer_model_failed",
+        need_reply=True,
+    )
+    assert raw_error not in json.dumps(result, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
-async def test_categorizer_invalid_schema_requires_manual_review(graph_node_harness):
+async def test_categorizer_invalid_schema_preserves_final_route(
+    graph_node_harness,
+    route_decision_factory,
+):
     state = graph_node_harness.state(
-        {"id": "categorizer-schema", "subject": "Q", "body": "body"}
+        {"id": "categorizer-schema", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("read_only"),
     )
 
-    with patch(
-        "src.nodes.categorizer.get_routing_engine", return_value=_identity_router()
-    ), patch(
-        "src.nodes.categorizer.enforce_model_input_budget"
-    ), patch(
+    with patch("src.nodes.categorizer.enforce_model_input_budget"), patch(
         "src.nodes.categorizer.with_llm_retry",
         side_effect=_retry_outcome({"priority": "P1"}),
     ), patch(
@@ -101,24 +107,34 @@ async def test_categorizer_invalid_schema_requires_manual_review(graph_node_harn
     ):
         result = await categorize_email(state, graph_node_harness.dependencies)
 
-    _assert_manual_classification(result)
+    _assert_display_fallback(
+        result,
+        reason="categorizer_model_failed",
+        need_reply=False,
+    )
 
 
 @pytest.mark.asyncio
-async def test_categorizer_token_overflow_requires_manual_review(graph_node_harness):
+async def test_categorizer_token_overflow_preserves_final_route(
+    graph_node_harness,
+    route_decision_factory,
+):
     state = graph_node_harness.state(
-        {"id": "categorizer-budget", "subject": "Q", "body": "body"}
+        {"id": "categorizer-budget", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
 
     with patch(
-        "src.nodes.categorizer.get_routing_engine", return_value=_identity_router()
-    ), patch(
         "src.nodes.categorizer.enforce_model_input_budget",
         side_effect=ModelInputTooLarge("categorizer"),
     ):
         result = await categorize_email(state, graph_node_harness.dependencies)
 
-    _assert_manual_classification(result)
+    _assert_display_fallback(
+        result,
+        reason="categorizer_input_too_large",
+        need_reply=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -147,25 +163,23 @@ async def test_tier3_router_failure_requires_manual_review():
 
 
 @pytest.mark.asyncio
-async def test_thread_summary_failure_requires_manual_review(graph_node_harness):
+async def test_thread_summary_failure_degrades_without_rerouting(
+    graph_node_harness,
+    route_decision_factory,
+):
     raw_error = "summary-timeout-private-detail"
     state = graph_node_harness.state(
-        {"id": "summary-failure", "subject": "Q", "body": "body"}
+        {"id": "summary-failure", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
     retriever = MagicMock()
     retriever.search.return_value = [
         {"id": "old-1", "sender": "one@example.com", "subject": "Q", "body": "a"},
         {"id": "old-2", "sender": "two@example.com", "subject": "Q", "body": "b"},
     ]
-    router = SimpleNamespace(
-        apply_tier2_hits=AsyncMock(return_value={}),
-        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
-    )
     model = SimpleNamespace(ainvoke=AsyncMock(side_effect=TimeoutError(raw_error)))
 
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
-        "src.nodes.retriever_node.get_routing_engine", return_value=router
-    ), patch(
         "src.nodes.retriever_node.enforce_model_input_budget"
     ), patch(
         "src.providers.factory.get_llm_for_role", return_value=model
@@ -184,7 +198,9 @@ async def test_thread_summary_failure_requires_manual_review(graph_node_harness)
     ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
-    _assert_manual_review(result, raw_error)
+    assert "next_step" not in result
+    assert len(result["context_summaries"]) == 2
+    assert raw_error not in json.dumps(result, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -361,11 +377,13 @@ async def test_empty_draft_requires_manual_review(graph_node_harness):
 )
 async def test_categorizer_rejects_coerced_decision_types(
     graph_node_harness,
+    route_decision_factory,
     need_reply,
     confidence,
 ):
     state = graph_node_harness.state(
-        {"id": "categorizer-strict", "subject": "Q", "body": "body"}
+        {"id": "categorizer-strict", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
     classification = {
         "priority": "P1",
@@ -377,9 +395,6 @@ async def test_categorizer_rejects_coerced_decision_types(
     }
 
     with patch(
-        "src.nodes.categorizer.get_routing_engine",
-        return_value=_identity_router(),
-    ), patch(
         "src.nodes.categorizer.with_llm_retry",
         side_effect=_retry_outcome(classification),
     ), patch(
@@ -388,7 +403,11 @@ async def test_categorizer_rejects_coerced_decision_types(
     ):
         result = await categorize_email(state, graph_node_harness.dependencies)
 
-    _assert_manual_classification(result)
+    _assert_display_fallback(
+        result,
+        reason="categorizer_model_failed",
+        need_reply=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -432,27 +451,24 @@ async def test_large_router_failure_still_returns_bounded_manual_delta():
 
 
 @pytest.mark.asyncio
-async def test_empty_thread_summary_requires_manual_review(graph_node_harness):
+async def test_empty_thread_summary_degrades_without_rerouting(
+    graph_node_harness,
+    route_decision_factory,
+):
     state = graph_node_harness.state(
-        {"id": "summary-empty", "subject": "Q", "body": "body"}
+        {"id": "summary-empty", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
     retriever = MagicMock()
     retriever.search.return_value = [
         {"id": "old-1", "sender": "one@example.com", "subject": "Q", "body": "a"},
         {"id": "old-2", "sender": "two@example.com", "subject": "Q", "body": "b"},
     ]
-    router = SimpleNamespace(
-        apply_tier2_hits=AsyncMock(return_value={}),
-        apply_tier3_fallback=AsyncMock(return_value={"routing_stage": "none"}),
-    )
     model = SimpleNamespace(
         ainvoke=AsyncMock(return_value=SimpleNamespace(content="  \n"))
     )
 
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
-        "src.nodes.retriever_node.get_routing_engine",
-        return_value=router,
-    ), patch(
         "src.providers.factory.get_llm_for_role",
         return_value=model,
     ), patch(
@@ -467,7 +483,8 @@ async def test_empty_thread_summary_requires_manual_review(graph_node_harness):
     ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
-    _assert_manual_review(result)
+    assert "next_step" not in result
+    assert len(result["context_summaries"]) == 2
 
 
 @pytest.mark.asyncio
@@ -531,23 +548,21 @@ async def test_content_guard_rejection_requires_manual_review(graph_node_harness
 
 
 @pytest.mark.asyncio
-async def test_tier2_skill_failure_requires_manual_review(graph_node_harness):
-    raw_error = "tier2-skill-private-detail"
+async def test_writing_retriever_never_invokes_route_resolution(
+    graph_node_harness,
+    route_decision_factory,
+):
     state = graph_node_harness.state(
-        {"id": "tier2-failure", "subject": "Q", "body": "body"}
+        {"id": "tier2-failure", "subject": "Q", "body": "body"},
+        route_decision=route_decision_factory("reply"),
     )
     retriever = MagicMock()
     retriever.search.return_value = []
-    router = SimpleNamespace(
-        apply_tier2_hits=AsyncMock(side_effect=RuntimeError(raw_error))
-    )
-
     with patch(
         "src.nodes.retriever_node.get_retriever", return_value=retriever
-    ), patch(
-        "src.nodes.retriever_node.get_routing_engine", return_value=router
     ):
         result = await retrieve_context(state, graph_node_harness.dependencies)
 
-    _assert_manual_review(result, raw_error)
-
+    assert result["context_summaries"] == []
+    assert "route_decision" not in result
+    assert "next_step" not in result

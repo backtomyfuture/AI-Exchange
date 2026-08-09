@@ -20,7 +20,7 @@ branch_labels = None
 depends_on = None
 
 _BASELINE_SQL_PATH = Path(__file__).with_suffix(".sql")
-_BASELINE_SQL_SHA256 = "28bea32dc49efe753dabdb59d7306ed0856ac1be5dd02ad1c4fef489dd11a815"
+_BASELINE_SQL_SHA256 = "124f807e7e2e25aa1e7b56dc2a5e82077242aba279282ece30ac2d452c5d5133"
 
 
 def _baseline_sql() -> str:

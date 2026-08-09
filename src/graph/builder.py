@@ -15,6 +15,7 @@ from src.nodes.reviewer import review_draft
 from src.nodes.sender import send_final_email
 from src.nodes.manual_review import enter_manual_review
 from src.domain.errors import DatabaseOperationError
+from src.router.decision import RouteDecision
 
 logger = logging.getLogger(__name__)
 
@@ -111,14 +112,15 @@ def build_graph(
     workflow.set_entry_point("categorizer")
 
     def route_after_categorizer(state: AgentState):
-        if state.get("next_step") == "manual_review":
+        raw = state.get("route_decision")
+        if raw is None:
             return "manual_review"
-        need_reply = (state.get("classification") or {}).get("need_reply")
-        if need_reply is True:
+        route = RouteDecision.model_validate(raw).route.value
+        if route in {"reply", "forward"}:
             return "retriever"
-        if need_reply is False:
-            return "end"
-        return "manual_review"
+        if route == "manual_review":
+            return "manual_review"
+        return "end"
 
     workflow.add_conditional_edges(
         "categorizer",
@@ -130,7 +132,26 @@ def build_graph(
         },
     )
 
-    workflow.add_edge("retriever", "drafter")
+    def route_after_retriever(state: AgentState):
+        raw = state.get("route_decision")
+        if raw is None:
+            return "manual_review"
+        route = RouteDecision.model_validate(raw).route.value
+        if route in {"reply", "forward"}:
+            return "drafter"
+        if route == "manual_review":
+            return "manual_review"
+        return "end"
+
+    workflow.add_conditional_edges(
+        "retriever",
+        route_after_retriever,
+        {
+            "drafter": "drafter",
+            "manual_review": "manual_review",
+            "end": END,
+        },
+    )
 
     workflow.add_conditional_edges(
         "drafter",

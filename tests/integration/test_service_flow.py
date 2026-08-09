@@ -10,6 +10,7 @@ from src.email_feishu_delivery import (
     EmailDeliverySideEffectCommittedError,
 )
 from src.exchange_service import process_and_archive_email
+from src.router.decision import RouteDecision
 from src.storage import ContentRef
 
 
@@ -24,7 +25,7 @@ def _content_ref():
     )
 
 @pytest.fixture
-def mock_context():
+def mock_context(monkeypatch, route_decision_factory):
     ctx = MagicMock()
     ctx.db_manager = AsyncMock()
     ctx.db_manager.get_content_ref.return_value = _content_ref()
@@ -34,6 +35,19 @@ def mock_context():
     ctx.graph = AsyncMock()
     ctx.exchange_client = AsyncMock()
     ctx.email_feishu_delivery = SimpleNamespace(deliver=AsyncMock())
+    routing_engine = SimpleNamespace(
+        resolve_route=AsyncMock(
+            return_value=RouteDecision.model_validate(route_decision_factory("reply"))
+        ),
+    )
+    monkeypatch.setattr(
+        "src.exchange_service.get_routing_engine",
+        lambda: routing_engine,
+    )
+    monkeypatch.setattr(
+        "src.exchange_service._routing_evidence_hits",
+        AsyncMock(return_value=[]),
+    )
     return ctx
 
 
@@ -53,6 +67,8 @@ def configure_completed_graph(mock_context, email_data, *, classification, event
     async def mock_astream(*args, **kwargs):
         for event in events:
             yield event
+        if args and isinstance(args[0], dict):
+            final_values["route_decision"] = args[0].get("route_decision")
         mock_state.values.update(final_values)
 
     async def update_state(_config, delta, **_kwargs):
@@ -96,6 +112,8 @@ async def test_process_flow_new_email(mock_context):
     async def mock_astream(*args, **kwargs):
         yield {"categorizer": {"classification": {"need_reply": True}}}
         yield {"drafter": {"draft_id": "msg_1"}}
+        if args and isinstance(args[0], dict):
+            final_values["route_decision"] = args[0].get("route_decision")
         mock_state.values.update(final_values)
 
     async def update_state(_config, delta, **_kwargs):

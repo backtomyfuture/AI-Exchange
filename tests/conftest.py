@@ -97,3 +97,51 @@ def graph_node_harness(monkeypatch):
         lambda: SimpleNamespace(EXCHANGE_ACCOUNT_ID=8),
     )
     return GraphNodeHarness()
+
+
+@pytest.fixture
+def route_decision_factory():
+    """Build a finalized canonical route for graph/node contract tests."""
+
+    from src.router.decision import (
+        DecisionOutcome,
+        RouteDecision,
+        RouteProvenance,
+        RouteTier,
+    )
+
+    def build(route="reply", *, params=None, profile_id=None, reason_code="test_route"):
+        if params is None:
+            if route == "forward":
+                params = {
+                    "fixed_recipients": ["approved@example.com"],
+                    "cc": [],
+                    "allow_recipient_edit": True,
+                    "include_attachments": False,
+                }
+            elif route in {"no_action", "manual_review"}:
+                params = {"reason_code": reason_code}
+            else:
+                params = {}
+        if profile_id is None:
+            profile_id = (
+                "generic_reply_v1"
+                if route == "reply"
+                else "generic_forward_v1"
+                if route == "forward"
+                else None
+            )
+        return RouteDecision(
+            outcome=DecisionOutcome.MATCHED,
+            route=route,
+            params=params,
+            provenance=RouteProvenance(
+                tier=RouteTier.SYSTEM,
+                source_version="test-route-v1",
+                confidence=1.0,
+            ),
+            reason_code=reason_code,
+            handoff_profile_id=profile_id,
+        ).model_dump(mode="json")
+
+    return build

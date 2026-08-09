@@ -34,6 +34,7 @@ match:
 decision:
   route: reply
   business_flow_id: vip-escalation
+  handoff_profile_id: vip_direct_reply_v1
   params:
     reply_mode: sender_and_original_cc
 

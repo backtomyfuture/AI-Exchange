@@ -136,17 +136,18 @@ def test_graph_builder_accepts_the_shared_dependencies():
 
 
 @pytest.mark.asyncio
-async def test_categorizer_hydrates_body_locally_and_returns_only_bounded_delta():
+async def test_categorizer_hydrates_body_locally_and_returns_only_bounded_delta(
+    route_decision_factory,
+):
     dependencies = _dependencies()
     state = _state()
+    state["route_decision"] = route_decision_factory("reply")
     captured = {}
-    router = MagicMock()
-    router.execute_router = AsyncMock(side_effect=lambda local_state: local_state)
 
     def capture_budget(_role, value, *, budget):
         captured["prompt"] = value
 
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router), patch(
+    with patch(
         "src.nodes.categorizer.with_llm_retry", side_effect=_classification_retry
     ), patch(
         "src.nodes.categorizer.enforce_model_input_budget", side_effect=capture_budget
@@ -158,14 +159,16 @@ async def test_categorizer_hydrates_body_locally_and_returns_only_bounded_delta(
 
     assert "CURRENT-BODY-SENTINEL" in captured["prompt"]
     assert dependencies.content_store.loads == [(_ref(), False)]
-    assert set(result) == {"classification", "next_step"}
+    assert set(result) == {"classification"}
     assert len(result["classification"]["summary"].encode()) <= 512
     assert "email" not in result
     assert "content_ref" not in result
 
 
 @pytest.mark.asyncio
-async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
+async def test_categorizer_sends_latest_reply_separately_from_quoted_history(
+    route_decision_factory,
+):
     email = {
         "id": "mail-evolution",
         "subject": "答复: 外部信息单据待处理提醒",
@@ -185,6 +188,7 @@ async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
     }
     dependencies = _dependencies(email)
     state = _state(email)
+    state["route_decision"] = route_decision_factory("read_only")
     captured = {}
 
     def fake_model(prompt_value):
@@ -225,7 +229,9 @@ async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
 
 
 @pytest.mark.asyncio
-async def test_categorizer_does_not_route_on_keyword_found_only_in_history():
+async def test_categorizer_does_not_route_on_keyword_found_only_in_history(
+    route_decision_factory,
+):
     email = {
         "id": "mail-history-keyword",
         "subject": "答复: 项目材料",
@@ -241,6 +247,7 @@ async def test_categorizer_does_not_route_on_keyword_found_only_in_history():
     }
     dependencies = _dependencies(email)
     state = _state(email)
+    state["route_decision"] = route_decision_factory("reply")
 
     def fake_model(_prompt_value):
         return json.dumps(
@@ -265,43 +272,39 @@ async def test_categorizer_does_not_route_on_keyword_found_only_in_history():
     # probe for "a keyword only in quoted history must not trigger Tier 1";
     # that guarantee now lives in the current/quoted-history split itself.
     assert result["classification"]["need_reply"] is True
-    assert result["next_step"] == "rag_search"
+    assert "next_step" not in result
 
 
 @pytest.mark.asyncio
-async def test_categorizer_persists_fixed_forward_draft_and_recipients():
+async def test_categorizer_does_not_own_forward_draft_or_recipients(
+    route_decision_factory,
+):
     dependencies = _dependencies()
     state = _state()
-    router = MagicMock()
+    state["route_decision"] = route_decision_factory(
+        "forward",
+        params={
+            "fixed_recipients": ["boss@example.com"],
+            "cc": ["observer@example.com"],
+            "allow_recipient_edit": False,
+            "include_attachments": False,
+        },
+    )
 
-    async def route(local_state):
-        local_state = deepcopy(local_state)
-        local_state["classification"] = {
-            "priority": "P0",
-            "need_reply": True,
-            "intent": "转发",
-            "action": "forward",
-        }
-        local_state["email"]["draft_to"] = ["boss@example.com"]
-        local_state["email"]["draft_cc"] = ["observer@example.com"]
-        local_state["draft"] = "呈阅"
-        return local_state
+    result = await categorize_email(state, dependencies)
 
-    router.execute_router = AsyncMock(side_effect=route)
-
-    with patch("src.nodes.categorizer.get_routing_engine", return_value=router):
-        result = await categorize_email(state, dependencies)
-
-    assert dependencies.drafts.saves == [("mail-1", "呈阅")]
-    assert result["draft_id"] == "mail-1"
-    assert result["draft_to"] == ["boss@example.com"]
-    assert result["draft_cc"] == ["observer@example.com"]
+    assert dependencies.drafts.saves == []
+    assert "draft_id" not in result
+    assert "draft_to" not in result
+    assert "draft_cc" not in result
     assert "draft" not in result
     assert "email" not in result
 
 
 @pytest.mark.asyncio
-async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries():
+async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
+    route_decision_factory,
+):
     email = {
         "id": "mail-1",
         "subject": "subject",
@@ -315,21 +318,14 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
     dependencies = _dependencies(email)
     state = _state(email)
     state["classification"] = {"need_reply": False}
+    state["route_decision"] = route_decision_factory("reply")
     complete_hit = "COMPLETE-HIT-SENTINEL-" + "x" * 5_000
     retriever = MagicMock()
     retriever.search.return_value = [
         {"id": "old-1", "sender": "one", "subject": "first", "body": complete_hit},
         {"id": "old-2", "sender": "two", "subject": "second", "body": complete_hit},
     ]
-    router = MagicMock()
-    router.apply_tier2_hits = AsyncMock(return_value={})
-    router.apply_tier3_fallback = AsyncMock(
-        return_value={"routing_stage": "none"}
-    )
-
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
-        "src.nodes.retriever_node.get_routing_engine", return_value=router
-    ), patch(
         "src.nodes.retriever_node._generate_thread_summary",
         new_callable=AsyncMock,
         return_value="small thread summary",
@@ -355,19 +351,19 @@ async def test_retriever_keeps_complete_hits_local_and_returns_capped_summaries(
     ]
     assert "data:image" not in retriever.search.call_args.kwargs["query_text"]
     assert retriever.search.call_args.kwargs["exclude_email_id"] == "mail-1"
-    routed_email = router.apply_tier2_hits.await_args.args[0]["email"]
-    assert routed_email["body"] == "CURRENT-BODY-SENTINEL\n[内嵌图片]"
     encoded = json.dumps(result, ensure_ascii=False)
     assert "context" not in result
     assert len(result["context_summaries"]) == 2
     assert complete_hit not in encoded
     assert "COMPLETE-HIT-SENTINEL" in encoded
     assert result["metadata"]["thread_summary"] == "small thread summary"
-    assert dependencies.content_store.loads == [(_ref(), False)]
+    assert dependencies.content_store.loads == [(_ref(), False), (_ref(), True)]
 
 
 @pytest.mark.asyncio
-async def test_reply_required_retrieval_projects_visual_summary_without_image_bytes():
+async def test_reply_required_retrieval_projects_visual_summary_without_image_bytes(
+    route_decision_factory,
+):
     email = {
         "id": "mail-vision",
         "subject": "请结合图片回复",
@@ -395,17 +391,10 @@ async def test_reply_required_retrieval_projects_visual_summary_without_image_by
         "need_reply": True,
         "intent": "咨询",
     }
+    state["route_decision"] = route_decision_factory("reply")
     retriever = MagicMock()
     retriever.search.return_value = []
-    router = MagicMock()
-    router.apply_tier2_hits = AsyncMock(return_value={})
-    router.apply_tier3_fallback = AsyncMock(
-        return_value={"routing_stage": "none"}
-    )
-
     with patch("src.nodes.retriever_node.get_retriever", return_value=retriever), patch(
-        "src.nodes.retriever_node.get_routing_engine", return_value=router
-    ), patch(
         "src.nodes.retriever_node._retrieve_experience",
         new_callable=AsyncMock,
         return_value=[],
@@ -626,7 +615,7 @@ async def test_reviewer_checks_current_request_separately_from_quoted_history():
 
 
 @pytest.mark.asyncio
-async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
+async def test_sender_rejects_mutable_checkpoint_even_with_legacy_flag():
     dependencies = _dependencies()
     dependencies.drafts.values["mail-1"] = "COMPLETE-DRAFT-SENTINEL"
     state = _state()
@@ -636,16 +625,9 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
             "draft_to": ["to@example.com"],
             "draft_cc": ["cc@example.com"],
             "approval_status": "approved",
+            "legacy_mutable_sender_allowed": True,
         }
     )
-    persisted_status = {"value": "approved"}
-
-    async def compare_and_set_status(_email_id, *, expected, target):
-        if persisted_status["value"] not in expected:
-            return False
-        persisted_status["value"] = target
-        return True
-
     ctx = SimpleNamespace(
         exchange_client=SimpleNamespace(
             reply_email_result=AsyncMock(
@@ -653,7 +635,7 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
             )
         ),
         db_manager=SimpleNamespace(
-            compare_and_set_status=AsyncMock(side_effect=compare_and_set_status),
+            compare_and_set_manual_review=AsyncMock(return_value=True),
         ),
         email_processor=SimpleNamespace(process_sent_email=MagicMock()),
     )
@@ -661,13 +643,11 @@ async def test_sender_hydrates_content_and_draft_then_returns_small_delta():
     with patch("src.init_app.get_app_context", return_value=ctx):
         result = await send_final_email(state, dependencies)
 
-    ctx.exchange_client.reply_email_result.assert_awaited_once_with(
-        email_id="mail-1",
-        body="COMPLETE-DRAFT-SENTINEL",
-        to=["to@example.com"],
-        cc=["cc@example.com"],
-    )
-    assert result == {"next_step": "end"}
-    assert persisted_status["value"] == "sent"
+    ctx.exchange_client.reply_email_result.assert_not_awaited()
+    assert result["next_step"] == "manual_review"
+    assert result["safe_error_summary"] == "durable_approval_required"
+    ctx.db_manager.compare_and_set_manual_review.assert_awaited_once()
+    assert dependencies.content_store.loads == []
+    assert dependencies.drafts.loads == []
     assert "email" not in result
     assert "draft" not in result

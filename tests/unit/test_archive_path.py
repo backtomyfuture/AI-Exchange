@@ -10,6 +10,7 @@ from src.email_feishu_delivery import (
     EmailDeliveryOutcome,
 )
 from src.storage import ContentRef
+from src.router.decision import RouteDecision
 
 
 def _context() -> SimpleNamespace:
@@ -52,7 +53,9 @@ async def test_archive_route_never_constructs_email_feishu_delivery():
 
 
 @pytest.mark.asyncio
-async def test_skipped_email_never_constructs_email_feishu_delivery():
+async def test_skipped_email_never_constructs_email_feishu_delivery(
+    route_decision_factory,
+):
     from src.exchange_service import _run_ai_path
     from src.exchange_service import CleanupHandleSnapshot
 
@@ -64,6 +67,13 @@ async def test_skipped_email_never_constructs_email_feishu_delivery():
         "email": {"id": "INBOX_001", "attachments": []},
         "routing_log": [],
     }
+    routing_engine = SimpleNamespace(
+        resolve_route=AsyncMock(
+            return_value=RouteDecision.model_validate(
+                route_decision_factory("no_action")
+            )
+        ),
+    )
     with patch(
         "src.exchange_service._snapshot_cleanup_handles",
         new=AsyncMock(return_value=CleanupHandleSnapshot()),
@@ -72,6 +82,10 @@ async def test_skipped_email_never_constructs_email_feishu_delivery():
         new=AsyncMock(return_value=CleanupHandleSnapshot()),
     ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
         "src.exchange_service._run_ai_pipeline", new=AsyncMock(return_value=pipeline_result)
+    ), patch(
+        "src.exchange_service.get_routing_engine", return_value=routing_engine
+    ), patch(
+        "src.exchange_service._routing_evidence_hits", new=AsyncMock(return_value=[])
     ):
         outcome = await _run_ai_path(
             "INBOX_001",
@@ -86,7 +100,9 @@ async def test_skipped_email_never_constructs_email_feishu_delivery():
 
 
 @pytest.mark.asyncio
-async def test_read_notification_delivery_is_the_only_owner_of_business_attachments():
+async def test_read_notification_delivery_is_the_only_owner_of_business_attachments(
+    route_decision_factory,
+):
     from src.exchange_service import _run_ai_path
     from src.exchange_service import CleanupHandleSnapshot
 
@@ -105,6 +121,12 @@ async def test_read_notification_delivery_is_the_only_owner_of_business_attachme
         },
         "routing_log": [],
     }
+    route_decision = route_decision_factory("read_only")
+    routing_engine = SimpleNamespace(
+        resolve_route=AsyncMock(
+            return_value=RouteDecision.model_validate(route_decision)
+        ),
+    )
     with patch(
         "src.exchange_service._snapshot_cleanup_handles",
         new=AsyncMock(return_value=CleanupHandleSnapshot()),
@@ -113,10 +135,17 @@ async def test_read_notification_delivery_is_the_only_owner_of_business_attachme
         new=AsyncMock(return_value=CleanupHandleSnapshot()),
     ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
         "src.exchange_service._run_ai_pipeline", new=AsyncMock(return_value=pipeline_result)
+    ), patch(
+        "src.exchange_service.get_routing_engine", return_value=routing_engine
+    ), patch(
+        "src.exchange_service._routing_evidence_hits", new=AsyncMock(return_value=[])
     ):
         await _run_ai_path(
             "INBOX_READ_ONLY",
-            {"id": "INBOX_READ_ONLY", "attachments": []},
+            {
+                "id": "INBOX_READ_ONLY",
+                "attachments": [{"name": "notice.pdf", "content": "UERG"}],
+            },
             ctx,
             {"configurable": {"thread_id": "INBOX_READ_ONLY"}},
         )

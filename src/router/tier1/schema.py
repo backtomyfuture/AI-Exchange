@@ -336,12 +336,26 @@ class Decision(BaseModel):
 
     route: CanonicalRoute
     business_flow_id: Optional[str] = None
+    handoff_profile_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]*_v[1-9][0-9]*$",
+    )
     params: Dict[str, Any] = Field(default_factory=dict)
 
     _typed_params: BaseModel = PrivateAttr()
 
     @model_validator(mode="after")
     def _validate_params_for_route(self) -> "Decision":
+        defaults = {
+            CanonicalRoute.REPLY: "generic_reply_v1",
+            CanonicalRoute.FORWARD: "generic_forward_v1",
+        }
+        if self.handoff_profile_id is None:
+            self.handoff_profile_id = defaults.get(self.route)
+        if self.handoff_profile_id is not None:
+            from src.handoff.profiles import get_handoff_profile
+
+            get_handoff_profile(self.handoff_profile_id)
         params_model = _PARAMS_BY_ROUTE[self.route]
         try:
             self._typed_params = params_model.model_validate(self.params)

@@ -22,8 +22,8 @@ from src.router.decision import (
 from src.router.tier1.compiler import CompiledArtifact, CompilationFailure, compile_registry
 from src.router.tier1.decision import EvaluationOutcome, build_tier1_decision
 from src.router.tier1.dsl import EmailView
-from src.router.tier1.fingerprint import compute_action_fingerprint
 from src.router.tier1.schema import CanonicalRoute, Decision
+from src.handoff.history import HistoricalRouteConsensus
 from src.safety.model_budget import enforce_model_input_budget, token_budget_from_settings
 
 
@@ -69,7 +69,7 @@ def _email_view(email: Mapping[str, Any]) -> EmailView:
     )
 
 
-def _classification_for(decision: RouteDecision) -> dict[str, Any]:
+def classification_for_route(decision: RouteDecision) -> dict[str, Any]:
     route = decision.route
     if route is CanonicalRoute.REPLY:
         return {"need_reply": True, "action": "reply"}
@@ -90,7 +90,7 @@ def _decision_delta(decision: RouteDecision) -> AgentState:
         "route_decision": decision.model_dump(mode="json"),
         "routing_stage": stage,
         "routing_log": [f"{stage} route={decision.route.value if decision.route else 'abstain'}"],
-        "classification": _classification_for(decision),
+        "classification": classification_for_route(decision),
     }
     if decision.route is CanonicalRoute.FORWARD:
         delta["draft_to"] = list(decision.params["fixed_recipients"])
@@ -134,6 +134,7 @@ class RoutingEngine:
         self.me_email = me_email if me_email is not None else configured_me
 
     async def execute_router(self, state: AgentState) -> AgentState:
+        """Evaluate Tier 1 only; abstention deliberately emits no RouteDecision."""
         email = state.get("email") or {}
         decision_time = datetime.now(UTC)
         tier1 = build_tier1_decision(
@@ -150,14 +151,8 @@ class RoutingEngine:
             confidence=1.0 if tier1.outcome is EvaluationOutcome.MATCHED else None,
         )
         if tier1.outcome is EvaluationOutcome.ABSTAIN:
-            decision = RouteDecision(
-                outcome=DecisionOutcome.ABSTAIN,
-                route=None,
-                provenance=provenance,
-            )
             return {
                 **state,
-                "route_decision": decision.model_dump(mode="json"),
                 "routing_log": [*(state.get("routing_log") or []), "tier1 route=abstain"],
                 "routing_stage": "pending",
             }
@@ -178,6 +173,7 @@ class RoutingEngine:
                 or selected.manifest.decision.business_flow_id
                 or selected.manifest.rule_id
             )
+            handoff_profile_id = selected.manifest.decision.handoff_profile_id
             outcome = DecisionOutcome.MATCHED
         else:
             route = CanonicalRoute.MANUAL_REVIEW
@@ -189,6 +185,7 @@ class RoutingEngine:
                 )
             }
             reason = params["reason_code"]
+            handoff_profile_id = None
             outcome = (
                 DecisionOutcome.CONFLICT
                 if tier1.outcome is EvaluationOutcome.CONFLICT
@@ -201,6 +198,7 @@ class RoutingEngine:
             provenance=provenance,
             reason_code=reason,
             selected_action_fingerprint=tier1.selected_action_fingerprint,
+            handoff_profile_id=handoff_profile_id,
             candidate_actions=[
                 {
                     "fingerprint": item.fingerprint,
@@ -232,63 +230,11 @@ class RoutingEngine:
         state: AgentState,
         hits: Iterable[dict[str, Any]],
     ) -> AgentState:
-        by_digest: dict[str, RouteDecision] = {}
-        evidence: dict[str, list[str]] = {}
-        seen: set[tuple[str, str]] = set()
-        total_ids: set[str] = set()
-        for position, hit in enumerate(hits or []):
-            if not isinstance(hit, Mapping):
-                continue
-            email_id = str(hit.get("id") or hit.get("email_id") or position)
-            total_ids.add(email_id)
-            decision = self._decision_from_hit(hit)
-            if decision is None:
-                continue
-            action = Decision(route=decision.route, params=decision.params)
-            fingerprint = compute_action_fingerprint(action)
-            if (email_id, fingerprint) in seen:
-                continue
-            seen.add((email_id, fingerprint))
-            by_digest[fingerprint] = decision
-            evidence.setdefault(fingerprint, []).append(email_id)
-        denominator = max(1, len(total_ids))
-        eligible = {
-            fingerprint: ids
-            for fingerprint, ids in evidence.items()
-            if len(ids) >= TIER2_MIN_HITS and len(ids) / denominator >= TIER2_MIN_RATIO
-        }
-        if not eligible:
-            return {}
-        if len(eligible) > 1:
-            conflict = RouteDecision(
-                outcome=DecisionOutcome.CONFLICT,
-                route=CanonicalRoute.MANUAL_REVIEW,
-                params={"reason_code": "tier2_conflict"},
-                provenance=RouteProvenance(
-                    tier=RouteTier.TIER2,
-                    source_version="routing-label-v1",
-                    evidence_ids=sorted({item for ids in eligible.values() for item in ids})[:16],
-                ),
-                reason_code="tier2_conflict",
-                candidate_actions=[{"fingerprint": fp, "evidence_ids": ids} for fp, ids in eligible.items()],
-            )
-            return _decision_delta(conflict)
-        fingerprint, ids = next(iter(eligible.items()))
-        historical = by_digest[fingerprint]
-        decision = RouteDecision(
-            outcome=DecisionOutcome.MATCHED,
-            route=historical.route,
-            params=historical.params,
-            provenance=RouteProvenance(
-                tier=RouteTier.TIER2,
-                source_version="routing-label-v1",
-                evidence_ids=ids[:16],
-                confidence=len(ids) / denominator,
-            ),
-            reason_code="historical_consensus",
-            selected_action_fingerprint=fingerprint,
-        )
-        return _decision_delta(decision)
+        decision = HistoricalRouteConsensus(
+            min_hits=TIER2_MIN_HITS,
+            min_ratio=TIER2_MIN_RATIO,
+        ).decide(hit for hit in (hits or []) if isinstance(hit, Mapping))
+        return {} if decision is None else _decision_delta(decision)
 
     async def apply_tier3_fallback(self, state: AgentState) -> AgentState:
         email = state.get("email") or {}
@@ -325,6 +271,13 @@ class RoutingEngine:
                     confidence=parsed.confidence,
                 ),
                 reason_code=parsed.reason_code,
+                handoff_profile_id=(
+                    "generic_reply_v1"
+                    if parsed.route is CanonicalRoute.REPLY
+                    else "generic_forward_v1"
+                    if parsed.route is CanonicalRoute.FORWARD
+                    else None
+                ),
             )
         except Exception as exc:
             logger.error("Tier 3 routing failed: error_type=%s", type(exc).__name__)
@@ -339,6 +292,41 @@ class RoutingEngine:
                 reason_code="router_model_failed",
             )
         return _decision_delta(decision)
+
+    async def resolve_route(
+        self,
+        state: AgentState,
+        hits: Iterable[dict[str, Any]],
+    ) -> RouteDecision:
+        """Run the cascade and return exactly one final decision."""
+
+        tier1_state = await self.execute_router(state)
+        raw = tier1_state.get("route_decision")
+        if raw is not None:
+            return self.with_default_handoff_profile(RouteDecision.model_validate(raw))
+        tier2_delta = await self.apply_tier2_hits(state, hits)
+        raw = tier2_delta.get("route_decision")
+        if raw is not None:
+            return self.with_default_handoff_profile(RouteDecision.model_validate(raw))
+        tier3_delta = await self.apply_tier3_fallback(state)
+        return self.with_default_handoff_profile(
+            RouteDecision.model_validate(tier3_delta.get("route_decision"))
+        )
+
+    @staticmethod
+    def with_default_handoff_profile(decision: RouteDecision) -> RouteDecision:
+        if decision.handoff_profile_id is not None:
+            return decision
+        profile_id = (
+            "generic_reply_v1"
+            if decision.route is CanonicalRoute.REPLY
+            else "generic_forward_v1"
+            if decision.route is CanonicalRoute.FORWARD
+            else None
+        )
+        if profile_id is None:
+            return decision
+        return decision.model_copy(update={"handoff_profile_id": profile_id})
 
     def dry_run(self, subject: str, sender: str, body: str = "") -> dict[str, Any]:
         decision_time = datetime.now(UTC)
@@ -378,5 +366,6 @@ __all__ = [
     "TIER2_MIN_HITS",
     "TIER2_MIN_RATIO",
     "configure_routing_engine",
+    "classification_for_route",
     "get_routing_engine",
 ]

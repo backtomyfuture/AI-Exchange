@@ -56,6 +56,7 @@ from src.ingestion.processing import (
     ProcessingReceiptConflict,
     ReplaySafeExternalEffectFailed,
 )
+from src.intake_guard import IntakeDecision, IntakeDisposition
 
 
 _DATABASE_EXCEPTIONS = (psycopg.Error, PoolTimeout)
@@ -1002,6 +1003,124 @@ class InboxRepository:
             raise
         except _DATABASE_EXCEPTIONS as error:
             raise _database_error("apply_email_event", error) from None
+
+    async def release_intake_quarantine(
+        self,
+        *,
+        inbox_id: str,
+        expected_execution_epoch: int,
+        actor: str,
+        reason: str,
+    ) -> int:
+        """Audit a quarantine release and requeue it under a fresh attempt."""
+
+        inbox_id = _require_email_id(inbox_id)
+        if (
+            isinstance(expected_execution_epoch, bool)
+            or not isinstance(expected_execution_epoch, int)
+            or expected_execution_epoch < 0
+            or expected_execution_epoch > POSTGRES_BIGINT_MAX - 1
+        ):
+            raise ValueError(
+                "expected_execution_epoch must be an integer between 0 and "
+                f"{POSTGRES_BIGINT_MAX - 1}"
+            )
+        actor = _require_exact_text("actor", actor, max_length=512)
+        reason = _require_exact_text("reason", reason, max_length=1_024)
+        new_epoch = expected_execution_epoch + 1
+        try:
+            async with self._pool.connection() as connection:
+                async with connection.transaction():
+                    await self._configure_transaction(connection)
+                    decision_cursor = await connection.execute(
+                        sql.SQL(
+                            "SELECT i.external_email_id FROM {} i JOIN {} e ON e.id=i.inbox_id "
+                            "WHERE i.inbox_id=%s AND i.execution_epoch=%s "
+                            "AND i.disposition='quarantine' AND e.status='manual_review' FOR UPDATE OF e"
+                        ).format(self._table("intake_decisions"), self._table("event_inbox")),
+                        (inbox_id, expected_execution_epoch),
+                    )
+                    decision_row = await decision_cursor.fetchone()
+                    if decision_row is None:
+                        raise DatabaseOperationError(
+                            operation="release_intake_quarantine", retryable=False,
+                            message="matching quarantine decision not found",
+                        )
+                    external_email_id = _row_values(decision_row, ("external_email_id",))[0]
+                    email_update = sql.SQL(
+                        "UPDATE {} SET status='retry_wait', version=version+1, "
+                        "processing_execution_epoch=%s, processing_started_at=NULL, "
+                        "safe_error_code='intake.quarantine_released', "
+                        "safe_error_summary=NULL, "
+                        "updated_at=pg_catalog.clock_timestamp() WHERE account_id=(SELECT account_id FROM {} WHERE id=%s) "
+                        "AND external_email_id=%s AND status='manual_review' "
+                        "AND processing_inbox_id=%s AND processing_execution_epoch=%s RETURNING id"
+                    ).format(self._table("emails"), self._table("event_inbox"))
+                    email_cursor = await connection.execute(
+                        email_update,
+                        (
+                            new_epoch,
+                            inbox_id,
+                            external_email_id,
+                            inbox_id,
+                            expected_execution_epoch,
+                        ),
+                    )
+                    if await email_cursor.fetchone() is None:
+                        raise DatabaseOperationError(
+                            operation="release_intake_quarantine", retryable=False,
+                            message="quarantined email aggregate conflict",
+                        )
+                    update = sql.SQL(
+                        "UPDATE {} SET status='pending', execution_epoch=%s, attempts=0, "
+                        "lease_owner=NULL, lease_until=NULL, lease_session_id=NULL, "
+                        "processing_started_at=NULL, effect_started_at=NULL, "
+                        "safe_error_code=NULL, safe_error_summary=NULL, "
+                        "available_at=pg_catalog.clock_timestamp(), "
+                        "updated_at=pg_catalog.clock_timestamp() "
+                        "WHERE id=%s AND status='manual_review' "
+                        "AND execution_epoch=%s RETURNING execution_epoch"
+                    ).format(self._table("event_inbox"))
+                    cursor = await connection.execute(
+                        update,
+                        (new_epoch, inbox_id, expected_execution_epoch),
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        raise DatabaseOperationError(
+                            operation="release_intake_quarantine",
+                            retryable=False,
+                            message="intake quarantine release conflict",
+                        )
+                    persisted_epoch = _row_values(row, ("execution_epoch",))[0]
+                    if persisted_epoch != new_epoch:
+                        raise DatabaseOperationError(
+                            operation="release_intake_quarantine",
+                            retryable=False,
+                            message="intake quarantine release readback failed",
+                        )
+                    insert = sql.SQL(
+                        "INSERT INTO {} ("
+                        "id, inbox_id, prior_execution_epoch, "
+                        "new_execution_epoch, actor, reason"
+                        ") VALUES (%s, %s, %s, %s, %s, %s)"
+                    ).format(self._table("intake_releases"))
+                    await connection.execute(
+                        insert,
+                        (
+                            str(uuid4()),
+                            inbox_id,
+                            expected_execution_epoch,
+                            new_epoch,
+                            actor,
+                            reason,
+                        ),
+                    )
+            return new_epoch
+        except (DatabaseOperationError, ValueError):
+            raise
+        except _DATABASE_EXCEPTIONS as error:
+            raise _database_error("release_intake_quarantine", error) from None
 
     async def _append_audit(
         self,
@@ -2114,6 +2233,13 @@ class InboxRepository:
                     inbox = await self._lock_processing_inbox(connection, lease)
                     if inbox is None:
                         raise ProcessingCompletionRejected()
+                    await self._append_intake_decision(
+                        connection,
+                        lease=lease,
+                        email_id=email_id,
+                        decision=completion.intake_decision,
+                        target_status=completion.target_status,
+                    )
                     effect_started = (
                         inbox.effect_started_at is not None
                         or email.external_effects_started_at is not None
@@ -2270,6 +2396,48 @@ class InboxRepository:
             raise
         except _DATABASE_EXCEPTIONS as error:
             raise _database_error("finish_email_processing", error) from None
+
+    async def _append_intake_decision(
+        self,
+        connection: psycopg.AsyncConnection[Any],
+        *,
+        lease: InboxLease,
+        email_id: str,
+        decision: IntakeDecision | None,
+        target_status: EmailStatus,
+    ) -> None:
+        if decision is None:
+            return
+        expected = {
+            IntakeDisposition.SUPPRESS: EmailStatus.NO_ACTION,
+            IntakeDisposition.QUARANTINE: EmailStatus.MANUAL_REVIEW,
+        }
+        if (
+            decision.disposition in expected
+            and expected[decision.disposition] is not target_status
+        ):
+            raise ProcessingCompletionRejected()
+        payload = decision.audit_metadata()
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        insert = sql.SQL(
+            "INSERT INTO {} (inbox_id, execution_epoch, external_email_id, decision_json, "
+            "decision_digest, disposition, reason_code, policy_version, snapshot_digest) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (inbox_id, execution_epoch) DO NOTHING"
+        ).format(self._table("intake_decisions"))
+        await connection.execute(insert, (
+            lease.id, lease.execution_epoch, lease.event.external_email_id, Jsonb(payload),
+            digest, decision.disposition.value, decision.reason_code,
+            decision.policy_version, decision.message_snapshot_digest,
+        ))
+        cursor = await connection.execute(
+            sql.SQL("SELECT decision_digest, disposition, external_email_id FROM {} WHERE inbox_id=%s AND execution_epoch=%s").format(self._table("intake_decisions")),
+            (lease.id, lease.execution_epoch),
+        )
+        row = await cursor.fetchone()
+        values = _row_values(row, ("decision_digest", "disposition", "external_email_id")) if row else ()
+        if values != (digest, decision.disposition.value, lease.event.external_email_id):
+            raise ProcessingCompletionRejected()
 
     async def finish_email_processing_failure(
         self,

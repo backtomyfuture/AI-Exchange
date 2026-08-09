@@ -9,12 +9,23 @@ Covers:
 """
 import json
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 from src.utils.card_builder import LarkCardBuilder
 
 
 def _make_builder():
     return LarkCardBuilder(lark_api_client=None, exchange_client=None)
+
+
+def _card_action_values(value):
+    if isinstance(value, dict):
+        if "action" in value and "id" in value:
+            yield value
+        for child in value.values():
+            yield from _card_action_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _card_action_values(child)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +92,37 @@ class TestBuildEmailInfoSection:
 # ---------------------------------------------------------------------------
 
 class TestApprovalCardReplyWithRecipients:
+
+    def test_every_durable_card_action_carries_the_exact_revision_binding(self):
+        builder = _make_builder()
+        inbox_id = "00000000-0000-4000-8000-000000000123"
+        payload_digest = "a" * 64
+        actions = []
+        for edit_field in (None, "to", "cc", "draft"):
+            card = builder.build_approval_card(
+                email_id="e1",
+                draft="Draft reply",
+                context=[],
+                email_data={
+                    "subject": "Hello",
+                    "sender": "alice@example.com",
+                    "to": ["bob@example.com"],
+                    "cc": [],
+                    "draft_to": ["bob@example.com"],
+                    "draft_cc": [],
+                },
+                classification={"reasoning": "test"},
+                edit_field=edit_field,
+                inbox_id=inbox_id,
+                payload_revision=7,
+                payload_digest=payload_digest,
+            )
+            actions.extend(_card_action_values(card))
+
+        assert actions
+        assert all(action["inbox_id"] == inbox_id for action in actions)
+        assert all(action["payload_revision"] == 7 for action in actions)
+        assert all(action["payload_digest"] == payload_digest for action in actions)
 
     def test_card_contains_to_cc_rows(self):
         builder = _make_builder()
@@ -317,7 +359,11 @@ class TestReadOnlyCardWithRecipients:
 class TestForwardCategorizerEnrichment:
 
     @pytest.mark.asyncio
-    async def test_forward_gets_summary_and_confidence(self, graph_node_harness):
+    async def test_forward_gets_summary_and_confidence(
+        self,
+        graph_node_harness,
+        route_decision_factory,
+    ):
         from src.nodes.categorizer import categorize_email
 
         state = graph_node_harness.state(
@@ -334,17 +380,13 @@ class TestForwardCategorizerEnrichment:
                 "action": "forward",
                 "reasoning": "Triggered by skill Forward to Boss",
             },
+            route_decision=route_decision_factory("forward"),
         )
 
-        with patch("src.nodes.categorizer.get_routing_engine") as mock_engine:
-            engine = MagicMock()
-            engine.execute_router = AsyncMock(side_effect=lambda local: local)
-            mock_engine.return_value = engine
-
-            result = await categorize_email(
-                state,
-                graph_node_harness.dependencies,
-            )
+        result = await categorize_email(
+            state,
+            graph_node_harness.dependencies,
+        )
 
         cls = result["classification"]
         assert cls["confidence"] == 1.0
@@ -352,7 +394,11 @@ class TestForwardCategorizerEnrichment:
         assert cls["reasoning"] == "系统规则自动触发转发"
 
     @pytest.mark.asyncio
-    async def test_forward_preserves_existing_summary(self, graph_node_harness):
+    async def test_forward_preserves_existing_summary(
+        self,
+        graph_node_harness,
+        route_decision_factory,
+    ):
         from src.nodes.categorizer import categorize_email
 
         state = graph_node_harness.state(
@@ -367,16 +413,12 @@ class TestForwardCategorizerEnrichment:
                 "reasoning": "Triggered by skill test",
                 "summary": "Custom summary from skill",
             },
+            route_decision=route_decision_factory("forward"),
         )
 
-        with patch("src.nodes.categorizer.get_routing_engine") as mock_engine:
-            engine = MagicMock()
-            engine.execute_router = AsyncMock(side_effect=lambda local: local)
-            mock_engine.return_value = engine
-
-            result = await categorize_email(
-                state,
-                graph_node_harness.dependencies,
-            )
+        result = await categorize_email(
+            state,
+            graph_node_harness.dependencies,
+        )
 
         assert result["classification"]["summary"] == "Custom summary from skill"

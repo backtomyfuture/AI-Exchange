@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from dataclasses import replace
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 
@@ -33,6 +34,7 @@ from src.ingestion.processing import (
     ReplaySafeExternalEffectFailed,
 )
 from src.ingestion.runtime_authority import GREENFIELD_PIPELINE_NAME
+from src.intake_guard import IntakeDecision, IntakeDisposition, IntakeGuard
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -130,7 +132,7 @@ class EmailProcessingAdapter:
 
     pipeline_name = GREENFIELD_PIPELINE_NAME
 
-    __slots__ = ("_ctx", "_guarded_processor", "_account_id")
+    __slots__ = ("_ctx", "_guarded_processor", "_account_id", "_intake_guard")
 
     def __init__(
         self,
@@ -152,6 +154,7 @@ class EmailProcessingAdapter:
         object.__setattr__(self, "_ctx", ctx)
         object.__setattr__(self, "_account_id", account_id)
         object.__setattr__(self, "_guarded_processor", guarded_processor)
+        object.__setattr__(self, "_intake_guard", IntakeGuard())
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("EmailProcessingAdapter is immutable")
@@ -215,9 +218,14 @@ class EmailProcessingAdapter:
 
         try:
             email_data = self._project_detail(lease, details)
+            decision = self._intake_guard.evaluate(email_data)
         except Exception as error:
             _log_stage_failure("detail_projection", error)
-            raise
+            decision = self._intake_guard.parsing_failure(details)
+            return await self._complete_intake_decision(lease, decision)
+
+        if decision.disposition is not IntakeDisposition.PASS:
+            return await self._complete_intake_decision(lease, decision)
 
         try:
             outcome = await self._guarded_processor(
@@ -247,10 +255,29 @@ class EmailProcessingAdapter:
             _log_stage_failure("completion_readback", error)
             raise
         try:
-            return self._map_completion(policy, outcome, persisted_status)
+            return replace(
+                self._map_completion(policy, outcome, persisted_status),
+                intake_decision=decision,
+            )
         except Exception as error:
             _log_stage_failure("completion_projection", error)
             raise
+
+    async def _complete_intake_decision(
+        self,
+        lease: InboxLease,
+        decision: IntakeDecision,
+    ) -> ProcessingCompletion:
+        target = (
+            "no_action"
+            if decision.disposition is IntakeDisposition.SUPPRESS
+            else "manual_review"
+        )
+        if decision.disposition is IntakeDisposition.PASS:
+            raise ProcessingPolicyRejected()
+        if target == "no_action":
+            return ProcessingCompletion.no_action(intake_decision=decision)
+        return ProcessingCompletion.manual_review(intake_decision=decision)
 
     @staticmethod
     def _validate_attempt(

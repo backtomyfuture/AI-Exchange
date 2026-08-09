@@ -1366,6 +1366,7 @@ class ExchangeClient:
         email_id: str,
         to: List[str],
         body: str,
+        include_attachments: bool = False,
     ) -> ExchangeSendResult:
         """
         Forward once and return a typed result. Any non-confirmation is unknown.
@@ -1377,7 +1378,8 @@ class ExchangeClient:
             "reference_item_id": email_id,
             "to": to,
             "body": body,
-            "body_type": "html"
+            "body_type": "html",
+            "include_attachments": include_attachments,
         }
 
         return await self._send_existing_email_result(
@@ -1391,7 +1393,13 @@ class ExchangeClient:
         email_id: str,
         to: List[str],
         body: str,
+        include_attachments: bool = False,
     ) -> bool:
         """Compatibility wrapper for callers that still require a bool."""
-        result = await self.forward_email_result(email_id, to, body)
+        result = await self.forward_email_result(
+            email_id,
+            to,
+            body,
+            include_attachments=include_attachments,
+        )
         return result.confirmed_sent

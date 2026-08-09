@@ -104,6 +104,9 @@ def deliver_approval_card(
     pdf_url: str = None,
     routing_log: List = None,
     *,
+    inbox_id: str | None = None,
+    payload_revision: int | None = None,
+    payload_digest: str | None = None,
     lark_api_client=None,
     card_builder=None,
 ) -> LarkTextDelivery:
@@ -120,6 +123,9 @@ def deliver_approval_card(
             classification,
             pdf_url=pdf_url,
             routing_log=routing_log,
+            inbox_id=inbox_id,
+            payload_revision=payload_revision,
+            payload_digest=payload_digest,
         )
     except Exception as exc:
         logger.error(
