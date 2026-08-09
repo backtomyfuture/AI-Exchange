@@ -798,6 +798,7 @@ TRIGGER_FUNCTION_SOURCE_SHA256: Final = {
     "reject_pipeline_folder_scopes_mutation": "c5e8b59c56e648a32713943ea36e8e7d2aca7a04916aebe04cf19a959eeda706",
     "reject_pipeline_initializations_mutation": "d74a5146da3ed09d01bde3725343ee536f64d6ca151b79fa0be802fd30d5bbea",
     "reject_pipeline_runtime_capabilities_mutation": "4f451f9f20e5538a7bd18117b7cd207474350055e2baa20f9595f38f11b20461",
+    "reject_tier1_decisions_mutation": "a9b3145a55a04ab0e51e70ebaae7fe1c90d3ca72f2ca38d4b9f41999f9dfd357",
 }
 TRIGGER_FUNCTION_SEARCH_PATH: Final = {
     "guard_emails_runtime_identity": "pg_catalog",
@@ -810,6 +811,7 @@ TRIGGER_FUNCTION_SEARCH_PATH: Final = {
     "reject_pipeline_folder_scopes_mutation": "pg_catalog",
     "reject_pipeline_initializations_mutation": "pg_catalog",
     "reject_pipeline_runtime_capabilities_mutation": "pg_catalog",
+    "reject_tier1_decisions_mutation": "target_schema",
 }
 TRIGGER_FUNCTIONS: Final = tuple(sorted(TRIGGER_FUNCTION_SOURCE_SHA256))
 TRIGGER_FUNCTION_SOURCE_SHA256_BY_REVISION: Final = {

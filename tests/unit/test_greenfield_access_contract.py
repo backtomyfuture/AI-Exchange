@@ -45,6 +45,7 @@ def test_relation_and_trigger_contracts_have_no_retired_ingress_shape() -> None:
     assert {"event_inbox", "sync_cursors", "pipeline_folder_scopes"} <= relations
     assert not {"cold_start_command_receipts", "sync_cold_start_plans"} & relations
     assert not any("webhook" in name or "cold_start" in name for name in trigger_functions)
+    assert "reject_tier1_decisions_mutation" in trigger_functions
     assert set(access_contract.TRIGGER_FUNCTION_SOURCE_SHA256) == set(
         access_contract.TRIGGER_FUNCTION_SEARCH_PATH
     )
