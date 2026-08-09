@@ -9,13 +9,18 @@
 
 ## 1. 手工导入历史邮件
 
-优先导入 Outlook PST。Mbox、EML 和 EML 目录仍可用于迁移或排查，但不会启动任何持续同步。
+优先从 Exchange 回填服务器仍保留的历史，再用 Outlook PST 补充服务器不存在的邮件。Mbox、EML 和 EML 目录仍可用于迁移或排查，但不会启动任何持续同步。
 
 先预览，再进行一次正式导入：
 
 ```bash
 .venv/bin/python scripts/import_pst.py archive.pst --dry-run
 .venv/bin/python scripts/import_pst.py archive.pst
+
+# Exchange 全部业务邮件文件夹 + PST 补充；务必先 dry-run
+.venv/bin/python scripts/import_pst.py \
+  --source exchange --folder ALL --limit 0 --all-mail \
+  --supplement archive.pst --dry-run
 ```
 
 正式导入通过 `EmailProcessor` 写入默认的 `emails` 集合；在线 `retriever_node` 也读取这个集合。因此导入完成后，历史邮件会自然成为当前邮件拟稿的 RAG 背景，无需建立第二个“历史库”。
@@ -29,9 +34,59 @@ SOURCE                    PST/Mbox/EML 文件或 EML 目录
 --source exchange         手工从 Exchange 拉取；不是后台同步任务
 --folder NAME             Exchange 文件夹
 --limit N                 Exchange 拉取上限
+--all-mail                包含已读邮件；历史回填必须显式使用
+--supplement PATH         Exchange 优先完成后，用 PST/Mbox/EML 补充缺失邮件
 ```
 
+`--folder ALL` 会导入 Inbox、Sent Items 和非空的用户自建邮件文件夹，默认排除 Drafts、Outbox、Junk Email 和 Deleted Items。列表、详情或服务端总数不完整时，命令以失败退出，不把部分结果报告成完整导入。
+
+同一次 `--source exchange --supplement ...` 运行总是先读取 Exchange。Internet Message-ID 相同的本地副本会跳过；缺少 Message-ID 时使用规范化邮件签名兜底。摘要分别显示空正文、重复、失败、成功邮件和 Qdrant 点数；历史导入会等待 Qdrant 确认写入，Qdrant/Embedding 返回零点时进程以非零状态退出。
+
 PST 解析优先使用 `libpff-python`；不可用时，脚本会回退到已安装的 `readpst`。大文件可调大 `--batch-size`，但建议仍先执行 `--dry-run`。
+
+### Docker 一次性任务
+
+历史导入使用独立覆盖文件，不进入常驻应用进程。必须复用当前部署的 Compose project 和应用镜像，原始 PST 只读挂载，`HISTORY_IMPORT_WORKDIR` 是 `readpst` 的显式临时展开目录。
+
+```bash
+project_name="$(tr -d '\r\n' < secrets/compose_project_name)"
+app_image="$(docker ps \
+  --filter "label=com.docker.compose.project=$project_name" \
+  --filter "label=com.docker.compose.service=ai-assistant-service" \
+  --format '{{.Image}}' | head -n 1)"
+
+export AI_EXCHANGE_IMAGE="$app_image"
+export HISTORY_IMPORT_SOURCE="/absolute/path/archive.pst"
+export HISTORY_IMPORT_WORKDIR="/absolute/path/history-import-work"
+
+# 构建一次性镜像
+docker compose -p "$project_name" \
+  --env-file .env --env-file secrets/deployment.env \
+  -f docker-compose.yml \
+  -f docker-compose.history-import.yml \
+  -f docker-compose.history-import.exchange-tls.yml \
+  --profile history-import build history-import
+
+# 默认命令是全量 Exchange + PST 补充的 dry-run
+docker compose -p "$project_name" \
+  --env-file .env --env-file secrets/deployment.env \
+  -f docker-compose.yml \
+  -f docker-compose.history-import.yml \
+  -f docker-compose.history-import.exchange-tls.yml \
+  --profile history-import run --rm history-import
+
+# 核对 dry-run 后，正式写入 Qdrant
+docker compose -p "$project_name" \
+  --env-file .env --env-file secrets/deployment.env \
+  -f docker-compose.yml \
+  -f docker-compose.history-import.yml \
+  -f docker-compose.history-import.exchange-tls.yml \
+  --profile history-import run --rm history-import \
+  --source exchange --folder ALL --limit 0 --all-mail \
+  --supplement /imports/history.pst
+```
+
+若 Exchange 使用公共证书且不需要固定私网主机别名，省略 `docker-compose.history-import.exchange-tls.yml`。该任务只写共享 Qdrant `emails` 集合，不写 PostgreSQL Durable Inbox、Content Store，不触发分类、通知或已读操作。
 
 ## 2. 发现候选，不直接启用规则
 

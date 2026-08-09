@@ -1,0 +1,17 @@
+ARG AI_EXCHANGE_BASE_IMAGE=ai-exchange:local
+FROM ${AI_EXCHANGE_BASE_IMAGE}
+
+USER root
+
+# PST imports use the distribution-pinned readpst fallback. The base image has
+# already replaced Debian mirrors with the repository's immutable snapshots.
+RUN apt-get update && apt-get install -y --no-install-recommends pst-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY scripts/import_pst.py ./scripts/import_pst.py
+COPY src/utils/email_processor.py ./src/utils/email_processor.py
+RUN chown appuser:appuser \
+    /app/scripts/import_pst.py \
+    /app/src/utils/email_processor.py
+
+USER appuser

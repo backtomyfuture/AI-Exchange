@@ -17,6 +17,7 @@ import email as email_lib
 import email.policy
 import email.utils
 import hashlib
+from itertools import chain
 import logging
 import mailbox
 import shutil
@@ -42,6 +43,16 @@ logging.basicConfig(
 logger = logging.getLogger("pst_import")
 
 
+class ExchangeImportIncomplete(RuntimeError):
+    """The Exchange source could not prove a complete bounded read."""
+
+
+def _exchange_ssl_verify(settings) -> bool | str:
+    ssl_verify = bool(settings.EXCHANGE_SSL_VERIFY)
+    ca_file = str(getattr(settings, "EXCHANGE_CA_FILE", "") or "").strip()
+    return ca_file if ssl_verify and ca_file else ssl_verify
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -61,11 +72,12 @@ class ParsedEmail:
     message_type: str = "received"
     in_reply_to: str = ""
     conversation_id: str = ""
+    internet_message_id: str = ""
     attachments_metadata: list[dict] = field(default_factory=list)
     import_source: str = "pst_import"
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "id": self.id,
             "subject": self.subject,
             "sender": self.sender,
@@ -77,10 +89,35 @@ class ParsedEmail:
             "type": self.message_type,
             "in_reply_to": self.in_reply_to,
             "thread_id": self.conversation_id,
+            "internet_message_id": self.internet_message_id,
             "attachments": [],
             "attachments_metadata": self.attachments_metadata,
             "_import_source": self.import_source,
         }
+        payload["history_dedupe_key"] = _history_dedupe_key(self)
+        return payload
+
+
+def _history_dedupe_key(message: ParsedEmail) -> str:
+    """Return a source-independent identity for one Historical Email."""
+    internet_message_id = " ".join(message.internet_message_id.split()).casefold()
+    if internet_message_id:
+        return f"message-id:{internet_message_id}"
+
+    def normalized(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    signature = "\0".join(
+        (
+            normalized(message.subject),
+            normalized(message.sender),
+            ",".join(sorted(normalized(value) for value in message.to)),
+            ",".join(sorted(normalized(value) for value in message.cc)),
+            normalized(message.received_at),
+            normalized(message.body),
+        )
+    )
+    return f"signature:{hashlib.sha256(signature.encode('utf-8')).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +242,7 @@ def parse_email_message(
             message_type=message_type,
             in_reply_to=in_reply_to,
             conversation_id=conversation_id,
+            internet_message_id=msg_id.strip(),
             attachments_metadata=_extract_attachments_metadata(msg),
         )
     except Exception as e:
@@ -321,11 +359,13 @@ def _pypff_message_to_email(
 
         in_reply_to = ""
         conversation_id = ""
+        internet_message_id = ""
         to_list: list[str] = []
         cc_list: list[str] = []
 
         if headers:
             hdr_msg = email_lib.message_from_string(headers)
+            internet_message_id = hdr_msg.get("Message-ID", "") or ""
             in_reply_to = hdr_msg.get("In-Reply-To", "") or ""
             refs = hdr_msg.get("References", "") or ""
             conversation_id = (
@@ -366,6 +406,7 @@ def _pypff_message_to_email(
             message_type=message_type,
             in_reply_to=in_reply_to,
             conversation_id=conversation_id,
+            internet_message_id=internet_message_id,
             attachments_metadata=attachments_meta,
         )
     except Exception as e:
@@ -505,6 +546,9 @@ def _exchange_item_to_parsed_email(
             message_type=message_type,
             in_reply_to=in_reply_to,
             conversation_id=conversation_id,
+            internet_message_id=(
+                item.get("internet_message_id") or item.get("message_id", "") or ""
+            ),
             attachments_metadata=attachments_meta,
             import_source="exchange_import",
         )
@@ -549,7 +593,7 @@ def _fetch_exchange_emails(
     api_url = settings.EXCHANGE_API_URL.rstrip("/")
     api_key = resolve_secret(settings.EXCHANGE_API_KEY)
     account_id = settings.EXCHANGE_ACCOUNT_ID
-    ssl_verify = settings.EXCHANGE_SSL_VERIFY
+    ssl_verify = _exchange_ssl_verify(settings)
 
     headers = {"X-API-KEY": api_key} if api_key else {}
 
@@ -573,6 +617,7 @@ def _fetch_exchange_emails(
         offset = 0
         page = 0
         total_on_server: int | None = None
+        detail_failures = 0
 
         while len(results) < max_fetch:
             page_size = min(PAGE_SIZE, max_fetch - len(results))
@@ -588,14 +633,12 @@ def _fetch_exchange_emails(
             try:
                 response = http.get(list_url, params=params)
             except Exception as e:
-                logger.warning("Exchange 列表请求失败 [%s]: %s", type(e).__name__, e)
-                break
+                logger.warning("Exchange 列表请求失败: error_type=%s", type(e).__name__)
+                raise ExchangeImportIncomplete("exchange_import_list_failed") from e
 
             if response.status_code != 200:
-                logger.warning(
-                    "列表获取失败: %s - %s", response.status_code, response.text[:200],
-                )
-                break
+                logger.warning("Exchange 列表获取失败: status=%s", response.status_code)
+                raise ExchangeImportIncomplete("exchange_import_list_failed")
 
             data = response.json().get("data", {})
             items = data.get("items", [])
@@ -614,6 +657,7 @@ def _fetch_exchange_emails(
             for item in items:
                 email_id = item.get("id", "")
                 if not email_id:
+                    detail_failures += 1
                     continue
 
                 # Fetch full detail
@@ -622,7 +666,7 @@ def _fetch_exchange_emails(
                 try:
                     detail_resp = http.get(
                         detail_url,
-                        params={"account_id": account_id},
+                        params={"account_id": account_id, "folder": folder},
                         timeout=30.0,
                     )
                     if detail_resp.status_code == 200:
@@ -636,15 +680,21 @@ def _fetch_exchange_emails(
                             if parsed:
                                 results.append(parsed)
                                 page_success += 1
+                            else:
+                                detail_failures += 1
+                        else:
+                            detail_failures += 1
                     else:
+                        detail_failures += 1
                         logger.warning(
-                            "详情获取失败 (ID: %s): %s",
-                            email_id, detail_resp.status_code,
+                            "Exchange 详情获取失败: status=%s",
+                            detail_resp.status_code,
                         )
                 except Exception as e:
+                    detail_failures += 1
                     logger.warning(
-                        "获取详情异常 [%s] (ID: %s): %s",
-                        type(e).__name__, email_id, e,
+                        "Exchange 详情请求异常: error_type=%s",
+                        type(e).__name__,
                     )
 
             offset += len(items)
@@ -655,6 +705,15 @@ def _fetch_exchange_emails(
                 logger.info("已到达邮件列表末尾")
                 break
 
+    expected_count = min(total_on_server or 0, max_fetch)
+    if offset != expected_count:
+        raise ExchangeImportIncomplete(
+            f"exchange_import_count_mismatch:{offset}/{expected_count}"
+        )
+    if detail_failures:
+        raise ExchangeImportIncomplete(
+            f"exchange_import_detail_failed:{detail_failures}"
+        )
     return results
 
 
@@ -675,6 +734,10 @@ _EWS_FOLDER_MAP: dict[str, str] = {
     "Junk Email": "junkemail",
     "Outbox": "outbox",
 }
+
+_HISTORY_EXCLUDED_FOLDER_API_NAMES = frozenset(
+    {"deleteditems", "drafts", "junkemail", "outbox"}
+)
 
 # Non-mail folder classes to exclude (IPF.Note = mail; others are not mail)
 _NON_MAIL_CLASSES = {"IPF.Contact", "IPF.Appointment", "IPF.Task",
@@ -698,7 +761,7 @@ def _get_exchange_mail_folders() -> list[tuple[str, str]]:
     api_url = settings.EXCHANGE_API_URL.rstrip("/")
     api_key = resolve_secret(settings.EXCHANGE_API_KEY)
     account_id = settings.EXCHANGE_ACCOUNT_ID
-    ssl_verify = settings.EXCHANGE_SSL_VERIFY
+    ssl_verify = _exchange_ssl_verify(settings)
     headers = {"X-API-KEY": api_key} if api_key else {}
 
     folders_url = f"{api_url}/folders/all"
@@ -717,12 +780,14 @@ def _get_exchange_mail_folders() -> list[tuple[str, str]]:
                 headers=headers, verify=ssl_verify, timeout=30.0,
             )
     except Exception as e:
-        logger.error("获取文件夹列表失败: %s", e)
-        return [("inbox", "Inbox")]
+        logger.error("Exchange 文件夹列表请求失败: error_type=%s", type(e).__name__)
+        raise ExchangeImportIncomplete(
+            "exchange_import_folder_discovery_failed"
+        ) from e
 
     if r.status_code != 200:
-        logger.warning("文件夹列表请求失败 (%s), 仅使用 Inbox", r.status_code)
-        return [("inbox", "Inbox")]
+        logger.warning("文件夹列表请求失败 (%s)", r.status_code)
+        raise ExchangeImportIncomplete("exchange_import_folder_discovery_failed")
 
     folders_data = r.json().get("data", {}).get("folders", [])
     result: list[tuple[str, str]] = []
@@ -753,14 +818,14 @@ def _get_exchange_mail_folders() -> list[tuple[str, str]]:
         else:
             api_name = name  # custom folders use their display name directly
 
+        if api_name.casefold() in _HISTORY_EXCLUDED_FOLDER_API_NAMES:
+            continue
+
         # Avoid duplicates (e.g. Chinese and English names mapping to same API name)
         if not any(api == api_name for api, _ in result):
             result.append((api_name, name))
             logger.debug("发现邮件文件夹: %s -> %s (%d 封, class=%s)",
                          name, api_name, total, folder_class or "未知")
-
-    if not result:
-        result = [("inbox", "Inbox")]
 
     return result
 
@@ -803,6 +868,7 @@ class ImportStats:
     total: int = 0
     imported: int = 0
     skipped: int = 0
+    duplicates: int = 0
     failed: int = 0
     points_created: int = 0
 
@@ -812,9 +878,23 @@ class ImportStats:
         print(f"  扫描邮件数:  {self.total}")
         print(f"  成功导入:    {self.imported}")
         print(f"  跳过 (空):   {self.skipped}")
+        print(f"  跳过 (重复): {self.duplicates}")
         print(f"  失败:        {self.failed}")
         print(f"  Qdrant 点数: {self.points_created}")
         print(f"{'━' * 50}")
+
+
+def _iter_from_file_source(source: Path) -> tuple[Iterator[ParsedEmail], str]:
+    suffix = source.suffix.lower()
+    if source.is_dir():
+        return iter_from_eml_dir(source), f"EML 目录: {source}"
+    if suffix == ".pst":
+        return iter_from_pst(source), f"PST 文件: {source}"
+    if suffix == ".mbox":
+        return iter_from_mbox(source), f"Mbox 文件: {source}"
+    if suffix == ".eml":
+        return iter_from_eml(source), f"EML 文件: {source}"
+    raise ValueError(f"unsupported_history_source:{suffix}")
 
 
 def run_import(
@@ -826,6 +906,7 @@ def run_import(
     exchange_folder: str = "INBOX",
     exchange_limit: int = 100,
     exchange_all_mail: bool = False,
+    supplement_source: Path | None = None,
 ) -> ImportStats:
     """Main import logic — detect source type, parse, and batch-ingest."""
     stats = ImportStats()
@@ -839,24 +920,17 @@ def run_import(
         mail_scope = "全部邮件" if exchange_all_mail else "未读邮件"
         limit_desc = f"最多 {exchange_limit} 封" if exchange_limit > 0 else "全部"
         source_desc = f"Exchange 服务器 [{exchange_folder}] ({mail_scope}, {limit_desc})"
+        if supplement_source is not None:
+            supplement_iter, supplement_desc = _iter_from_file_source(
+                supplement_source
+            )
+            email_iter = chain(email_iter, supplement_iter)
+            source_desc = f"{source_desc} + 补充 {supplement_desc}"
     else:
         assert source is not None
-        suffix = source.suffix.lower()
-        if source.is_dir():
-            email_iter = iter_from_eml_dir(source)
-            source_desc = f"EML 目录: {source}"
-        elif suffix == ".pst":
-            email_iter = iter_from_pst(source)
-            source_desc = f"PST 文件: {source}"
-        elif suffix == ".mbox":
-            email_iter = iter_from_mbox(source)
-            source_desc = f"Mbox 文件: {source}"
-        elif suffix == ".eml":
-            email_iter = iter_from_eml(source)
-            source_desc = f"EML 文件: {source}"
-        else:
-            logger.error("不支持的文件格式: %s", suffix)
-            sys.exit(1)
+        if supplement_source is not None:
+            raise ValueError("supplement_source_requires_exchange")
+        email_iter, source_desc = _iter_from_file_source(source)
 
     print("\n📧 邮件导入工具")
     print(f"   来源: {source_desc}")
@@ -878,6 +952,7 @@ def run_import(
             sys.exit(1)
 
     batch: list[dict] = []
+    seen_dedupe_keys: set[str] = set()
 
     try:
         for parsed in email_iter:
@@ -886,6 +961,12 @@ def run_import(
             if not parsed.body.strip():
                 stats.skipped += 1
                 continue
+
+            dedupe_key = _history_dedupe_key(parsed)
+            if dedupe_key in seen_dedupe_keys:
+                stats.duplicates += 1
+                continue
+            seen_dedupe_keys.add(dedupe_key)
 
             if dry_run:
                 _type_icon = "📤" if parsed.message_type == "sent" else "📥"
@@ -900,9 +981,12 @@ def run_import(
             batch.append(parsed.to_dict())
 
             if len(batch) >= batch_size:
-                points = processor.process_batch(batch)
+                points = processor.process_batch(batch, wait=True)
                 stats.points_created += points
-                stats.imported += len(batch)
+                if points > 0:
+                    stats.imported += len(batch)
+                else:
+                    stats.failed += len(batch)
                 logger.info(
                     "批次完成: %d 封邮件 → %d 个向量点 (累计: %d)",
                     len(batch), points, stats.imported,
@@ -914,9 +998,12 @@ def run_import(
 
     if batch and not dry_run:
         try:
-            points = processor.process_batch(batch)
+            points = processor.process_batch(batch, wait=True)
             stats.points_created += points
-            stats.imported += len(batch)
+            if points > 0:
+                stats.imported += len(batch)
+            else:
+                stats.failed += len(batch)
         except Exception as e:
             logger.error("最后批次失败: %s", e)
             stats.failed += len(batch)
@@ -945,6 +1032,8 @@ def main():
   python scripts/import_pst.py --source exchange --dry-run
   python scripts/import_pst.py --source exchange --folder Inbox --limit 50
   python scripts/import_pst.py --source exchange --all-mail --limit 200
+  python scripts/import_pst.py --source exchange --folder ALL --limit 0 \
+    --all-mail --supplement archive.pst --dry-run
         """,
     )
     parser.add_argument(
@@ -977,6 +1066,12 @@ def main():
         help="拉取全部邮件（含已读），默认只拉未读。仅 --source exchange 时生效",
     )
     parser.add_argument(
+        "--supplement",
+        type=Path,
+        default=None,
+        help="Exchange 优先导入后，用 PST/Mbox/EML 补充缺失历史邮件",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -991,7 +1086,9 @@ def main():
     args = parser.parse_args()
 
     if args.source_type == "exchange":
-        run_import(
+        if args.supplement is not None and not args.supplement.exists():
+            parser.error("--supplement 文件或目录不存在")
+        stats = run_import(
             source=None,
             batch_size=args.batch_size,
             dry_run=args.dry_run,
@@ -999,6 +1096,7 @@ def main():
             exchange_folder=args.folder,
             exchange_limit=args.limit,
             exchange_all_mail=args.all_mail,
+            supplement_source=args.supplement,
         )
     else:
         if not args.source:
@@ -1007,7 +1105,10 @@ def main():
         if not source.exists():
             logger.error("文件或目录不存在: %s", source)
             sys.exit(1)
-        run_import(source, batch_size=args.batch_size, dry_run=args.dry_run)
+        stats = run_import(source, batch_size=args.batch_size, dry_run=args.dry_run)
+
+    if stats.failed:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

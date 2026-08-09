@@ -120,9 +120,18 @@ class EmailProcessor:
         
 
     @retry(stop=stop_after_attempt(2), wait=wait_random_exponential(multiplier=1, max=10))
-    def process_batch(self, batch_emails: List[Dict[str, Any]]) -> int:
+    def process_batch(
+        self,
+        batch_emails: List[Dict[str, Any]],
+        *,
+        wait: bool = False,
+    ) -> int:
         """
         Embed and upsert a batch of emails. Returns number of points upserted.
+
+        ``wait=True`` asks Qdrant to confirm completion before returning. The
+        online path keeps the existing asynchronous default; one-shot history
+        imports opt into confirmation for honest completion reporting.
         """
         if not batch_emails:
             return 0
@@ -289,7 +298,7 @@ class EmailProcessor:
                     self.qdrant_client.upsert(
                         collection_name=self.collection_name,
                         points=batch_points,
-                        wait=False
+                        wait=wait,
                     )
                     total_upserted += len(batch_points)
                 logger.info(f"Successfully upserted {total_upserted} points to Qdrant.")

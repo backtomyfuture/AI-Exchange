@@ -1,0 +1,11 @@
+services:
+  history-import:
+    environment:
+      EXCHANGE_CA_FILE: /run/ai-exchange/exchange-ca.pem
+    extra_hosts:
+      - "${EXCHANGE_TLS_HOSTNAME:?EXCHANGE_TLS_HOSTNAME is required}:${EXCHANGE_TLS_IP:?EXCHANGE_TLS_IP is required}"
+    volumes:
+      - type: bind
+        source: ${EXCHANGE_CA_FILE_HOST:?EXCHANGE_CA_FILE_HOST is required}
+        target: /run/ai-exchange/exchange-ca.pem
+        read_only: true

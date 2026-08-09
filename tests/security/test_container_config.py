@@ -15,7 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRODUCTION_COMPOSE = PROJECT_ROOT / "docker-compose.yml"
 EXCHANGE_TLS_COMPOSE = PROJECT_ROOT / "docker-compose.exchange-tls.yml"
 DEVELOPMENT_COMPOSE = PROJECT_ROOT / "docker-compose.dev.yml"
+HISTORY_IMPORT_COMPOSE = PROJECT_ROOT / "docker-compose.history-import.yml"
+HISTORY_IMPORT_TLS_COMPOSE = (
+    PROJECT_ROOT / "docker-compose.history-import.exchange-tls.yml"
+)
 DOCKERFILE = PROJECT_ROOT / "Dockerfile"
+HISTORY_IMPORT_DOCKERFILE = PROJECT_ROOT / "Dockerfile.history-import"
 BOOTSTRAP_REQUIREMENTS = PROJECT_ROOT / "requirements.bootstrap.txt"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
@@ -115,6 +120,68 @@ def test_application_waits_for_healthy_qdrant():
         "qdrant"
     ]
     assert dependency == {"condition": "service_healthy"}
+
+
+def test_history_import_is_an_explicit_read_only_one_shot():
+    compose = _load_yaml(HISTORY_IMPORT_COMPOSE)
+    service = compose["services"]["history-import"]
+
+    assert service["profiles"] == ["history-import"]
+    assert service["restart"] == "no"
+    assert service["read_only"] is True
+    assert service["cap_drop"] == ["ALL"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["entrypoint"] == ["python", "scripts/import_pst.py"]
+    assert service["command"][-1] == "--dry-run"
+    assert "ports" not in service
+    assert _network_names(service) == {"backend", "edge"}
+    assert service["depends_on"]["qdrant"] == {"condition": "service_healthy"}
+    assert service["volumes"] == [
+        {
+            "type": "bind",
+            "source": "${HISTORY_IMPORT_SOURCE:?HISTORY_IMPORT_SOURCE is required}",
+            "target": "/imports/history.pst",
+            "read_only": True,
+        },
+        {
+            "type": "bind",
+            "source": "${HISTORY_IMPORT_WORKDIR:?HISTORY_IMPORT_WORKDIR is required}",
+            "target": "/work",
+        },
+    ]
+    assert service["environment"]["TMPDIR"] == "/work"
+
+    dockerfile = HISTORY_IMPORT_DOCKERFILE.read_text(encoding="utf-8")
+    assert "ARG AI_EXCHANGE_BASE_IMAGE=ai-exchange:local" in dockerfile
+    assert "FROM ${AI_EXCHANGE_BASE_IMAGE}" in dockerfile
+    assert "COPY scripts/import_pst.py ./scripts/import_pst.py" in dockerfile
+    assert (
+        "COPY src/utils/email_processor.py ./src/utils/email_processor.py"
+        in dockerfile
+    )
+    assert "pst-utils" in dockerfile
+    assert dockerfile.rstrip().endswith("USER appuser")
+
+
+def test_history_import_private_exchange_tls_is_an_explicit_overlay():
+    compose = _load_yaml(HISTORY_IMPORT_TLS_COMPOSE)
+    service = compose["services"]["history-import"]
+
+    assert service["environment"] == {
+        "EXCHANGE_CA_FILE": "/run/ai-exchange/exchange-ca.pem"
+    }
+    assert service["extra_hosts"] == [
+        "${EXCHANGE_TLS_HOSTNAME:?EXCHANGE_TLS_HOSTNAME is required}:"
+        "${EXCHANGE_TLS_IP:?EXCHANGE_TLS_IP is required}"
+    ]
+    assert service["volumes"] == [
+        {
+            "type": "bind",
+            "source": "${EXCHANGE_CA_FILE_HOST:?EXCHANGE_CA_FILE_HOST is required}",
+            "target": "/run/ai-exchange/exchange-ca.pem",
+            "read_only": True,
+        }
+    ]
 
 
 def test_production_container_inputs_do_not_use_latest_tags():
