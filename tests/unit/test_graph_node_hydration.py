@@ -219,9 +219,8 @@ async def test_categorizer_sends_latest_reply_separately_from_quoted_history():
     # override: skill_auto_1446 (the body_match skill that used to fire on
     # "呈阅") was retired during the Tier 1 v1 migration -- it had no
     # sender/to/cc anchor, which the new schema requires and the old one
-    # didn't (see docs/tier1-migration-inventory.md RETIRE group). The
-    # current/quoted-history separation this test actually exercises is
-    # asserted above via captured["prompt"].
+    # didn't. The current/quoted-history separation this test actually
+    # exercises is asserted above via captured["prompt"].
     assert result["classification"]["need_reply"] is False
 
 

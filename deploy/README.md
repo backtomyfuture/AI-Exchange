@@ -5,8 +5,8 @@
 ## 发布前条件
 
 1. 当前 Git HEAD 已提交、工作树干净，且已通过 `.venv/bin/ruff check src/ tests/` 与 `.venv/bin/python -m pytest -q`。
-2. 已按根目录 [`README.md`](../README.md) 生成 `.env` 和 `secrets/`，并为本次部署选择从未使用过的 Compose project 名。
-3. 已构建当前 HEAD 的 `ai-assistant-service` 镜像。不要复用旧 project、旧卷或未知镜像。
+2. 已按根目录 [`README.md`](../README.md) 生成 `.env` 和 `secrets/`。首次部署使用新 Compose project；已知项目只有在明确授权永久清空后才能进入 `greenfield-reset`。
+3. 已构建当前 HEAD 的 `ai-assistant-service` 镜像。不要复用未知镜像，也不要在未核对 Compose 标签时删除任何卷。
 
 ## 发布证据
 
@@ -95,4 +95,4 @@ docker image inspect --format '{{.Id}}' ai-exchange:local | sed 's/^sha256://'
 
 运行时控制只能使用 `ingestion-maintenance` 的 `status`、`pause`、`resume-ingress` 和受审计的 `requeue` 子命令。它们不用于数据库升级。
 
-在新 project 经过真实轮询、审批和外部动作验证后，才可停止旧 project 并删除它的容器和命名卷。保留 `secrets/`，不要对新 project、共享卷或未核对的 Docker 资源使用 `down --volumes`。
+在新 project 经过真实轮询、审批和外部动作验证后，才可停止旧 project。需要永久重建一个已知项目时，优先使用 `scripts/deploy_system.py greenfield-reset`：它先构建镜像并按 Compose project/service/volume 标签验证精确边界，再删除该项目的容器和命名卷。保留 `secrets/`，不要对共享卷、未核对资源或错误项目名使用 `down --volumes`。

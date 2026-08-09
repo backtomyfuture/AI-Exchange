@@ -34,7 +34,7 @@ flowchart LR
 - 只支持**全新、空的数据库初始化**。不要接入旧版数据库、旧 Compose volume 或历史 Alembic revision。
 - 首次同步只建立 `sync_state` 基线，不会把已有历史邮件批量送入处理队列；之后才处理增量变化。
 - 部署形态固定为一个应用进程、一个 Exchange 账户与一个飞书账户；不要横向扩容应用服务。
-- Tier1 v1 规则、编译器和测试资产已保留，但尚未接入默认路由，不能视为已启用功能。
+- Tier1 v1 声明式规则通过固定摘要的编译产物接入默认路由；规则冲突、产物失效或下游模型异常都失败关闭到人工复核。
 - 偏好/风格记忆学习默认关闭。只有经过单独评审后显式设置 `MEMORY_LEARNING_ENABLED=true` 才允许写入学习结果。
 
 ## 本地开发
@@ -55,7 +55,7 @@ Docker 镜像固定使用 Python 3.12；本机其他 Python 版本仅用于开�
 
 ## 从空环境首次部署
 
-首次部署必须使用新的 Compose project 和新的命名卷。它不会升级、接管或删除旧部署。详细的发布证据、manifest、私网 TLS 与 checkpoint 维护步骤见 [部署说明](deploy/README.md)。
+首次部署应使用新的 Compose project 和新的命名卷。只有在操作者明确授权永久清空、且脚本通过 Compose 标签核对精确资源边界时，才可对一个已知项目执行 `greenfield-reset`；该命令不提供升级或数据保留。详细的发布证据、manifest、私网 TLS 与 checkpoint 维护步骤见 [部署说明](deploy/README.md)。
 
 ### 1. 配置集成参数
 
@@ -153,7 +153,7 @@ docker compose --project-name <old-project> down --volumes --remove-orphans
 ## 相关文档
 
 - [首次部署与发布证据](deploy/README.md)
-- [2026-08 清理审计与绿地部署记录](docs/cleanup-audit-2026-08.md)
 - [绿地基线 ADR](docs/adr/0009-greenfield-only-cleanup-baseline.md)
 - [记忆学习显式启用 ADR](docs/adr/0010-explicit-memory-learning-activation.md)
-- [Tier1 迁移库存与后续启用边界](docs/tier1-migration-inventory.md)
+- [Tier1 路由设计](docs/tier1-routing-design.md)
+- [Tier1 决策与原子激活 ADR](docs/adr/0008-tier1-decision-model-and-atomic-activation.md)
