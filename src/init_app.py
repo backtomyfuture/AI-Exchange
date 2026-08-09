@@ -36,6 +36,7 @@ class AppContext:
         self.pool = None
         self.content_store = None
         self.graph_dependencies = None
+        self.email_feishu_delivery = None
         self.ingestion_runtime: IngestionRuntime | None = None
         self._checkpoint_write_guard: CheckpointWriteGuard | None = None
         self._checkpoint_setup_started = False

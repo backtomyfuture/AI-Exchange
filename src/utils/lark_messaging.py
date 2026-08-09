@@ -39,112 +39,228 @@ class LarkTextReconciliationUnavailable(RuntimeError):
     """The configured chat could not be read safely for delivery recovery."""
 
 
-def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
-                       classification: dict, pdf_url: str = None,
-                       routing_log: List = None,
-                       *, lark_api_client=None, card_builder=None) -> bool:
-    """Send an interactive approval card. Returns True iff Lark accepted the message."""
+def _send_interactive_card(
+    *,
+    email_id: str,
+    card_content: object,
+    card_kind: str,
+    lark_api_client: object | None,
+) -> LarkTextDelivery:
+    """Send one completed card without collapsing transport ambiguity into False."""
     if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
-        lark_api_client = _client
-        card_builder = _cb
-
-    if not lark_api_client:
         logger.error("Lark Client not initialized. Cannot send card.")
-        return False
+        return LarkTextDelivery(accepted=False, outcome_known=True)
 
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
+    chat_id = str(getattr(get_settings(), "LARK_CHAT_ID", "") or "")
     if not chat_id:
         logger.error("LARK_CHAT_ID not configured.")
-        return False
+        return LarkTextDelivery(accepted=False, outcome_known=True)
 
+    try:
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("interactive")
+                .content(json.dumps(card_content))
+                .build()) \
+            .build()
+        response = lark_api_client.im.v1.message.create(request)
+    except Exception as exc:
+        # The SDK can fail after Lark has accepted the request.  Only a later
+        # reconciliation may decide whether another card is safe.
+        logger.error(
+            "Lark %s card transport outcome unknown: error_type=%s",
+            card_kind,
+            type(exc).__name__,
+        )
+        return LarkTextDelivery(accepted=False, outcome_known=False)
+
+    if not response.success():
+        logger.error("Lark %s card rejected: code=%s", card_kind, response.code)
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+    message_id = getattr(getattr(response, "data", None), "message_id", None)
+    if not isinstance(message_id, str) or not message_id:
+        message_id = None
+    logger.info(
+        "Lark %s card sent: email=%s message=%s",
+        card_kind,
+        fingerprint_identifier(email_id, namespace="email"),
+        fingerprint_identifier(message_id or "unknown", namespace="lark_message"),
+    )
+    return LarkTextDelivery(
+        accepted=True,
+        outcome_known=True,
+        message_id=message_id,
+    )
+
+
+def deliver_approval_card(
+    email_id: str,
+    draft: str,
+    context: List[dict],
+    email_data: dict,
+    classification: dict,
+    pdf_url: str = None,
+    routing_log: List = None,
+    *,
+    lark_api_client=None,
+    card_builder=None,
+) -> LarkTextDelivery:
+    """Return the complete delivery fact for one interactive approval card."""
+    if card_builder is None:
+        logger.error("Card builder not initialized. Cannot send card.")
+        return LarkTextDelivery(accepted=False, outcome_known=True)
     try:
         card_content = card_builder.build_approval_card(
-            email_id, draft, context, email_data, classification, pdf_url=pdf_url,
+            email_id,
+            draft,
+            context,
+            email_data,
+            classification,
+            pdf_url=pdf_url,
             routing_log=routing_log,
         )
-
-        request = CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
-            .request_body(CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("interactive")
-                .content(json.dumps(card_content))
-                .build()) \
-            .build()
-
-        response = lark_api_client.im.v1.message.create(request)
     except Exception as exc:
         logger.error(
-            "Lark approval card send failed: error_type=%s",
+            "Lark approval card build failed: error_type=%s",
             type(exc).__name__,
         )
-        return False
-
-    if not response.success():
-        logger.error("Lark approval card rejected: code=%s", response.code)
-        return False
-    logger.info(
-        "Lark approval card sent: email=%s message=%s",
-        fingerprint_identifier(email_id, namespace="email"),
-        fingerprint_identifier(response.data.message_id, namespace="lark_message"),
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+    return _send_interactive_card(
+        email_id=email_id,
+        card_content=card_content,
+        card_kind="approval",
+        lark_api_client=lark_api_client,
     )
-    return True
 
 
-def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
-                        classification: dict, pdf_url: str = None,
-                        routing_log: List = None,
-                        *, lark_api_client=None, card_builder=None) -> bool:
-    """Send a read-only Lark card. Returns True iff Lark accepted the message."""
-    if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
-        lark_api_client = _client
-        card_builder = _cb
+def send_approval_card(
+    email_id: str,
+    draft: str,
+    context: List[dict],
+    email_data: dict,
+    classification: dict,
+    pdf_url: str = None,
+    routing_log: List = None,
+    *,
+    lark_api_client=None,
+    card_builder=None,
+) -> bool:
+    """Compatibility projection for callers that only need acceptance."""
+    return deliver_approval_card(
+        email_id,
+        draft,
+        context,
+        email_data,
+        classification,
+        pdf_url=pdf_url,
+        routing_log=routing_log,
+        lark_api_client=lark_api_client,
+        card_builder=card_builder,
+    ).accepted
 
-    if not lark_api_client:
-        logger.error("Lark Client not initialized. Cannot send card.")
-        return False
 
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
-    if not chat_id:
-        logger.error("LARK_CHAT_ID not configured.")
-        return False
-
+def deliver_read_only_card(
+    email_id: str,
+    context: List[dict],
+    email_data: dict,
+    classification: dict,
+    pdf_url: str = None,
+    routing_log: List = None,
+    *,
+    lark_api_client=None,
+    card_builder=None,
+) -> LarkTextDelivery:
+    """Return the complete delivery fact for one read-notification card."""
+    if card_builder is None:
+        logger.error("Card builder not initialized. Cannot send card.")
+        return LarkTextDelivery(accepted=False, outcome_known=True)
     try:
         card_content = card_builder.build_read_only_card(
-            email_id, context, email_data, classification, pdf_url=pdf_url,
+            email_id,
+            context,
+            email_data,
+            classification,
+            pdf_url=pdf_url,
             routing_log=routing_log,
         )
-
-        request = CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
-            .request_body(CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("interactive")
-                .content(json.dumps(card_content))
-                .build()) \
-            .build()
-
-        response = lark_api_client.im.v1.message.create(request)
     except Exception as exc:
         logger.error(
-            "Lark read-only card send failed: error_type=%s",
+            "Lark read-only card build failed: error_type=%s",
             type(exc).__name__,
         )
-        return False
-
-    if not response.success():
-        logger.error("Lark read-only card rejected: code=%s", response.code)
-        return False
-    logger.info(
-        "Lark read-only card sent: email=%s message=%s",
-        fingerprint_identifier(email_id, namespace="email"),
-        fingerprint_identifier(response.data.message_id, namespace="lark_message"),
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+    return _send_interactive_card(
+        email_id=email_id,
+        card_content=card_content,
+        card_kind="read_only",
+        lark_api_client=lark_api_client,
     )
-    return True
+
+
+def send_read_only_card(
+    email_id: str,
+    context: List[dict],
+    email_data: dict,
+    classification: dict,
+    pdf_url: str = None,
+    routing_log: List = None,
+    *,
+    lark_api_client=None,
+    card_builder=None,
+) -> bool:
+    """Compatibility projection for callers that only need acceptance."""
+    return deliver_read_only_card(
+        email_id,
+        context,
+        email_data,
+        classification,
+        pdf_url=pdf_url,
+        routing_log=routing_log,
+        lark_api_client=lark_api_client,
+        card_builder=card_builder,
+    ).accepted
+
+
+def deliver_manual_review_card(
+    email_id: str,
+    email_data: dict,
+    reason: str,
+    classification: dict | None = None,
+    pdf_url=None,
+    routing_log: List | None = None,
+    *,
+    lark_api_client=None,
+    card_builder=None,
+) -> LarkTextDelivery:
+    """Return the complete delivery fact for an immutable manual-review card."""
+    if not lark_api_client:
+        logger.error("Lark Client not initialized. Cannot send manual-review card.")
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+
+    if not card_builder:
+        logger.error("Card builder not initialized. Cannot send manual-review card.")
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+
+    data = email_data if isinstance(email_data, dict) else {}
+    try:
+        card_content = card_builder.build_manual_review_card(
+            email_id, data, reason, classification=classification, pdf_url=pdf_url,
+            routing_log=routing_log,
+        )
+    except Exception as exc:
+        logger.error(
+            "Manual-review card build failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return LarkTextDelivery(accepted=False, outcome_known=True)
+    return _send_interactive_card(
+        email_id=email_id,
+        card_content=card_content,
+        card_kind="manual_review",
+        lark_api_client=lark_api_client,
+    )
 
 
 def send_manual_review_card(
@@ -158,66 +274,17 @@ def send_manual_review_card(
     lark_api_client=None,
     card_builder=None,
 ) -> bool:
-    """Send an immutable manual-review alert without an acknowledge action."""
-    if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client, card_builder as _cb
-
-        lark_api_client = _client
-        card_builder = _cb
-
-    if not lark_api_client:
-        logger.error("Lark Client not initialized. Cannot send manual-review card.")
-        return False
-
-    if not card_builder:
-        logger.error("Card builder not initialized. Cannot send manual-review card.")
-        return False
-
-    settings = get_settings()
-    chat_id = settings.LARK_CHAT_ID
-    if not chat_id:
-        logger.error("LARK_CHAT_ID not configured.")
-        return False
-
-    data = email_data if isinstance(email_data, dict) else {}
-    try:
-        card_content = card_builder.build_manual_review_card(
-            email_id, data, reason, classification=classification, pdf_url=pdf_url,
-            routing_log=routing_log,
-        )
-    except Exception as exc:
-        logger.error(
-            "Manual-review card build failed: error_type=%s",
-            type(exc).__name__,
-        )
-        return False
-
-    try:
-        request = CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
-            .request_body(CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("interactive")
-                .content(json.dumps(card_content))
-                .build()) \
-            .build()
-        response = lark_api_client.im.v1.message.create(request)
-    except Exception as exc:
-        logger.error(
-            "Lark manual-review card send failed: error_type=%s",
-            type(exc).__name__,
-        )
-        return False
-
-    if not response.success():
-        logger.error("Lark manual-review card rejected: code=%s", response.code)
-        return False
-    logger.info(
-        "Lark manual-review card sent: email=%s message=%s",
-        fingerprint_identifier(email_id, namespace="email"),
-        fingerprint_identifier(response.data.message_id, namespace="lark_message"),
-    )
-    return True
+    """Compatibility projection for callers that only need acceptance."""
+    return deliver_manual_review_card(
+        email_id,
+        email_data,
+        reason,
+        classification=classification,
+        pdf_url=pdf_url,
+        routing_log=routing_log,
+        lark_api_client=lark_api_client,
+        card_builder=card_builder,
+    ).accepted
 
 
 def send_system_notification(title: str, content: str, template: str = "red",

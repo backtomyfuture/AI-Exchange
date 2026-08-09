@@ -3,171 +3,123 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.domain.email_state import InitialEmailWriteResult, ProcessingOutcome
+from src.email_feishu_delivery import (
+    EmailDeliveryDisposition,
+    EmailDeliveryKind,
+    EmailDeliveryOutcome,
+)
 from src.storage import ContentRef
 
 
-def _content_ref():
-    from src.exchange_service import get_settings
-
-    return ContentRef(
-        account_id=get_settings().EXCHANGE_ACCOUNT_ID,
+def _context() -> SimpleNamespace:
+    ref = ContentRef(
+        account_id=8,
         object_id="00000000-0000-4000-8000-000000000037",
         key_version="v1",
         sha256="3" * 64,
     )
-
-
-def _wire_content_store(ctx):
-    ctx.content_store = AsyncMock()
-    ref = _content_ref()
-    ctx.content_store.put_email.return_value = ref
-    ctx.db_manager.set_content_ref = AsyncMock()
-    ctx.db_manager.set_content_ref_if_absent = AsyncMock(return_value=True)
-    ctx.db_manager.get_content_ref = AsyncMock(return_value=ref)
-    values = {}
-    state = SimpleNamespace(values=values, next=())
-
-    async def update_state(_config, delta, **kwargs):
-        values.update(delta)
-        if kwargs.get("as_node") == "__start__":
-            state.next = ("categorizer",)
-
-    ctx.graph = SimpleNamespace(
-        aget_state=AsyncMock(return_value=state),
-        aupdate_state=AsyncMock(side_effect=update_state),
+    return SimpleNamespace(
+        db_manager=SimpleNamespace(
+            log_initial_email=AsyncMock(return_value=InitialEmailWriteResult.CREATED),
+            set_content_ref_if_absent=AsyncMock(return_value=True),
+            get_content_ref=AsyncMock(return_value=ref),
+            update_status=AsyncMock(),
+        ),
+        content_store=SimpleNamespace(put_email=AsyncMock(return_value=ref)),
+        email_processor=SimpleNamespace(process_email=MagicMock(return_value=True)),
+        exchange_client=SimpleNamespace(mark_as_read=AsyncMock(return_value=True)),
+        email_feishu_delivery=SimpleNamespace(deliver=AsyncMock()),
+        graph=MagicMock(),
     )
 
 
 @pytest.mark.asyncio
-async def test_skip_analysis_skips_attachment_upload():
+async def test_archive_route_never_constructs_email_feishu_delivery():
     from src.exchange_service import process_and_archive_email
 
-    mock_ctx = MagicMock()
-    mock_ctx.db_manager = AsyncMock()
-    mock_ctx.db_manager.log_initial_email = AsyncMock(return_value=True)
-    mock_ctx.db_manager.update_status = AsyncMock()
-    mock_ctx.email_processor = MagicMock()
-    mock_ctx.email_processor.process_email = MagicMock()
-    mock_ctx.exchange_client = AsyncMock()
-    mock_ctx.exchange_client.mark_as_read = AsyncMock(return_value=True)
-    _wire_content_store(mock_ctx)
+    ctx = _context()
+    archive = AsyncMock()
+    email = {"id": "SENT_001", "subject": "sent", "sender": "me@example.com"}
 
-    email_data = {
-        "id": "SENT_001",
-        "subject": "Test sent email",
-        "sender": "me@example.com",
-        "body": "<p>Hello</p>",
-        "attachments": [
-            {"name": "file.pdf", "content": "YmFzZTY0ZGF0YQ=="}
-        ],
-        "_event_type": "CreatedEvent",
-    }
+    with patch("src.exchange_service._archive_only", new=archive):
+        outcome = await process_and_archive_email(email, ctx, skip_analysis=True)
 
-    with patch("src.exchange_service._upload_attachments_to_lark") as mock_upload, patch(
-        "src.exchange_service._ingest_to_qdrant"
-    ) as mock_ingest, patch("src.exchange_service._mark_email_read") as mock_read:
-        await process_and_archive_email(email_data, mock_ctx, skip_analysis=True)
-
-        mock_upload.assert_not_called()
-        mock_ingest.assert_called_once()
-        mock_read.assert_not_called()
+    assert outcome is ProcessingOutcome.ARCHIVED
+    archive.assert_awaited_once()
+    ctx.email_feishu_delivery.deliver.assert_not_awaited()
+    ctx.exchange_client.mark_as_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_full_pipeline_does_not_upload_attachments_when_feishu_delivery_is_skipped():
-    from src.exchange_service import process_and_archive_email
+async def test_skipped_email_never_constructs_email_feishu_delivery():
+    from src.exchange_service import _run_ai_path
+    from src.exchange_service import CleanupHandleSnapshot
 
-    mock_ctx = MagicMock()
-    mock_ctx.db_manager = AsyncMock()
-    mock_ctx.db_manager.log_initial_email = AsyncMock(return_value=True)
-    mock_ctx.db_manager.update_status = AsyncMock()
-    mock_ctx.email_processor = MagicMock()
-    mock_ctx.email_processor.process_email = MagicMock()
-    mock_ctx.exchange_client = AsyncMock()
-    _wire_content_store(mock_ctx)
-
-    email_data = {
-        "id": "INBOX_001",
-        "subject": "Test incoming email",
-        "sender": "someone@example.com",
-        "body": "<p>Hello</p>",
-        "attachments": [],
-        "_event_type": "NewMailEvent",
-    }
-
-    with patch(
-        "src.exchange_service.decide_notification_kind",
-        return_value="skipped",
-    ), patch("src.exchange_service._upload_attachments_to_lark") as mock_upload, patch(
-        "src.exchange_service._ingest_to_qdrant"
-    ) as mock_ingest, patch(
-        "src.exchange_service._run_ai_pipeline",
-        return_value={"classification": {"need_reply": False}},
-    ) as mock_ai, patch(
-        "src.exchange_service._dispatch_notification",
-        new_callable=AsyncMock,
-    ) as mock_notify, patch(
-        "src.exchange_service._mark_email_read"
-    ) as mock_read:
-        mock_notify.return_value = {"delivered": True, "kind": "skipped"}
-        await process_and_archive_email(email_data, mock_ctx, skip_analysis=False)
-
-        mock_upload.assert_not_called()
-        mock_ingest.assert_called_once()
-        mock_ai.assert_called_once()
-        mock_notify.assert_called_once()
-        mock_read.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_read_only_feishu_delivery_uploads_business_attachments():
-    from src.exchange_service import process_and_archive_email
-
-    mock_ctx = MagicMock()
-    mock_ctx.db_manager = AsyncMock()
-    mock_ctx.db_manager.log_initial_email = AsyncMock(return_value=True)
-    mock_ctx.db_manager.update_status = AsyncMock()
-    mock_ctx.email_processor = MagicMock()
-    mock_ctx.email_processor.process_email = MagicMock()
-    mock_ctx.exchange_client = AsyncMock()
-    _wire_content_store(mock_ctx)
-
-    email_data = {
-        "id": "INBOX_READ_ONLY",
-        "subject": "Important notice",
-        "sender": "someone@example.com",
-        "body": "<p>Please read</p>",
-        "attachments": [{"name": "notice.pdf", "content": "UERG"}],
-        "_event_type": "NewMailEvent",
-    }
+    ctx = _context()
     pipeline_result = {
-        "classification": {
-            "need_reply": False,
-            "priority": "P1",
-            "intent": "通知",
-        },
-        "email": {**email_data, "attachments": [{"name": "notice.pdf"}]},
+        "classification": {"need_reply": False, "priority": "P3", "intent": "垃圾邮件"},
+        "draft": "",
+        "context": [],
+        "email": {"id": "INBOX_001", "attachments": []},
+        "routing_log": [],
     }
-
     with patch(
-        "src.exchange_service.decide_notification_kind",
-        return_value="read_only",
+        "src.exchange_service._snapshot_cleanup_handles",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
     ), patch(
-        "src.exchange_service._upload_attachments_to_lark",
-        new=AsyncMock(return_value=SimpleNamespace(tokens=(), links=())),
-    ) as upload, patch(
-        "src.exchange_service._ingest_to_qdrant",
-        new_callable=AsyncMock,
-    ), patch(
-        "src.exchange_service._run_ai_pipeline",
-        new=AsyncMock(return_value=pipeline_result),
-    ), patch(
-        "src.exchange_service._dispatch_notification",
-        new=AsyncMock(return_value={"delivered": True, "kind": "read_only"}),
-    ), patch(
-        "src.exchange_service._mark_email_read",
-        new_callable=AsyncMock,
+        "src.exchange_service._checkpoint_ai_path_resources",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
+        "src.exchange_service._run_ai_pipeline", new=AsyncMock(return_value=pipeline_result)
     ):
-        await process_and_archive_email(email_data, mock_ctx, skip_analysis=False)
+        outcome = await _run_ai_path(
+            "INBOX_001",
+            {"id": "INBOX_001", "attachments": []},
+            ctx,
+            {"configurable": {"thread_id": "INBOX_001"}},
+        )
 
-    upload.assert_awaited_once()
+    assert outcome is ProcessingOutcome.PROCESSED
+    ctx.email_feishu_delivery.deliver.assert_not_awaited()
+    ctx.exchange_client.mark_as_read.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_notification_delivery_is_the_only_owner_of_business_attachments():
+    from src.exchange_service import _run_ai_path
+    from src.exchange_service import CleanupHandleSnapshot
+
+    ctx = _context()
+    ctx.email_feishu_delivery.deliver.return_value = EmailDeliveryOutcome(
+        EmailDeliveryKind.READ_NOTIFICATION,
+        EmailDeliveryDisposition.CONFIRMED,
+    )
+    pipeline_result = {
+        "classification": {"need_reply": False, "priority": "P1", "intent": "通知"},
+        "draft": "",
+        "context": [],
+        "email": {
+            "id": "INBOX_READ_ONLY",
+            "attachments": [{"name": "notice.pdf", "content": "UERG"}],
+        },
+        "routing_log": [],
+    }
+    with patch(
+        "src.exchange_service._snapshot_cleanup_handles",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch(
+        "src.exchange_service._checkpoint_ai_path_resources",
+        new=AsyncMock(return_value=CleanupHandleSnapshot()),
+    ), patch("src.exchange_service._ingest_to_qdrant", new=AsyncMock()), patch(
+        "src.exchange_service._run_ai_pipeline", new=AsyncMock(return_value=pipeline_result)
+    ):
+        await _run_ai_path(
+            "INBOX_READ_ONLY",
+            {"id": "INBOX_READ_ONLY", "attachments": []},
+            ctx,
+            {"configurable": {"thread_id": "INBOX_READ_ONLY"}},
+        )
+
+    request = ctx.email_feishu_delivery.deliver.await_args.args[0]
+    assert request.email_data["attachments"][0]["name"] == "notice.pdf"

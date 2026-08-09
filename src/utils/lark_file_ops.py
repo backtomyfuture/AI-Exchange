@@ -13,10 +13,6 @@ logger = logging.getLogger(__name__)
 
 def upload_file_to_drive(name: str, content: bytes, size: int,
                          *, lark_api_client=None) -> Optional[dict]:
-    if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client
-        lark_api_client = _client
-
     if not lark_api_client:
         logger.warning("Lark Client not initialized.")
         return None
@@ -62,10 +58,6 @@ def upload_file_to_drive(name: str, content: bytes, size: int,
 
 
 def delete_file_from_drive(file_token: str, *, lark_api_client=None) -> bool:
-    if lark_api_client is None:
-        from src.utils.lark_app import lark_api_client as _client
-        lark_api_client = _client
-
     if not lark_api_client or not file_token:
         return False
 

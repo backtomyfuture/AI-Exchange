@@ -1,19 +1,16 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 
-from src.exchange_service import (
-    CleanupHandleSnapshot,
-    _cleanup_graph_drive_files,
-    _delete_replaced_pdf,
+from src.email_feishu_delivery import (
+    EmailDeliveryDisposition,
+    EmailFeishuDelivery,
+    LarkCardDelivery,
+    ReadNotificationRequest,
 )
-from src.ingestion.processing import (
-    ExternalEffectBoundary,
-    GuardedExternalEffectFailed,
-    ProcessingEffectScope,
-)
+from src.ingestion.processing import ExternalEffectBoundary, ProcessingEffectScope
 
 
 async def _allow_effect(_kind: str, _ordinal: int, _target_hash: str) -> None:
@@ -37,162 +34,84 @@ def _boundary() -> ExternalEffectBoundary:
     )
 
 
-@pytest.mark.asyncio
-async def test_guarded_cleanup_state_lookup_failure_prevents_remote_delete() -> None:
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(side_effect=RuntimeError("state unavailable")),
-            aupdate_state=AsyncMock(),
-        )
-    )
+def _stateful_graph(values: dict[str, object]):
+    async def get_state(_config):
+        return SimpleNamespace(values=dict(values), next=())
 
-    with patch(
-        "src.exchange_service.lark_app.delete_file_from_drive",
-        return_value=True,
-    ) as delete:
-        with pytest.raises(GuardedExternalEffectFailed):
-            await _cleanup_graph_drive_files(
-                "mail-1",
-                ctx,
-                fallback_attachment_tokens=["token-1"],
-                _effect_boundary=_boundary(),
-            )
-
-    delete.assert_not_called()
-    ctx.graph.aupdate_state.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_guarded_cleanup_state_update_failure_is_fixed_failure() -> None:
-    values = {"attachment_tokens": ["token-1"], "pdf_token": None}
-    state = SimpleNamespace(values=values, next=())
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(return_value=state),
-            aupdate_state=AsyncMock(side_effect=RuntimeError("write unavailable")),
-        )
-    )
-
-    with patch(
-        "src.exchange_service.lark_app.delete_file_from_drive",
-        return_value=True,
-    ) as delete:
-        with pytest.raises(GuardedExternalEffectFailed):
-            await _cleanup_graph_drive_files(
-                "mail-1",
-                ctx,
-                fallback_attachment_tokens=[],
-                _effect_boundary=_boundary(),
-            )
-
-    delete.assert_called_once_with("token-1")
-
-
-@pytest.mark.asyncio
-async def test_guarded_cleanup_state_readback_failure_is_fixed_failure() -> None:
-    values = {"attachment_tokens": ["token-1"], "pdf_token": None}
-    state = SimpleNamespace(values=values, next=())
-
-    async def update(_config, delta, **_kwargs) -> None:
+    async def update_state(_config, delta, **_kwargs):
         values.update(delta)
 
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(return_value=state),
-            aupdate_state=AsyncMock(side_effect=update),
-        )
+    return SimpleNamespace(
+        aget_state=AsyncMock(side_effect=get_state),
+        aupdate_state=AsyncMock(side_effect=update_state),
     )
 
-    with (
-        patch(
-            "src.exchange_service.lark_app.delete_file_from_drive",
-            return_value=True,
+
+@pytest.mark.asyncio
+async def test_confirmed_card_retains_replaced_pdf_when_guarded_cleanup_is_not_confirmed():
+    values: dict[str, object] = {"attachment_tokens": [], "pdf_token": "old-pdf"}
+    graph = _stateful_graph(values)
+    database = AsyncMock()
+
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/new", "file_token": "new-pdf"}
+
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=lambda *_args: LarkCardDelivery(True, True),
+        upload_file=MagicMock(),
+        delete_file=MagicMock(return_value=False),
+    )
+
+    outcome = await delivery.deliver(
+        ReadNotificationRequest(
+            email_id="mail-1",
+            email_data={"id": "mail-1", "attachments": []},
+            classification={"need_reply": False},
+            context=(),
+            routing_log=(),
         ),
-        patch(
-            "src.exchange_service._snapshot_cleanup_handles",
-            new=AsyncMock(side_effect=RuntimeError("readback unavailable")),
+        _boundary(),
+    )
+
+    assert outcome.disposition is EmailDeliveryDisposition.CONFIRMED
+    assert values["pdf_token"] == "new-pdf"
+    assert values["attachment_tokens"] == ["old-pdf"]
+
+
+@pytest.mark.asyncio
+async def test_known_rejected_card_moves_its_pdf_to_retry_safe_cleanup_before_delete():
+    values: dict[str, object] = {"attachment_tokens": [], "pdf_token": None}
+    graph = _stateful_graph(values)
+    database = AsyncMock()
+
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/new", "file_token": "new-pdf"}
+
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=lambda *_args: LarkCardDelivery(False, True),
+        upload_file=MagicMock(),
+        delete_file=MagicMock(return_value=False),
+    )
+
+    outcome = await delivery.deliver(
+        ReadNotificationRequest(
+            email_id="mail-1",
+            email_data={"id": "mail-1", "attachments": []},
+            classification={"need_reply": False},
+            context=(),
+            routing_log=(),
         ),
-    ):
-        with pytest.raises(GuardedExternalEffectFailed):
-            await _cleanup_graph_drive_files(
-                "mail-1",
-                ctx,
-                fallback_attachment_tokens=[],
-                _effect_boundary=_boundary(),
-            )
-
-
-@pytest.mark.asyncio
-async def test_guarded_cleanup_unconfirmed_state_is_fixed_failure() -> None:
-    values = {"attachment_tokens": ["preserved"], "pdf_token": None}
-    state = SimpleNamespace(values=values, next=())
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(return_value=state),
-            aupdate_state=AsyncMock(),
-        )
+        effect_boundary=None,
     )
 
-    with patch(
-        "src.exchange_service._snapshot_cleanup_handles",
-        new=AsyncMock(return_value=CleanupHandleSnapshot()),
-    ):
-        with pytest.raises(GuardedExternalEffectFailed):
-            await _cleanup_graph_drive_files(
-                "mail-1",
-                ctx,
-                fallback_attachment_tokens=[],
-                preserve_attachment_tokens=["preserved"],
-                _effect_boundary=_boundary(),
-            )
-
-
-@pytest.mark.asyncio
-async def test_guarded_replaced_pdf_state_failure_stops_after_remote_delete() -> None:
-    values = {"attachment_tokens": ["old-pdf"]}
-    state = SimpleNamespace(values=values)
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(return_value=state),
-            aupdate_state=AsyncMock(side_effect=RuntimeError("write unavailable")),
-        )
-    )
-
-    with patch(
-        "src.exchange_service.lark_app.delete_file_from_drive",
-        return_value=True,
-    ) as delete:
-        with pytest.raises(GuardedExternalEffectFailed):
-            await _delete_replaced_pdf(
-                "mail-1",
-                ctx,
-                "old-pdf",
-                "new-pdf",
-                _effect_boundary=_boundary(),
-            )
-
-    delete.assert_called_once_with("old-pdf")
-
-
-@pytest.mark.asyncio
-async def test_live_cleanup_keeps_best_effort_behavior_on_state_lookup_failure() -> (
-    None
-):
-    ctx = SimpleNamespace(
-        graph=SimpleNamespace(
-            aget_state=AsyncMock(side_effect=RuntimeError("state unavailable")),
-            aupdate_state=AsyncMock(),
-        )
-    )
-
-    with patch(
-        "src.exchange_service.lark_app.delete_file_from_drive",
-        return_value=True,
-    ) as delete:
-        await _cleanup_graph_drive_files(
-            "mail-1",
-            ctx,
-            fallback_attachment_tokens=["token-1"],
-        )
-
-    delete.assert_called_once_with("token-1")
+    assert outcome.disposition is EmailDeliveryDisposition.KNOWN_FAILURE
+    assert values["pdf_token"] is None
+    assert values["attachment_tokens"] == ["new-pdf"]

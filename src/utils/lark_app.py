@@ -12,7 +12,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from collections.abc import Callable
-from typing import Dict, Any, List, Optional
+from typing import Any, List, Optional
 import lark_oapi
 from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
 from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
@@ -221,16 +221,6 @@ def _format_address_str(raw_str: str) -> str:
     except Exception:
         return html.escape(str(raw_str))
 
-def upload_file_to_drive(name: str, content: bytes, size: int) -> Optional[dict]:
-    """Upload file to Lark Drive. Delegates to lark_file_ops."""
-    from src.utils.lark_file_ops import upload_file_to_drive as _impl
-    return _impl(name, content, size, lark_api_client=lark_api_client)
-
-def delete_file_from_drive(file_token: str) -> bool:
-    """Delete a file from Lark Drive. Delegates to lark_file_ops."""
-    from src.utils.lark_file_ops import delete_file_from_drive as _impl
-    return _impl(file_token, lark_api_client=lark_api_client)
-
 def init_lark_app(
     db_mgr,
     graph_instance,
@@ -371,9 +361,15 @@ async def _cleanup_action_drive_tokens(
         return
 
     deleted: set[str] = set()
+    from src.utils.lark_file_ops import delete_file_from_drive
+
     for token in targets:
         try:
-            if await asyncio.to_thread(delete_file_from_drive, token):
+            if await asyncio.to_thread(
+                delete_file_from_drive,
+                token,
+                lark_api_client=lark_api_client,
+            ):
                 deleted.add(token)
         except Exception as exc:
             logger.error(
@@ -575,51 +571,10 @@ def _resolve_current_user_email(chat_id: str):
     except Exception as exc:
         logger.error("Identity resolution failed: error_type=%s", type(exc).__name__)
 
-def send_approval_card(email_id: str, draft: str, context: List[dict], email_data: dict,
-                       classification: dict, pdf_url: str = None,
-                       routing_log: List = None):
-    """Send an interactive approval card. Delegates to lark_messaging."""
-    from src.utils.lark_messaging import send_approval_card as _impl
-    return _impl(email_id, draft, context, email_data, classification, pdf_url=pdf_url,
-                 routing_log=routing_log,
-                 lark_api_client=lark_api_client, card_builder=card_builder)
-
 def send_system_notification(title: str, content: str, template: str = "red"):
     """Send a system notification card. Delegates to lark_messaging."""
     from src.utils.lark_messaging import send_system_notification as _impl
     return _impl(title, content, template, lark_api_client=lark_api_client)
-
-
-def send_manual_review_card(email_id: str, email_data: dict, reason: str,
-                            classification: dict = None, pdf_url=None,
-                            routing_log: List = None):
-    """Send a manual-review alert card. Delegates to lark_messaging."""
-    from src.utils.lark_messaging import send_manual_review_card as _impl
-
-    return _impl(
-        email_id,
-        email_data,
-        reason,
-        classification=classification,
-        pdf_url=pdf_url,
-        routing_log=routing_log,
-        lark_api_client=lark_api_client,
-        card_builder=card_builder,
-    )
-
-
-
-
-# Event Handlers
-
-def send_read_only_card(email_id: str, context: List[dict], email_data: dict,
-                        classification: dict, pdf_url: str = None,
-                        routing_log: List = None):
-    """Send a read-only card. Delegates to lark_messaging."""
-    from src.utils.lark_messaging import send_read_only_card as _impl
-    return _impl(email_id, context, email_data, classification, pdf_url=pdf_url,
-                 routing_log=routing_log,
-                 lark_api_client=lark_api_client, card_builder=card_builder)
 
 
 def update_card_ui(message_id, card_content):
@@ -2048,29 +2003,26 @@ async def process_save_draft(email_id, state=None) -> bool:
         return False
     return await _run_claimed_draft_save(email_id, state)
 
-async def generate_and_upload_pdf(
-    email_id: str,
-) -> Optional[Dict[str, Any]] | PdfFlowOutcome:
-    """Resolve strict Graph refs, render email -> PDF, then upload."""
-    from src.utils.lark_pdf_flow import generate_and_upload_pdf as _impl
-    config = {"configurable": {"thread_id": email_id}}
-    state = await graph.aget_state(config)
-    return await _impl(
-        email_id,
-        state,
-        dependencies=_require_graph_dependencies(),
-        upload_fn=upload_file_to_drive,
-        delete_fn=delete_file_from_drive,
-    )
-
-
 async def process_pdf_generation_and_reply(
     email_id,
     state,
     message_id,
 ) -> PdfFlowOutcome | None:
     """Generate PDF and reply with file link. Delegates to lark_pdf_flow."""
+    from src.utils.lark_file_ops import delete_file_from_drive, upload_file_to_drive
     from src.utils.lark_pdf_flow import process_pdf_generation_and_reply as _impl
+
+    def upload_file(name: str, content: bytes, size: int):
+        return upload_file_to_drive(
+            name,
+            content,
+            size,
+            lark_api_client=lark_api_client,
+        )
+
+    def delete_file(token: str) -> bool:
+        return delete_file_from_drive(token, lark_api_client=lark_api_client)
+
     return await _impl(
         email_id,
         state,
@@ -2078,8 +2030,8 @@ async def process_pdf_generation_and_reply(
         graph=graph,
         dependencies=_require_graph_dependencies(),
         lark_api_client=lark_api_client,
-        upload_fn=upload_file_to_drive,
-        delete_fn=delete_file_from_drive,
+        upload_fn=upload_file,
+        delete_fn=delete_file,
     )
 
 

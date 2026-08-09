@@ -5,8 +5,8 @@ Extracted from ``lark_app`` so the giant module stops growing and these CPU /
 network heavy paths can be tested in isolation.
 
 Both functions accept their Lark dependencies as keyword arguments rather than
-reaching into module-level globals. ``lark_app`` keeps thin shim functions for
-backwards compatibility with callers that have not yet been migrated.
+reaching into module-level globals. The two callers are the explicit Email
+Feishu Delivery composition root and the inbound card-action handler.
 """
 
 from __future__ import annotations

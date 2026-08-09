@@ -9,7 +9,7 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 
-from src.exchange_service import _dispatch_notification, _run_ai_pipeline
+from src.exchange_service import _run_ai_pipeline
 from src.graph.builder import build_graph
 from src.domain.send_result import ExchangeSendResult
 from src.graph.dependencies import GraphDependencies
@@ -400,18 +400,6 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
         "src.init_app.get_app_context", return_value=sender_context
     ):
         with ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "src.exchange_service.lark_app.generate_and_upload_pdf",
-                    new=AsyncMock(return_value=None),
-                )
-            )
-            send_card = stack.enter_context(
-                patch(
-                    "src.exchange_service.lark_app.send_approval_card",
-                    return_value=True,
-                )
-            )
             stack.enter_context(patch.object(lark_app, "graph", graph))
             stack.enter_context(
                 patch.object(lark_app, "graph_dependencies", dependencies)
@@ -445,14 +433,12 @@ async def test_compiled_flow_never_checkpoints_complete_content(monkeypatch):
             assert second_interrupt.values["next_step"] == "approval"
             assert second_interrupt.values["metadata"]["review_count"] == 1
 
-            dispatch = await _dispatch_notification(
+            # Email Feishu Delivery owns the card and delivery status. This
+            # checkpoint test begins at the subsequent card-action boundary.
+            await sender_context.db_manager.update_status(
                 email["id"],
-                pipeline_result,
-                sender_context,
-                config,
+                "waiting_approval",
             )
-            assert dispatch == {"delivered": True, "kind": "approval"}
-            assert send_card.call_args.kwargs["draft"] == second_draft
 
             edit_saved = await asyncio.to_thread(
                 lark_app.process_modification,

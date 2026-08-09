@@ -1,7 +1,14 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, ANY
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock
 from src.domain.email_state import InitialEmailWriteResult, ProcessingOutcome
 from src.domain.errors import DatabaseOperationError
+from src.email_feishu_delivery import (
+    EmailDeliveryDisposition,
+    EmailDeliveryKind,
+    EmailDeliveryOutcome,
+    EmailDeliverySideEffectCommittedError,
+)
 from src.exchange_service import process_and_archive_email
 from src.storage import ContentRef
 
@@ -26,6 +33,7 @@ def mock_context():
     ctx.email_processor = MagicMock()
     ctx.graph = AsyncMock()
     ctx.exchange_client = AsyncMock()
+    ctx.email_feishu_delivery = SimpleNamespace(deliver=AsyncMock())
     return ctx
 
 
@@ -104,32 +112,22 @@ async def test_process_flow_new_email(mock_context):
     # 4. exchange_client.mark_as_read returns True
     mock_context.exchange_client.mark_as_read.return_value = True
     
-    # Mock lark_app.send_approval_card globally
-    with patch("src.exchange_service.lark_app.send_approval_card") as mock_lark_send, patch(
-        "src.exchange_service.lark_app.generate_and_upload_pdf",
-        new=AsyncMock(return_value=None),
-    ):
-        result = await process_and_archive_email(email_data, mock_context)
+    mock_context.email_feishu_delivery.deliver.return_value = EmailDeliveryOutcome(
+        EmailDeliveryKind.APPROVAL,
+        EmailDeliveryDisposition.CONFIRMED,
+    )
+    result = await process_and_archive_email(email_data, mock_context)
 
-        assert result is ProcessingOutcome.PROCESSED
-        
-        # Verify steps
-        # Ingestion
-        mock_context.email_processor.process_email.assert_called_with(email_data)
-        mock_context.db_manager.update_status.assert_any_call(
-            "msg_1", "ingested", error_message=None
-        )
-        
-        # Analysis updates
-        mock_context.db_manager.update_status.assert_any_call("msg_1", "analyzed", classification=ANY)
-        mock_context.db_manager.update_status.assert_any_call("msg_1", "drafted")
-        
-        # Lark Card
-        mock_lark_send.assert_called_once()
-        mock_context.db_manager.update_status.assert_any_call("msg_1", "waiting_approval")
-        
-        # Mark as Read
-        mock_context.exchange_client.mark_as_read.assert_called_with("msg_1", is_read=True)
+    assert result is ProcessingOutcome.PROCESSED
+    # Verify steps
+    mock_context.email_processor.process_email.assert_called_with(email_data)
+    mock_context.db_manager.update_status.assert_any_call(
+        "msg_1", "ingested", error_message=None
+    )
+    mock_context.db_manager.update_status.assert_any_call("msg_1", "analyzed", classification=ANY)
+    mock_context.db_manager.update_status.assert_any_call("msg_1", "drafted")
+    mock_context.email_feishu_delivery.deliver.assert_awaited_once()
+    mock_context.exchange_client.mark_as_read.assert_called_with("msg_1", is_read=True)
 
 @pytest.mark.asyncio
 async def test_process_flow_skip_analysis(mock_context):
@@ -295,15 +293,14 @@ async def test_notification_status_write_failure_propagates_and_never_marks_read
     )
     fail_status_write(mock_context, "waiting_approval", failure)
 
+    mock_context.email_feishu_delivery.deliver.side_effect = (
+        EmailDeliverySideEffectCommittedError(
+            kind=EmailDeliveryKind.APPROVAL,
+            cause=failure,
+        )
+    )
     outcome = None
-    with (
-        patch(
-            "src.exchange_service.lark_app.generate_and_upload_pdf",
-            new=AsyncMock(return_value=None),
-        ),
-        patch("src.exchange_service.lark_app.send_approval_card", return_value=True),
-        pytest.raises(DatabaseOperationError) as caught,
-    ):
+    with pytest.raises(DatabaseOperationError) as caught:
         outcome = await process_and_archive_email(email_data, mock_context)
 
     assert caught.value is failure

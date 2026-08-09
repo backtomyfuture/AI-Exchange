@@ -11,6 +11,7 @@ from src.ingestion.processing import ExternalEffectKind
 
 ROOT = Path(__file__).resolve().parents[2]
 EXCHANGE_SERVICE = ROOT / "src" / "exchange_service.py"
+EMAIL_DELIVERY = ROOT / "src" / "email_feishu_delivery.py"
 EMAIL_PIPELINE = ROOT / "src" / "ingestion" / "email_pipeline.py"
 RUNTIME = ROOT / "src" / "ingestion" / "runtime.py"
 LIVE_ROOTS = (
@@ -21,16 +22,11 @@ LIVE_ROOTS = (
 )
 DIRECT_EFFECT_FUNCTIONS = frozenset(
     {
-        "_upload_attachments_to_lark",
         "_ingest_to_qdrant",
         "_run_ai_pipeline",
-        "_delete_drive_token_or_retain",
-        "_delete_replaced_pdf",
-        "_dispatch_notification",
         "_mark_email_read",
         "_delete_unclaimed_content_candidate",
         "_ensure_durable_content_ref",
-        "_cleanup_graph_drive_files",
     }
 )
 
@@ -122,9 +118,35 @@ def test_every_external_call_owner_has_an_effect_authorization_gate() -> None:
         }
         assert "_authorize_external_effect" in calls, name
 
+    delivery_tree = _tree(EMAIL_DELIVERY)
+    delivery_class = next(
+        node
+        for node in delivery_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EmailFeishuDelivery"
+    )
+    methods = {
+        node.name: node
+        for node in delivery_class.body
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    assert {"deliver", "_upload_business_attachments", "_delete_or_retain_token"} <= set(
+        methods
+    )
+    for name in ("deliver", "_upload_business_attachments", "_delete_or_retain_token"):
+        calls = {
+            node.func.attr
+            for node in ast.walk(methods[name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_authorize"
+        }
+        assert calls == {"_authorize"}, name
+
 
 def test_synchronous_lark_network_calls_run_off_the_event_loop() -> None:
-    tree = _tree(EXCHANGE_SERVICE)
+    assert "lark_app" not in EXCHANGE_SERVICE.read_text(encoding="utf-8")
+
+    tree = _tree(EMAIL_DELIVERY)
     threaded_targets = {
         node.args[0].attr
         for node in ast.walk(tree)
@@ -136,14 +158,15 @@ def test_synchronous_lark_network_calls_run_off_the_event_loop() -> None:
         and node.args
         and isinstance(node.args[0], ast.Attribute)
         and isinstance(node.args[0].value, ast.Name)
-        and node.args[0].value.id == "lark_app"
+        and node.args[0].value.id == "self"
     }
 
     assert {
-        "upload_file_to_drive",
-        "send_approval_card",
-        "send_read_only_card",
+        "_upload_file",
+        "_send_card",
+        "_delete_file",
     } <= threaded_targets
+    assert "lark_app" not in EMAIL_DELIVERY.read_text(encoding="utf-8")
 
 
 def test_polling_adapter_effect_ceilings_are_closed_and_exact() -> None:
