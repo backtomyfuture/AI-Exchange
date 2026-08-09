@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import stat
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -213,3 +214,48 @@ def test_deployment_context_adds_the_development_overlay_only_on_request(
     assert project_name == "test-project"
     assert port == 8000
     assert str(tmp_path / "docker-compose.dev.yml") in compose
+
+
+def test_deployment_prepares_and_pins_complete_tier1_artifact(tmp_path: Path):
+    rules = tmp_path / "tier1_rules"
+    rules.mkdir()
+    (rules / "rule.yaml").write_text(
+        textwrap.dedent(
+            """
+            rule_id: RULE-DEPLOY-001
+            rule_version: 1
+            status: enabled
+            owner: team-x
+            match:
+              anchor: {any: [{field: sender.address, op: eq, value: a@example.test}]}
+            decision: {route: read_only}
+            governance:
+              positive_cases: [{case_id: p1, email: {sender: {address: a@example.test}}}]
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    digest = deploy_system._prepare_tier1_artifact(
+        tmp_path,
+        me_email="owner@example.test",
+        internal_domains=("example.test",),
+    )
+
+    artifact = tmp_path / "artifacts" / "tier1" / f"{digest}.json"
+    assert artifact.is_file()
+    assert (tmp_path / "artifacts" / "tier1" / "current.json").is_file()
+
+
+def test_greenfield_reset_builds_then_label_checks_before_volume_deletion():
+    source = Path(deploy_system.__file__).read_text(encoding="utf-8")
+    function = source[source.index("def greenfield_reset(") : source.index("def main(")]
+
+    assert function.index('"build", "--pull"') < function.index(
+        "_verify_project_resources("
+    )
+    assert function.index("_verify_project_resources(") < function.index(
+        '"down", "--volumes", "--remove-orphans"'
+    )
+    assert "required_data_volumes_not_found" in source
+    assert "volume_label_boundary_violation" in source

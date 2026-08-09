@@ -17,6 +17,8 @@ from src.utils.db_async import AsyncDatabaseManager
 from src.config import get_settings, resolve_secret
 from src.storage import EncryptedFileContentStore
 from src.ingestion.runtime import IngestionRuntime, build_ingestion_runtime
+from src.router.engine import RoutingEngine, configure_routing_engine
+from src.router.tier1.compiler import load_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,18 @@ class AppContext:
         """
         logger.info("Initializing Application Context...")
         settings = get_settings()
+
+        if getattr(settings, "APP_ENV", "development") == "production":
+            artifact = load_artifact(
+                settings.TIER1_ARTIFACT_DIR,
+                expected_digest=settings.TIER1_ARTIFACT_DIGEST,
+            )
+            configure_routing_engine(
+                RoutingEngine(
+                    artifact=artifact,
+                    me_email=settings.EXCHANGE_ACCOUNT_EMAIL,
+                )
+            )
 
         self.content_store = EncryptedFileContentStore(
             root=settings.CONTENT_STORE_ROOT,

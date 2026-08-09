@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     # compile time to decide whether a `forward` rule's fixed_recipients target
     # an external address. Compile-time only, no live directory lookup.
     INTERNAL_EMAIL_DOMAINS: str = ""
+    TIER1_ARTIFACT_DIR: str = "/app/tier1_artifacts"
+    TIER1_ARTIFACT_DIGEST: str = ""
 
     # Lark
     LARK_APP_ID: str = ""

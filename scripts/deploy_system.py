@@ -15,12 +15,18 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db.migration_settings import _read_secret_file  # noqa: E402
 from src.deployment.configuration import USER_ENV_KEYS, read_env_file  # noqa: E402
+from src.router.tier1.compiler import (  # noqa: E402
+    CompilationFailure,
+    compile_registry,
+    write_artifact,
+)
 
 
 _REQUIRED_SECRETS = (
@@ -49,6 +55,41 @@ class DeploymentError(RuntimeError):
     pass
 
 
+_COMPOSE_SERVICES = frozenset(
+    {
+        "qdrant",
+        "postgres",
+        "database-provision",
+        "database-bootstrap",
+        "ingestion-maintenance",
+        "checkpoint-maintenance",
+        "checkpoint-maintenance-execute",
+        "ai-assistant-service",
+    }
+)
+_COMPOSE_VOLUMES = frozenset(
+    {"postgres_data", "qdrant_data", "content_data", "checkpoint_maintenance_state"}
+)
+
+
+def _prepare_tier1_artifact(
+    root: Path,
+    *,
+    me_email: str,
+    internal_domains: tuple[str, ...],
+) -> str:
+    result = compile_registry(
+        root / "tier1_rules",
+        internal_email_domains=internal_domains,
+        me_email=me_email,
+    )
+    if isinstance(result, CompilationFailure):
+        codes = sorted({issue.code for issue in result.errors})
+        raise DeploymentError("tier1_compile_failed:" + ",".join(codes))
+    write_artifact(result, root / "artifacts" / "tier1")
+    return result.digest
+
+
 def _run(arguments: list[str], *, environment: dict[str, str]) -> None:
     result = subprocess.run(
         arguments,
@@ -58,6 +99,85 @@ def _run(arguments: list[str], *, environment: dict[str, str]) -> None:
     )
     if result.returncode != 0:
         raise DeploymentError(f"command_failed:{arguments[-1]}")
+
+
+def _docker_json(arguments: list[str], *, environment: dict[str, str]) -> Any:
+    try:
+        raw = subprocess.check_output(
+            arguments,
+            cwd=PROJECT_ROOT,
+            env=environment,
+            text=True,
+        )
+        return json.loads(raw)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        raise DeploymentError("docker_resource_inspection_failed") from None
+
+
+def _verify_project_resources(
+    project_name: str,
+    *,
+    environment: dict[str, str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Resolve and validate only exact Compose-labelled resources."""
+    try:
+        container_ids = subprocess.check_output(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label=com.docker.compose.project={project_name}",
+            ],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            text=True,
+        ).split()
+        volume_names = subprocess.check_output(
+            [
+                "docker",
+                "volume",
+                "ls",
+                "-q",
+                "--filter",
+                f"label=com.docker.compose.project={project_name}",
+            ],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            text=True,
+        ).split()
+    except (OSError, subprocess.CalledProcessError):
+        raise DeploymentError("docker_resource_inspection_failed") from None
+    if not container_ids or not volume_names:
+        raise DeploymentError("project_resources_not_found")
+    containers = _docker_json(
+        ["docker", "inspect", *container_ids],
+        environment=environment,
+    )
+    volumes = _docker_json(
+        ["docker", "volume", "inspect", *volume_names],
+        environment=environment,
+    )
+    for item in containers:
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        if (
+            labels.get("com.docker.compose.project") != project_name
+            or labels.get("com.docker.compose.service") not in _COMPOSE_SERVICES
+        ):
+            raise DeploymentError("container_label_boundary_violation")
+    seen_volume_keys: set[str] = set()
+    for item in volumes:
+        labels = item.get("Labels") or {}
+        volume_key = labels.get("com.docker.compose.volume")
+        if (
+            labels.get("com.docker.compose.project") != project_name
+            or volume_key not in _COMPOSE_VOLUMES
+        ):
+            raise DeploymentError("volume_label_boundary_violation")
+        seen_volume_keys.add(volume_key)
+    if not {"postgres_data", "qdrant_data", "content_data"} <= seen_volume_keys:
+        raise DeploymentError("required_data_volumes_not_found")
+    return tuple(container_ids), tuple(volume_names)
 
 
 def _private_file(path: Path) -> str:
@@ -133,6 +253,13 @@ def _deployment_context(
     timestamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     environment = dict(os.environ)
     environment["AI_EXCHANGE_IMAGE"] = f"ai-exchange:local-{timestamp}-{head}"
+    rules_dir = PROJECT_ROOT / "tier1_rules"
+    if rules_dir.is_dir():
+        environment["TIER1_ARTIFACT_DIGEST"] = _prepare_tier1_artifact(
+            PROJECT_ROOT,
+            me_email=user_values.get("EXCHANGE_ACCOUNT_EMAIL", ""),
+            internal_domains=("tianjin-air.com", "hnair.com", "hnaaviation.com"),
+        )
 
     compose = ["docker", "compose"]
     for env_file in env_files:
@@ -229,21 +356,112 @@ def redeploy(
     print(f"Deployment ready: project={resolved_project}")
 
 
+def greenfield_reset(
+    project_name: str | None,
+    *,
+    manifest_dir: Path,
+    build_id: str,
+    actor: str,
+) -> None:
+    """Permanently erase the exact project volumes and bootstrap one empty system."""
+    compose, environment, resolved_project, port = check(project_name)
+    policy = manifest_dir / "POLICY.json"
+    contract = manifest_dir / "CONTRACT.json"
+    if not manifest_dir.is_dir() or not policy.is_file() or not contract.is_file():
+        raise DeploymentError("greenfield_manifest_missing")
+    account_id = read_env_file(PROJECT_ROOT / ".env")[0].get(
+        "EXCHANGE_ACCOUNT_ID", ""
+    )
+    if not account_id.isdecimal() or int(account_id) <= 0:
+        raise DeploymentError("exchange_account_id_invalid")
+
+    print("Building and validating the canonical image before destructive cutover...")
+    _run([*compose, "build", "--pull", "ai-assistant-service"], environment=environment)
+    containers, volumes = _verify_project_resources(
+        resolved_project,
+        environment=environment,
+    )
+    print(
+        "Verified destructive boundary: "
+        f"project={resolved_project} containers={len(containers)} volumes={len(volumes)}"
+    )
+    _run(
+        [*compose, "down", "--volumes", "--remove-orphans"],
+        environment=environment,
+    )
+    print("Project containers and named volumes permanently removed; bootstrapping empty data.")
+    _run([*compose, "up", "-d", "--no-build", "postgres", "qdrant"], environment=environment)
+    _run(
+        [*compose, "--profile", "database-provision", "run", "--rm", "database-provision"],
+        environment=environment,
+    )
+    _run(
+        [*compose, "--profile", "migration", "run", "--rm", "database-bootstrap"],
+        environment=environment,
+    )
+    manifest_mount = f"{manifest_dir.resolve()}:/run/manifest:ro"
+    initialize = [
+        *compose,
+        "--profile",
+        "ingestion-maintenance",
+        "run",
+        "--rm",
+        "--volume",
+        manifest_mount,
+        "ingestion-maintenance",
+        "initialize",
+        "--account-id",
+        account_id,
+        "--policy-file",
+        "/run/manifest/POLICY.json",
+        "--contract-file",
+        "/run/manifest/CONTRACT.json",
+        "--actor",
+        actor,
+        "--reason",
+        "authorized-greenfield-reset",
+        "--idempotency-key",
+        build_id,
+    ]
+    _run([*initialize, "--dry-run"], environment=environment)
+    _run(initialize, environment=environment)
+    _run(
+        [*compose, "up", "-d", "--no-build", "ai-assistant-service"],
+        environment=environment,
+    )
+    _wait_ready(port)
+    _run([*compose, "ps"], environment=environment)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("check", "redeploy"))
+    parser.add_argument("command", choices=("check", "redeploy", "greenfield-reset"))
     parser.add_argument("--project-name")
     parser.add_argument(
         "--development",
         action="store_true",
         help="使用 docker-compose.dev.yml；仅适用于本机或受控开发环境。",
     )
+    parser.add_argument("--manifest-dir", type=Path)
+    parser.add_argument("--build-id")
+    parser.add_argument("--actor")
     arguments = parser.parse_args()
     try:
         if arguments.command == "check":
             check(arguments.project_name, development=arguments.development)
-        else:
+        elif arguments.command == "redeploy":
             redeploy(arguments.project_name, development=arguments.development)
+        else:
+            if arguments.development:
+                raise DeploymentError("greenfield_reset_production_only")
+            if not arguments.manifest_dir or not arguments.build_id or not arguments.actor:
+                raise DeploymentError("greenfield_reset_arguments_missing")
+            greenfield_reset(
+                arguments.project_name,
+                manifest_dir=arguments.manifest_dir,
+                build_id=arguments.build_id,
+                actor=arguments.actor,
+            )
     except DeploymentError as exc:
         print(f"Deployment failed: {exc}", file=sys.stderr)
         return 1

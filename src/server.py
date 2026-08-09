@@ -9,10 +9,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from weakref import WeakKeyDictionary
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from typing import Any
 from src.config import get_settings
 from src.daily_digest import DailyDigestScheduler
 from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
@@ -21,7 +20,6 @@ from src.db.runtime_boundary import require_runtime_database_boundary
 from src.init_app import get_app_context as initialize_app_context
 from src.init_app import get_runtime_app_context
 from src.security.auth import require_metrics_auth, validate_runtime_security
-from src.security.redaction import fingerprint_identifier
 from src.utils import lark_app
 
 logger = logging.getLogger("WebServer")
@@ -724,130 +722,3 @@ async def queue_status(request: Request):
         },
     }
 
-
-class MockEmailData(BaseModel):
-    id: str = Field(min_length=1, max_length=512)
-    subject: str = Field(max_length=998)
-    sender: str = Field(max_length=1_024)
-    to: List[str] = Field(min_length=1, max_length=100)
-    cc: List[str] = Field(default_factory=list, max_length=100)
-    body: str = Field(max_length=DEBUG_BODY_MAX_CHARS)
-    received_at: str = Field(max_length=128)
-    attachments: List[Dict[str, Any]] = Field(default_factory=list, max_length=20)
-    draft: str = Field(default="", max_length=DEBUG_BODY_MAX_CHARS)
-    context: List[Dict[str, Any]] = Field(default_factory=list, max_length=20)
-    classification: Dict[str, Any] = Field(default_factory=dict)
-    attachment_tokens: List[str] = Field(default_factory=list, max_length=20)
-    pdf_token: Optional[str] = Field(default=None, max_length=512)
-    recipient_candidates: Dict[str, List[Any]] = Field(
-        default_factory=lambda: {"to": [], "cc": []}
-    )
-
-
-def _require_debug_endpoint(settings: Any) -> None:
-    if str(getattr(settings, "APP_ENV", "development")).casefold() == "production":
-        raise HTTPException(status_code=404, detail="Not found")
-    if not bool(getattr(settings, "DEBUG", False)):
-        raise HTTPException(status_code=403, detail="Debug endpoints disabled")
-
-
-@app.post("/debug/inject_email")
-async def inject_test_email(data: MockEmailData):
-    """
-    Inject a test email into the in-memory mock store for viewing.
-    """
-    settings = get_settings()
-    _require_debug_endpoint(settings)
-    if not lark_app.is_test_card_id(data.id):
-        raise HTTPException(
-            status_code=400,
-            detail="Debug email id must use the test_push_ namespace",
-        )
-
-    logger.info(
-        "Injecting DEBUG mock email: email=%s",
-        fingerprint_identifier(data.id, namespace="debug_email"),
-    )
-
-    # Construct state-like object
-    # The view_email function expects state.values.get("email")
-    # So we structure it accordingly.
-
-    mock_state = type("MockState", (), {})()
-    email_data = {
-        "id": data.id,
-        "subject": data.subject,
-        "sender": data.sender,
-        "to": data.to,
-        "cc": data.cc,
-        "draft_to": list(data.to),
-        "draft_cc": list(data.cc),
-        "body": data.body,
-        "received_at": data.received_at,
-        "attachments": data.attachments,
-    }
-    mock_state.values = {
-        "email": email_data,
-        "draft": data.draft,
-        "context": data.context,
-        "classification": data.classification
-        or {
-            "need_reply": True,
-            "reasoning": "debug_injection",
-        },
-        "attachment_tokens": data.attachment_tokens,
-        "pdf_token": data.pdf_token,
-        "recipient_candidates": data.recipient_candidates,
-    }
-
-    lark_app._mock_store[data.id] = mock_state
-    return {"status": "ok", "id": data.id}
-
-
-@app.delete("/debug/inject_email/{email_id:path}")
-async def delete_test_email(email_id: str):
-    """Remove only an explicitly namespaced DEBUG test-card state."""
-    settings = get_settings()
-    _require_debug_endpoint(settings)
-    if not lark_app.is_test_card_id(email_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Debug email id must use the test_push_ namespace",
-        )
-    removed = lark_app._mock_store.pop(email_id, None) is not None
-    return {
-        "status": "ok",
-        "id": email_id,
-        "removed": removed,
-    }
-
-
-@app.get("/email/{email_id:path}", response_class=HTMLResponse)
-async def view_email(email_id: str):
-    """Render only an explicitly seeded DEBUG test card until Phase 5."""
-    settings = get_settings()
-    is_explicit_debug_email = (
-        bool(settings.DEBUG)
-        and str(getattr(settings, "APP_ENV", "development")).casefold() != "production"
-        and lark_app.is_test_card_id(email_id)
-        and email_id in lark_app._mock_store
-    )
-    if not is_explicit_debug_email:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    state = lark_app._mock_store[email_id]
-    email_data = state.values.get("email", {})
-
-    # Use shared renderer
-    from src.utils.email_renderer import render_email_html
-
-    full_email_html = render_email_html(email_data)
-
-    return HTMLResponse(
-        content=full_email_html,
-        headers={
-            "Cache-Control": "no-store",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )

@@ -13,7 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures"
 SYNTHETIC_EML = FIXTURES / "synthetic_notification.eml"
 CONVERT_SCRIPT = PROJECT_ROOT / "scripts" / "convert_eml.py"
-CARD_SCRIPT = PROJECT_ROOT / "scripts" / "push_test_card.py"
 
 _ALLOWED_MAIL_FIXTURES = {Path("synthetic_notification.eml")}
 _MAIL_ARTIFACT_SUFFIXES = {".eml", ".mbox", ".msg", ".ost", ".pdf", ".pst"}
@@ -70,9 +69,7 @@ def test_synthetic_mail_fixture_has_only_reserved_identities_and_no_route_data()
 def test_manual_fixture_tools_reference_only_synthetic_input_and_untracked_output() -> (
     None
 ):
-    scripts = CONVERT_SCRIPT.read_text(encoding="utf-8") + CARD_SCRIPT.read_text(
-        encoding="utf-8"
-    )
+    scripts = CONVERT_SCRIPT.read_text(encoding="utf-8")
 
     assert "nas.eml" not in scripts
     assert "nas.pdf" not in scripts

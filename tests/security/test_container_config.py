@@ -138,7 +138,12 @@ def test_all_application_one_shots_share_one_explicit_release_image():
         "ai-assistant-service",
     ):
         service = compose["services"][service_name]
-        assert service["build"] == "."
+        assert service["build"] == {
+            "context": ".",
+            "args": {
+                "TIER1_ARTIFACT_DIGEST": "${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}"
+            },
+        }
         assert service["image"] == expected
 
 
@@ -626,7 +631,7 @@ def test_dockerfile_copies_only_the_explicit_runtime_allowlist():
         "COPY scripts/manage_ingestion.py scripts/checkpoint_cleanup.py ./scripts/",
         "COPY alembic ./alembic",
         "COPY alembic.ini ./alembic.ini",
-        "COPY skills_registry ./skills_registry",
+        "COPY artifacts/tier1 ./tier1_artifacts",
         "COPY tier1_rules ./tier1_rules",
     } <= dockerfile_lines
     assert "COPY scripts ./scripts" not in dockerfile_lines

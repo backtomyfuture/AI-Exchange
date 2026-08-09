@@ -26,7 +26,6 @@ from src.maintenance.cleanup_artifacts import (
 )
 from src.maintenance.cleanup_backup import (
     Ed25519BackupReceiptVerifier,
-    create_signed_backup_receipt,
     create_ed25519_signed_backup_receipt,
 )
 
@@ -224,8 +223,8 @@ async def test_cli_plan_and_execute_use_distinct_roles_and_ed25519_v2(
     plan_id = plan_output["plan"]["plan_id"]
     plan = PlanArtifactStore(state_dir).load_plan(plan_id)
 
-    legacy_receipt = create_signed_backup_receipt(
-        key=b"legacy-hmac-key-is-never-a-production-verifier" * 2,
+    retired_receipt = create_ed25519_signed_backup_receipt(
+        private_seed=RECEIPT_PRIVATE_SEED,
         plan_id=plan.plan_id,
         database_fingerprint=plan.database_fingerprint,
         alembic_revision=plan.alembic_revision,
@@ -234,8 +233,13 @@ async def test_cli_plan_and_execute_use_distinct_roles_and_ed25519_v2(
         completed_at=datetime.now(UTC),
         manifest_sha256="e" * 64,
     )
+    retired_payload = json.loads(retired_receipt)
+    retired_payload["version"] = 1
     receipt_file = tmp_path / "receipt.json"
-    receipt_file.write_text(legacy_receipt, encoding="utf-8")
+    receipt_file.write_text(
+        json.dumps(retired_payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
     receipt_file.chmod(0o600)
     execute_args = [
         "execute",

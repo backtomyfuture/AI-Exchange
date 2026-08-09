@@ -11,6 +11,10 @@ docs/
 .agent/
 .superpowers/
 artifacts/
+!artifacts/
+artifacts/*
+!artifacts/tier1/
+!artifacts/tier1/**
 *.eml
 *.pdf
 .git/
