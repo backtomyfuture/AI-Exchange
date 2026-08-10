@@ -1,0 +1,77 @@
+schema_version: 1
+rule_id: T1-NON-VIP-DIRECT-READONLY-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  Counterpart of T1-VIP-DIRECT-REPLY-001: any email addressed directly to the
+  mailbox owner (To contains $ME) by a sender without a more specific Tier 1
+  rule is routed read_only -- seen but not replied to automatically. Senders
+  owned by other rules with a different decision (VIP lanjuan/xt_zong;
+  hhsc marketing platform; hnasafety safety platform) are excluded so their
+  dedicated routes remain authoritative instead of fighting this fallback as
+  runtime conflicts. CC-only non-VIP email is not covered and falls through to
+  Tier 2/3.
+
+validity:
+  effective_from: "2026-08-10T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: to.addresses
+        op: has_any
+        values: ["$ME"]
+  conditions:
+    all:
+      - not:
+          field: sender.address
+          op: in
+          values:
+            - lanjuan@tianjin-air.com
+            - xt_zong@tianjin-air.com
+            - hhsc@hnair.com
+            - hnasafety@hnaaviation.com
+
+decision:
+  route: read_only
+  business_flow_id: direct-recipient-fyi
+
+governance:
+  criticality: P2
+  risk_notes: >
+    Intentionally a broad default: with it, most direct-to-owner email leaves
+    Tier 1 labelled read_only instead of falling through to Tier 2/3. Keep
+    the sender exclusion list in sync with every sender-specific Tier 1 rule
+    that decides a different route; any new no_action/reply rule whose sender
+    emails the owner directly must add its sender here or it will fight this
+    fallback as a runtime conflict. By-design corner remaining: mail addressed
+    to both $ME and a silent internal distlist matches two different actions
+    and is forced to manual_review rather than silently choosing one.
+  positive_cases:
+    - case_id: ops-direct-to-me
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: colleague-direct-to-me-with-cc
+      email:
+        sender: {address: colleague@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]
+        cc: [uninvolved@example.com]
+  negative_cases:
+    - case_id: vip-direct-to-me-belongs-to-vip-rule
+      email:
+        sender: {address: lanjuan@tianjin-air.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: marketing-direct-to-me-belongs-to-marketing-rule
+      email:
+        sender: {address: hhsc@hnair.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: safety-direct-to-me-belongs-to-safety-rule
+      email:
+        sender: {address: hnasafety@hnaaviation.com}
+        to: [q-fu@tianjin-air.com]
+    - case_id: not-direct-to-me
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [someone-else@tianjin-air.com]

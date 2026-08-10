@@ -1,6 +1,6 @@
 schema_version: 1
 rule_id: T1-INTERNAL-DISTLIST-SILENCE-001
-rule_version: 2
+rule_version: 3
 status: enabled
 owner: mailbox-owner
 purpose: >
@@ -8,10 +8,13 @@ purpose: >
   (gs4193/hhlyrlzyb/hhsc/m_wu/shj_zhen/thitzb/thxxcxb/thxxyfzx/tjhkgh/yq_w/
   zhang_xia): each was auto-discovered from a single internal distribution-
   list address the mailbox owner belongs to, with a 0% historical reply rate
-  (samples ranging 3-44 emails; thxxcxb=32 and zhang-xia=44 are the strongest-
-  confidence members). Same anchor field, same route, same reason_code for
-  all 11 -> one rule per design doc §4.5 (address-group inlining in
-  anchor.any) instead of 11 near-duplicate single-address files.
+  (samples ranging 3-44 emails). Same anchor field, same route, same
+  reason_code for all 11 -> one rule per design doc §4.5 (address-group
+  inlining in anchor.any) instead of 11 near-duplicate single-address files.
+  Owner review on 2026-08-10 pulled m.wu/shj-zhen/yq.w/zhang-xia out of the
+  group list: m.wu and zhang-xia are now treated as individual senders
+  (T1-ZHANGXIA-FORWARD-READONLY-001 covers their forwards) and shj-zhen/yq.w
+  rejoin normal Tier 2/3 routing instead of unconditional silence.
 
 validity:
   effective_from: "2025-01-01T00:00:00Z"
@@ -26,14 +29,10 @@ match:
           - gs4193@hnair.com
           - hhlyrlzyb@hnaaviation.com
           - hhsc@hnair.com
-          - m.wu@tianjin-air.com
-          - shj-zhen@tianjin-air.com
           - thitzb@hnair.com
           - thxxcxb@hnair.com
           - thxxyfzx@hnair.com
           - tjhkgh@tianjin-air.com
-          - yq.w@tianjin-air.com
-          - zhang-xia@tianjin-air.com
 
 decision:
   route: no_action
@@ -43,21 +42,22 @@ decision:
 
 governance:
   criticality: P3
-  owner_reviewed_at: "2026-08-09T00:00:00Z"
+  owner_reviewed_at: "2026-08-10T00:00:00Z"
   risk_notes: >
     All 11 source addresses independently showed a 0% reply rate historically.
     Any address with a future non-zero observed reply rate must be pulled out
     of this rule's anchor list rather than left in, per design doc's no_action
-    governance bar.
+    governance bar. 2026-08-10: m.wu/shj-zhen/yq.w/zhang-xia removed per owner
+    review.
   positive_cases:
     - case_id: to-gs4193
       email:
         sender: {address: some-ops@hnair.com}
         to: [gs4193@hnair.com]
-    - case_id: to-zhang-xia
+    - case_id: to-tjhkgh
       email:
         sender: {address: some-ops@tianjin-air.com}
-        to: [zhang-xia@tianjin-air.com]
+        to: [tjhkgh@tianjin-air.com]
     - case_id: to-thxxcxb-with-other-cc
       email:
         sender: {address: some-ops@hnair.com}
@@ -73,3 +73,7 @@ governance:
         sender: {address: some-ops@hnair.com}
         to: [q-fu@tianjin-air.com]
         cc: [gs4193@hnair.com]
+    - case_id: removed-address-in-to-not-group-any-more
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [zhang-xia@tianjin-air.com]

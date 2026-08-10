@@ -3,8 +3,8 @@
 per-file fixture replay the compiler already runs by asserting the full
 compiled artifact's outcome/route for representative emails, including cases
 that only a whole-registry evaluation (not a single rule in isolation) can
-catch: cross-rule conflicts, the $ME split's mutual exclusivity, and
-group-mailbox address-list membership.
+catch: cross-rule conflicts, the $ME split's mutual exclusivity, the
+non-VIP direct-recipient fallback, and group-mailbox address-list membership.
 
 Any change to ``match``/``decision`` in ``tier1_rules/`` must keep this test
 green; a change that requires updating an assertion here is exactly the kind
@@ -41,16 +41,36 @@ def test_migrated_registry_compiles():
         "T1-ZHANGXIA-FORWARD-READONLY-001",
         "T1-VIP-DIRECT-REPLY-001",
         "T1-VIP-CC-ONLY-READONLY-001",
+        "T1-NON-VIP-DIRECT-READONLY-001",
     }
 
 
 def test_group_mailbox_email_is_no_action():
     artifact = _compile()
-    view = EmailView(sender_address="ops@hnair.com", to_addresses=["zhang-xia@tianjin-air.com"])
+    view = EmailView(sender_address="ops@hnair.com", to_addresses=["tjhkgh@tianjin-air.com"])
     decision = build_tier1_decision(_rules(artifact), view, me_email=ME_EMAIL)
     assert decision.outcome is EvaluationOutcome.MATCHED
     assert decision.route is CanonicalRoute.NO_ACTION
     assert decision.reason_codes == ["internal_distribution_list"]
+
+
+def test_removed_group_addresses_rejoin_normal_routing():
+    """The 2026-08-10 owner review pulled m.wu/shj-zhen/yq.w/zhang-xia out of
+    the silent-group list: an email merely addressed to one of them is no
+    longer no_action and, with no other rule applying, falls through to
+    Tier 2/3."""
+    artifact = _compile()
+    rules = _rules(artifact)
+    for removed in (
+        "m.wu@tianjin-air.com",
+        "shj-zhen@tianjin-air.com",
+        "yq.w@tianjin-air.com",
+        "zhang-xia@tianjin-air.com",
+    ):
+        view = EmailView(sender_address="ops@hnair.com", to_addresses=[removed])
+        decision = build_tier1_decision(rules, view, me_email=ME_EMAIL)
+        assert decision.outcome is EvaluationOutcome.ABSTAIN, removed
+        assert decision.route is None, removed
 
 
 def test_vip_direct_recipient_is_reply_not_read_only():
@@ -94,6 +114,38 @@ def test_vip_split_is_mutually_exclusive_never_a_runtime_conflict():
         assert decision.outcome is not EvaluationOutcome.CONFLICT
 
 
+def test_non_vip_direct_recipient_is_read_only():
+    """Counterpart of T1-VIP-DIRECT-REPLY-001: a direct recipient email from
+    any sender without a more specific rule is read_only, not a Tier 2/3
+    abstention."""
+    artifact = _compile()
+    rules = _rules(artifact)
+    for sender in ("some-ops@hnair.com", "colleague@tianjin-air.com"):
+        view = EmailView(sender_address=sender, to_addresses=[ME_EMAIL])
+        decision = build_tier1_decision(rules, view, me_email=ME_EMAIL)
+        assert decision.outcome is EvaluationOutcome.MATCHED, sender
+        assert decision.route is CanonicalRoute.READ_ONLY, sender
+        assert decision.business_flow_ids == ["direct-recipient-fyi"], sender
+
+
+def test_non_vip_fallback_never_shadows_sender_specific_rules():
+    """The fallback excludes senders owned by other rules; otherwise hhsc/
+    hnasafety direct-to-owner mail would conflict (no_action vs read_only)
+    instead of archiving. Asserting the exact route below doubles as the
+    exclusion regression check."""
+    artifact = _compile()
+    rules = _rules(artifact)
+    for sender, reason in (
+        ("hnasafety@hnaaviation.com", "automated_system_notification"),
+        ("hhsc@hnair.com", "marketing_spam"),
+    ):
+        view = EmailView(sender_address=sender, to_addresses=[ME_EMAIL])
+        decision = build_tier1_decision(rules, view, me_email=ME_EMAIL)
+        assert decision.outcome is EvaluationOutcome.MATCHED, sender
+        assert decision.route is CanonicalRoute.NO_ACTION, sender
+        assert decision.reason_codes == [reason], sender
+
+
 def test_safety_platform_and_marketing_are_distinct_no_action_reasons():
     artifact = _compile()
     rules = _rules(artifact)
@@ -113,19 +165,43 @@ def test_zhangxia_forward_requires_both_sender_and_subject_shape():
     artifact = _compile()
     rules = _rules(artifact)
 
-    matches = EmailView(sender_address="zhang-xia@tianjin-air.com", subject="Fw: 通知")
-    assert build_tier1_decision(rules, matches, me_email=ME_EMAIL).route is CanonicalRoute.READ_ONLY
+    for sender in ("zhang-xia@tianjin-air.com", "m.wu@tianjin-air.com"):
+        matches = EmailView(sender_address=sender, subject="Fw: 通知")
+        assert build_tier1_decision(rules, matches, me_email=ME_EMAIL).route is CanonicalRoute.READ_ONLY, sender
+
+        not_a_forward = EmailView(sender_address=sender, subject="请审批")
+        assert build_tier1_decision(rules, not_a_forward, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN, sender
 
     wrong_sender = EmailView(sender_address="someone-else@tianjin-air.com", subject="Fw: 通知")
     assert build_tier1_decision(rules, wrong_sender, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
 
-    not_a_forward = EmailView(sender_address="zhang-xia@tianjin-air.com", subject="请审批")
-    assert build_tier1_decision(rules, not_a_forward, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
 
-
-def test_unrelated_email_abstains_falls_through_to_tier2_tier3():
+def test_direct_to_me_plus_distlist_is_conflict_manual_review():
+    """By-design corner: mail addressed to both $ME and a silent distlist
+    matches two different actions (read_only fallback vs no_action group) and
+    is forced to manual review rather than silently picking one."""
     artifact = _compile()
-    view = EmailView(sender_address="rando@external.com", to_addresses=[ME_EMAIL])
+    view = EmailView(
+        sender_address="ops@hnair.com",
+        to_addresses=[ME_EMAIL, "tjhkgh@tianjin-air.com"],
+    )
     decision = build_tier1_decision(_rules(artifact), view, me_email=ME_EMAIL)
-    assert decision.outcome is EvaluationOutcome.ABSTAIN
-    assert decision.route is None
+    assert decision.outcome is EvaluationOutcome.CONFLICT
+    assert decision.route is CanonicalRoute.MANUAL_REVIEW
+
+
+def test_non_direct_email_abstains_falls_through_to_tier2_tier3():
+    """The non-VIP fallback only claims direct (To) email: cc-only or
+    not-for-the-owner mail still falls through to Tier 2/3."""
+    artifact = _compile()
+    rules = _rules(artifact)
+
+    cc_only = EmailView(
+        sender_address="rando@external.com",
+        to_addresses=["someone-else@tianjin-air.com"],
+        cc_addresses=[ME_EMAIL],
+    )
+    assert build_tier1_decision(rules, cc_only, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
+
+    not_mine = EmailView(sender_address="rando@external.com", to_addresses=["colleague@tianjin-air.com"])
+    assert build_tier1_decision(rules, not_mine, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
