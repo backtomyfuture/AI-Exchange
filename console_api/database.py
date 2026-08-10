@@ -164,8 +164,8 @@ class ConsoleDatabase:
                         if not identity or identity["console_user"] != self._settings.database_role:
                             raise ConsoleDatabaseError("console_database_identity_invalid")
                         await cursor.execute(
-                            "SET LOCAL statement_timeout = %s",
-                            (self._settings.statement_timeout_ms,),
+                            "SELECT pg_catalog.set_config('statement_timeout', %s, true)",
+                            (str(self._settings.statement_timeout_ms),),
                         )
                         await cursor.execute("SET LOCAL default_transaction_read_only = on")
                         yield cursor
