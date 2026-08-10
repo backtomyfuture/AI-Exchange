@@ -20,7 +20,11 @@ from typing import Any
 from src.config import get_settings
 from src.graph.dependencies import GraphDependencies
 from src.graph.resource_locks import get_graph_resource_lock
-from src.graph.state_factory import MAX_TOKENS, sanitize_graph_delta
+from src.graph.state_factory import (
+    MAX_TOKENS,
+    resolve_bookkeeping_as_node,
+    sanitize_graph_delta,
+)
 from src.ingestion.processing import ExternalEffectBoundary, ExternalEffectKind
 from src.router.decision import RouteDecision
 from src.safety.attachments import AttachmentPolicy
@@ -639,7 +643,9 @@ class EmailFeishuDelivery:
                     values,
                     {"pdf_token": token, "attachment_tokens": cleanup_tokens},
                 )
-                await self._graph.aupdate_state(config, update)
+                await self._graph.aupdate_state(
+                    config, update, as_node=resolve_bookkeeping_as_node(state)
+                )
                 confirmed = await self._graph.aget_state(config)
                 confirmed_values = getattr(confirmed, "values", None)
                 confirmed_tokens = (
@@ -827,6 +833,7 @@ class EmailFeishuDelivery:
             await self._graph.aupdate_state(
                 config,
                 sanitize_graph_delta(values, {"attachment_tokens": [*tokens, token]}),
+                as_node=resolve_bookkeeping_as_node(state),
             )
             confirmed = await self._graph.aget_state(config)
             confirmed_values = getattr(confirmed, "values", {})
@@ -863,6 +870,7 @@ class EmailFeishuDelivery:
         await self._graph.aupdate_state(
             config,
             sanitize_graph_delta(values, {"attachment_tokens": tokens}),
+            as_node=resolve_bookkeeping_as_node(state),
         )
 
     async def _delete_or_retain_token(
@@ -930,6 +938,7 @@ class EmailFeishuDelivery:
             await self._graph.aupdate_state(
                 config,
                 sanitize_graph_delta(values, delta),
+                as_node=resolve_bookkeeping_as_node(state),
             )
         return await self._delete_or_retain_token(
             email_id,

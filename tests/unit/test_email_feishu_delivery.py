@@ -654,3 +654,86 @@ async def test_pdf_stage_must_be_read_back_before_a_card_can_be_sent():
 
     assert outcome.disposition is EmailDeliveryDisposition.KNOWN_FAILURE
     card.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notification_delivery_survives_a_checkpoint_that_never_ran_a_node():
+    """A real LangGraph checkpoint seeded via as_node="__start__" and never
+    advanced (a Tier 1/2/3 route, e.g. tier1_conflict, that bypasses
+    ``_run_ai_pipeline``) must not raise ``InvalidUpdateError`` when the
+    notification PDF's token is recorded afterwards.
+
+    This is a regression test for the production incident where every
+    ``manual_review``/``read_only`` email needing a PDF attachment failed
+    with ``InvalidUpdateError: Ambiguous update, specify as_node`` right
+    after the PDF was already uploaded to Feishu, leaving the graph
+    checkpoint stuck at ``next=('categorizer',)`` and the inbox row at
+    ``notification_pdf_cleanup_untracked`` / ``effect_outcome_unknown``.
+    Uses the real compiled graph and ``MemorySaver`` instead of a mock so a
+    future change to ``as_node`` handling cannot silently regress.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from src.graph.builder import build_graph
+
+    email_id = "email-tier1-conflict-bypass"
+    checkpointer = MemorySaver()
+    graph = build_graph(checkpointer, dependencies=_MagicMock())
+    config = {"configurable": {"thread_id": email_id}}
+
+    # Mirrors src.exchange_service._checkpoint_ai_path_resources: seed the
+    # checkpoint before any real node runs, exactly as the manual_review /
+    # tier1_conflict bypass path does.
+    await graph.aupdate_state(
+        config,
+        {
+            "email_id": email_id,
+            "content_ref": "ref-1",
+            "attachment_tokens": [],
+            "pdf_token": None,
+        },
+        as_node="__start__",
+    )
+    assert (await graph.aget_state(config)).next == ("categorizer",)
+
+    database = AsyncMock()
+
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/pdf", "file_token": "pdf-token"}
+
+    def send_card(_request, _url):
+        return LarkCardDelivery(True, True, message_id="m-1")
+
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=send_card,
+        upload_file=MagicMock(),
+        delete_file=MagicMock(return_value=True),
+    )
+
+    outcome = await delivery.deliver(
+        ReadNotificationRequest(
+            email_id=email_id,
+            email_data={"id": email_id, "attachments": []},
+            classification={"need_reply": False},
+            context=(),
+            routing_log=(),
+        ),
+        effect_boundary=None,
+    )
+
+    assert outcome.disposition is EmailDeliveryDisposition.CONFIRMED
+    assert outcome.pdf_token == "pdf-token"
+    final_state = await graph.aget_state(config)
+    assert final_state.values["pdf_token"] == "pdf-token"
+    # The bookkeeping write must not resurrect the pipeline: the entry node
+    # stays pending, it must not be re-triggered or cleared.
+    assert final_state.next == ("categorizer",)
+
+
+

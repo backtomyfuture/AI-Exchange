@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph, END
 
 from langgraph.checkpoint.memory import MemorySaver
 from src.graph.state import AgentState
+from src.graph.state_factory import GRAPH_ENTRY_NODE
 from src.graph.dependencies import GraphDependencies
 from src.nodes.categorizer import categorize_email
 from src.nodes.retriever_node import retrieve_context
@@ -109,7 +110,7 @@ def build_graph(
         _guard_graph_node("manual_review", enter_manual_review),
     )
 
-    workflow.set_entry_point("categorizer")
+    workflow.set_entry_point(GRAPH_ENTRY_NODE)
 
     def route_after_categorizer(state: AgentState):
         raw = state.get("route_decision")

@@ -600,6 +600,42 @@ def sanitize_graph_delta(
     return result
 
 
+# Must match ``workflow.set_entry_point(...)`` in ``src/graph/builder.py``. The
+# compiled graph never routes back to this node, so ``next == (GRAPH_ENTRY_NODE,)``
+# is a sufficient and necessary signal that no real node has executed yet.
+GRAPH_ENTRY_NODE = "categorizer"
+
+
+def resolve_bookkeeping_as_node(next_nodes: object) -> str | None:
+    """Attribute an out-of-band bookkeeping write to the right LangGraph node.
+
+    Callers use this before ``graph.aupdate_state(...)`` calls that only
+    persist bounded side-channel bookkeeping (``pdf_token``,
+    ``attachment_tokens``, ``payload_revision``) and must never move the
+    graph forward or backward. ``next_nodes`` accepts either a state
+    snapshot exposing ``.next`` or that tuple already extracted, so callers
+    can reuse a snapshot they fetched moments earlier without an extra
+    ``aget_state`` round trip.
+
+    Tier 1/2/3 routes that bypass ``_run_ai_pipeline`` (e.g. ``manual_review``
+    from a Tier 1 rule conflict) still seed the checkpoint via
+    ``graph.aupdate_state(config, state, as_node="__start__")`` so cleanup
+    handles survive a crash. That seed leaves ``checkpoint["versions_seen"]``
+    with only an empty ``"__start__"`` entry, so LangGraph has zero
+    candidates to infer a writer from and raises
+    ``InvalidUpdateError: Ambiguous update, specify as_node`` on the very
+    next unattributed write. Once a real node has run (drafter, reviewer,
+    manual_review, ...), LangGraph can infer the writer from
+    ``versions_seen`` on its own, and forcing ``as_node="__start__"`` at that
+    point would incorrectly rewind ``next`` back to the entry point.
+    """
+    if hasattr(next_nodes, "next"):
+        next_nodes = getattr(next_nodes, "next", ())
+    if tuple(next_nodes or ()) == (GRAPH_ENTRY_NODE,):
+        return "__start__"
+    return None
+
+
 async def hydrate_email_from_state(
     state: Mapping[str, Any],
     dependencies: GraphDependencies,

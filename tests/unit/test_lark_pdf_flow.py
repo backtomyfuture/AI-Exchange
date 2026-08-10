@@ -849,7 +849,7 @@ async def test_pdf_flow_serializes_same_email_transitions(monkeypatch):
             await asyncio.sleep(0)
             return SimpleNamespace(values=deepcopy(self.values))
 
-        async def aupdate_state(self, _config, delta):
+        async def aupdate_state(self, _config, delta, **_kwargs):
             self.active_updates += 1
             self.max_active_updates = max(
                 self.max_active_updates,

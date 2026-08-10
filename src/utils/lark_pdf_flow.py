@@ -28,6 +28,7 @@ from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import (
     MAX_TOKENS,
     hydrate_email_for_rendering,
+    resolve_bookkeeping_as_node,
     sanitize_graph_delta,
 )
 from src.security.redaction import fingerprint_identifier
@@ -104,23 +105,31 @@ def _pdf_transition_confirmed(
 async def _read_graph_values(
     graph: Any,
     config: dict[str, Any],
-) -> tuple[str, dict[str, Any] | None]:
-    """Read the latest state when supported, distinguishing absent from failed."""
+) -> tuple[str, dict[str, Any] | None, tuple[str, ...]]:
+    """Read the latest state when supported, distinguishing absent from failed.
+
+    The third element is the snapshot's ``next`` tuple, exposed so a caller
+    about to perform a bookkeeping-only write can pass it straight to
+    ``resolve_bookkeeping_as_node`` without an extra ``aget_state`` round
+    trip (several callers here are exercised by tests that assert an exact
+    number of state reads).
+    """
     get_state = getattr(graph, "aget_state", None)
     if not callable(get_state):
-        return "unavailable", None
+        return "unavailable", None, ()
     try:
         snapshot = await get_state(config)
         current = snapshot.values if hasattr(snapshot, "values") else snapshot
         if not isinstance(current, Mapping):
-            return "failed", None
-        return "loaded", dict(current)
+            return "failed", None, ()
+        next_nodes = tuple(getattr(snapshot, "next", ()) or ())
+        return "loaded", dict(current), next_nodes
     except Exception as exc:
         logger.error(
             "Graph state reconciliation failed: error_type=%s",
             type(exc).__name__,
         )
-        return "failed", None
+        return "failed", None, ()
 
 
 async def _retain_cleanup_handle(
@@ -129,7 +138,7 @@ async def _retain_cleanup_handle(
     values: dict[str, Any],
     token: str,
 ) -> bool:
-    read_status, current_values = await _read_graph_values(graph, config)
+    read_status, current_values, current_next = await _read_graph_values(graph, config)
     if read_status == "failed":
         return False
     base_values = current_values if current_values is not None else values
@@ -145,14 +154,20 @@ async def _retain_cleanup_handle(
             base_values,
             {"attachment_tokens": cleanup_tokens},
         )
-        await graph.aupdate_state(config, cleanup_update)
+        await graph.aupdate_state(
+            config,
+            cleanup_update,
+            as_node=resolve_bookkeeping_as_node(current_next),
+        )
         return True
     except Exception as exc:
         logger.error(
             "Remote cleanup handle persistence failed: error_type=%s",
             type(exc).__name__,
         )
-        read_status, current_values = await _read_graph_values(graph, config)
+        read_status, current_values, _current_next = await _read_graph_values(
+            graph, config
+        )
         if read_status == "loaded" and token in (
             current_values.get("attachment_tokens") or []
         ):
@@ -191,7 +206,7 @@ async def _delete_registered_cleanup_handle(
     delete_fn: Callable[[str], bool],
 ) -> str:
     """Delete only a token registered against the expected active PDF."""
-    read_status, current_values = await _read_graph_values(graph, config)
+    read_status, current_values, current_next = await _read_graph_values(graph, config)
     if read_status == "failed":
         return "protected"
     base_values = current_values if current_values is not None else values
@@ -212,7 +227,7 @@ async def _delete_registered_cleanup_handle(
     if not deleted:
         return "retained"
 
-    read_status, current_values = await _read_graph_values(graph, config)
+    read_status, current_values, current_next = await _read_graph_values(graph, config)
     if read_status == "failed":
         return "stale"
     if read_status == "loaded":
@@ -232,14 +247,20 @@ async def _delete_registered_cleanup_handle(
             base_values,
             {"attachment_tokens": remaining_tokens},
         )
-        await graph.aupdate_state(config, removal)
+        await graph.aupdate_state(
+            config,
+            removal,
+            as_node=resolve_bookkeeping_as_node(current_next),
+        )
         return "deleted"
     except Exception as exc:
         logger.error(
             "Cleanup handle removal failed: error_type=%s",
             type(exc).__name__,
         )
-        read_status, current_values = await _read_graph_values(graph, config)
+        read_status, current_values, _current_next = await _read_graph_values(
+            graph, config
+        )
         if read_status == "loaded" and cleanup_token not in (
             current_values.get("attachment_tokens") or []
         ):
@@ -420,7 +441,9 @@ async def _process_pdf_generation_and_reply_locked(
 
         config = {"configurable": {"thread_id": email_id}}
         values = dict(state.values)
-        read_status, current_values = await _read_graph_values(graph, config)
+        read_status, current_values, current_next = await _read_graph_values(
+            graph, config
+        )
         if read_status == "loaded" and (
             not current_values
             or current_values.get("email_id") != values.get("email_id")
@@ -479,14 +502,20 @@ async def _process_pdf_generation_and_reply_locked(
             )
 
         try:
-            await graph.aupdate_state(config, update)
+            await graph.aupdate_state(
+                config,
+                update,
+                as_node=resolve_bookkeeping_as_node(current_next),
+            )
             values = staged_values
         except Exception as exc:
             logger.error(
                 "PDF token persistence failed: error_type=%s",
                 type(exc).__name__,
             )
-            read_status, current_values = await _read_graph_values(graph, config)
+            read_status, current_values, _current_next = await _read_graph_values(
+                graph, config
+            )
             if read_status == "loaded":
                 current_token = current_values.get("pdf_token")
                 if _pdf_transition_confirmed(
@@ -601,7 +630,9 @@ async def _process_pdf_generation_and_reply_locked(
                 type(exc).__name__,
             )
             restore_already_done = False
-            read_status, current_values = await _read_graph_values(graph, config)
+            read_status, current_values, current_next = await _read_graph_values(
+                graph, config
+            )
             if read_status == "failed":
                 return PdfFlowOutcome(
                     status="reply_failed_restore_ambiguous",
@@ -645,16 +676,22 @@ async def _process_pdf_generation_and_reply_locked(
                         protected_tokens=_token_tuple(old_token, file_token),
                     )
                 try:
-                    await graph.aupdate_state(config, restore)
+                    await graph.aupdate_state(
+                        config,
+                        restore,
+                        as_node=resolve_bookkeeping_as_node(current_next),
+                    )
                     values = restored_values
                 except Exception as restore_exc:
                     logger.error(
                         "PDF token restore failed: error_type=%s",
                         type(restore_exc).__name__,
                     )
-                    read_status, current_values = await _read_graph_values(
-                        graph,
-                        config,
+                    read_status, current_values, _current_next = (
+                        await _read_graph_values(
+                            graph,
+                            config,
+                        )
                     )
                     if read_status == "loaded" and _pdf_transition_confirmed(
                         current_values,
