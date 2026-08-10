@@ -32,7 +32,9 @@ from console_api.rules import RuleStore, RuleStoreError
 from console_api.settings import ConsoleSettings, get_console_settings, running_in_production
 
 
-_LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+_LOCAL_CLIENT_HOSTS = frozenset(
+    {"127.0.0.1", "::1", "localhost", "testclient", "172.17.0.1"}
+)
 
 
 def _database(settings: ConsoleSettings = Depends(get_console_settings)) -> ConsoleDatabase:
