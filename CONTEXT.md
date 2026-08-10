@@ -104,8 +104,20 @@ A promotion attempt whose target rule ID already exists in `tier1_rules`. It sto
 _Avoid_: Silent overwrite, automatic merge
 
 **Skill Activation**:
-The loading of a promoted Declarative Tier 1 Skill at a planned service restart. Promotion does not hot-reload rules into a running email-processing service.
+The loading of any `tier1_rules/` change — from Skill Promotion or from a directly authored Rule Draft — at a planned service restart. No path hot-reloads rules into a running email-processing service.
 _Avoid_: Hot reload, mid-processing rule switch
+
+**Rule Draft**:
+A Declarative Tier 1 Skill created or edited directly through the Operations Console, independent of a Discovered Skill Candidate. It may be saved incomplete, but must pass the same schema, fixture, and conflict validation as any other rule before its status can become enabled.
+_Avoid_: Discovered Skill Candidate, proposed candidate
+
+**Operations Console**:
+A local-only, single-operator web tool that renders an Inbound Email's Pipeline Trace and authors Rule Drafts. It has read-only access to production data, writes rule changes only to the same `tier1_rules/` files an operator would otherwise hand-edit, and never restarts or hot-reloads the email-processing service.
+_Avoid_: Admin dashboard, production console, hosted panel
+
+**Pipeline Trace**:
+The assembled, business-stage view of one Inbound Email's journey — ingestion, Intake Guard, Canonical Route Decision, Handoff Plan and Evidence Pack, draft revisions, approval, and send outcome — read from existing durable tables and replayed in the Operations Console. It is not a live stream of LangGraph node execution.
+_Avoid_: LangGraph execution trace, live stream, checkpoint replay
 
 **Bounded Recovery**:
 Recovery of a processing attempt within explicit durable state boundaries. It may retry a known-safe transient internal failure or be operator-triggered, but it never blindly replays an outcome-unknown Feishu or Exchange external effect.
