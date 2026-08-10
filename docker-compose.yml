@@ -1,5 +1,6 @@
 services:
   qdrant:
+    container_name: ai-exchange-qdrant
     image: qdrant/qdrant:v1.17.0@sha256:f1c7272cdac52b38c1a0e89313922d940ba50afd90d593a1605dbbc214e66ffb
     restart: always
     command: ["./entrypoint.sh", "--disable-telemetry"]
@@ -24,6 +25,7 @@ services:
       - backend
 
   postgres:
+    container_name: ai-exchange-postgres
     image: postgres:15@sha256:f30e3de0ac9cc938dac627ef2231099867c694b5f949fadb924c8c977428c399
     restart: always
     environment:
@@ -256,6 +258,7 @@ services:
       - backend
 
   ai-assistant-service:
+    container_name: ai-exchange
     build:
       context: .
       args:
