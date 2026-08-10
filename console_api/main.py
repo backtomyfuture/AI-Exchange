@@ -32,11 +32,6 @@ from console_api.rules import RuleStore, RuleStoreError
 from console_api.settings import ConsoleSettings, get_console_settings, running_in_production
 
 
-_LOCAL_CLIENT_HOSTS = frozenset(
-    {"127.0.0.1", "::1", "localhost", "testclient", "172.17.0.1"}
-)
-
-
 def _database(settings: ConsoleSettings = Depends(get_console_settings)) -> ConsoleDatabase:
     try:
         return ConsoleDatabase(settings)
@@ -63,6 +58,7 @@ def create_app() -> FastAPI:
         description="Local-only Pipeline Trace and Tier 1 Rule Draft editor.",
     )
     settings = get_console_settings()
+    local_client_hosts = frozenset(settings.client_host_list())
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.origin_list(),
@@ -74,7 +70,7 @@ def create_app() -> FastAPI:
     @application.middleware("http")
     async def local_only_guard(request, call_next):
         client_host = request.client.host if request.client else None
-        if running_in_production() or client_host not in _LOCAL_CLIENT_HOSTS:
+        if running_in_production() or client_host not in local_client_hosts:
             return JSONResponse(status_code=404, content={"detail": "Not found"})
         return await call_next(request)
 

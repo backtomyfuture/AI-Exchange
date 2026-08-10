@@ -33,6 +33,7 @@ class ConsoleSettings(BaseSettings):
     internal_email_domains: str = ""
     me_email: str = ""
     allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    allowed_client_hosts: str = "127.0.0.1,::1,localhost,testclient"
     statement_timeout_ms: int = Field(default=5000, ge=250, le=30000)
     max_page_size: int = Field(default=50, ge=1, le=100)
 
@@ -54,6 +55,9 @@ class ConsoleSettings(BaseSettings):
 
     def origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
+
+    def client_host_list(self) -> list[str]:
+        return [host.strip() for host in self.allowed_client_hosts.split(",") if host.strip()]
 
 
 @lru_cache
