@@ -127,6 +127,36 @@ curl --fail http://127.0.0.1:8000/health
 
 `/ready` 必须同时返回 `status=ready` 与 `processing=active`。健康接口仅代表应用可用；仍应通过受保护的 `/queue`、`/metrics` 和一次真实的非破坏性邮件流，分别验证轮询、Durable Inbox、审批与外部动作。
 
+## Operations Console（本地操作台）
+
+Operations Console 是本机、单操作员工具，不是生产 FastAPI 路由，也不会加入生产
+Compose。它通过独立的只读 PostgreSQL 角色读取 Pipeline Trace，并把 Rule Draft
+写回当前工作树的 `tier1_rules/`；它不会提交 Git、重启服务或热加载规则。
+
+首次为已完成数据库初始化的环境创建只读角色时，管理员 DSN 只能通过私有文件提供：
+
+```bash
+.venv/bin/python scripts/provision_operations_console.py \
+  --admin-dsn-file /path/to/private/admin-dsn \
+  --dsn-output /path/to/private/operations-console-dsn
+```
+
+随后在本地启动 API 和前端：
+
+```bash
+CONSOLE_DATABASE_URL_FILE=/path/to/private/operations-console-dsn \
+  .venv/bin/uvicorn console_api.main:app --host 127.0.0.1 --port 8090
+
+cd console-web
+npm install
+npm run dev
+```
+
+浏览器访问 `http://127.0.0.1:5173`。规则的 `Validate` 使用真实
+`compile_registry()`，`Compile artifact` 只写本地 digest-addressed artifact；生效
+仍需人工提交并运行 `scripts/deploy_system.py` 的既有发布流程和计划重启。完整接口与
+边界见 [Operations Console ADR](docs/adr/0017-operations-console-contract.md)。
+
 ## 日常运维
 
 | 目标 | 入口 |
