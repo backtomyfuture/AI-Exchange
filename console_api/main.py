@@ -103,7 +103,10 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise _safe_error(exc) from exc
 
-    @application.get("/api/emails/{external_email_id}/trace", response_model=PipelineTrace)
+    # Exchange message IDs are base64-like values and may contain "/" even
+    # after the browser URL-encodes them. A path converter keeps the decoded
+    # slash inside the identifier instead of treating it as a route boundary.
+    @application.get("/api/emails/{external_email_id:path}/trace", response_model=PipelineTrace)
     async def email_trace(
         external_email_id: str,
         database: ConsoleDatabase = Depends(_database),

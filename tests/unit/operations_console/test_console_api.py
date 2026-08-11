@@ -179,6 +179,35 @@ def test_trace_endpoint_uses_business_stage_projection():
     assert response.json()["nodes"][0]["id"] == "ingestion"
 
 
+def test_trace_endpoint_accepts_base64_like_ids_with_path_characters():
+    app = create_app()
+    trace = PipelineTrace(
+        external_email_id="mail/001+abc=",
+        inbox_id=None,
+        subject="Quarterly review",
+        sender="sender@example.com",
+        current_status="waiting_approval",
+        nodes=[],
+        edges=[],
+    )
+
+    class FakeDatabase:
+        async def trace(self, external_email_id):
+            assert external_email_id == "mail/001+abc="
+            return trace
+
+    app.dependency_overrides[_database] = lambda: FakeDatabase()
+    try:
+        response = TestClient(app).get(
+            "/api/emails/mail%2F001%2Babc%3D/trace"
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["external_email_id"] == "mail/001+abc="
+
+
 def test_trace_endpoint_maps_database_unavailability_to_safe_error():
     app = create_app()
 

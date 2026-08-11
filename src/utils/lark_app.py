@@ -682,25 +682,13 @@ def _resolve_current_user_email(chat_id: str):
             fingerprint_identifier(owner_id, namespace="lark_actor"),
         )
         
-        # 3. Derive Exchange Email
-        # Strategy: Use local part of Lark email, or full email if matches user preference
-        # User Instruction: "Append tianjin-air.com"
-        
-        effective_email = user.email
+        # The Exchange mailbox is deployment configuration, not a value to
+        # derive from the Lark actor. In particular, replacing a full mailbox
+        # address with a local part would make Tier 1's ``$ME`` fixtures fail
+        # and could change routing semantics after startup.
         if user.email:
-            # Extract local part "q-fu" from "q-fu@hnair.com"
-            local_part = user.email.split("@")[0]
-            # We set this as EXCHANGE_ACCOUNT_EMAIL. 
-            # The card builder logic checks `if my_email in recipient_email`. 
-            # Setting it to the local part "q-fu" is the most robust way to match "q-fu@tianjin-air.com" AND "q-fu@hnair.com"
-            effective_email = local_part
-            
-        if effective_email:
-            settings = get_settings()
-            settings.EXCHANGE_ACCOUNT_EMAIL = effective_email
             logger.info(
-                "Exchange account identity configured: account=%s",
-                fingerprint_identifier(effective_email, namespace="exchange_account"),
+                "Lark identity email resolved; Exchange account configuration preserved"
             )
             
     except Exception as exc:
