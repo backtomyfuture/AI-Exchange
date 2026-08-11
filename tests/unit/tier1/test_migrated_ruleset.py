@@ -167,7 +167,9 @@ def test_zhangxia_forward_requires_both_sender_and_subject_shape():
 
     for sender in ("zhang-xia@tianjin-air.com", "m.wu@tianjin-air.com"):
         matches = EmailView(sender_address=sender, subject="Fw: 通知")
-        assert build_tier1_decision(rules, matches, me_email=ME_EMAIL).route is CanonicalRoute.READ_ONLY, sender
+        decision = build_tier1_decision(rules, matches, me_email=ME_EMAIL)
+        assert decision.route is CanonicalRoute.NO_ACTION, sender
+        assert decision.reason_codes == ["forwarded_informational"], sender
 
         not_a_forward = EmailView(sender_address=sender, subject="请审批")
         assert build_tier1_decision(rules, not_a_forward, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN, sender
