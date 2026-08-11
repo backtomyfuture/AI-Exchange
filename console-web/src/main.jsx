@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -21,7 +21,8 @@ import {
   SlidersHorizontal,
   Sparkles,
   Split,
-  Workflow
+  Workflow,
+  X
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -36,6 +37,12 @@ import {
   useNodesState
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardPortal,
+  HoverCardTrigger
+} from "./components/ui/hover-card";
 import "./styles.css";
 
 const API = "";
@@ -253,7 +260,7 @@ function TraceDetail({ trace }) {
         <SummaryMetric label="Inbox ID" value={trace.inbox_id ? `${trace.inbox_id.slice(0, 8)}…` : "—"} />
         <SummaryMetric label="Stages" value={`${trace.nodes.filter((node) => node.status === "completed").length} / ${trace.nodes.length}`} />
       </div>
-      <div className="graph-label"><span>BUSINESS-STAGE REPLAY</span><span className="graph-hint"><Sparkles size={13} /> Hover a node to inspect</span></div>
+      <div className="graph-label"><span>BUSINESS-STAGE REPLAY</span><span className="graph-hint"><Sparkles size={13} /> Hover or focus a node to inspect · click to pin</span></div>
       <div className="graph-frame">
         <ReactFlow nodes={nodes} edges={edges} nodeTypes={{ trace: TraceNode }} fitView fitViewOptions={{ padding: 0.12 }} nodesDraggable={false} nodesConnectable={false} zoomOnDoubleClick={false}>
           <Background color="#182238" gap={24} size={1} />
@@ -271,14 +278,122 @@ function TraceDetail({ trace }) {
 
 function TraceNode({ data }) {
   const Icon = stageIcons[data.kind] || Workflow;
+  const detailsId = `trace-node-details-${useId().replaceAll(":", "")}`;
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const lastTouchToggleAt = useRef(0);
+  const open = hoverOpen || pinned;
+  const closeDetails = () => {
+    setPinned(false);
+    setHoverOpen(false);
+  };
+  const togglePinned = (event) => {
+    event.stopPropagation();
+    if (event.type === "click" && Date.now() - lastTouchToggleAt.current < 500) return;
+    setPinned((current) => {
+      const next = !current;
+      setHoverOpen(next);
+      return next;
+    });
+  };
+  const handlePointerDown = (event) => {
+    if (event.pointerType === "touch") {
+      event.preventDefault();
+      lastTouchToggleAt.current = Date.now();
+      togglePinned(event);
+    }
+  };
+  const handleKeyDown = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      togglePinned(event);
+    }
+  };
   return (
-    <motion.div className={`flow-node flow-${data.status}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: data.index * 0.08 }}>
-      <Handle type="target" position={Position.Left} className="flow-handle" />
-      <div className="flow-node-top"><div className="flow-icon"><Icon size={15} /></div><span>{String(data.index + 1).padStart(2, "0")}</span></div>
-      <div className="flow-node-label">{data.label}</div>
-      <div className="flow-node-status"><span className="tiny-status" />{data.status}</div>
-      <Handle type="source" position={Position.Right} className="flow-handle" />
-    </motion.div>
+    <HoverCard
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!pinned) setHoverOpen(nextOpen);
+      }}
+      openDelay={180}
+      closeDelay={120}
+    >
+      <HoverCardTrigger asChild>
+        <motion.div
+          data-testid={`trace-node-${data.id}`}
+          role="button"
+          tabIndex={0}
+          data-trace-node-trigger={data.id}
+          className={`flow-node flow-${data.status} nodrag nopan`}
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: data.index * 0.08 }}
+          aria-controls={detailsId}
+          aria-expanded={open}
+          onPointerDown={handlePointerDown}
+          onClick={togglePinned}
+          onKeyDown={handleKeyDown}
+        >
+          <Handle type="target" position={Position.Left} className="flow-handle" />
+          <div className="flow-node-top"><div className="flow-icon"><Icon size={15} /></div><span>{String(data.index + 1).padStart(2, "0")}</span></div>
+          <div className="flow-node-label">{data.label}</div>
+          <div className="flow-node-status"><span className="tiny-status" />{data.status}</div>
+          <Handle type="source" position={Position.Right} className="flow-handle" />
+        </motion.div>
+      </HoverCardTrigger>
+      <HoverCardPortal>
+        <HoverCardContent
+          id={detailsId}
+          className="hover-card-content"
+          side="bottom"
+          align="start"
+          sideOffset={10}
+          collisionPadding={12}
+          onPointerDownOutside={(event) => {
+            const target = event.detail?.originalEvent?.target;
+            const trigger = target instanceof Element
+              ? target.closest("[data-trace-node-trigger]")
+              : null;
+            if (trigger?.getAttribute("data-trace-node-trigger") === data.id) return;
+            closeDetails();
+          }}
+          onEscapeKeyDown={closeDetails}
+        >
+          <TraceNodeDetails node={data} onClose={closeDetails} />
+        </HoverCardContent>
+      </HoverCardPortal>
+    </HoverCard>
+  );
+}
+
+function TraceNodeDetails({ node, onClose }) {
+  const detail = node.detail || {};
+  const useful = Object.entries(detail).filter(([key, value]) => value !== null && value !== undefined && value !== "" && !(Array.isArray(value) && !value.length));
+  return (
+    <div className="trace-node-details" role="dialog" aria-label={`${node.label} details`}>
+      <div className="hover-card-header">
+        <div>
+          <div className="hover-card-kicker">STAGE {String(node.index + 1).padStart(2, "0")}</div>
+          <strong>{node.label}</strong>
+        </div>
+        <button type="button" className="hover-card-close" aria-label={`Close ${node.label} details`} onClick={onClose}>
+          <X size={14} />
+        </button>
+      </div>
+      <div className={`hover-card-status hover-card-status-${node.status}`}>
+        <span className="tiny-status" /> {node.status}
+      </div>
+      {node.safe_error_code && <div className="hover-card-error"><CircleAlert size={13} /> {node.safe_error_code}</div>}
+      <div className="hover-card-details">
+        {useful.length ? useful.map(([key, value]) => (
+          <div className="hover-card-detail" key={key}>
+            <span>{key.replaceAll("_", " ")}</span>
+            <strong>{formatDetail(value)}</strong>
+          </div>
+        )) : <span className="hover-card-empty">No additional safe detail</span>}
+      </div>
+      <div className="hover-card-hint">Click the node to keep this panel open</div>
+    </div>
   );
 }
 
@@ -405,4 +520,7 @@ function toYaml(value) { return Object.entries(value).map(([key, item]) => `${ke
 function formatTime(value) { if (!value) return "—"; return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
 function formatDetail(value) { if (typeof value === "object") return JSON.stringify(value); return String(value); }
 
-createRoot(document.getElementById("root")).render(<App />);
+export { App, TraceNode, TraceNodeDetails };
+
+const rootElement = document.getElementById("root");
+if (rootElement) createRoot(rootElement).render(<App />);

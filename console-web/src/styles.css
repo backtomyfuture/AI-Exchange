@@ -117,8 +117,9 @@ input:focus, select:focus, textarea:focus { border-color: #597daf; box-shadow: 0
 .react-flow__controls { border: 1px solid var(--border); box-shadow: none; }
 .react-flow__controls-button { width: 26px; height: 26px; border-bottom: 1px solid var(--border); background: #111a2b; fill: #8092b2; }
 .react-flow__minimap { border: 1px solid var(--border); background: #0b111c; }
-.flow-node { width: 148px; min-height: 108px; padding: 10px 11px; border: 1px solid #2c3e60; border-radius: 8px; background: linear-gradient(145deg, #17243b, #101827); box-shadow: 0 8px 20px rgba(0, 0, 0, .22); }
+.flow-node { width: 148px; min-height: 108px; padding: 10px 11px; border: 1px solid #2c3e60; border-radius: 8px; background: linear-gradient(145deg, #17243b, #101827); box-shadow: 0 8px 20px rgba(0, 0, 0, .22); appearance: none; color: inherit; cursor: pointer; text-align: left; }
 .flow-node:hover { border-color: #83aff9; box-shadow: 0 0 0 1px #405f91, 0 0 22px rgba(82, 138, 231, .23); }
+.flow-node:focus-visible { border-color: #a7c7ff; outline: 2px solid rgba(120, 169, 255, .72); outline-offset: 3px; box-shadow: 0 0 0 1px #405f91, 0 0 22px rgba(82, 138, 231, .23); }
 .flow-completed { border-color: #285d53; background: linear-gradient(145deg, #132a2a, #101c27); }
 .flow-failed { border-color: #70404b; background: linear-gradient(145deg, #2c1a26, #1c1621); }
 .flow-active { border-color: #9b7739; background: linear-gradient(145deg, #2c2517, #1d1b1a); }
@@ -132,6 +133,26 @@ input:focus, select:focus, textarea:focus { border-color: #597daf; box-shadow: 0
 .flow-failed .tiny-status { background: var(--red); box-shadow: 0 0 7px var(--red); }
 .flow-active .tiny-status { background: var(--yellow); box-shadow: 0 0 7px var(--yellow); }
 .flow-handle { width: 5px; height: 5px; border: 0; background: #50698f; }
+.hover-card-content { z-index: 20; width: min(320px, calc(100vw - 32px)); padding: 14px; color: #ccd7e9; border: 1px solid #35547f; border-radius: 9px; background: linear-gradient(155deg, #13223a, #0d1422); box-shadow: 0 18px 45px rgba(0, 0, 0, .42), 0 0 0 1px rgba(111, 159, 232, .08); animation: hover-card-in .14s ease-out; }
+.hover-card-content[data-state="closed"] { animation: hover-card-out .1s ease-in; }
+.hover-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.hover-card-kicker { color: #6d83a5; font: 8px var(--mono); letter-spacing: .13em; }
+.hover-card-header strong { display: block; margin-top: 5px; color: #edf3ff; font-size: 12px; }
+.hover-card-close { display: grid; width: 26px; height: 26px; flex: 0 0 auto; place-items: center; color: #8198ba; border: 1px solid #294365; border-radius: 5px; background: #101c30; }
+.hover-card-close:hover { color: #e8f0ff; border-color: #6286ba; background: #172a48; }
+.hover-card-close:focus-visible { outline: 2px solid rgba(120, 169, 255, .72); outline-offset: 2px; }
+.hover-card-status { display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; padding: 4px 7px; color: #91a7c8; border: 1px solid #294665; border-radius: 4px; background: #101c2e; font: 8px var(--mono); text-transform: uppercase; }
+.hover-card-status-completed { color: #90dfc2; border-color: #2d6959; background: #102820; }
+.hover-card-status-failed { color: #ffabb1; border-color: #70404b; background: #2a171e; }
+.hover-card-status-active { color: #f4ce82; border-color: #71552d; background: #292115; }
+.hover-card-error { display: flex; align-items: center; gap: 5px; margin-top: 10px; color: #f28e98; font: 9px var(--mono); }
+.hover-card-details { display: grid; gap: 8px; margin-top: 13px; padding-top: 11px; border-top: 1px solid #233957; }
+.hover-card-detail { display: grid; grid-template-columns: minmax(80px, .7fr) minmax(0, 1.3fr); gap: 12px; color: #7186a7; font: 9px var(--mono); }
+.hover-card-detail strong { overflow-wrap: anywhere; color: #b8c8df; font-weight: 400; text-align: right; }
+.hover-card-empty { color: #6f829f; font: 9px var(--mono); }
+.hover-card-hint { margin-top: 12px; color: #5e7495; font: 8px var(--mono); }
+@keyframes hover-card-in { from { opacity: 0; transform: translateY(-3px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes hover-card-out { from { opacity: 1; } to { opacity: 0; } }
 .trace-inspector { padding: 21px 25px 25px; }
 .inspector-header { display: flex; align-items: center; gap: 10px; }
 .inspector-line { height: 1px; flex: 1; background: var(--border); }
