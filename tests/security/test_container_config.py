@@ -541,6 +541,14 @@ def test_operations_dashboard_is_a_local_frontend_container():
     assert service["depends_on"]["operations-console-api"]["condition"] == (
         "service_healthy"
     )
+    assert service["healthcheck"]["test"] == [
+        "CMD",
+        "wget",
+        "-q",
+        "-O",
+        "-",
+        "http://127.0.0.1:5173/",
+    ]
     assert _network_names(service) == {"backend", "edge"}
 
 
