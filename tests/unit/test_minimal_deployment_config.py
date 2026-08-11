@@ -198,9 +198,11 @@ def test_deployment_context_uses_only_the_polling_compose_stack(
     assert port == 8000
     assert all("webhook" not in item for item in compose)
     assert str(tmp_path / "docker-compose.dev.yml") not in compose
+    assert compose.count("--file") == 1
+    assert str(tmp_path / "docker-compose.yml") in compose
 
 
-def test_deployment_context_adds_the_development_overlay_only_on_request(
+def test_development_deployment_uses_the_canonical_compose_file_and_console_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -213,7 +215,10 @@ def test_deployment_context_adds_the_development_overlay_only_on_request(
 
     assert project_name == "test-project"
     assert port == 8000
-    assert str(tmp_path / "docker-compose.dev.yml") in compose
+    assert str(tmp_path / "docker-compose.dev.yml") not in compose
+    assert compose.count("--file") == 1
+    assert "--profile" in compose
+    assert "operations-console" in compose
 
 
 def test_deployment_prepares_and_pins_complete_tier1_artifact(tmp_path: Path):

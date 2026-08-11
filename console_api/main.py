@@ -70,7 +70,10 @@ def create_app() -> FastAPI:
     @application.middleware("http")
     async def local_only_guard(request, call_next):
         client_host = request.client.host if request.client else None
-        if running_in_production() or client_host not in local_client_hosts:
+        if running_in_production() or not (
+            client_host in local_client_hosts
+            or settings.client_host_allowed(client_host)
+        ):
             return JSONResponse(status_code=404, content={"detail": "Not found"})
         return await call_next(request)
 

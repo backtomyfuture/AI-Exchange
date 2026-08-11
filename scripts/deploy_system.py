@@ -228,9 +228,6 @@ def _deployment_context(
             ca_path = PROJECT_ROOT / ca_path
         if not ca_path.is_file():
             raise DeploymentError("exchange_ca_file_missing")
-        compose_files.append(PROJECT_ROOT / "docker-compose.exchange-tls.yml")
-    if development:
-        compose_files.append(PROJECT_ROOT / "docker-compose.dev.yml")
 
     project_name = project_override or _private_file(
         secrets_dir / "compose_project_name"
@@ -250,6 +247,11 @@ def _deployment_context(
     except (OSError, subprocess.CalledProcessError):
         raise DeploymentError("git_revision_unavailable") from None
     environment = dict(os.environ)
+    if development:
+        environment["APP_ENV"] = "development"
+        environment["APP_BIND_HOST"] = "127.0.0.1"
+    if all(tls_values):
+        environment["EXCHANGE_CA_FILE"] = "/run/ai-exchange/exchange-ca.pem"
     environment["AI_EXCHANGE_IMAGE"] = f"ai-exchange:local-{head}"
     rules_dir = PROJECT_ROOT / "tier1_rules"
     if rules_dir.is_dir():
@@ -265,6 +267,8 @@ def _deployment_context(
     compose.extend(("--project-name", project_name))
     for compose_file in compose_files:
         compose.extend(("--file", str(compose_file)))
+    if development:
+        compose.extend(("--profile", "operations-console"))
 
     try:
         port = int(advanced.get("APP_PORT", "8000"))
@@ -323,6 +327,10 @@ def redeploy(
         development=development,
     )
     application_services = ["ai-assistant-service"]
+    compose_reconcile_options: list[str] = []
+    if development:
+        application_services.append("operations-console-api")
+        compose_reconcile_options = ["--force-recreate", "--remove-orphans"]
     print("Building the canonical application image...")
     _run(
         [*compose, "build", "--pull", "ai-assistant-service"],
@@ -335,7 +343,15 @@ def redeploy(
     )
     print("Refreshing data services with existing volumes...")
     _run(
-        [*compose, "up", "-d", "--no-build", "postgres", "qdrant"],
+        [
+            *compose,
+            "up",
+            "-d",
+            "--no-build",
+            *compose_reconcile_options,
+            "postgres",
+            "qdrant",
+        ],
         environment=environment,
     )
     print("Starting the rebuilt polling application...")
@@ -345,6 +361,7 @@ def redeploy(
             "up",
             "-d",
             "--no-build",
+            *compose_reconcile_options,
             *application_services,
         ],
         environment=environment,

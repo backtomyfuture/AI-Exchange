@@ -276,7 +276,7 @@ services:
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
-      APP_ENV: production
+      APP_ENV: ${APP_ENV:-production}
       DEBUG: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       EXTERNAL_URL: ${EXTERNAL_URL:?EXTERNAL_URL is required}
@@ -298,6 +298,7 @@ services:
       TIER1_ARTIFACT_DIR: /app/tier1_artifacts
       TIER1_ARTIFACT_DIGEST: ${TIER1_ARTIFACT_DIGEST:?TIER1_ARTIFACT_DIGEST is required}
       EXCHANGE_SSL_VERIFY: "true"
+      EXCHANGE_CA_FILE: ${EXCHANGE_CA_FILE:-}
       EXCHANGE_API_URL: ${EXCHANGE_API_URL:?EXCHANGE_API_URL is required}
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:?EXCHANGE_API_KEY is required}
       EXCHANGE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
@@ -327,13 +328,19 @@ services:
       - source: content_store_key
         target: content_store_key
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${APP_BIND_HOST:-0.0.0.0}:${APP_PORT:-8000}:8000"
+    extra_hosts:
+      - "${EXCHANGE_TLS_HOSTNAME:-unused.invalid}:${EXCHANGE_TLS_IP:-127.0.0.1}"
     depends_on:
       qdrant:
         condition: service_healthy
       postgres:
         condition: service_healthy
     volumes:
+      - type: bind
+        source: ${EXCHANGE_CA_FILE_HOST:-docker/exchange-ca-placeholder.pem}
+        target: /run/ai-exchange/exchange-ca.pem
+        read_only: true
       - content_data:/app/data/content
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
@@ -351,6 +358,54 @@ services:
           cpus: "2"
           memory: 2G
           pids: 256
+    networks:
+      - backend
+      - edge
+
+  operations-console-api:
+    profiles: ["operations-console"]
+    container_name: ai-exchange-operations-console-api
+    image: ${AI_EXCHANGE_IMAGE:-ai-exchange:local}
+    restart: unless-stopped
+    command: ["uvicorn", "console_api.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    working_dir: /app
+    # The console is local-only and intentionally runs with the current
+    # worktree mounted. It can update rule drafts and local artifacts, but it
+    # never shares the application runtime credential.
+    environment:
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+      CONSOLE_DATABASE_URL_FILE: /run/secrets/operations_console_dsn
+      CONSOLE_ACCOUNT_ID: ${EXCHANGE_ACCOUNT_ID:?EXCHANGE_ACCOUNT_ID is required}
+      CONSOLE_ME_EMAIL: ${EXCHANGE_ACCOUNT_EMAIL:?EXCHANGE_ACCOUNT_EMAIL is required}
+      CONSOLE_INTERNAL_EMAIL_DOMAINS: "tianjin-air.com,hnair.com,hnaaviation.com"
+      CONSOLE_ALLOWED_ORIGINS: "http://127.0.0.1:5173,http://localhost:5173"
+      CONSOLE_ALLOWED_CLIENT_HOSTS: "127.0.0.1,::1,localhost"
+      CONSOLE_ALLOW_PRIVATE_CLIENT_HOSTS: "true"
+    secrets:
+      - source: operations_console_dsn
+        target: operations_console_dsn
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - type: bind
+        source: ./console_api
+        target: /app/console_api
+        read_only: true
+      - type: bind
+        source: ./tier1_rules
+        target: /app/tier1_rules
+      - type: bind
+        source: ./artifacts/tier1
+        target: /app/artifacts/tier1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     networks:
       - backend
       - edge
@@ -393,3 +448,5 @@ secrets:
     file: ./secrets/metrics_token
   content_store_key:
     file: ./secrets/content_store_key
+  operations_console_dsn:
+    file: ./secrets/operations-console-dsn

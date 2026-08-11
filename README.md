@@ -77,14 +77,15 @@ cp .env.example .env
   --project-name ai-exchange-greenfield
 ```
 
-若 Exchange 是本机、私网或非 HTTPS 的受控开发端点，显式使用开发覆盖层：
+若 Exchange 是本机、私网或非 HTTPS 的受控开发端点，显式使用开发模式：
 
 ```bash
 .venv/bin/python scripts/deploy_system.py check \
-  --development --project-name ai-exchange-greenfield
+--development --project-name ai-exchange-greenfield
 ```
 
-`--development` 只加载 `docker-compose.dev.yml`，不会降低默认生产模式的 TLS 和运行时安全校验。开发覆盖层必须和基础 Compose 文件配对使用，不能单独启动。
+`--development` 仍使用同一个 `docker-compose.yml`，仅将应用绑定到回环地址并启用
+`operations-console` profile；不会降低 TLS 或数据库运行时安全校验。
 
 ### 3. 初始化空数据库与轮询权限
 
@@ -141,18 +142,19 @@ Compose。它通过独立的只读 PostgreSQL 角色读取 Pipeline Trace，并�
   --dsn-output /path/to/private/operations-console-dsn
 ```
 
-随后在本地启动 API 和前端：
+随后用同一个 Compose project 启动 API，再单独启动前端开发服务器：
 
 ```bash
-CONSOLE_DATABASE_URL_FILE=/path/to/private/operations-console-dsn \
-  .venv/bin/uvicorn console_api.main:app --host 127.0.0.1 --port 8090
+.venv/bin/python scripts/deploy_system.py redeploy --development \
+  --project-name ai-exchange-greenfield
 
 cd console-web
 npm install
 npm run dev
 ```
 
-浏览器访问 `http://127.0.0.1:5173`。规则的 `Validate` 使用真实
+API 容器名为 `ai-exchange-operations-console-api`，浏览器访问
+`http://127.0.0.1:5173`。规则的 `Validate` 使用真实
 `compile_registry()`，`Compile artifact` 只写本地 digest-addressed artifact；生效
 仍需人工提交并运行 `scripts/deploy_system.py` 的既有发布流程和计划重启。完整接口与
 边界见 [Operations Console ADR](docs/adr/0017-operations-console-contract.md)。

@@ -22,6 +22,17 @@ def _settings(tmp_path):
     )
 
 
+def test_console_settings_can_allow_private_docker_gateway_only_when_enabled(tmp_path):
+    settings = _settings(tmp_path)
+
+    assert settings.client_host_allowed("192.168.117.1") is False
+
+    settings.allow_private_client_hosts = True
+    assert settings.client_host_allowed("192.168.117.1") is True
+    assert settings.client_host_allowed("8.8.8.8") is False
+    assert settings.client_host_allowed("not-an-ip") is False
+
+
 def _manifest(status: str = "proposed") -> dict:
     return {
         "schema_version": 1,

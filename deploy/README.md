@@ -79,17 +79,22 @@ docker image inspect --format '{{.Id}}' ai-exchange:local | sed 's/^sha256://'
   --dry-run
 ```
 
-去掉 `--dry-run` 才会写入运行时授权。成功后再运行 `scripts/deploy_system.py redeploy --project-name "$PROJECT_NAME"`，并检查 `/ready` 的 `status=ready` 与 `processing=active`。如果 Exchange 指向本机或非 HTTPS 的受控开发地址，必须显式改用 `scripts/deploy_system.py redeploy --development --project-name "$PROJECT_NAME"`；该选项只加载 `docker-compose.dev.yml`，不降低生产 TLS 校验。
+去掉 `--dry-run` 才会写入运行时授权。成功后再运行
+`scripts/deploy_system.py redeploy --project-name "$PROJECT_NAME"`，并检查 `/ready`
+的 `status=ready` 与 `processing=active`。如果 Exchange 指向本机或非 HTTPS 的受控开发
+地址，必须显式改用
+`scripts/deploy_system.py redeploy --development --project-name "$PROJECT_NAME"`；
+该选项仍只使用主 `docker-compose.yml`，仅启用本地绑定和
+`operations-console` profile，不降低生产 TLS 校验。
 
 ## 私网 Exchange TLS
 
-若 Exchange API 使用私网 IP、但证书签发给 DNS 名称，保持 `EXCHANGE_SSL_VERIFY=true`。在 `.env` 的旧版迁移值或 `secrets/deployment.env` 中提供完整的 `EXCHANGE_TLS_HOSTNAME`、`EXCHANGE_TLS_IP` 与 `EXCHANGE_CA_FILE_HOST` 三项，然后所有 Compose 命令都额外使用：
-
-```bash
---file docker-compose.yml --file docker-compose.exchange-tls.yml
-```
-
-`scripts/deploy_system.py check|redeploy` 会在三项完整时自动使用 overlay。不要通过关闭证书校验、把密钥放入命令行或创建入站 Webhook 来绕开 TLS 问题。
+若 Exchange API 使用私网 IP、但证书签发给 DNS 名称，保持
+`EXCHANGE_SSL_VERIFY=true`。在 `.env` 的旧版迁移值或 `secrets/deployment.env` 中提供
+完整的 `EXCHANGE_TLS_HOSTNAME`、`EXCHANGE_TLS_IP` 与 `EXCHANGE_CA_FILE_HOST` 三项。
+主 `docker-compose.yml` 会直接加载 DNS、SNI 和只读 CA 挂载；不再需要额外的 Compose
+TLS overlay。不要通过关闭证书校验、把密钥放入命令行或创建入站 Webhook 来绕开 TLS
+问题。
 
 ## 后续控制与旧资源
 

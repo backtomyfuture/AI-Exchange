@@ -308,7 +308,7 @@ def test_production_application_publishes_one_api_port():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     ports = _ports(compose["services"]["ai-assistant-service"])
 
-    assert ports == ("${APP_PORT:-8000}:8000",)
+    assert ports == ("${APP_BIND_HOST:-0.0.0.0}:${APP_PORT:-8000}:8000",)
 
 
 def test_production_full_folder_default_matches_runtime_and_template():
@@ -341,11 +341,12 @@ def test_production_healthchecks_use_session_aware_readiness():
     assert "CMD curl -f http://localhost:8000/health || exit 1" not in dockerfile
 
 
-def test_production_does_not_expose_host_gateway_to_application():
+def test_production_exchange_host_alias_is_not_host_gateway():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     service = compose["services"]["ai-assistant-service"]
 
-    assert "extra_hosts" not in service
+    assert "extra_hosts" in service
+    assert all("host-gateway" not in str(host) for host in service["extra_hosts"])
 
 
 def test_optional_exchange_tls_overlay_pins_dns_alias_and_read_only_ca():
@@ -500,6 +501,29 @@ def test_database_bootstrap_is_manual_one_shot_with_only_migration_secret():
         "checkpoint_maintenance_receipt_ed25519_public_key",
         "metrics_token",
         "content_store_key",
+        "operations_console_dsn",
+    }
+
+
+def test_operations_console_is_local_only_and_uses_a_dedicated_read_only_secret():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["operations-console-api"]
+
+    assert service["profiles"] == ["operations-console"]
+    assert service["container_name"] == "ai-exchange-operations-console-api"
+    assert service["ports"] == ["127.0.0.1:8090:8090"]
+    assert service["secrets"] == [
+        {"source": "operations_console_dsn", "target": "operations_console_dsn"}
+    ]
+    assert service["environment"]["CONSOLE_DATABASE_URL_FILE"] == (
+        "/run/secrets/operations_console_dsn"
+    )
+    assert service["environment"]["CONSOLE_ALLOWED_CLIENT_HOSTS"] == (
+        "127.0.0.1,::1,localhost"
+    )
+    assert _network_names(service) == {"backend", "edge"}
+    assert "postgres_runtime_password" not in {
+        secret["source"] for secret in service["secrets"]
     }
 
 

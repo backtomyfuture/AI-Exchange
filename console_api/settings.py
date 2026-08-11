@@ -8,6 +8,7 @@ maintenance DSN.
 from __future__ import annotations
 
 import os
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class ConsoleSettings(BaseSettings):
     me_email: str = ""
     allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
     allowed_client_hosts: str = "127.0.0.1,::1,localhost,testclient"
+    allow_private_client_hosts: bool = False
     statement_timeout_ms: int = Field(default=5000, ge=250, le=30000)
     max_page_size: int = Field(default=50, ge=1, le=100)
 
@@ -58,6 +60,16 @@ class ConsoleSettings(BaseSettings):
 
     def client_host_list(self) -> list[str]:
         return [host.strip() for host in self.allowed_client_hosts.split(",") if host.strip()]
+
+    def client_host_allowed(self, host: str | None) -> bool:
+        if host in self.client_host_list():
+            return True
+        if not self.allow_private_client_hosts or not host:
+            return False
+        try:
+            return ipaddress.ip_address(host).is_private
+        except ValueError:
+            return False
 
 
 @lru_cache
