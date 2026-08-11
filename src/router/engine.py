@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 TIER2_MIN_HITS = 2
 TIER2_MIN_RATIO = 0.5
 _MAILBOX_ADDRESS = re.compile(r"email_address='([^']+)'", re.IGNORECASE)
+_JSON_CODE_FENCE = re.compile(
+    r"```(?:json)?\s*(.*?)\s*```",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class _Tier3Result(BaseModel):
@@ -41,6 +45,14 @@ class _Tier3Result(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(ge=0.0, le=1.0)
     reason_code: str = Field(min_length=1, max_length=128)
+
+
+def _parse_tier3_json(content: str) -> Any:
+    normalized = content.strip()
+    fenced = _JSON_CODE_FENCE.fullmatch(normalized)
+    if fenced:
+        normalized = fenced.group(1).strip()
+    return json.loads(normalized)
 
 
 def _address(value: object) -> str:
@@ -259,7 +271,7 @@ class RoutingEngine:
             content = getattr(response, "content", None)
             if not isinstance(content, str):
                 raise ValueError("router_schema_invalid")
-            parsed = _Tier3Result.model_validate(json.loads(content))
+            parsed = _Tier3Result.model_validate(_parse_tier3_json(content))
             Decision(route=parsed.route, params=parsed.params)
             decision = RouteDecision(
                 outcome=DecisionOutcome.MATCHED,

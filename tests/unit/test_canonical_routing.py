@@ -102,3 +102,26 @@ async def test_tier3_requires_strict_route_json_and_fails_closed():
     failed_decision = RouteDecision.model_validate(failed["route_decision"])
     assert failed_decision.route is CanonicalRoute.MANUAL_REVIEW
     assert failed["next_step"] == "manual_review"
+
+
+@pytest.mark.asyncio
+async def test_tier3_accepts_json_code_fence_from_model():
+    engine = RoutingEngine(artifact=_artifact(), me_email="q-fu@tianjin-air.com")
+    model = AsyncMock()
+    model.ainvoke.return_value = Mock(
+        content=(
+            "```json\n"
+            '{"route":"read_only","params":{},"confidence":0.9,'
+            '"reason_code":"informational_notice"}\n'
+            "```"
+        )
+    )
+
+    with patch("src.providers.factory.get_llm_for_role", return_value=model):
+        delta = await engine.apply_tier3_fallback(
+            {"email": {"subject": "FYI", "body": "notice", "sender": "a@example.com"}}
+        )
+
+    decision = RouteDecision.model_validate(delta["route_decision"])
+    assert decision.route is CanonicalRoute.READ_ONLY
+    assert decision.provenance.tier is RouteTier.TIER3
