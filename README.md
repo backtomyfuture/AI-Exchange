@@ -142,7 +142,7 @@ Compose。它通过独立的只读 PostgreSQL 角色读取 Pipeline Trace，并�
   --dsn-output /path/to/private/operations-console-dsn
 ```
 
-随后用同一个 Compose project 启动 API，再单独启动前端开发服务器：
+随后用同一个 Compose project 启动 API 和 dashboard 前端容器：
 
 ```bash
 .venv/bin/python scripts/deploy_system.py redeploy --development \
@@ -154,7 +154,8 @@ npm run dev
 ```
 
 API 容器名为 `ai-exchange-operations-console-api`，浏览器访问
-`http://127.0.0.1:5173`。规则的 `Validate` 使用真实
+`http://127.0.0.1:5173`，前端容器名为
+`ai-exchange-operations-dashboard`。规则的 `Validate` 使用真实
 `compile_registry()`，`Compile artifact` 只写本地 digest-addressed artifact；生效
 仍需人工提交并运行 `scripts/deploy_system.py` 的既有发布流程和计划重启。完整接口与
 边界见 [Operations Console ADR](docs/adr/0017-operations-console-contract.md)。

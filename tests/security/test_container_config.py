@@ -527,6 +527,23 @@ def test_operations_console_is_local_only_and_uses_a_dedicated_read_only_secret(
     }
 
 
+def test_operations_dashboard_is_a_local_frontend_container():
+    compose = _load_yaml(PRODUCTION_COMPOSE)
+    service = compose["services"]["operations-dashboard"]
+
+    assert service["profiles"] == ["operations-console"]
+    assert service["container_name"] == "ai-exchange-operations-dashboard"
+    assert service["build"] == {
+        "context": "./console-web",
+        "dockerfile": "Dockerfile",
+    }
+    assert service["ports"] == ["127.0.0.1:5173:5173"]
+    assert service["depends_on"]["operations-console-api"]["condition"] == (
+        "service_healthy"
+    )
+    assert _network_names(service) == {"backend", "edge"}
+
+
 def test_database_provision_is_isolated_greenfield_admin_one_shot():
     compose = _load_yaml(PRODUCTION_COMPOSE)
     service = compose["services"]["database-provision"]

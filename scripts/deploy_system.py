@@ -330,10 +330,14 @@ def redeploy(
     compose_reconcile_options: list[str] = []
     if development:
         application_services.append("operations-console-api")
+        application_services.append("operations-dashboard")
         compose_reconcile_options = ["--force-recreate", "--remove-orphans"]
     print("Building the canonical application image...")
+    build_services = ["ai-assistant-service"]
+    if development:
+        build_services.append("operations-dashboard")
     _run(
-        [*compose, "build", "--pull", "ai-assistant-service"],
+        [*compose, "build", "--pull", *build_services],
         environment=environment,
     )
     print("Stopping the application while data services remain available...")

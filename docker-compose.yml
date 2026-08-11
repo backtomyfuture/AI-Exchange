@@ -410,6 +410,28 @@ services:
       - backend
       - edge
 
+  operations-dashboard:
+    profiles: ["operations-console"]
+    container_name: ai-exchange-operations-dashboard
+    build:
+      context: ./console-web
+      dockerfile: Dockerfile
+    image: ${OPERATIONS_DASHBOARD_IMAGE:-ai-exchange-operations-dashboard:local}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      operations-console-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5173/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - backend
+      - edge
+
 networks:
   backend:
     internal: true
