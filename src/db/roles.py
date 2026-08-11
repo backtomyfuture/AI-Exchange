@@ -36,6 +36,7 @@ from src.db.access_contract import (
 
 
 _IDENTIFIER: Final = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+_OPERATIONS_CONSOLE_ROLE: Final = "ai_exchange_operations_console"
 logger = logging.getLogger(__name__)
 
 
@@ -283,9 +284,16 @@ def _target_acl_exclusive_sql(
     schema_oid: str,
     database_oid: str,
 ) -> str:
-    """Allow target ACLs only for managed roles and the configured auditor."""
+    """Allow target ACLs for managed roles, auditor, and the read-only console."""
 
-    allowed = f"({migration_oid}, {runtime_oid}, {maintenance_oid})"
+    operations_console_oid = (
+        "(SELECT oid FROM pg_catalog.pg_roles "
+        f"WHERE rolname = '{_OPERATIONS_CONSOLE_ROLE}')"
+    )
+    allowed = (
+        f"({migration_oid}, {runtime_oid}, {maintenance_oid}, "
+        f"{operations_console_oid})"
+    )
     return f"""NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_database AS object

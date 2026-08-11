@@ -25,6 +25,21 @@ def _valid_snapshot(snapshot_type):
     return snapshot_type(**{field.name: True for field in fields(snapshot_type)})
 
 
+def test_target_acl_allowlist_includes_read_only_operations_console_role():
+    module = _module()
+
+    predicate = module._target_acl_exclusive_sql(
+        "migration_oid",
+        "runtime_oid",
+        "maintenance_oid",
+        "auditor_oid",
+        "schema_oid",
+        "database_oid",
+    )
+
+    assert "ai_exchange_operations_console" in predicate
+
+
 def test_role_snapshots_prove_all_identities_have_no_role_memberships():
     module = _module()
 
