@@ -20,6 +20,7 @@ from src.ingestion.models import (
 )
 from src.ingestion.processing import (
     GuardedExternalEffectFailed,
+    PreFeishuDeliveryFailure,
     ProcessingCompletion,
     ProcessingCompletionRejected,
     ProcessingReceiptConflict,
@@ -373,6 +374,30 @@ def test_unknown_external_outcome_with_effect_marker_still_requires_review(
 
     assert resolution.inbox_status is InboxStatus.MANUAL_REVIEW
     assert resolution.safe_code == "inbox.effect_outcome_unknown"
+
+
+def test_pre_feishu_failure_does_not_become_remote_outcome_unknown(
+    normalized_event: NormalizedIngressEvent,
+) -> None:
+    lease = _lease(normalized_event)
+    effect_started_at = datetime.now(UTC)
+
+    resolution = InboxRepository._failure_resolution(
+        error=PreFeishuDeliveryFailure(),
+        lease=lease,
+        email=_email(
+            lease,
+            external_effects_started_at=effect_started_at,
+        ),
+        inbox=_inbox(
+            lease,
+            effect_started_at=effect_started_at,
+        ),
+        expected_email_version=4,
+    )
+
+    assert resolution.inbox_status is InboxStatus.DEAD_LETTER
+    assert resolution.safe_code == "inbox.internal_invariant"
 
 
 def _repository_with_connection(

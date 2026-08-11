@@ -121,6 +121,20 @@ class GuardedExternalEffectFailed(RuntimeError):
         return f"GuardedExternalEffectFailed(safe_code={self.safe_code!r})"
 
 
+class PreFeishuDeliveryFailure(RuntimeError):
+    """A local delivery-preparation failure before any Feishu message call."""
+
+    kind = ErrorKind.INTERNAL_INVARIANT
+    safe_code = "processing.pre_feishu_delivery_failed"
+    safe_summary = "Feishu delivery preparation failed before send"
+
+    def __init__(self) -> None:
+        super().__init__(self.safe_summary)
+
+    def __repr__(self) -> str:
+        return f"PreFeishuDeliveryFailure(safe_code={self.safe_code!r})"
+
+
 class ReplaySafeExternalEffectFailed(RuntimeError):
     """An authorized, replay-safe external call failed before later effects."""
 
@@ -532,6 +546,7 @@ __all__ = [
     "ExternalEffectBoundary",
     "ExternalEffectKind",
     "GuardedExternalEffectFailed",
+    "PreFeishuDeliveryFailure",
     "ProcessingEffectScope",
     "ProcessingAdapter",
     "ProcessingAdapterRouter",

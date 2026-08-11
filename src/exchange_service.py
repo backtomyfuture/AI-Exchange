@@ -50,6 +50,7 @@ from src.ingestion.processing import (
     ExternalEffectBoundary,
     ExternalEffectKind,
     GuardedExternalEffectFailed,
+    PreFeishuDeliveryFailure,
     ProcessingEffectScope,
     ProcessingPolicyRejected,
 )
@@ -404,6 +405,29 @@ def _require_owned_ref(ref: object) -> ContentRef:
     )
 
 
+def _project_pipeline_result(
+    state_values: Mapping[str, object],
+    email_data: Mapping[str, object],
+    draft: str,
+) -> dict[str, object]:
+    """Project graph state into the delivery seam without dropping ownership."""
+    projection_email = deepcopy(dict(email_data))
+    projection_email["draft_to"] = list(state_values.get("draft_to") or [])
+    projection_email["draft_cc"] = list(state_values.get("draft_cc") or [])
+    return {
+        "classification": state_values.get("classification", {}),
+        "draft": draft,
+        "context": state_values.get("context_summaries", []),
+        "email": projection_email,
+        "routing_log": state_values.get("routing_log", []),
+        "route_decision": state_values.get("route_decision"),
+        "approval_status": state_values.get("approval_status", ""),
+        "next_step": state_values.get("next_step", ""),
+        "safe_error_summary": state_values.get("safe_error_summary"),
+        "inbox_id": state_values.get("inbox_id"),
+    }
+
+
 async def _run_ai_pipeline(
     email_id: str,
     ctx,
@@ -538,24 +562,12 @@ async def _run_ai_pipeline(
             if draft_id is not None and not is_manual_review
             else ""
         )
-        projection_email = deepcopy(dict(email_data))
-        projection_email["draft_to"] = list(state_values.get("draft_to") or [])
-        projection_email["draft_cc"] = list(state_values.get("draft_cc") or [])
-        return {
-            "classification": state_values.get("classification", {}),
-            "draft": draft,
-            "context": state_values.get("context_summaries", []),
-            "email": projection_email,
-            "routing_log": state_values.get("routing_log", []),
-            "route_decision": state_values.get("route_decision"),
-            "approval_status": state_values.get("approval_status", ""),
-            "next_step": state_values.get("next_step", ""),
-            "safe_error_summary": state_values.get("safe_error_summary"),
-        }
+        return _project_pipeline_result(state_values, email_data, draft)
     except (
         ExternalEffectAuthorizationError,
         StaleFence,
         GuardedExternalEffectFailed,
+        PreFeishuDeliveryFailure,
     ):
         raise
     except DatabaseOperationError:
@@ -1605,7 +1617,12 @@ async def _run_ai_path(
         raise
     except DatabaseOperationError:
         raise
-    except (ExternalEffectAuthorizationError, StaleFence, GuardedExternalEffectFailed):
+    except (
+        ExternalEffectAuthorizationError,
+        StaleFence,
+        GuardedExternalEffectFailed,
+        PreFeishuDeliveryFailure,
+    ):
         raise
     except Exception as exc:
         if _effect_boundary is not None:

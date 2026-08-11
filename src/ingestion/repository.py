@@ -50,6 +50,7 @@ from src.ingestion.models import (
 from src.ingestion.ownership import ownership_advisory_lock_key
 from src.ingestion.processing import (
     ExternalEffectKind,
+    PreFeishuDeliveryFailure,
     ProcessingCompletion,
     ProcessingCompletionRejected,
     ProcessingFinishResult,
@@ -1673,7 +1674,11 @@ class InboxRepository:
             inbox.effect_started_at is not None
             or email.external_effects_started_at is not None
         )
-        decision = _EFFECT_UNKNOWN if effect_started else _failure_decision(error)
+        decision = (
+            _failure_decision(error)
+            if isinstance(error, PreFeishuDeliveryFailure) or not effect_started
+            else _EFFECT_UNKNOWN
+        )
         return cls._resolution_for_failure_decision(
             decision=decision,
             lease=lease,

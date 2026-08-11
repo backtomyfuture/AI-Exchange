@@ -12,7 +12,7 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 
-from src.exchange_service import _run_ai_pipeline
+from src.exchange_service import _project_pipeline_result, _run_ai_pipeline
 from src.graph.builder import build_graph
 from src.domain.send_result import ExchangeSendResult
 from src.graph.dependencies import GraphDependencies
@@ -126,6 +126,23 @@ def _classification_retry(**_kwargs):
         return wrapped
 
     return decorator
+
+
+def test_pipeline_projection_preserves_durable_inbox_identity():
+    inbox_id = "00000000-0000-4000-8000-000000000126"
+
+    result = _project_pipeline_result(
+        {
+            "inbox_id": inbox_id,
+            "draft_to": ["recipient@example.com"],
+            "draft_cc": [],
+        },
+        {"id": "projection-mail", "attachments": []},
+        "draft",
+    )
+
+    assert result["inbox_id"] == inbox_id
+    assert result["email"]["draft_to"] == ["recipient@example.com"]
 
 
 @pytest.mark.asyncio

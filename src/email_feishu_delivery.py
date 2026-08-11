@@ -18,6 +18,7 @@ from enum import StrEnum
 from typing import Any
 
 from src.config import get_settings
+from src.domain.errors import DatabaseOperationError
 from src.graph.dependencies import GraphDependencies
 from src.graph.resource_locks import get_graph_resource_lock
 from src.graph.state_factory import (
@@ -25,7 +26,11 @@ from src.graph.state_factory import (
     resolve_bookkeeping_as_node,
     sanitize_graph_delta,
 )
-from src.ingestion.processing import ExternalEffectBoundary, ExternalEffectKind
+from src.ingestion.processing import (
+    ExternalEffectBoundary,
+    ExternalEffectKind,
+    PreFeishuDeliveryFailure,
+)
 from src.router.decision import RouteDecision
 from src.safety.attachments import AttachmentPolicy
 from src.safety.input_limits import input_limits_from_settings
@@ -198,12 +203,22 @@ class EmailFeishuDelivery:
         config = {"configurable": {"thread_id": request.email_id}}
         state = await self._graph.aget_state(config)
         if isinstance(request, ApprovalRequest) and effect_boundary is not None:
-            request = await self._freeze_approval_payload(
-                request,
-                state,
-                config,
-                effect_boundary,
-            )
+            try:
+                request = await self._freeze_approval_payload(
+                    request,
+                    state,
+                    config,
+                    effect_boundary,
+                )
+            except (asyncio.CancelledError, DatabaseOperationError):
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Approval payload freeze failed before Feishu send: "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
+                raise PreFeishuDeliveryFailure() from None
 
         await self._authorize(
             effect_boundary,
@@ -415,6 +430,7 @@ class EmailFeishuDelivery:
                 "payload_revision": revision,
                 "payload_digest": binding["payload_digest"],
             },
+            as_node=resolve_bookkeeping_as_node(state),
         )
         return replace(
             request,

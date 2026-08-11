@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from langgraph.checkpoint.memory import MemorySaver
 from src.email_feishu_delivery import (
     ApprovalRequest,
     EmailDeliveryDisposition,
@@ -11,6 +12,8 @@ from src.email_feishu_delivery import (
     ManualReviewNotificationRequest,
     ReadNotificationRequest,
 )
+from src.graph.builder import build_graph
+from src.ingestion.processing import PreFeishuDeliveryFailure
 from src.router.decision import (
     DecisionOutcome,
     RouteDecision,
@@ -365,6 +368,155 @@ async def test_durable_approval_freezes_revision_before_rendering_card():
     assert frozen["to"] == ["recipient@example.com"]
     assert values["payload_revision"] == 1
     assert values["payload_digest"] == payload_digest
+
+
+@pytest.mark.asyncio
+async def test_durable_approval_freeze_handles_pristine_real_checkpoint():
+    """Payload freezing must attribute its bookkeeping write on a fresh graph."""
+
+    email_id = "email-pristine-durable-approval"
+    inbox_id = "00000000-0000-4000-8000-000000000124"
+    plan_digest = "1" * 64
+    evidence_digest = "2" * 64
+    payload_digest = "3" * 64
+    decision = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.REPLY,
+        params={},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER3,
+            source_version="router-model-v1",
+        ),
+        handoff_profile_id="generic_reply_v1",
+    )
+    graph = build_graph(MemorySaver(), dependencies=MagicMock())
+    config = {"configurable": {"thread_id": email_id}}
+    await graph.aupdate_state(
+        config,
+        {
+            "email_id": email_id,
+            "route_decision": decision.model_dump(mode="json"),
+            "handoff_plan_digest": plan_digest,
+            "evidence_pack_digest": evidence_digest,
+            "draft_id": email_id,
+            "draft_to": ["recipient@example.com"],
+            "draft_cc": [],
+            "attachment_tokens": [],
+            "pdf_token": None,
+            "approval_status": "pending",
+            "next_step": "approval",
+        },
+        as_node="__start__",
+    )
+
+    database = AsyncMock()
+    database.get_handoff_run = AsyncMock(
+        return_value={
+            "state": "evidence_ready",
+            "version": 1,
+            "evidence_digest": evidence_digest,
+        }
+    )
+    database.create_payload_revision = AsyncMock(return_value=1)
+    database.get_payload_revision_binding = AsyncMock(
+        return_value={
+            "inbox_id": inbox_id,
+            "payload_revision": 1,
+            "payload_digest": payload_digest,
+        }
+    )
+    database.advance_handoff_execution = AsyncMock()
+    resolver = AsyncMock(
+        return_value=ResolvedRecipients(
+            to=("recipient@example.com",),
+            cc=(),
+        )
+    )
+
+    async def generate_pdf(*_args, **_kwargs):
+        return {"url": "https://feishu.example/pdf", "file_token": "pdf-token"}
+
+    published: list[ApprovalRequest] = []
+
+    def send_card(request, _pdf_url):
+        published.append(request)
+        return LarkCardDelivery(accepted=True, outcome_known=True)
+
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=generate_pdf,
+        send_card=send_card,
+        upload_file=MagicMock(),
+        delete_file=MagicMock(return_value=True),
+        resolve_approval_recipients=resolver,
+    )
+
+    outcome = await delivery.deliver(
+        ApprovalRequest(
+            email_id=email_id,
+            email_data={
+                "id": email_id,
+                "sender": "sender@example.com",
+                "attachments": [],
+                "draft_to": ["recipient@example.com"],
+                "draft_cc": [],
+            },
+            classification={"need_reply": True},
+            draft="frozen approved draft",
+            context=(),
+            routing_log=(),
+            inbox_id=inbox_id,
+        ),
+        SimpleNamespace(
+            scope=SimpleNamespace(inbox_id=inbox_id),
+            before=AsyncMock(),
+        ),
+    )
+
+    assert outcome.disposition is EmailDeliveryDisposition.CONFIRMED
+    assert published[0].payload_revision == 1
+    assert published[0].payload_digest == payload_digest
+    state = await graph.aget_state(config)
+    assert state.values["payload_revision"] == 1
+    assert state.values["payload_digest"] == payload_digest
+
+
+@pytest.mark.asyncio
+async def test_approval_freeze_failure_is_not_reported_as_transport_unknown():
+    graph = MagicMock()
+    graph.aget_state = AsyncMock(
+        return_value=SimpleNamespace(values={}, next=())
+    )
+    database = AsyncMock()
+    delivery = EmailFeishuDelivery(
+        database=database,
+        graph=graph,
+        graph_dependencies=MagicMock(),
+        generate_pdf=AsyncMock(),
+        send_card=MagicMock(),
+        upload_file=MagicMock(),
+        delete_file=MagicMock(),
+        resolve_approval_recipients=AsyncMock(),
+    )
+
+    with pytest.raises(PreFeishuDeliveryFailure):
+        await delivery.deliver(
+            ApprovalRequest(
+                email_id="email-freeze-failure",
+                email_data={"id": "email-freeze-failure", "attachments": []},
+                classification={},
+                draft="draft",
+                context=(),
+                routing_log=(),
+                inbox_id=None,
+            ),
+            SimpleNamespace(
+                scope=SimpleNamespace(inbox_id="expected-inbox"),
+                before=AsyncMock(),
+            ),
+        )
 
 
 @pytest.mark.asyncio
