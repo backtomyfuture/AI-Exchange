@@ -59,6 +59,18 @@ _Avoid_: Classification projection, graph next_step
 Tier 2 voting over immutable Canonical Route Decision labels from distinct Historical Email. It runs only after Tier 1 abstains; duplicate evidence contributes at most one vote, conflicting labels fail closed, and it is separate from writing retrieval.
 _Avoid_: Historical RAG Context, writing style retrieval
 
+**Routing Assessment**:
+A bounded advisory assessment of the current Inbound Email, the mailbox owner's recipient
+relationship, Tier 1 abstention, and Tier 2 Historical RAG evidence. It is supplied only to
+the Tier 3 fallback and cannot authorize a route, handoff profile, or recipient.
+_Avoid_: Canonical Route Decision, Evidence Pack
+
+**Routing Evidence Bundle**:
+The one bounded retrieval result shared by Historical Route Consensus and Tier 3. It preserves
+thread and semantic Historical Email snippets even when no historical route consensus exists,
+and records partial or unavailable retrieval instead of treating it as empty history.
+_Avoid_: Evidence Pack, Historical Route Consensus
+
 **Handoff Profile**:
 A read-only, versioned writing contract selected by a reply or forward Canonical Route Decision. It names only registered evidence sources and a bounded writer mode; it cannot point to arbitrary Python, URLs, credentials, or scripts.
 _Avoid_: Executable Tier 1 handler, RAG result

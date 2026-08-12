@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from src.router.context import RecipientRelation, RoutingEvidenceBundle
 from src.router.decision import DecisionOutcome, RouteDecision, RouteProvenance, RouteTier
 from src.router.engine import RoutingEngine
 from src.router.tier1.compiler import CompiledArtifact, compile_registry
@@ -17,6 +18,21 @@ def _artifact() -> CompiledArtifact:
     )
     assert isinstance(result, CompiledArtifact)
     return result
+
+
+def test_recipient_relation_normalizes_exchange_mailbox_mappings():
+    relation = RecipientRelation.from_email(
+        {
+            "sender": {"email": "sender@example.com"},
+            "to": [{"email": "colleague@example.com"}],
+            "cc": [{"email_address": "me@example.com"}],
+        },
+        owner_email="me@example.com",
+    )
+
+    assert relation.relation == "cc_only"
+    assert relation.owner_in_to is False
+    assert relation.owner_in_cc is True
 
 
 @pytest.mark.asyncio
@@ -73,6 +89,37 @@ async def test_tier2_votes_on_canonical_actions_not_legacy_skill_ids():
 
 
 @pytest.mark.asyncio
+async def test_tier2_consensus_remains_authoritative_over_tier3():
+    engine = RoutingEngine(artifact=_artifact(), me_email="me@example.com")
+    model = AsyncMock()
+    historical = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.READ_ONLY,
+        params={},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER3,
+            source_version="router-model-v1",
+            confidence=0.9,
+        ),
+        reason_code="historical_label",
+    ).model_dump(mode="json")
+
+    with patch("src.providers.factory.get_llm_for_role", return_value=model):
+        decision = await engine.resolve_route(
+            {"email": {"subject": "FYI", "body": "notice", "sender": "a@example.com"}},
+            RoutingEvidenceBundle.from_hits(
+                [
+                    {"id": "h1", "route_decision": historical},
+                    {"id": "h2", "route_decision": historical},
+                ]
+            ),
+        )
+
+    assert decision.route is CanonicalRoute.READ_ONLY
+    model.ainvoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_tier3_requires_strict_route_json_and_fails_closed():
     engine = RoutingEngine(artifact=_artifact(), me_email="q-fu@tianjin-air.com")
     model = AsyncMock()
@@ -125,3 +172,101 @@ async def test_tier3_accepts_json_code_fence_from_model():
     decision = RouteDecision.model_validate(delta["route_decision"])
     assert decision.route is CanonicalRoute.READ_ONLY
     assert decision.provenance.tier is RouteTier.TIER3
+
+
+@pytest.mark.asyncio
+async def test_tier3_receives_recipient_semantics_and_historical_routing_context():
+    engine = RoutingEngine(artifact=_artifact(), me_email="me@example.com")
+    model = AsyncMock()
+    model.ainvoke.return_value = Mock(
+        content=json.dumps(
+            {
+                "route": "read_only",
+                "params": {},
+                "confidence": 0.91,
+                "reason_code": "historical_context_supports_read_only",
+                "explicit_current_action": False,
+            }
+        )
+    )
+    historical = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.READ_ONLY,
+        params={},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER3,
+            source_version="router-model-v1",
+            confidence=0.9,
+        ),
+        reason_code="historical_label",
+    ).model_dump(mode="json")
+    evidence = RoutingEvidenceBundle.from_hits(
+        [
+            {
+                "id": "thread-1",
+                "sender": "me@example.com",
+                "to": ["colleague@example.com"],
+                "cc": [],
+                "subject": "Earlier task",
+                "body": "I asked the colleague to handle the task.",
+                "route_decision": historical,
+            }
+        ]
+    )
+
+    with patch("src.providers.factory.get_llm_for_role", return_value=model):
+        delta = await engine.resolve_route(
+            {
+                "email": {
+                    "sender": "sender@example.com",
+                    "to": ["colleague@example.com"],
+                    "cc": ["me@example.com"],
+                    "subject": "Current update",
+                    "body": "The task was handled.",
+                }
+            },
+            evidence,
+        )
+
+    assert delta.route is CanonicalRoute.READ_ONLY
+    prompt = model.ainvoke.call_args.args[0]
+    assert "owner_relation: cc_only" in prompt
+    assert "Tier 1 status: abstained" in prompt
+    assert "Tier 2 status: no_consensus" in prompt
+    assert "Tier 2 candidate routes: read_only (1 vote)" in prompt
+    assert "Earlier task" in prompt
+    assert "I asked the colleague to handle the task." in prompt
+
+
+@pytest.mark.asyncio
+async def test_tier3_downgrades_cc_only_writing_route_without_current_action():
+    engine = RoutingEngine(artifact=_artifact(), me_email="me@example.com")
+    model = AsyncMock()
+    model.ainvoke.return_value = Mock(
+        content=json.dumps(
+            {
+                "route": "forward",
+                "params": {"fixed_recipients": ["admin@example.com"]},
+                "confidence": 0.95,
+                "reason_code": "request_requires_action_by_third_party",
+                "explicit_current_action": False,
+            }
+        )
+    )
+
+    with patch("src.providers.factory.get_llm_for_role", return_value=model):
+        delta = await engine.resolve_route(
+            {
+                "email": {
+                    "sender": "sender@example.com",
+                    "to": ["colleague@example.com"],
+                    "cc": ["me@example.com"],
+                    "subject": "Current update",
+                    "body": "The task was handled.",
+                }
+            },
+            RoutingEvidenceBundle.from_hits([]),
+        )
+
+    assert delta.route is CanonicalRoute.READ_ONLY
+    assert delta.reason_code == "mailbox_owner_in_cc_no_explicit_action_request"

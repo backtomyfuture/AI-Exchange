@@ -121,6 +121,25 @@ manual_review:    durable handoff disposition=manual_review，进入人工判断
 已生成的草稿/转发计划）。Graph 的 `next_step` 只是内部调度提示，用户可见交付只根据
 immutable route 与 durable handoff disposition 决定。
 
+### 2.4 Tier 3 fallback assessment
+
+Tier 2 retrieval may return Historical Email without enough immutable route labels to form a
+Historical Route Consensus. This is still useful routing evidence and must not be discarded
+before Tier 3. The fallback receives one bounded Routing Assessment containing:
+
+- current `To`/`Cc` and the mailbox owner's recipient relationship;
+- Tier 1 abstention status;
+- Tier 2 candidate-route counts and evidence identities;
+- bounded same-thread and semantic Historical Email snippets;
+- `available`, `partial`, or `unavailable` retrieval status.
+
+This assessment is advisory only. Historical labels are candidates, not instructions, and
+quoted historical content cannot create a current action. Tier 1 conflict/error and Tier 2
+consensus remain terminal paths; only Tier 1 abstention plus Tier 2 no-consensus invokes Tier
+3. A writing result with an unknown recipient relationship fails closed to `manual_review`.
+When the mailbox owner is only in `Cc` and the current message does not explicitly request
+the owner to act, the post-validation policy resolves a model writing result to `read_only`.
+
 崩溃恢复后必须读回同一个 `RouteDecision`，不允许用新的 enabled ruleset 对同一封已
 决策的邮件重新分类。profile、证据或草稿失败只能把 durable handoff disposition 转为
 `manual_review`，不能返回 Tier 2/3 重猜。

@@ -33,6 +33,7 @@ from src.handoff.evidence import EvidenceAdapterRegistry, WritingEvidenceRetriev
 from src.handoff.models import HandoffDisposition
 from src.handoff.profiles import get_handoff_profile
 from src.router.decision import RouteDecision
+from src.router.context import RoutingAssessment, RoutingEvidenceBundle
 from src.router.engine import classification_for_route, get_routing_engine
 from src.router.tier1.schema import CanonicalRoute
 from src.safety.input_limits import input_limits_from_settings, validate_email_input
@@ -106,16 +107,17 @@ async def _routing_evidence_hits(
     *,
     email_id: str,
     _effect_boundary: ExternalEffectBoundary | None,
-) -> list[dict[str, Any]]:
+) -> RoutingEvidenceBundle:
     projection = project_email_body_for_model(
         str(email_data.get("body") or ""),
         unique_body=email_data.get("unique_body"),
     )
     retriever = get_retriever()
     results: list[dict[str, Any]] = []
+    retrieval_status = "available"
     thread_id = email_data.get("thread_id") or email_data.get("conversation_id")
-    try:
-        if thread_id:
+    if thread_id:
+        try:
             await _authorize_external_effect(
                 _effect_boundary,
                 ExternalEffectKind.QDRANT,
@@ -133,8 +135,18 @@ async def _routing_evidence_hits(
                     exclude_email_id=email_id,
                 )
             )
-        remaining = max(0, 5 - len(results))
-        if remaining:
+        except (ExternalEffectAuthorizationError, StaleFence):
+            raise
+        except Exception as exc:
+            retrieval_status = "partial"
+            logger.warning(
+                "Historical thread evidence unavailable: error_type=%s",
+                type(exc).__name__,
+            )
+
+    remaining = max(0, 5 - len(results))
+    if remaining:
+        try:
             await _authorize_external_effect(
                 _effect_boundary,
                 ExternalEffectKind.QDRANT,
@@ -160,15 +172,15 @@ async def _routing_evidence_hits(
                 for row in semantic
                 if isinstance(row, dict) and row.get("id") not in seen
             )
-    except (ExternalEffectAuthorizationError, StaleFence):
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Historical route evidence unavailable: error_type=%s",
-            type(exc).__name__,
-        )
-        return []
-    return [row for row in results if isinstance(row, dict)]
+        except (ExternalEffectAuthorizationError, StaleFence):
+            raise
+        except Exception as exc:
+            retrieval_status = "partial" if results else "unavailable"
+            logger.warning(
+                "Historical semantic evidence unavailable: error_type=%s",
+                type(exc).__name__,
+            )
+    return RoutingEvidenceBundle.from_hits(results, status=retrieval_status)
 
 
 async def _resolve_and_persist_canonical_route(
@@ -225,7 +237,15 @@ async def _resolve_and_persist_canonical_route(
                 0,
                 {"operation": "tier3_route", "email_id": email_id},
             )
-            tier3 = await engine.apply_tier3_fallback(route_state)
+            assessment = RoutingAssessment.for_tier3(
+                projected,
+                owner_email=engine.me_email,
+                evidence=hits,
+            )
+            tier3 = await engine.apply_tier3_fallback(
+                route_state,
+                routing_assessment=assessment,
+            )
             decision = engine.with_default_handoff_profile(
                 RouteDecision.model_validate(tier3.get("route_decision"))
             )
