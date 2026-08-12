@@ -44,6 +44,32 @@ _TRACE_TABLES = frozenset(
 )
 
 
+def _authoritative_event_order() -> sql.SQL:
+    """Prefer the event that owns business processing over sync projections.
+
+    ``event_inbox`` contains both the original create event and later
+    metadata-only update events.  The ``emails.processing_inbox_id`` foreign
+    key points at the exact create event used for business processing.  The
+    console must follow that ownership relation instead of treating the
+    newest inbox event as the pipeline's current trace.
+    """
+
+    return sql.SQL(
+        """
+        CASE
+            WHEN email.processing_inbox_id IS NOT NULL THEN 0
+            WHEN inbox.change_kind = 'create' THEN 1
+            ELSE 2
+        END,
+        CASE
+            WHEN inbox.change_kind = 'create' THEN inbox.received_at
+        END ASC NULLS LAST,
+        inbox.received_at DESC,
+        inbox.id
+        """
+    )
+
+
 def _json_mapping(value: object) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -209,6 +235,7 @@ class ConsoleDatabase:
         emails = self._relation("emails")
         decisions = self._relation("tier1_decisions")
         logs = self._relation("emails_log")
+        event_order = _authoritative_event_order()
         query = sql.SQL(
             """
             WITH latest AS (
@@ -234,7 +261,7 @@ class ConsoleDatabase:
                 LEFT JOIN {logs} AS log
                   ON log.id = inbox.external_email_id
                 WHERE {where}
-                ORDER BY inbox.external_email_id, inbox.received_at DESC
+                ORDER BY inbox.external_email_id, {event_order}
             )
             SELECT *, COUNT(*) OVER () AS total_count
             FROM latest
@@ -242,7 +269,14 @@ class ConsoleDatabase:
                      external_email_id DESC
             LIMIT %s OFFSET %s
             """
-        ).format(inbox=inbox, emails=emails, decisions=decisions, logs=logs, where=where)
+        ).format(
+            inbox=inbox,
+            emails=emails,
+            decisions=decisions,
+            logs=logs,
+            where=where,
+            event_order=event_order,
+        )
         async with self._connection() as cursor:
             await cursor.execute(query, (*params, page_size, offset))
             rows = await cursor.fetchall()
@@ -276,6 +310,7 @@ class ConsoleDatabase:
         envelopes = self._relation("approved_execution_envelopes")
         audits = self._relation("audit_events")
         logs = self._relation("emails_log")
+        event_order = _authoritative_event_order()
         async with self._connection() as cursor:
             await cursor.execute(
                 sql.SQL(
@@ -331,7 +366,7 @@ class ConsoleDatabase:
                       ON execution.inbox_id = inbox.id
                     WHERE inbox.account_id = %s
                       AND inbox.external_email_id = %s
-                    ORDER BY inbox.received_at DESC
+                    ORDER BY {event_order}
                     LIMIT 1
                     """
                 ).format(
@@ -342,6 +377,7 @@ class ConsoleDatabase:
                     decisions=decisions,
                     handoffs=handoffs,
                     executions=executions,
+                    event_order=event_order,
                 ),
                 (self._settings.account_id, external_email_id),
             )

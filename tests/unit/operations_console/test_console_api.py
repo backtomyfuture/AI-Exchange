@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from console_api.database import ConsoleDatabaseError, _safe_projection
+from console_api.database import (
+    ConsoleDatabase,
+    ConsoleDatabaseError,
+    _authoritative_event_order,
+    _safe_projection,
+)
 from console_api.main import _database, create_app
 from console_api.models import PipelineTrace, TraceNode
 from console_api.rules import RuleStore, RuleStoreError
@@ -143,6 +149,49 @@ def test_trace_projection_excludes_content_and_bounds_metadata():
         "nested": {"stage": "router"},
         "items": list(range(32)),
     }
+
+
+def test_authoritative_event_order_prefers_business_processing_owner():
+    rendered = str(_authoritative_event_order())
+
+    assert "processing_inbox_id IS NOT NULL THEN 0" in rendered
+    assert "inbox.change_kind = 'create' THEN 1" in rendered
+    assert "inbox.received_at DESC" in rendered
+    assert "inbox.id" in rendered
+
+
+@pytest.mark.asyncio
+async def test_console_queries_do_not_replace_create_trace_with_update(monkeypatch, tmp_path):
+    database = ConsoleDatabase(_settings(tmp_path))
+
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+
+        async def execute(self, query, _params=None):
+            self.queries.append(str(query))
+
+        async def fetchall(self):
+            return []
+
+        async def fetchone(self):
+            return None
+
+    cursor = Cursor()
+
+    @asynccontextmanager
+    async def connection():
+        yield cursor
+
+    monkeypatch.setattr(database, "_connection", connection)
+
+    await database.list_emails(page=1, page_size=25)
+    assert await database.trace("mail-001") is None
+
+    list_query, trace_query = cursor.queries[0], cursor.queries[1]
+    for query in (list_query, trace_query):
+        assert "processing_inbox_id IS NOT NULL THEN 0" in query
+        assert "inbox.change_kind = 'create' THEN 1" in query
 
 
 def test_trace_endpoint_uses_business_stage_projection():
