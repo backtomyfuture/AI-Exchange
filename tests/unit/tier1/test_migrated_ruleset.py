@@ -194,6 +194,53 @@ def test_distlist_read_only_groups_are_read_only():
         assert decision.business_flow_ids == ["internal-distribution-list-fyi"], group
 
 
+def test_distlist_read_only_excludes_zhangxia_and_mwu_forwards():
+    """Forwarded group mail remains owned by the dedicated no_action rule."""
+    artifact = _compile()
+    rules = _rules(artifact)
+
+    for sender, subject, group in (
+        (
+            "zhang-xia@tianjin-air.com",
+            "转发: 部门通知",
+            "thxxcxb@hnair.com",
+        ),
+        (
+            "m.wu@tianjin-air.com",
+            "Fw: 部门通知",
+            "thxxyfzx@hnair.com",
+        ),
+    ):
+        decision = build_tier1_decision(
+            rules,
+            EmailView(
+                sender_address=sender,
+                to_addresses=[group],
+                subject=subject,
+            ),
+            me_email=ME_EMAIL,
+        )
+        assert decision.outcome is EvaluationOutcome.MATCHED, sender
+        assert decision.route is CanonicalRoute.NO_ACTION, sender
+        assert decision.reason_codes == ["forwarded_informational"], sender
+        assert [
+            item.rule_id for item in decision.matched_rules
+        ] == ["T1-ZHANGXIA-FORWARD-READONLY-001"], sender
+
+    ordinary = build_tier1_decision(
+        rules,
+        EmailView(
+            sender_address="zhang-xia@tianjin-air.com",
+            to_addresses=["thxxcxb@hnair.com"],
+            subject="请阅：部门通知",
+        ),
+        me_email=ME_EMAIL,
+    )
+    assert ordinary.outcome is EvaluationOutcome.MATCHED
+    assert ordinary.route is CanonicalRoute.READ_ONLY
+    assert ordinary.business_flow_ids == ["internal-distribution-list-fyi"]
+
+
 def test_zhangxia_forward_to_silent_distlist_merges_same_no_action():
     artifact = _compile()
     view = EmailView(
