@@ -1,10 +1,11 @@
 """Action fingerprint: a versioned hash of the canonicalized route + its
 default-expanded, normalized params (design doc §3).
 
-``business_flow_id`` is a non-authoritative audit/grouping label and never
-enters this computation — only fields that actually determine execution
-semantics do. Two rules that produce the identical fingerprint are treated as
-the same action and merged into one execution; any difference is a conflict.
+``business_flow_id`` and the ``no_action`` ``reason_code`` are non-authoritative
+audit/explanation metadata and never enter this computation — only fields that
+actually determine execution semantics do. Two rules that produce the identical
+fingerprint are treated as the same action and merged into one execution; any
+authoritative difference is a conflict.
 """
 from __future__ import annotations
 
@@ -51,7 +52,11 @@ def canonicalize_params(route: CanonicalRoute, typed_params: Any) -> Dict[str, A
 
     if route is CanonicalRoute.NO_ACTION:
         assert isinstance(typed_params, NoActionParams)
-        return {"reason_code": typed_params.reason_code}
+        # ``reason_code`` explains why no business action is needed; it does
+        # not change the no-op execution. Multiple no_action rules may
+        # therefore merge while Tier1Decision.reason_codes retains all
+        # explanations for audit and diagnostics.
+        return {}
 
     if route is CanonicalRoute.MANUAL_REVIEW:
         assert isinstance(typed_params, ManualReviewParams)

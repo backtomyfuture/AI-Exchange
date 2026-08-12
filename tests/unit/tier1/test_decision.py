@@ -69,6 +69,33 @@ def test_two_rules_same_action_merge_without_conflict():
     assert decision.business_flow_ids == ["flow-a", "flow-b"]
 
 
+def test_two_no_action_rules_with_different_reasons_merge_without_conflict():
+    rule_a = _rule(
+        "RULE-D-003A",
+        "a@example.com",
+        route="no_action",
+        params={"reason_code": "internal_distribution_list"},
+    )
+    rule_b = _rule(
+        "RULE-D-003B",
+        "a@example.com",
+        route="no_action",
+        params={"reason_code": "forwarded_informational"},
+    )
+    view = EmailView(sender_address="a@example.com")
+
+    decision = build_tier1_decision([rule_a, rule_b], view)
+
+    assert decision.outcome is EvaluationOutcome.MATCHED
+    assert decision.route is CanonicalRoute.NO_ACTION
+    assert len(decision.candidate_actions) == 1
+    assert sorted(decision.candidate_actions[0].rule_ids) == ["RULE-D-003A", "RULE-D-003B"]
+    assert decision.reason_codes == [
+        "forwarded_informational",
+        "internal_distribution_list",
+    ]
+
+
 def test_two_rules_different_actions_is_conflict_forced_to_manual_review():
     rule_a = _rule("RULE-D-005", "a@example.com", route="read_only")
     rule_b = _rule("RULE-D-006", "a@example.com", route="no_action", params={"reason_code": "auto_reply_detected"})

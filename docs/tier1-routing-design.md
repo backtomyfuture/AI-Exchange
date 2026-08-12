@@ -155,6 +155,10 @@ Canonicalization 规则（编译期在原子激活流水线中统一执行,见 �
 5. 固定的 JSON 序列化格式（无多余空白，键顺序确定）；
 6. 记录 `fingerprint_version`，未来算法变化时递增,不静默改变旧记录的含义。
 
+`no_action.params.reason_code` 仅说明规则命中的业务原因，不改变执行语义，因此不参与
+fingerprint。多个 `no_action` 规则可以合并执行，Tier 1 仍保留全部 `reason_codes` 和
+命中的规则 ID 用于审计；只有会改变实际执行行为的 route 或参数差异才构成冲突。
+
 ### 3.1 Profile、计划与证据
 
 `HandoffProfile` 是代码注册表中的只读、版本化合同，不能由 YAML 指向任意模块或网络
@@ -182,7 +186,7 @@ draft。每次执行将 profile 展开成不可变 `HandoffPlan`，再由封闭�
 | `reply` | 无 | 可选 `reply_mode: sender_only \| sender_and_original_cc`。不写时沿用现有默认行为（`draft_to=[原发件人]`, `draft_cc=原 Cc 列表`，即 `sender_and_original_cc`）。v1 不开放 `reply_all`，除非后续显式处理共享邮箱、代理发送、重复地址、Reply-To、外部收件人这些边界情况。 |
 | `forward` | `fixed_recipients: List[str]`（精确地址，禁止通配符/域名级规则） | 可选 `cc`、`allow_recipient_edit`（人工可编辑，仍需审批）、`include_attachments`（显式布尔）。命中外部地址（判据见 §3.2）时必须显式声明 `governance.external_recipient_acknowledged: true`，否则该规则在原子激活阶段判定为不合法。 |
 | `read_only` | 无 | — |
-| `no_action` | `reason_code`（业务命名空间，见 §3.3） | `owner`/`validity`/`positive_cases`/`negative_cases` 不属于 params，见下。 |
+| `no_action` | `reason_code`（业务命名空间，见 §3.3；解释元数据，不参与 action fingerprint） | `owner`/`validity`/`positive_cases`/`negative_cases` 不属于 params，见下。 |
 | `manual_review`（规则主动声明） | `reason_code`（业务命名空间） | 与系统合成的 `manual_review` 共用下游卡片/审计路径，`decision_origin` 区分来源。 |
 
 `no_action` 是误判成本最高的路由（重要邮件被静默压制），因此 schema 强制：

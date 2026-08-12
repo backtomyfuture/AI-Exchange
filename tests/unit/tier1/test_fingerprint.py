@@ -70,10 +70,10 @@ def test_forward_extra_cc_fingerprints_differently():
     assert compute_action_fingerprint(a) != compute_action_fingerprint(b)
 
 
-def test_no_action_reason_code_participates_in_fingerprint():
+def test_no_action_reason_code_does_not_participate_in_fingerprint():
     a = _decision({"route": "no_action", "params": {"reason_code": "auto_reply_detected"}})
     b = _decision({"route": "no_action", "params": {"reason_code": "ndr_detected"}})
-    assert compute_action_fingerprint(a) != compute_action_fingerprint(b)
+    assert compute_action_fingerprint(a) == compute_action_fingerprint(b)
 
 
 def test_read_only_fingerprint_is_stable_and_route_scoped():

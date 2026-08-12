@@ -178,6 +178,29 @@ def test_zhangxia_forward_requires_both_sender_and_subject_shape():
     assert build_tier1_decision(rules, wrong_sender, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
 
 
+def test_zhangxia_forward_to_silent_distlist_merges_same_no_action():
+    artifact = _compile()
+    view = EmailView(
+        sender_address="zhang-xia@tianjin-air.com",
+        to_addresses=["thxxcxb@hnair.com"],
+        subject="转发: 请阅处：关于修订《安全管理手册》《安全管理程序手册》的会签",
+    )
+
+    decision = build_tier1_decision(_rules(artifact), view, me_email=ME_EMAIL)
+
+    assert decision.outcome is EvaluationOutcome.MATCHED
+    assert decision.route is CanonicalRoute.NO_ACTION
+    assert len(decision.candidate_actions) == 1
+    assert sorted(decision.candidate_actions[0].rule_ids) == [
+        "T1-INTERNAL-DISTLIST-SILENCE-001",
+        "T1-ZHANGXIA-FORWARD-READONLY-001",
+    ]
+    assert decision.reason_codes == [
+        "forwarded_informational",
+        "internal_distribution_list",
+    ]
+
+
 def test_direct_to_me_plus_distlist_is_conflict_manual_review():
     """By-design corner: mail addressed to both $ME and a silent distlist
     matches two different actions (read_only fallback vs no_action group) and

@@ -12,10 +12,10 @@ manual_review, replacing the ambiguous `skip`) and a separately mutable
 `handoff_execution` state machine; a downstream execution failure only changes
 `handoff_execution.state`, never triggers Tier 2/3 reclassification or rewrites the
 persisted decision. Multiple matching rules are merged only when their
-`action_fingerprint` — a versioned hash of the canonicalized `route` and its
-default-expanded `params`, deliberately excluding the non-authoritative
-`business_flow_id` audit label — is identical; any distinct fingerprint produces
-`outcome=conflict, route=manual_review` with every competing fingerprint retained in
+`action_fingerprint` — a versioned hash of the canonicalized execution
+`route` and its default-expanded parameters, deliberately excluding the
+non-authoritative `business_flow_id` audit label and `no_action.reason_code`
+explanation — is identical; any distinct fingerprint produces
 `candidate_actions`, never a single overwritten value. `priority`/`intent` remain
 non-authoritative descriptive metadata (`governance.criticality`, still `P0`–`P3`) and
 must never select a winner. Declarative field-match conditions use three-valued logic
