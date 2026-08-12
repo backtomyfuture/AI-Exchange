@@ -1,0 +1,65 @@
+schema_version: 1
+rule_id: T1-INTERNAL-DISTLIST-READONLY-001
+rule_version: 1
+status: enabled
+owner: mailbox-owner
+purpose: >
+  Split half of legacy T1-INTERNAL-DISTLIST-SILENCE-001:
+  thxxcxb@hnair.com (部门群组) and thxxyfzx@hnair.com (中心群组) are
+  department/center distribution lists whose messages the mailbox owner still
+  wants to see. Mail addressed to these groups is routed read_only (FYI card,
+  no auto-reply) instead of no_action. Owner review 2026-08-12 pulled both
+  addresses out of the silence rule's anchor list; the remaining addresses
+  there keep unconditional silence.
+
+validity:
+  effective_from: "2026-08-12T00:00:00Z"
+
+match:
+  anchor:
+    any:
+      - field: to.addresses
+        op: has_any
+        values:
+          - thxxcxb@hnair.com
+          - thxxyfzx@hnair.com
+
+decision:
+  route: read_only
+  business_flow_id: internal-distribution-list-fyi
+
+governance:
+  criticality: P3
+  owner_reviewed_at: "2026-08-12T00:00:00Z"
+  risk_notes: >
+    These two addresses were historically no_action because they showed a 0%
+    reply rate; the owner decided they still warrant reading (department and
+    center group mail). Unlike the silence rule they carry no expires_at:
+    read_only is an FYI route, not a no-op. By-design corner remaining: mail
+    addressed to both this rule's group and a still-silent group (e.g.
+    gs4193@hnair.com) matches two different actions and is forced to
+    manual_review rather than silently choosing one.
+  positive_cases:
+    - case_id: to-thxxcxb
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [thxxcxb@hnair.com]
+    - case_id: to-thxxyfzx-with-other-cc
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [thxxyfzx@hnair.com]
+        cc: [uninvolved@example.com]
+  negative_cases:
+    - case_id: unrelated-recipient
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [someone-else@hnair.com]
+    - case_id: group-address-only-in-cc-not-to
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [q-fu@tianjin-air.com]
+        cc: [thxxcxb@hnair.com]
+    - case_id: still-silent-group-belongs-to-silence-rule
+      email:
+        sender: {address: some-ops@hnair.com}
+        to: [gs4193@hnair.com]

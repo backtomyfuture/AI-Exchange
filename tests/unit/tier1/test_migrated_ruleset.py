@@ -36,6 +36,7 @@ def test_migrated_registry_compiles():
     artifact = _compile()
     assert {r.rule_id for r in _rules(artifact)} == {
         "T1-INTERNAL-DISTLIST-SILENCE-001",
+        "T1-INTERNAL-DISTLIST-READONLY-001",
         "T1-SAFETY-PLATFORM-ARCHIVE-001",
         "T1-HNAIR-MARKETING-ARCHIVE-001",
         "T1-ZHANGXIA-FORWARD-READONLY-001",
@@ -178,11 +179,26 @@ def test_zhangxia_forward_requires_both_sender_and_subject_shape():
     assert build_tier1_decision(rules, wrong_sender, me_email=ME_EMAIL).outcome is EvaluationOutcome.ABSTAIN
 
 
+def test_distlist_read_only_groups_are_read_only():
+    """The 2026-08-12 owner review moved thxxcxb/thxxyfzx out of the silent
+    group list into T1-INTERNAL-DISTLIST-READONLY-001: mail to these
+    department/center groups must still be read (read_only FYI), not
+    no_action."""
+    artifact = _compile()
+    rules = _rules(artifact)
+    for group in ("thxxcxb@hnair.com", "thxxyfzx@hnair.com"):
+        view = EmailView(sender_address="ops@hnair.com", to_addresses=[group])
+        decision = build_tier1_decision(rules, view, me_email=ME_EMAIL)
+        assert decision.outcome is EvaluationOutcome.MATCHED, group
+        assert decision.route is CanonicalRoute.READ_ONLY, group
+        assert decision.business_flow_ids == ["internal-distribution-list-fyi"], group
+
+
 def test_zhangxia_forward_to_silent_distlist_merges_same_no_action():
     artifact = _compile()
     view = EmailView(
         sender_address="zhang-xia@tianjin-air.com",
-        to_addresses=["thxxcxb@hnair.com"],
+        to_addresses=["gs4193@hnair.com"],
         subject="转发: 请阅处：关于修订《安全管理手册》《安全管理程序手册》的会签",
     )
 
