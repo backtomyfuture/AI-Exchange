@@ -107,6 +107,7 @@ POLLING_RELATIONS: Final = (
     "pipeline_runtime_authority",
     "pipeline_runtime_capabilities",
     "pipeline_runtime_instances",
+    "route_evaluation_traces",
     "sync_cursors",
     "tier1_decisions",
 )
@@ -314,6 +315,24 @@ RUNTIME_RELATION_ACCESS: Final = {
     "handoff_runs": _access(table=("SELECT",), insert=("inbox_id", "decision_digest", "plan_json", "plan_digest", "state"), update=("evidence_json", "evidence_digest", "state", "payload_revision", "version", "execution_claimed_at", "execution_claim_id", "updated_at")),
     "execution_payload_revisions": _access(table=("SELECT",), insert=("inbox_id", "revision", "payload_digest", "decision_digest", "plan_digest", "evidence_digest", "draft_digest", "draft_content", "draft_ref", "to_recipients", "cc_recipients", "attachment_refs", "attachment_digests", "external_recipient_acknowledged", "editor", "edited_at")),
     "approved_execution_envelopes": _access(table=("SELECT",), insert=("inbox_id", "payload_revision", "payload_digest", "envelope_json", "envelope_digest", "decision_digest", "plan_digest", "evidence_digest", "draft_digest", "approver", "approved_at")),
+    "route_evaluation_traces": _access(
+        table=("SELECT",),
+        insert=(
+            "inbox_id",
+            "sequence",
+            "tier",
+            "outcome",
+            "matched_rule_ids",
+            "candidate_routes",
+            "evidence_refs",
+            "confidence",
+            "continue_reason",
+            "safe_reason",
+            "started_at",
+            "finished_at",
+            "safe_detail_json",
+        ),
+    ),
 }
 RUNTIME_RELATION_ACCESS_BY_REVISION: Final = {DATABASE_REVISION: RUNTIME_RELATION_ACCESS}
 
@@ -343,6 +362,7 @@ MAINTENANCE_RELATION_ACCESS: Final = {
     "handoff_runs": _access(table=("SELECT",)),
     "execution_payload_revisions": _access(table=("SELECT",)),
     "approved_execution_envelopes": _access(table=("SELECT",)),
+    "route_evaluation_traces": _access(table=("SELECT",)),
 }
 MAINTENANCE_RELATION_ACCESS_BY_REVISION: Final = {
     DATABASE_REVISION: MAINTENANCE_RELATION_ACCESS
@@ -394,6 +414,7 @@ AUDITOR_RELATION_ACCESS: Final = {
     "handoff_runs": _access(table=("SELECT",)),
     "execution_payload_revisions": _access(table=("SELECT",)),
     "approved_execution_envelopes": _access(table=("SELECT",)),
+    "route_evaluation_traces": _access(table=("SELECT",)),
     "pipeline_folder_scopes": _access(
         select=(
             "initialization_id",
@@ -675,6 +696,14 @@ FOREIGN_KEY_SPECS: Final = (
         "s",
     ),
     ForeignKeySpec(
+        "fk_route_evaluation_traces_inbox",
+        "route_evaluation_traces",
+        ("inbox_id",),
+        "event_inbox",
+        ("id",),
+        "s",
+    ),
+    ForeignKeySpec(
         "fk_intake_decisions_inbox",
         "intake_decisions",
         ("inbox_id",),
@@ -868,6 +897,8 @@ TRIGGER_SPECS: Final = (
     TriggerSpec("trg_pipeline_runtime_instances_guard_truncate", "pipeline_runtime_instances", "guard_pipeline_runtime_instances", 34),
     TriggerSpec("trg_tier1_decisions_guard_row", "tier1_decisions", "reject_tier1_decisions_mutation", 27),
     TriggerSpec("trg_tier1_decisions_guard_truncate", "tier1_decisions", "reject_tier1_decisions_mutation", 34),
+    TriggerSpec("trg_route_evaluation_traces_guard_row", "route_evaluation_traces", "reject_durable_artifact_mutation", 27),
+    TriggerSpec("trg_route_evaluation_traces_guard_truncate", "route_evaluation_traces", "reject_durable_artifact_mutation", 34),
     TriggerSpec("trg_intake_decisions_guard_row", "intake_decisions", "reject_durable_artifact_mutation", 27),
     TriggerSpec("trg_intake_decisions_guard_truncate", "intake_decisions", "reject_durable_artifact_mutation", 34),
     TriggerSpec("trg_intake_releases_guard_row", "intake_releases", "reject_durable_artifact_mutation", 27),

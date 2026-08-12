@@ -22,6 +22,7 @@ from src.handoff.evidence import EvidencePack
 from src.handoff.models import HandoffPlan
 from src.ingestion.processing import ProcessingEffectScope
 from src.router.decision import RouteDecision
+from src.router.observability import validate_route_evaluation
 from src.safety.execution_gate import ApprovedExecutionEnvelope
 from src.storage import ContentRef
 
@@ -257,6 +258,138 @@ class AsyncDatabaseManager:
                 message="route decision persistence failed",
             ) from None
         return decision
+
+    async def persist_route_evaluation_trace(
+        self,
+        *,
+        scope: ProcessingEffectScope,
+        sequence: int,
+        evaluation: object,
+    ) -> None:
+        """Append one bounded, non-authoritative routing observation.
+
+        The write is fenced to the current inbox lease, but its failure never
+        changes the canonical route decision.  The table has no update path.
+        """
+
+        if not isinstance(scope, ProcessingEffectScope):
+            raise ValueError("scope must be a ProcessingEffectScope")
+        try:
+            trace = validate_route_evaluation(
+                evaluation,
+                inbox_id=scope.inbox_id,
+                sequence=sequence,
+            )
+        except Exception:
+            raise DatabaseOperationError(
+                operation="persist_route_evaluation_trace",
+                retryable=False,
+                message="route evaluation projection is invalid",
+            ) from None
+        try:
+            async with self.get_connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            SELECT id
+                            FROM event_inbox
+                            WHERE id = %s
+                              AND account_id = %s
+                              AND external_email_id = %s
+                              AND generation = %s
+                              AND fencing_token = %s
+                              AND execution_epoch = %s
+                              AND authority_epoch = %s
+                              AND capability_hash = %s
+                              AND lease_session_id = %s
+                              AND lease_owner = %s
+                              AND status = 'leased'
+                              AND lease_until > statement_timestamp()
+                            LIMIT 1
+                            """,
+                            (
+                                scope.inbox_id,
+                                scope.account_id,
+                                scope.external_email_id,
+                                scope.generation,
+                                scope.fencing_token,
+                                scope.execution_epoch,
+                                scope.authority_epoch,
+                                scope.capability_hash,
+                                scope.lease_session_id,
+                                scope.lease_owner,
+                            ),
+                        )
+                        if await cur.fetchone() is None:
+                            raise DatabaseOperationError(
+                                operation="persist_route_evaluation_trace",
+                                retryable=False,
+                                message="route evaluation authority is stale",
+                            )
+                        await cur.execute(
+                            """
+                            INSERT INTO route_evaluation_traces (
+                                inbox_id, sequence, tier, outcome,
+                                matched_rule_ids, candidate_routes, evidence_refs,
+                                confidence, continue_reason, safe_reason,
+                                started_at, finished_at, safe_detail_json
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s
+                            )
+                            ON CONFLICT (inbox_id, sequence) DO NOTHING
+                            """,
+                            (
+                                trace.inbox_id,
+                                trace.sequence,
+                                trace.tier,
+                                trace.outcome,
+                                Jsonb(trace.matched_rule_ids),
+                                Jsonb(trace.candidate_routes),
+                                Jsonb(trace.evidence_refs),
+                                trace.confidence,
+                                trace.continue_reason,
+                                trace.safe_reason,
+                                trace.started_at,
+                                trace.finished_at,
+                                Jsonb(trace.safe_detail_json),
+                            ),
+                        )
+                        await cur.execute(
+                            """
+                            SELECT tier, outcome, safe_detail_json
+                            FROM route_evaluation_traces
+                            WHERE inbox_id = %s AND sequence = %s
+                            """,
+                            (trace.inbox_id, trace.sequence),
+                        )
+                        existing = await cur.fetchone()
+                        existing_detail = existing.get("safe_detail_json") if existing else None
+                        if isinstance(existing_detail, str):
+                            try:
+                                existing_detail = json.loads(existing_detail)
+                            except (TypeError, ValueError):
+                                existing_detail = None
+                        if (
+                            existing is None
+                            or existing.get("tier") != trace.tier
+                            or existing.get("outcome") != trace.outcome
+                            or existing_detail != trace.safe_detail_json
+                        ):
+                            raise DatabaseOperationError(
+                                operation="persist_route_evaluation_trace",
+                                retryable=False,
+                                message="route evaluation projection conflict",
+                            )
+        except DatabaseOperationError:
+            raise
+        except (psycopg.Error, ValueError, TypeError):
+            raise DatabaseOperationError(
+                operation="persist_route_evaluation_trace",
+                retryable=False,
+                message="route evaluation projection persistence failed",
+            ) from None
 
     async def get_route_decision_for_attempt(
         self,

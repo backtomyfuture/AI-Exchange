@@ -22,6 +22,7 @@ from console_api.models import (
     MatchTestRequest,
     MatchTestResponse,
     PipelineTrace,
+    RouteDecisionDetail,
     RuleDetail,
     RuleDraftRequest,
     RuleSaveResponse,
@@ -88,6 +89,11 @@ def create_app() -> FastAPI:
         page_size: int = Query(default=25, ge=1, le=100),
         status: str | None = Query(default=None, max_length=64),
         sender: str | None = Query(default=None, max_length=320),
+        query: str | None = Query(default=None, max_length=320),
+        route: str | None = Query(default=None, max_length=64),
+        tier: str | None = Query(default=None, max_length=32),
+        requires_human: bool | None = None,
+        has_anomaly: bool | None = None,
         received_from: datetime | None = None,
         received_to: datetime | None = None,
     ):
@@ -97,6 +103,11 @@ def create_app() -> FastAPI:
                 page_size=page_size,
                 status=status,
                 sender=sender,
+                query_text=query,
+                route=route,
+                tier=tier,
+                requires_human=requires_human,
+                has_anomaly=has_anomaly,
                 received_from=received_from,
                 received_to=received_to,
             )
@@ -118,6 +129,22 @@ def create_app() -> FastAPI:
         if trace is None:
             raise HTTPException(status_code=404, detail="email_not_found")
         return trace
+
+    @application.get(
+        "/api/emails/{external_email_id:path}/route-decision",
+        response_model=RouteDecisionDetail,
+    )
+    async def email_route_decision(
+        external_email_id: str,
+        database: ConsoleDatabase = Depends(_database),
+    ):
+        try:
+            trace = await database.trace(external_email_id)
+        except Exception as exc:
+            raise _safe_error(exc) from exc
+        if trace is None or trace.route_decision is None:
+            raise HTTPException(status_code=404, detail="route_decision_not_found")
+        return trace.route_decision
 
     @application.get("/api/rules", response_model=list[RuleSummary])
     async def list_rules(rule_store: RuleStore = Depends(_rules)):

@@ -2606,6 +2606,28 @@ CREATE TABLE public.tier1_decisions (
     CONSTRAINT ck_tier1_decisions_route CHECK (route = ANY (ARRAY['reply'::text, 'forward'::text, 'read_only'::text, 'no_action'::text, 'manual_review'::text])),
     CONSTRAINT ck_tier1_decisions_tier CHECK (tier = ANY (ARRAY['tier1'::text, 'tier2'::text, 'tier3'::text, 'system'::text]))
 );
+CREATE TABLE public.route_evaluation_traces (
+    inbox_id uuid NOT NULL,
+    sequence bigint NOT NULL,
+    tier text NOT NULL,
+    outcome text NOT NULL,
+    matched_rule_ids jsonb DEFAULT '[]'::jsonb NOT NULL,
+    candidate_routes jsonb DEFAULT '[]'::jsonb NOT NULL,
+    evidence_refs jsonb DEFAULT '[]'::jsonb NOT NULL,
+    confidence double precision,
+    continue_reason text,
+    safe_reason text,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone NOT NULL,
+    safe_detail_json jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT ck_route_evaluation_traces_sequence CHECK (sequence > 0),
+    CONSTRAINT ck_route_evaluation_traces_tier CHECK (tier = ANY (ARRAY['tier1'::text, 'tier2'::text, 'tier3'::text])),
+    CONSTRAINT ck_route_evaluation_traces_outcome CHECK (outcome = ANY (ARRAY['matched'::text, 'abstain'::text, 'conflict'::text, 'error'::text, 'partial'::text, 'unavailable'::text, 'skipped'::text, 'unknown'::text])),
+    CONSTRAINT ck_route_evaluation_traces_confidence CHECK ((confidence IS NULL) OR (confidence >= (0)::double precision AND confidence <= (1)::double precision)),
+    CONSTRAINT ck_route_evaluation_traces_reason CHECK ((continue_reason IS NULL OR (btrim(continue_reason) <> ''::text AND char_length(continue_reason) <= 512)) AND (safe_reason IS NULL OR (btrim(safe_reason) <> ''::text AND char_length(safe_reason) <= 512))),
+    CONSTRAINT ck_route_evaluation_traces_json CHECK ((jsonb_typeof(matched_rule_ids) = 'array'::text) AND (jsonb_typeof(candidate_routes) = 'array'::text) AND (jsonb_typeof(evidence_refs) = 'array'::text) AND (jsonb_typeof(safe_detail_json) = 'object'::text) AND octet_length((safe_detail_json)::text) <= 16384)
+);
 CREATE TABLE public.intake_decisions (
     inbox_id uuid NOT NULL, execution_epoch bigint NOT NULL, external_email_id text NOT NULL,
     decision_json jsonb NOT NULL, decision_digest character(64) NOT NULL,
@@ -2871,6 +2893,8 @@ ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT pk_event_inbox PRIMARY KEY (id);
 ALTER TABLE ONLY public.tier1_decisions
     ADD CONSTRAINT pk_tier1_decisions PRIMARY KEY (inbox_id);
+ALTER TABLE ONLY public.route_evaluation_traces
+    ADD CONSTRAINT pk_route_evaluation_traces PRIMARY KEY (inbox_id, sequence);
 ALTER TABLE ONLY public.handoff_executions
     ADD CONSTRAINT pk_handoff_executions PRIMARY KEY (inbox_id);
 ALTER TABLE ONLY public.pipeline_command_receipts
@@ -2945,6 +2969,7 @@ CREATE INDEX ix_emails_owner_status ON public.emails USING btree (account_id, ow
 CREATE INDEX ix_event_inbox_claim ON public.event_inbox USING btree (pipeline_name, status, available_at, received_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry_wait'::text]));
 CREATE INDEX ix_event_inbox_expired_lease ON public.event_inbox USING btree (lease_until, execution_epoch, authority_epoch, capability_hash, lease_session_id, id) WHERE (status = 'leased'::text);
 CREATE INDEX ix_tier1_decisions_route ON public.tier1_decisions USING btree (account_id, route, created_at DESC);
+CREATE INDEX ix_route_evaluation_traces_inbox ON public.route_evaluation_traces USING btree (inbox_id, sequence);
 CREATE INDEX ix_handoff_executions_state ON public.handoff_executions USING btree (state, updated_at);
 CREATE INDEX ix_pipeline_folder_scopes_account ON public.pipeline_folder_scopes USING btree (account_id, canonical_key);
 CREATE INDEX ix_pipeline_runtime_authority_state ON public.pipeline_runtime_authority USING btree (state, account_id);
@@ -2975,6 +3000,8 @@ CREATE TRIGGER trg_pipeline_runtime_instances_guard_row BEFORE INSERT OR DELETE 
 CREATE TRIGGER trg_pipeline_runtime_instances_guard_truncate BEFORE TRUNCATE ON public.pipeline_runtime_instances FOR EACH STATEMENT EXECUTE FUNCTION public.guard_pipeline_runtime_instances();
 CREATE TRIGGER trg_tier1_decisions_guard_row BEFORE DELETE OR UPDATE ON public.tier1_decisions FOR EACH ROW EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
 CREATE TRIGGER trg_tier1_decisions_guard_truncate BEFORE TRUNCATE ON public.tier1_decisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_tier1_decisions_mutation();
+CREATE TRIGGER trg_route_evaluation_traces_guard_row BEFORE DELETE OR UPDATE ON public.route_evaluation_traces FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
+CREATE TRIGGER trg_route_evaluation_traces_guard_truncate BEFORE TRUNCATE ON public.route_evaluation_traces FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
 CREATE TRIGGER trg_intake_decisions_guard_row BEFORE DELETE OR UPDATE ON public.intake_decisions FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
 CREATE TRIGGER trg_intake_decisions_guard_truncate BEFORE TRUNCATE ON public.intake_decisions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_durable_artifact_mutation();
 CREATE TRIGGER trg_intake_releases_guard_row BEFORE DELETE OR UPDATE ON public.intake_releases FOR EACH ROW EXECUTE FUNCTION public.reject_durable_artifact_mutation();
@@ -2999,6 +3026,8 @@ ALTER TABLE ONLY public.event_inbox
     ADD CONSTRAINT fk_event_inbox_runtime_capability FOREIGN KEY (capability_hash) REFERENCES public.pipeline_runtime_capabilities(capability_hash) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.tier1_decisions
     ADD CONSTRAINT fk_tier1_decisions_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+ALTER TABLE ONLY public.route_evaluation_traces
+    ADD CONSTRAINT fk_route_evaluation_traces_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE ONLY public.intake_decisions ADD CONSTRAINT fk_intake_decisions_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY public.intake_releases ADD CONSTRAINT fk_intake_releases_inbox FOREIGN KEY (inbox_id) REFERENCES public.event_inbox(id) ON DELETE RESTRICT;
 ALTER TABLE ONLY public.handoff_runs ADD CONSTRAINT fk_handoff_runs_decision FOREIGN KEY (inbox_id) REFERENCES public.tier1_decisions(inbox_id) ON DELETE RESTRICT;

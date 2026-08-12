@@ -54,6 +54,210 @@ class _Tier3Result(BaseModel):
     explicit_current_action: StrictBool = False
 
 
+def _safe_value(value: object, *, limit: int = 512) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] or None
+
+
+def _timestamp(value: datetime) -> str:
+    """Keep internal graph deltas JSON-safe while preserving UTC precision."""
+
+    return value.isoformat()
+
+
+def _tier1_trace(
+    artifact: CompiledArtifact,
+    decision: object,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+) -> dict[str, Any]:
+    matched_rules = [
+        {
+            "rule_id": item.rule_id,
+            "rule_version": item.rule_version,
+            "route": next(
+                (
+                    compiled.manifest.decision.route.value
+                    for compiled in artifact.rules
+                    if compiled.manifest.rule_id == item.rule_id
+                ),
+                None,
+            ),
+        }
+        for item in decision.matched_rules
+    ]
+    candidates = [
+        {
+            "fingerprint": item.fingerprint,
+            "rule_ids": list(item.rule_ids)[:32],
+            "route": item.route.value,
+        }
+        for item in decision.candidate_actions
+    ]
+    outcome = decision.outcome.value
+    if outcome == EvaluationOutcome.ABSTAIN.value:
+        continue_reason = "Tier 1 未命中，进入 Tier 2"
+    elif outcome == EvaluationOutcome.MATCHED.value:
+        continue_reason = "Tier 1 已命中，停止后续路由层"
+    elif outcome == EvaluationOutcome.CONFLICT.value:
+        continue_reason = "Tier 1 规则冲突，转人工审核"
+    else:
+        continue_reason = "Tier 1 事实不足或评估异常，转人工审核"
+    safe_detail = {
+        "source_version": "tier1-artifact-v1",
+        "artifact_digest": artifact.digest,
+        "evaluated_rule_count": len(artifact.rules),
+        "matched_rule_count": len(matched_rules),
+        "candidate_count": len(candidates),
+        "matched_rules": matched_rules,
+        "candidate_actions": candidates,
+        "reason_codes": list(decision.reason_codes)[:16],
+        "decision_origin": (
+            decision.decision_origin.value if decision.decision_origin else None
+        ),
+    }
+    return {
+        "tier": "tier1",
+        "outcome": outcome,
+        "matched_rule_ids": matched_rules,
+        "candidate_routes": candidates,
+        "evidence_refs": [],
+        "confidence": 1.0 if outcome == EvaluationOutcome.MATCHED.value else None,
+        "continue_reason": continue_reason,
+        "safe_reason": _safe_value(
+            decision.reason_codes[0] if decision.reason_codes else None
+        ),
+        "started_at": _timestamp(started_at),
+        "finished_at": _timestamp(finished_at),
+        "safe_detail_json": safe_detail,
+    }
+
+
+def _tier2_trace(
+    evidence: RoutingEvidenceBundle,
+    decision: RouteDecision | None,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+) -> dict[str, Any]:
+    vote_counts: dict[str, int] = {}
+    evidence_refs: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for hit in evidence:
+        evidence_id = _safe_value(hit.get("id") or hit.get("email_id"), limit=512)
+        if not evidence_id or evidence_id in seen_ids:
+            continue
+        seen_ids.add(evidence_id)
+        historical = RoutingEngine._decision_from_hit(hit)
+        route = historical.route.value if historical and historical.route else None
+        if route:
+            vote_counts[route] = vote_counts.get(route, 0) + 1
+        score = hit.get("score")
+        bounded_score = score if isinstance(score, (int, float)) and 0 <= score <= 1 else None
+        evidence_refs.append(
+            {
+                "id": evidence_id,
+                "route": route,
+                "score": bounded_score,
+                "received_at": _safe_value(
+                    hit.get("received_at") or hit.get("sent_at") or hit.get("date"),
+                    limit=64,
+                ),
+            }
+        )
+    outcome = decision.outcome.value if decision else (
+        "unavailable" if evidence.status == "unavailable" else "abstain"
+    )
+    if decision is not None and decision.outcome is DecisionOutcome.MATCHED:
+        continue_reason = "Tier 2 已形成共识，停止 Tier 3"
+    elif decision is not None and decision.outcome is DecisionOutcome.CONFLICT:
+        continue_reason = "Tier 2 证据冲突，转人工审核"
+    else:
+        continue_reason = "Tier 2 未形成共识，进入 Tier 3"
+    candidates = [
+        {"route": route, "votes": votes}
+        for route, votes in sorted(vote_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    safe_detail = {
+        "retrieved_count": len(evidence),
+        "unique_evidence_count": len(evidence_refs),
+        "retrieval_status": evidence.status,
+        "vote_distribution": candidates,
+        "consensus": bool(decision and decision.outcome is DecisionOutcome.MATCHED),
+        "min_hits": TIER2_MIN_HITS,
+        "min_ratio": TIER2_MIN_RATIO,
+    }
+    return {
+        "tier": "tier2",
+        "outcome": outcome,
+        "matched_rule_ids": [],
+        "candidate_routes": candidates,
+        "evidence_refs": evidence_refs[:32],
+        "confidence": (
+            decision.provenance.confidence
+            if decision is not None
+            else None
+        ),
+        "continue_reason": continue_reason,
+        "safe_reason": _safe_value(
+            decision.reason_code if decision is not None else evidence.status
+        ),
+        "started_at": _timestamp(started_at),
+        "finished_at": _timestamp(finished_at),
+        "safe_detail_json": safe_detail,
+    }
+
+
+def _tier3_trace(
+    decision: RouteDecision,
+    *,
+    parsed: _Tier3Result | None,
+    model_name: str,
+    started_at: datetime,
+    finished_at: datetime,
+) -> dict[str, Any]:
+    failed = decision.outcome is DecisionOutcome.ERROR
+    model_result = {
+        "route": decision.route.value if decision.route else None,
+        "confidence": (
+            parsed.confidence
+            if parsed is not None
+            else decision.provenance.confidence
+        ),
+        "reason_code": decision.reason_code,
+        "explicit_current_action": (
+            parsed.explicit_current_action if parsed is not None else None
+        ),
+        "model": _safe_value(model_name, limit=128),
+        "source_version": decision.provenance.source_version,
+    }
+    return {
+        "tier": "tier3",
+        "outcome": "error" if failed else "matched",
+        "matched_rule_ids": [],
+        "candidate_routes": (
+            [{"route": decision.route.value}] if decision.route else []
+        ),
+        "evidence_refs": [],
+        "confidence": decision.provenance.confidence,
+        "continue_reason": (
+            "Tier 3 模型失败，转人工审核"
+            if failed
+            else "Tier 3 已给出结构化路由结果"
+        ),
+        "safe_reason": _safe_value(decision.reason_code),
+        "started_at": _timestamp(started_at),
+        "finished_at": _timestamp(finished_at),
+        "safe_detail_json": {
+            "model_result": model_result,
+            "fallback": failed,
+        },
+    }
+
+
 def _parse_tier3_json(content: str) -> Any:
     normalized = content.strip()
     fenced = _JSON_CODE_FENCE.fullmatch(normalized)
@@ -156,6 +360,13 @@ class RoutingEngine:
             me_email=self.me_email or None,
             decision_time=decision_time,
         )
+        evaluation_finished_at = datetime.now(UTC)
+        route_evaluation = _tier1_trace(
+            self.artifact,
+            tier1,
+            started_at=decision_time,
+            finished_at=evaluation_finished_at,
+        )
         provenance = RouteProvenance(
             tier=RouteTier.TIER1,
             source_version="tier1-artifact-v1",
@@ -168,6 +379,7 @@ class RoutingEngine:
                 **state,
                 "routing_log": [*(state.get("routing_log") or []), "tier1 route=abstain"],
                 "routing_stage": "pending",
+                "_route_evaluation": route_evaluation,
             }
 
         if tier1.outcome is EvaluationOutcome.MATCHED:
@@ -222,7 +434,15 @@ class RoutingEngine:
             ],
         )
         delta = _decision_delta(decision)
-        return {**state, **delta, "routing_log": [*(state.get("routing_log") or []), *delta["routing_log"]]}
+        return {
+            **state,
+            **delta,
+            "routing_log": [
+                *(state.get("routing_log") or []),
+                *delta["routing_log"],
+            ],
+            "_route_evaluation": route_evaluation,
+        }
 
     @staticmethod
     def _decision_from_hit(hit: Mapping[str, Any]) -> RouteDecision | None:
@@ -248,17 +468,33 @@ class RoutingEngine:
             if isinstance(hits, RoutingEvidenceBundle)
             else RoutingEvidenceBundle.from_hits(hits)
         )
+        evaluation_started_at = datetime.now(UTC)
         decision = HistoricalRouteConsensus(
             min_hits=TIER2_MIN_HITS,
             min_ratio=TIER2_MIN_RATIO,
         ).decide(evidence)
-        return {} if decision is None else _decision_delta(decision)
+        evaluation_finished_at = datetime.now(UTC)
+        route_evaluation = _tier2_trace(
+            evidence,
+            decision,
+            started_at=evaluation_started_at,
+            finished_at=evaluation_finished_at,
+        )
+        if decision is None:
+            return {"_route_evaluation": route_evaluation}
+        return {
+            **_decision_delta(decision),
+            "_route_evaluation": route_evaluation,
+        }
 
     async def apply_tier3_fallback(
         self,
         state: AgentState,
         routing_assessment: RoutingAssessment | None = None,
     ) -> AgentState:
+        evaluation_started_at = datetime.now(UTC)
+        parsed: _Tier3Result | None = None
+        model_name = "router"
         email = state.get("email") or {}
         body_projection = project_email_body_for_model(
             str(email.get("body") or ""),
@@ -287,6 +523,11 @@ class RoutingEngine:
         )
         try:
             settings = get_settings()
+            model_name = str(
+                getattr(settings, "LLM_ROUTER_MODEL", "")
+                or getattr(settings, "LLM_MODEL", "")
+                or "router"
+            )
             enforce_model_input_budget(
                 "router",
                 prompt,
@@ -350,7 +591,17 @@ class RoutingEngine:
                 ),
                 reason_code="router_model_failed",
             )
-        return _decision_delta(decision)
+        route_evaluation = _tier3_trace(
+            decision,
+            parsed=parsed,
+            model_name=model_name,
+            started_at=evaluation_started_at,
+            finished_at=datetime.now(UTC),
+        )
+        return {
+            **_decision_delta(decision),
+            "_route_evaluation": route_evaluation,
+        }
 
     async def resolve_route(
         self,

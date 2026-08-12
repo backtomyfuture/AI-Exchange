@@ -238,6 +238,63 @@ async def test_route_persistence_requires_exact_processing_scope(db_manager):
 
 
 @pytest.mark.asyncio
+async def test_route_evaluation_is_fenced_and_append_only(db_manager):
+    now = datetime.now(UTC)
+    cursor = FakeCursor(
+        fetchone_results=[
+            {"id": _route_scope().inbox_id},
+            {
+                "tier": "tier1",
+                "outcome": "matched",
+                "safe_detail_json": {"matched_rule_count": 1},
+            },
+        ]
+    )
+    db_manager.get_connection = connection_factory(cursor)
+
+    await db_manager.persist_route_evaluation_trace(
+        scope=_route_scope(),
+        sequence=1,
+        evaluation={
+            "tier": "tier1",
+            "outcome": "matched",
+            "matched_rule_ids": [{"rule_id": "rule-1"}],
+            "candidate_routes": [],
+            "evidence_refs": [],
+            "started_at": now,
+            "finished_at": now,
+            "safe_detail_json": {"matched_rule_count": 1},
+        },
+    )
+
+    statements = [" ".join(query.split()) for query, _ in cursor.executions]
+    assert "status = 'leased'" in statements[0]
+    assert any("INSERT INTO route_evaluation_traces" in query for query in statements)
+    assert any("ON CONFLICT (inbox_id, sequence) DO NOTHING" in query for query in statements)
+
+
+@pytest.mark.asyncio
+async def test_route_evaluation_rejects_content_before_database_write(db_manager):
+    cursor = FakeCursor(fetchone_result={"id": _route_scope().inbox_id})
+    db_manager.get_connection = connection_factory(cursor)
+
+    with pytest.raises(DatabaseOperationError, match="route evaluation projection is invalid"):
+        await db_manager.persist_route_evaluation_trace(
+            scope=_route_scope(),
+            sequence=1,
+            evaluation={
+                "tier": "tier1",
+                "outcome": "matched",
+                "started_at": datetime.now(UTC),
+                "finished_at": datetime.now(UTC),
+                "safe_detail_json": {"body": "protected"},
+            },
+        )
+
+    assert cursor.executions == []
+
+
+@pytest.mark.asyncio
 async def test_route_recovery_requires_live_runtime_and_exact_scope(db_manager):
     decision = RouteDecision.model_validate(_canonical_decision())
     cursor = FakeCursor(

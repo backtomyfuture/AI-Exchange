@@ -12,15 +12,23 @@ class ConsoleModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SenderInfo(ConsoleModel):
+    name: str | None = None
+    address: str | None = None
+
+
 class EmailListItem(ConsoleModel):
     external_email_id: str
     inbox_id: str | None = None
     subject: str | None = None
-    sender: str | None = None
+    sender: SenderInfo | str | None = None
     received_at: datetime | None = None
     status: str
     route: str | None = None
     tier: str | None = None
+    matched_rule_count: int | None = None
+    requires_human: bool = False
+    has_anomaly: bool = False
     updated_at: datetime | None = None
 
 
@@ -43,9 +51,29 @@ class TraceNode(ConsoleModel):
         "approval",
         "send",
     ]
-    status: Literal["pending", "active", "completed", "failed", "skipped", "unknown"]
+    status: Literal[
+        "pending",
+        "active",
+        "waiting",
+        "human_action",
+        "completed",
+        "not_triggered",
+        "skipped",
+        "failed",
+        "unknown",
+    ]
     timestamp: datetime | None = None
+    summary: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: int | None = Field(default=None, ge=0)
+    data_quality: Literal["ok", "missing", "inconsistent"] = "ok"
     safe_error_code: str | None = None
+    business_detail: dict[str, Any] = Field(default_factory=dict)
+    input_output: dict[str, Any] = Field(default_factory=dict)
+    technical_detail: dict[str, Any] = Field(default_factory=dict)
+    # Kept for one transition period so older local dashboard bundles can
+    # continue reading the projection while the structured fields roll out.
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -54,14 +82,51 @@ class TraceEdge(ConsoleModel):
     target: str
 
 
+class RouteEvaluationStep(ConsoleModel):
+    tier: Literal["tier1", "tier2", "tier3"]
+    status: Literal[
+        "completed",
+        "active",
+        "waiting",
+        "human_action",
+        "not_triggered",
+        "skipped",
+        "failed",
+        "unknown",
+    ]
+    summary: str
+    continue_reason: str | None = None
+    matched_rules: list[dict[str, Any]] = Field(default_factory=list)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    model_result: dict[str, Any] | None = None
+    safe_error_code: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: int | None = Field(default=None, ge=0)
+    data_quality: Literal["ok", "missing", "inconsistent"] = "ok"
+
+
+class RouteDecisionDetail(ConsoleModel):
+    final_route: str | None = None
+    final_tier: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    reason_code: str | None = None
+    steps: list[RouteEvaluationStep] = Field(default_factory=list)
+    decision_digest: str | None = None
+    decision_data_quality: Literal["ok", "missing", "inconsistent"] = "missing"
+
+
 class PipelineTrace(ConsoleModel):
     external_email_id: str
     inbox_id: str | None = None
     subject: str | None = None
-    sender: str | None = None
+    sender: SenderInfo | str | None = None
     current_status: str | None = None
     nodes: list[TraceNode]
     edges: list[TraceEdge]
+    route_decision: RouteDecisionDetail | None = None
+    updated_at: datetime | None = None
 
 
 class RuleSummary(ConsoleModel):

@@ -29,6 +29,7 @@ TABLES = (
     "handoff_executions",
     "execution_payload_revisions",
     "approved_execution_envelopes",
+    "route_evaluation_traces",
     "audit_events",
     "emails_log",
 )

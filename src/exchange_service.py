@@ -183,6 +183,33 @@ async def _routing_evidence_hits(
     return RoutingEvidenceBundle.from_hits(results, status=retrieval_status)
 
 
+async def _persist_route_evaluation(
+    ctx,
+    *,
+    scope: ProcessingEffectScope,
+    sequence: int,
+    evaluation: object,
+) -> None:
+    """Best-effort write of non-authoritative route observability."""
+
+    persist = getattr(ctx.db_manager, "persist_route_evaluation_trace", None)
+    if not callable(persist) or not isinstance(evaluation, Mapping):
+        return
+    try:
+        await persist(
+            scope=scope,
+            sequence=sequence,
+            evaluation=dict(evaluation),
+        )
+    except Exception as exc:
+        # A trace projection must never replace or delay the canonical route
+        # decision. The console will mark missing history instead.
+        logger.warning(
+            "Route evaluation projection unavailable: error_type=%s",
+            type(exc).__name__,
+        )
+
+
 async def _resolve_and_persist_canonical_route(
     email_id: str,
     email_data: Mapping[str, object],
@@ -213,6 +240,12 @@ async def _resolve_and_persist_canonical_route(
     route_state = {"email": projected}
     engine = get_routing_engine()
     tier1_state = await engine.execute_router(route_state)
+    await _persist_route_evaluation(
+        ctx,
+        scope=scope,
+        sequence=1,
+        evaluation=tier1_state.get("_route_evaluation"),
+    )
     raw = tier1_state.get("route_decision")
     if raw is not None:
         decision = engine.with_default_handoff_profile(
@@ -225,6 +258,12 @@ async def _resolve_and_persist_canonical_route(
             _effect_boundary=_effect_boundary,
         )
         tier2 = await engine.apply_tier2_hits(route_state, hits)
+        await _persist_route_evaluation(
+            ctx,
+            scope=scope,
+            sequence=2,
+            evaluation=tier2.get("_route_evaluation"),
+        )
         raw = tier2.get("route_decision")
         if raw is not None:
             decision = engine.with_default_handoff_profile(
@@ -245,6 +284,12 @@ async def _resolve_and_persist_canonical_route(
             tier3 = await engine.apply_tier3_fallback(
                 route_state,
                 routing_assessment=assessment,
+            )
+            await _persist_route_evaluation(
+                ctx,
+                scope=scope,
+                sequence=3,
+                evaluation=tier3.get("_route_evaluation"),
             )
             decision = engine.with_default_handoff_profile(
                 RouteDecision.model_validate(tier3.get("route_decision"))

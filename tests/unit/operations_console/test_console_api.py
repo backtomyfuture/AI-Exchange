@@ -10,10 +10,11 @@ from console_api.database import (
     ConsoleDatabase,
     ConsoleDatabaseError,
     _authoritative_event_order,
+    _mailbox_info,
     _safe_projection,
 )
 from console_api.main import _database, create_app
-from console_api.models import PipelineTrace, TraceNode
+from console_api.models import PipelineTrace, RouteDecisionDetail, RouteEvaluationStep, TraceNode
 from console_api.rules import RuleStore, RuleStoreError
 from console_api.settings import ConsoleSettings
 
@@ -149,6 +150,63 @@ def test_trace_projection_excludes_content_and_bounds_metadata():
         "nested": {"stage": "router"},
         "items": list(range(32)),
     }
+
+
+def test_mailbox_projection_normalizes_exchange_repr_without_body():
+    sender = _mailbox_info("Mailbox(name='Finance Bot', email_address='finance@example.com')")
+
+    assert sender is not None
+    assert sender.name == "Finance Bot"
+    assert sender.address == "finance@example.com"
+
+
+def test_route_decision_endpoint_returns_structured_steps():
+    app = create_app()
+    detail = RouteDecisionDetail(
+        final_route="reply",
+        final_tier="tier1",
+        confidence=1.0,
+        steps=[
+            RouteEvaluationStep(
+                tier="tier1",
+                status="completed",
+                summary="命中确定性规则",
+                matched_rules=[{"rule_id": "rule-1", "route": "reply"}],
+            ),
+            RouteEvaluationStep(
+                tier="tier2",
+                status="not_triggered",
+                summary="TIER2 未触发",
+            ),
+            RouteEvaluationStep(
+                tier="tier3",
+                status="not_triggered",
+                summary="TIER3 未触发",
+            ),
+        ],
+        decision_data_quality="ok",
+    )
+    trace = PipelineTrace(
+        external_email_id="mail-001",
+        inbox_id="00000000-0000-4000-8000-000000000001",
+        nodes=[],
+        edges=[],
+        route_decision=detail,
+    )
+
+    class FakeDatabase:
+        async def trace(self, external_email_id):
+            assert external_email_id == "mail-001"
+            return trace
+
+    app.dependency_overrides[_database] = lambda: FakeDatabase()
+    try:
+        response = TestClient(app).get("/api/emails/mail-001/route-decision")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["steps"][1]["status"] == "not_triggered"
 
 
 def test_authoritative_event_order_prefers_business_processing_owner():
