@@ -1,6 +1,7 @@
 import logging
 import math
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -111,7 +112,7 @@ def _utc_now() -> datetime:
 def _normalize_email_detail_recipients(
     email_data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Add canonical detail fields without discarding gateway aliases."""
+    """Add canonical detail fields and flatten JSON mailbox objects."""
     normalized = dict(email_data)
     for canonical, gateway_field in (
         ("to", "to_recipients"),
@@ -119,6 +120,26 @@ def _normalize_email_detail_recipients(
     ):
         if not normalized.get(canonical) and gateway_field in normalized:
             normalized[canonical] = normalized.get(gateway_field) or []
+
+    def normalize_mailbox(value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        for key in ("email", "email_address", "address", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        # Preserve malformed objects so the downstream input boundary fails
+        # closed instead of silently stringifying an untrusted value.
+        return value
+
+    for field in ("sender", "to", "cc", "bcc", "to_recipients", "cc_recipients"):
+        if field not in normalized:
+            continue
+        value = normalized[field]
+        if isinstance(value, list):
+            normalized[field] = [normalize_mailbox(item) for item in value]
+        else:
+            normalized[field] = normalize_mailbox(value)
 
     for canonical, gateway_fields in (
         (

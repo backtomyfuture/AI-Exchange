@@ -296,6 +296,36 @@ async def test_get_email_adds_canonical_recipient_fields(mock_settings):
 
 
 @pytest.mark.asyncio
+async def test_get_email_flattens_json_mailbox_objects(mock_settings):
+    raw_email = {
+        "id": "email-id",
+        "sender": {"name": "发件人", "email": "sender@example.com"},
+        "to": [{"name": "收件人", "email": "to@example.com"}],
+        "cc": [{"name": "抄送", "email": "cc@example.com"}],
+    }
+    response_body = json.dumps({"data": raw_email}, ensure_ascii=False).encode()
+    client = ExchangeClient(settings=mock_settings)
+    mock_http = StreamingHTTPClient(
+        [StreamingResponse(200, [response_body])]
+    )
+
+    with patch.object(
+        type(client),
+        "http_client",
+        new_callable=PropertyMock,
+        return_value=mock_http,
+    ):
+        email = await client.get_email("email-id")
+
+    assert email == {
+        "id": "email-id",
+        "sender": "sender@example.com",
+        "to": ["to@example.com"],
+        "cc": ["cc@example.com"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_email_adds_canonical_conversation_fields(mock_settings):
     raw_email = {
         "id": "email-id",
