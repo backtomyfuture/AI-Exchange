@@ -299,10 +299,18 @@ def init_lark_app(
         if settings.LARK_CHAT_ID:
             _resolve_current_user_email(settings.LARK_CHAT_ID)
             
-        card_builder = LarkCardBuilder(lark_api_client, exchange_client=exchange_client)
+        card_builder = LarkCardBuilder(
+            lark_api_client,
+            exchange_client=exchange_client,
+            exchange_loop=worker_loop_arg,
+        )
         logger.info("Lark API Client initialized.")
     else:
-        card_builder = LarkCardBuilder(None, exchange_client=exchange_client)
+        card_builder = LarkCardBuilder(
+            None,
+            exchange_client=exchange_client,
+            exchange_loop=worker_loop_arg,
+        )
         logger.warning("Lark App ID or Secret missing. Lark features disabled.")
 
     init_commands(db_mgr)

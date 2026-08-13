@@ -11,7 +11,11 @@ from src.utils.card_builder import LarkCardBuilder
 @pytest.mark.asyncio
 async def test_lookup_lark_users_falls_back_to_exchange_from_worker_thread():
     exchange_client = SimpleNamespace(resolve_contact=AsyncMock(return_value="联系人"))
-    builder = LarkCardBuilder(lark_api_client=None, exchange_client=exchange_client)
+    builder = LarkCardBuilder(
+        lark_api_client=None,
+        exchange_client=exchange_client,
+        exchange_loop=asyncio.get_running_loop(),
+    )
 
     result = await asyncio.to_thread(
         builder.lookup_lark_users,
@@ -20,6 +24,31 @@ async def test_lookup_lark_users_falls_back_to_exchange_from_worker_thread():
 
     assert result == {"recipient@example.com": {"name": "联系人"}}
     exchange_client.resolve_contact.assert_awaited_once_with("recipient@example.com")
+
+
+@pytest.mark.asyncio
+async def test_exchange_contact_fallback_runs_on_owner_event_loop():
+    owner_loop = asyncio.get_running_loop()
+    observed_loops = []
+
+    async def resolve_contact(_query):
+        observed_loops.append(asyncio.get_running_loop())
+        return "联系人"
+
+    exchange_client = SimpleNamespace(resolve_contact=resolve_contact)
+    builder = LarkCardBuilder(
+        lark_api_client=None,
+        exchange_client=exchange_client,
+        exchange_loop=owner_loop,
+    )
+
+    result = await asyncio.to_thread(
+        builder.lookup_lark_users,
+        ["recipient@example.com"],
+    )
+
+    assert result == {"recipient@example.com": {"name": "联系人"}}
+    assert observed_loops == [owner_loop]
 
 
 def test_build_approval_card_uses_pdf_url_from_dict():

@@ -2,6 +2,7 @@
 Lark Card Builder - 飞书卡片构建模块
 从 lark_app.py 拆分，负责卡片 JSON 结构的构建逻辑。
 """
+import asyncio
 import re
 import logging
 from typing import Dict, Any, List, Optional
@@ -108,10 +109,45 @@ def extract_email_address(raw: str) -> Optional[str]:
 class LarkCardBuilder:
     """飞书卡片构建器"""
 
-    def __init__(self, lark_api_client=None, exchange_client=None):
+    def __init__(
+        self,
+        lark_api_client=None,
+        exchange_client=None,
+        exchange_loop: asyncio.AbstractEventLoop | None = None,
+    ):
         self.lark_api_client = lark_api_client
         self.exchange_client = exchange_client
+        self.exchange_loop = exchange_loop
         self._user_cache: Dict[str, Dict[str, str]] = {}
+
+    def _resolve_exchange_contact(self, email: str) -> Optional[str]:
+        """Resolve a contact on the Exchange client's owning event loop.
+
+        Card construction runs in a worker thread, while ``ExchangeClient``
+        owns one shared ``httpx.AsyncClient`` on the application loop. Creating
+        a second event loop here can bind httpcore's async primitives to the
+        wrong loop and poison the next request, including mark-as-read.
+        """
+        if self.exchange_loop is not None:
+            if self.exchange_loop.is_closed():
+                raise RuntimeError("exchange_contact_loop_closed")
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is self.exchange_loop:
+                raise RuntimeError("exchange_contact_called_on_owner_loop")
+            future = asyncio.run_coroutine_threadsafe(
+                self.exchange_client.resolve_contact(email),
+                self.exchange_loop,
+            )
+            return future.result(timeout=10)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.exchange_client.resolve_contact(email))
+        raise RuntimeError("exchange_contact_loop_unavailable")
 
     @staticmethod
     def _approval_action_value(
@@ -203,25 +239,13 @@ class LarkCardBuilder:
 
         # Polling: Exchange contact resolution fallback
         if unresolved_emails and self.exchange_client:
-            import asyncio
             logger.info(
                 "Falling back to Exchange contact resolution: count=%d",
                 len(unresolved_emails),
             )
             for email in unresolved_emails:
                 try:
-                    # Run async resolve_contact in sync context
-                    try:
-                        asyncio.get_running_loop()
-                    except RuntimeError:
-                        name = asyncio.run(self.exchange_client.resolve_contact(email))
-                    else:
-                        import concurrent.futures
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            name = pool.submit(
-                                asyncio.run,
-                                self.exchange_client.resolve_contact(email)
-                            ).result(timeout=10)
+                    name = self._resolve_exchange_contact(email)
                     
                     if name:
                         logger.info(
