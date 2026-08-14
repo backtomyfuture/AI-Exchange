@@ -14,6 +14,11 @@ from fastapi.responses import JSONResponse, Response
 from typing import Any
 from src.config import get_settings
 from src.daily_digest import DailyDigestScheduler
+from src.maintenance.approval_sla import (
+    ApprovalExpiryService,
+    ApprovalSlaScheduler,
+    DatabaseApprovalExpiryRepository,
+)
 from src.email_feishu_delivery import build_email_feishu_delivery
 from src.db.maintenance_fence import RuntimeCheckpointMaintenanceFence
 from src.db.schema import require_runtime_database
@@ -323,6 +328,7 @@ async def _shutdown_application_components(
     lark_ws_start_attempted: bool,
     lark_ws_monitor_task: asyncio.Task[None] | None = None,
     daily_digest_scheduler: DailyDigestScheduler | None = None,
+    approval_sla_scheduler: ApprovalSlaScheduler | None = None,
     runtime_stop_seconds: float = _RUNTIME_STOP_SECONDS,
 ) -> None:
     """Attempt every owned shutdown stage before releasing the fence."""
@@ -330,6 +336,7 @@ async def _shutdown_application_components(
     failures: list[tuple[str, BaseException]] = []
     application.state.ingestion_runtime = None
     application.state.daily_digest_scheduler = None
+    application.state.approval_sla_scheduler = None
 
     def attempt_sync(stage: str, operation) -> bool:
         try:
@@ -377,6 +384,14 @@ async def _shutdown_application_components(
             else _async_noop()
         ),
     )
+    approval_sla_stopped = await attempt_async(
+        "approval_sla_stop",
+        lambda: (
+            approval_sla_scheduler.stop()
+            if approval_sla_scheduler is not None
+            else _async_noop()
+        ),
+    )
     runtime_stop_succeeded = await attempt_async(
         "runtime_stop",
         lambda: asyncio.wait_for(
@@ -412,6 +427,7 @@ async def _shutdown_application_components(
         and lark_ws_shutdown_started
         and lark_ws_monitor_stopped
         and daily_digest_stopped
+        and approval_sla_stopped
         and lark_disable_succeeded
         and lark_intake_stop_succeeded
         and lark_ws_stop_succeeded
@@ -493,7 +509,9 @@ async def application_lifespan(application: FastAPI):
     lark_ws_start_attempted = False
     lark_ws_monitor_task: asyncio.Task[None] | None = None
     daily_digest_scheduler: DailyDigestScheduler | None = None
+    approval_sla_scheduler: ApprovalSlaScheduler | None = None
     application.state.daily_digest_scheduler = None
+    application.state.approval_sla_scheduler = None
     try:
         if bool(getattr(settings, "DURABLE_INBOX_ENABLED", False)):
             fence = RuntimeCheckpointMaintenanceFence(
@@ -561,6 +579,42 @@ async def application_lifespan(application: FastAPI):
                 )
                 await daily_digest_scheduler.start()
                 application.state.daily_digest_scheduler = daily_digest_scheduler
+            async def _notify_expired_approval(row):
+                from src.email_feishu_delivery import ManualReviewNotificationRequest
+                from src.handoff.approval_feedback import record_human_route_outcome
+
+                record_human_route_outcome(
+                    context.email_processor,
+                    email_id=row.email_id,
+                    route_decision=row.route_decision,
+                    classification=row.classification if isinstance(row.classification, dict) else {},
+                    outcome="expired",
+                    original_draft=row.original_draft,
+                    final_draft=row.final_draft,
+                    waiting_since=row.waiting_since,
+                )
+                delivery = getattr(context, "email_feishu_delivery", None)
+                deliver = getattr(delivery, "deliver", None)
+                if not callable(deliver):
+                    return False
+                request = ManualReviewNotificationRequest(
+                    email_id=row.email_id,
+                    email_data={"id": row.email_id},
+                    classification=row.classification if isinstance(row.classification, dict) else {},
+                    reason="approval_expired",
+                    context=(),
+                    routing_log=(),
+                )
+                return await deliver(request, None)
+
+            approval_sla_scheduler = ApprovalSlaScheduler(
+                service=ApprovalExpiryService(
+                    repository=DatabaseApprovalExpiryRepository(context.db_manager),
+                    notify=_notify_expired_approval,
+                )
+            )
+            await approval_sla_scheduler.start()
+            application.state.approval_sla_scheduler = approval_sla_scheduler
         application.state.ingestion_runtime = runtime
         yield
     except BaseException as primary_exc:
@@ -575,6 +629,7 @@ async def application_lifespan(application: FastAPI):
                 lark_ws_start_attempted=lark_ws_start_attempted,
                 lark_ws_monitor_task=lark_ws_monitor_task,
                 daily_digest_scheduler=daily_digest_scheduler,
+                approval_sla_scheduler=approval_sla_scheduler,
                 runtime_stop_seconds=runtime_stop_seconds,
             )
         except BaseException as cleanup_exc:
@@ -596,6 +651,7 @@ async def application_lifespan(application: FastAPI):
             lark_ws_start_attempted=lark_ws_start_attempted,
             lark_ws_monitor_task=lark_ws_monitor_task,
             daily_digest_scheduler=daily_digest_scheduler,
+            approval_sla_scheduler=approval_sla_scheduler,
             runtime_stop_seconds=runtime_stop_seconds,
         )
 

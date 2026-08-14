@@ -149,6 +149,8 @@ class Settings(BaseSettings):
 
     # Embedding
     QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_EMAILS_COLLECTION: str = "emails"
+    QDRANT_ROUTING_SAMPLES_COLLECTION: str = "routing_samples"
     EMBEDDING_API_KEY: SecretStr = SecretStr("")
     EMBEDDING_BASE_URL: str = ""
     EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-4B"

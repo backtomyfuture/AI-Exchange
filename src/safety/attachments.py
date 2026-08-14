@@ -184,4 +184,26 @@ class AttachmentPolicy:
         return AttachmentDecision(True, name, content, is_image, None)
 
 
-__all__ = ["AttachmentDecision", "AttachmentPolicy", "DEFAULT_MAX_ATTACHMENT_BYTES"]
+_DEFAULT_POLICY: AttachmentPolicy | None = None
+
+
+def get_attachment_policy(*, max_bytes: int | None = None) -> AttachmentPolicy:
+    """Return the shared AttachmentPolicy used by retrieval and delivery."""
+
+    if max_bytes is None:
+        from src.config import get_settings
+        from src.safety.input_limits import input_limits_from_settings
+
+        max_bytes = input_limits_from_settings(get_settings()).attachment_single_bytes
+    global _DEFAULT_POLICY
+    if _DEFAULT_POLICY is None or _DEFAULT_POLICY._max_bytes != max_bytes:
+        _DEFAULT_POLICY = AttachmentPolicy(max_bytes=max_bytes)
+    return _DEFAULT_POLICY
+
+
+__all__ = [
+    "AttachmentDecision",
+    "AttachmentPolicy",
+    "DEFAULT_MAX_ATTACHMENT_BYTES",
+    "get_attachment_policy",
+]

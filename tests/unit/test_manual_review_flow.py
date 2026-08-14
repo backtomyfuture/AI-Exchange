@@ -269,6 +269,7 @@ async def test_run_ai_path_projects_manual_review_to_delivery_without_mark_read(
     request = ctx.email_feishu_delivery.deliver.await_args.args[0]
     assert isinstance(request, ManualReviewNotificationRequest)
     assert request.reason == "categorizer_model_failed"
+    ctx.email_processor.update_email_labels.assert_called()
     mark_read.assert_not_awaited()
     ctx.exchange_client.mark_as_read.assert_not_awaited()
 

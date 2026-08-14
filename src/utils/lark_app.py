@@ -2151,6 +2151,16 @@ async def _process_rejection_action(
                         {"approval_status": "rejected"},
                     ),
                 )
+                from src.handoff.approval_feedback import record_human_route_outcome
+                from src.init_app import get_runtime_app_context
+
+                record_human_route_outcome(
+                    get_runtime_app_context().email_processor,
+                    email_id=email_id,
+                    route_decision=state.values.get("route_decision"),
+                    classification=state.values.get("classification") or {},
+                    outcome="rejected",
+                )
             except Exception as exc:
                 # The durable rejection is authoritative.  A graph projection
                 # can be retried without changing that terminal outcome.
@@ -2182,6 +2192,16 @@ async def _process_rejection_action(
                 {"approval_status": "rejected"},
             )
             await graph.aupdate_state(config, update)
+            from src.handoff.approval_feedback import record_human_route_outcome
+            from src.init_app import get_runtime_app_context
+
+            record_human_route_outcome(
+                get_runtime_app_context().email_processor,
+                email_id=email_id,
+                route_decision=state.values.get("route_decision"),
+                classification=state.values.get("classification") or {},
+                outcome="rejected",
+            )
         except asyncio.CancelledError:
             logger.warning("Rejection handoff was cancelled after claim")
             await _move_claimed_action_to_manual(

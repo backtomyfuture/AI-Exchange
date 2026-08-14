@@ -30,7 +30,7 @@ MAX_CONTEXT_SNIPPET_BYTES = 384
 MAX_ROUTING_LOGS = 8
 MAX_ROUTING_LOG_BYTES = 256
 _ROUTING_STAGES = frozenset(
-    {"pending", "tier1", "tier2", "tier3", "system", "none"}
+    {"pending", "tier1", "tier2", "tier3", "system", "historical_inferred", "none"}
 )
 MAX_METADATA_TEXT_BYTES = 1_024
 # The visual summary is drafting context, not a transcript.  Keep enough room
@@ -62,6 +62,7 @@ _CLASSIFICATION_FIELDS = frozenset(
         "confidence",
         "action",
         "target_recipient",
+        "tier3_metadata_complete",
     }
 )
 _METADATA_FIELDS = frozenset(
@@ -266,7 +267,10 @@ def _sanitize_classification(value: object) -> dict[str, Any]:
         if key not in value:
             continue
         item = value[key]
-        if key in {"need_reply"}:
+        if key == "need_reply":
+            if type(item) is bool:
+                result[key] = item
+        elif key == "tier3_metadata_complete":
             if type(item) is bool:
                 result[key] = item
         elif key == "confidence":

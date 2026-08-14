@@ -42,15 +42,19 @@ def test_update_email_labels_writes_payload(processor):
         need_reply=True,
     )
     assert ok is True
-    args, kwargs = processor.qdrant_client.set_payload.call_args
-    assert kwargs["collection_name"] == processor.collection_name
-    assert kwargs["payload"] == {
+    calls = processor.qdrant_client.set_payload.call_args_list
+    assert [call.kwargs["collection_name"] for call in calls] == [
+        processor.collection_name,
+        processor.routing_collection_name,
+    ]
+    assert calls[0].kwargs["payload"] == {
         "route_decision": _decision(),
         "priority": "P0",
         "intent": "审批",
         "need_reply": True,
     }
-    assert kwargs["wait"] is False
+    assert processor.qdrant_client.set_payload.call_count == 2
+    assert calls[0].kwargs["wait"] is False
 
 
 def test_update_email_labels_noop_for_empty_id(processor):

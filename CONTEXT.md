@@ -36,8 +36,12 @@ A manually initiated, normally one-time analysis of Historical Email that uses t
 _Avoid_: Continuous learning, automatic rule creation
 
 **Historical RAG Context**:
-The shared Qdrant corpus of Historical Email used to retrieve relevant prior examples while processing a new Inbound Email. It is not limited to skill discovery.
-_Avoid_: Discovery-only corpus, separate historical index
+The shared Qdrant `emails` corpus of Historical Email used to retrieve relevant prior examples while processing a new Inbound Email. It is not limited to skill discovery.
+_Avoid_: Discovery-only corpus, routing-sample index
+
+**Routing Sample**:
+A Qdrant `routing_samples` point that stores one Canonical Route Decision plus eligibility flags for Historical Route Consensus. Writing retrieval must not read this collection.
+_Avoid_: Historical RAG Context, draft evidence
 
 **Declarative Tier 1 Skill**:
 A production routing rule represented by bounded data rather than executable `handler.py`. It may match an email and declare one Canonical Route Decision, including a versioned Handoff Profile for a writing route; it never sends email or names arbitrary executable code.

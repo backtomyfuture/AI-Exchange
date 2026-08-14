@@ -18,6 +18,29 @@ def _scrape() -> str:
     return body.decode("utf-8")
 
 
+def test_new_ops_metrics_are_exported():
+    m.record_route_decision("tier1")
+    m.record_manual_review()
+    m.record_reviewer_rewrite()
+    m.record_reviewer_reject("human")
+    m.record_approval_quality(draft_edited=False)
+    m.record_approval_quality(draft_edited=True)
+    m.record_silent_route("no_action", rule_id="vip_skip")
+    m.record_silent_route_share("silent", 0.4)
+    m.record_approval_expiry(SimpleNamespace(kind="expired", count=2, oldest_seconds=90000))
+
+    body = _scrape()
+    assert 'route_decisions_total{tier="tier1"}' in body
+    assert "manual_review_total" in body
+    assert "reviewer_rewrite_total" in body
+    assert 'reviewer_reject_total{source="human"}' in body
+    assert "approvals_as_written_total" in body
+    assert "approvals_after_edit_total" in body
+    assert 'silent_route_total{route="no_action",rule_id="vip_skip"}' in body
+    assert 'silent_route_share{route="silent"}' in body
+    assert "approval_expired_total" in body
+
+
 def test_record_email_status_increments_counter():
     m.record_email_status("ingested")
     m.record_email_status("ingested")

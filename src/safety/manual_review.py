@@ -15,6 +15,7 @@ from src.router.tier1.schema import CanonicalRoute
 
 MANUAL_REVIEW_CODES = frozenset(
     {
+        "approval_expired",
         "approval_handoff_failed",
         "approval_handoff_incomplete",
         "categorizer_input_too_large",
@@ -53,6 +54,7 @@ MANUAL_REVIEW_CODES = frozenset(
 DEFAULT_MANUAL_REVIEW_CODE = "invalid_classification"
 
 _REASON_LABELS: dict[str, str] = {
+    "approval_expired": "审批超过时限未处理，已转人工复核",
     "approval_handoff_failed": "审批流转失败，需人工核实",
     "approval_handoff_incomplete": "审批流转未完成，需人工核实",
     "categorizer_input_too_large": "邮件内容超出处理长度限制，需人工判断",

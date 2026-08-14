@@ -52,6 +52,8 @@ jobs:
         run: uv pip check --python .venv/bin/python
       - name: Run Ruff
         run: uv run --frozen ruff check src tests
+      - name: Compile Tier 1 rules
+        run: uv run --frozen python -c "from src.router.tier1.compiler import compile_registry, CompilationFailure; result = compile_registry('tier1_rules', internal_email_domains=('tianjin-air.com',), me_email='q-fu@tianjin-air.com'); raise SystemExit(result.message if isinstance(result, CompilationFailure) else 0)"
       - name: Verify production wheel availability
         shell: bash
         run: |

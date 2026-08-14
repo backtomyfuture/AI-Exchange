@@ -9,7 +9,10 @@ _PROFILES = {
         profile_id="generic_reply_v1", optional_sources=("mail_thread", "semantic_history")
     ),
     "generic_forward_v1": HandoffProfile(
-        profile_id="generic_forward_v1", optional_sources=("mail_thread", "semantic_history")
+        profile_id="generic_forward_v1",
+        optional_sources=("mail_thread", "semantic_history"),
+        writer_mode="fixed",
+        fixed_draft="呈阅",
     ),
     # A real business profile: the deterministic rule selects the writing
     # contract, while the read-only mail corpus supplies optional evidence.
@@ -17,7 +20,7 @@ _PROFILES = {
     "vip_direct_reply_v1": HandoffProfile(
         profile_id="vip_direct_reply_v1",
         optional_sources=("exchange_contact", "mail_thread", "semantic_history"),
-        writer_mode="template_then_llm",
+        writer_mode="llm",
         prompt_modifier=(
             "【VIP 直发写作合同】先明确回应本轮问题或任务，再给出下一步与时间承诺；"
             "信息不足时明确列出待确认项，不得编造日期、状态、金额或责任人。"

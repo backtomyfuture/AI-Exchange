@@ -28,6 +28,12 @@ from src.utils.lark_messaging import (
     find_daily_digest_headers,
     send_daily_digest_text,
 )
+from src.observability.silent_routes import (
+    count_silent,
+    publish_silent_share,
+    silent_share,
+    silent_share_alert,
+)
 from src.utils.mailbox_text import parse_serialized_mailbox
 
 
@@ -145,6 +151,10 @@ class DailyDigestSnapshot:
     polling_active: bool
     polling_cursor_ready: bool
     ready: bool
+    silent_count: int = 0
+    silent_share: float = 0.0
+    silent_baseline_share: float = 0.0
+    silent_share_alert: bool = False
 
     @property
     def processed_count(self) -> int:
@@ -272,8 +282,15 @@ def delivery_scope_hash(chat_id: str) -> str:
     return hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
 
 
-def digest_header(window: DailyDigestWindow, part: int | None = None, total: int | None = None) -> str:
-    header = f"【邮件日报 {window.label}】"
+def digest_header(
+    window: DailyDigestWindow,
+    part: int | None = None,
+    total: int | None = None,
+    *,
+    attention: bool = False,
+) -> str:
+    prefix = "【需关注】" if attention else ""
+    header = f"{prefix}【邮件日报 {window.label}】"
     if part is not None and total is not None:
         header += f"（第 {part}/{total} 部分）"
     return header
@@ -312,6 +329,7 @@ def render_daily_digest(
         and snapshot.processing_active
         and snapshot.polling_active
         and snapshot.polling_cursor_ready
+        and not snapshot.silent_share_alert
     ) else "需关注"
     lines = []
     if is_backfill:
@@ -333,6 +351,11 @@ def render_daily_digest(
         )
     )
     attention_lines: list[str] = []
+    if snapshot.silent_share_alert:
+        attention_lines.append(
+            f"- 静默路由占比偏离基线：今日 {snapshot.silent_share:.0%} / "
+            f"7日 {snapshot.silent_baseline_share:.0%}（{snapshot.silent_count} 封）"
+        )
     attention_lines.extend(
         f"- 历史漏发日报：{window.label}" for window in snapshot.missed_windows
     )
@@ -346,14 +369,22 @@ def render_daily_digest(
     if not snapshot.emails:
         lines.append("- 今日无新邮件")
 
-    single_header = digest_header(snapshot.window)
+    single_header = digest_header(
+        snapshot.window,
+        attention=snapshot.silent_share_alert,
+    )
     single_text = f"{single_header}\n" + "\n".join(lines)
     if len(single_text.encode("utf-8")) <= max_bytes:
         return ((single_header, single_text),)
 
     # Reserve enough bytes for the widest practical part marker so every
     # persisted message remains under the configured transport limit.
-    reserve_header = digest_header(snapshot.window, 999, 999)
+    reserve_header = digest_header(
+        snapshot.window,
+        999,
+        999,
+        attention=snapshot.silent_share_alert,
+    )
     chunks = _chunk_lines(lines, max_bytes - len(reserve_header.encode("utf-8")) - 1)
     if len(chunks) > 999:
         raise ValueError("daily_digest_too_many_parts")
@@ -417,6 +448,26 @@ class DailyDigestRepository:
                 email_rows = await cursor.fetchall()
                 await cursor.execute(
                     """
+                    WITH digest_rows AS (
+                        SELECT DISTINCT ON (inbox.external_email_id)
+                            COALESCE(email.status, inbox.status, 'unknown') AS status
+                        FROM public.event_inbox AS inbox
+                        LEFT JOIN public.emails AS email
+                          ON email.account_id = inbox.account_id
+                         AND email.external_email_id = inbox.external_email_id
+                        WHERE inbox.account_id = %s
+                          AND inbox.change_kind = 'create'
+                          AND inbox.received_at >= %s
+                          AND inbox.received_at < %s
+                        ORDER BY inbox.external_email_id, inbox.received_at ASC
+                    )
+                    SELECT status FROM digest_rows
+                    """,
+                    (self._account_id, window.start - timedelta(days=7), window.start),
+                )
+                baseline_rows = await cursor.fetchall()
+                await cursor.execute(
+                    """
                     WITH backlog_rows AS (
                         SELECT DISTINCT ON (inbox.external_email_id)
                             inbox.external_email_id,
@@ -467,6 +518,19 @@ class DailyDigestRepository:
             DailyDigestWindow(_as_utc(row["window_start"]), _as_utc(row["window_end"]))
             for row in missed_rows
         )
+        today_silent, today_total = count_silent(item.status for item in emails)
+        baseline_silent, baseline_total = count_silent(
+            row["status"] for row in baseline_rows
+        )
+        today_share = silent_share(today_silent, today_total)
+        baseline_share = silent_share(baseline_silent, baseline_total)
+        alert = silent_share_alert(
+            today_silent=today_silent,
+            today_total=today_total,
+            baseline_silent=baseline_silent,
+            baseline_total=baseline_total,
+        )
+        publish_silent_share("silent", today_share)
         return DailyDigestSnapshot(
             window=window,
             emails=emails,
@@ -476,6 +540,10 @@ class DailyDigestRepository:
             processing_active=bool(getattr(health, "processing_active", False)),
             polling_active=bool(getattr(health, "polling_active", False)),
             polling_cursor_ready=bool(getattr(health, "polling_cursor_ready", False)),
+            silent_count=today_silent,
+            silent_share=today_share,
+            silent_baseline_share=baseline_share,
+            silent_share_alert=alert,
         )
 
     async def get_execution(

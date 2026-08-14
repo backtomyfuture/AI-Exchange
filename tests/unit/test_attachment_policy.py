@@ -14,7 +14,7 @@ from src.email_feishu_delivery import (
     ReadNotificationRequest,
 )
 from src.nodes.retriever_node import _visual_analysis_inputs
-from src.safety.attachments import AttachmentPolicy
+from src.safety.attachments import AttachmentPolicy, get_attachment_policy
 
 
 def _attachment(
@@ -159,3 +159,9 @@ def test_visual_boundary_does_not_forward_disguised_image_to_a_model():
     )
 
     assert inputs == []
+
+
+def test_retrieval_and_delivery_share_one_attachment_policy():
+    first = get_attachment_policy(max_bytes=1024)
+    second = get_attachment_policy(max_bytes=1024)
+    assert first is second

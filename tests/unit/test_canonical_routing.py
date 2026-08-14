@@ -52,15 +52,17 @@ async def test_tier2_votes_on_canonical_actions_not_legacy_skill_ids():
         route=CanonicalRoute.REPLY,
         params={"reply_mode": "sender_only"},
         provenance=RouteProvenance(
-            tier=RouteTier.TIER3,
-            source_version="router-model-v1",
-            confidence=0.9,
+            tier=RouteTier.TIER1,
+            source_version="tier1-artifact-v1",
+            artifact_digest="a" * 64,
+            confidence=1.0,
         ),
         reason_code="historical_label",
     ).model_dump(mode="json")
     hits = [
-        {"id": "h1", "route_decision": historical},
-        {"id": "h2", "route_decision": historical},
+        {"id": "h1", "sender": "a@x.com", "thread_id": "t1", "score": 0.91, "route_decision": historical},
+        {"id": "h2", "sender": "b@x.com", "thread_id": "t2", "score": 0.88, "route_decision": historical},
+        {"id": "h3", "sender": "c@x.com", "thread_id": "t3", "score": 0.86, "route_decision": historical},
     ]
 
     delta = await engine.apply_tier2_hits({}, hits)
@@ -68,7 +70,7 @@ async def test_tier2_votes_on_canonical_actions_not_legacy_skill_ids():
     decision = RouteDecision.model_validate(delta["route_decision"])
     assert decision.route is CanonicalRoute.REPLY
     assert decision.provenance.tier is RouteTier.TIER2
-    assert decision.provenance.evidence_ids == ["h1", "h2"]
+    assert decision.provenance.evidence_ids == ["h1", "h2", "h3"]
     assert "active_skills" not in delta
 
 
@@ -83,6 +85,10 @@ async def test_tier3_requires_strict_route_json_and_fails_closed():
                 "params": {},
                 "confidence": 0.82,
                 "reason_code": "informational_notice",
+                "priority": "P3",
+                "intent": "通知",
+                "summary": "FYI notice",
+                "reasoning": "informational",
             }
         )
     )
@@ -93,6 +99,8 @@ async def test_tier3_requires_strict_route_json_and_fails_closed():
     decision = RouteDecision.model_validate(delta["route_decision"])
     assert decision.route is CanonicalRoute.READ_ONLY
     assert decision.provenance.tier is RouteTier.TIER3
+    assert delta["classification"]["priority"] == "P3"
+    assert delta["classification"]["tier3_metadata_complete"] is True
 
     model.ainvoke.return_value = Mock(content='{"route":"unknown"}')
     with patch("src.providers.factory.get_llm_for_role", return_value=model):

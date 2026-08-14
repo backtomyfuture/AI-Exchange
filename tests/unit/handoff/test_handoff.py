@@ -29,7 +29,7 @@ def _historical(profile: str | None = None) -> dict:
         outcome=DecisionOutcome.MATCHED,
         route=CanonicalRoute.REPLY,
         params=params,
-        provenance=RouteProvenance(tier=RouteTier.TIER3, source_version="router-model-v1"),
+        provenance=RouteProvenance(tier=RouteTier.TIER2, source_version="historical-route-consensus-v1"),
         handoff_profile_id=profile,
     )
     return decision.model_dump(mode="json")
@@ -44,6 +44,45 @@ def test_immutable_versioned_dtos_have_stable_canonical_digests():
     assert plan.canonical_digest() == HandoffPlan.model_validate(plan.model_dump()).canonical_digest()
     with pytest.raises(ValidationError):
         item.content = "changed"
+
+
+@pytest.mark.asyncio
+async def test_unknown_handoff_profile_fails_closed_before_writing():
+    from src.exchange_service import _prepare_durable_handoff
+    from src.router.decision import DecisionOutcome, RouteDecision, RouteProvenance, RouteTier
+    from src.router.tier1.schema import CanonicalRoute
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    decision = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.REPLY,
+        params={"reply_mode": "sender_only"},
+        provenance=RouteProvenance(
+            tier=RouteTier.TIER1,
+            source_version="tier1-artifact-v1",
+            artifact_digest="a" * 64,
+            confidence=1.0,
+        ),
+        reason_code="test",
+        handoff_profile_id="retired_profile_v1",
+    )
+    ctx = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            persist_handoff_plan=AsyncMock(),
+            persist_handoff_evidence=AsyncMock(),
+        )
+    )
+    boundary = SimpleNamespace(scope=SimpleNamespace(inbox_id="inbox-1"))
+    context, error = await _prepare_durable_handoff(
+        "mail-1",
+        {"id": "mail-1", "subject": "Q", "body": "body"},
+        decision,
+        ctx,
+        _effect_boundary=boundary,  # type: ignore[arg-type]
+    )
+    assert context == {}
+    assert error == "handoff_profile_failed"
 
 
 def test_registry_is_static_and_rejects_unknown_or_ad_hoc_adapter():
@@ -126,7 +165,17 @@ def test_vip_profile_has_real_readonly_history_plan():
         "mail_thread",
         "semantic_history",
     )
+    assert plan.writer_mode == "llm"
+    assert plan.fixed_draft is None
     assert profile.readonly is True
+
+
+def test_generic_forward_profile_is_a_fixed_writing_contract():
+    profile = get_handoff_profile("generic_forward_v1")
+    plan = profile.build_plan()
+    assert plan.writer_mode == "fixed"
+    assert plan.fixed_draft == "呈阅"
+    assert "template_then_llm" not in HandoffPlan.model_fields["writer_mode"].annotation.__args__
 
 
 def test_history_deduplicates_identical_evidence_votes():
@@ -192,6 +241,83 @@ def test_history_does_not_coerce_evidence_identity_types():
             {"id": "1", "route_decision": label},
         ]
     ) is None
+
+
+def test_history_excludes_tier3_and_historical_inferred_votes():
+    consensus = HistoricalRouteConsensus()
+    guessed = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.REPLY,
+        params={"reply_mode": "sender_only"},
+        provenance=RouteProvenance(tier=RouteTier.TIER3, source_version="router-model-v1"),
+    ).model_dump(mode="json")
+    inferred = RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute.REPLY,
+        params={"reply_mode": "sender_only"},
+        provenance=RouteProvenance(
+            tier=RouteTier.HISTORICAL_INFERRED,
+            source_version="historical-inferred-v1",
+        ),
+    ).model_dump(mode="json")
+    verified = _historical()
+
+    assert consensus.decide(
+        [
+            {"id": "g1", "route_decision": guessed, "score": 0.9},
+            {"id": "g2", "route_decision": guessed, "score": 0.9},
+            {"id": "g3", "route_decision": guessed, "score": 0.9},
+            {"id": "i1", "route_decision": inferred, "score": 0.9},
+            {"id": "v1", "route_decision": verified, "score": 0.9},
+            {"id": "v2", "route_decision": verified, "score": 0.9},
+            {"id": "v3", "route_decision": verified, "score": 0.9},
+        ]
+    ) is not None
+
+
+def test_history_folds_same_sender_and_thread_to_one_vote():
+    consensus = HistoricalRouteConsensus()
+    label = _historical()
+    hits = [
+        {
+            "id": f"same-thread-{index}",
+            "sender": "Boss <boss@example.com>",
+            "thread_id": "thread-1",
+            "score": 0.91,
+            "route_decision": label,
+        }
+        for index in range(5)
+    ]
+
+    assert consensus.decide(hits) is None
+
+
+def test_history_requires_three_independent_sources_and_similarity_floor():
+    consensus = HistoricalRouteConsensus()
+    label = _historical()
+
+    assert consensus.decide(
+        [
+            {"id": "a", "sender": "a@x.com", "thread_id": "t-a", "score": 0.91, "route_decision": label},
+            {"id": "b", "sender": "b@x.com", "thread_id": "t-b", "score": 0.91, "route_decision": label},
+        ]
+    ) is None
+    assert consensus.decide(
+        [
+            {"id": "a", "sender": "a@x.com", "thread_id": "t-a", "score": 0.5, "route_decision": label},
+            {"id": "b", "sender": "b@x.com", "thread_id": "t-b", "score": 0.5, "route_decision": label},
+            {"id": "c", "sender": "c@x.com", "thread_id": "t-c", "score": 0.5, "route_decision": label},
+        ]
+    ) is None
+    decision = consensus.decide(
+        [
+            {"id": "a", "sender": "a@x.com", "thread_id": "t-a", "score": 0.91, "route_decision": label},
+            {"id": "b", "sender": "b@x.com", "thread_id": "t-b", "score": 0.88, "route_decision": label},
+            {"id": "c", "sender": "c@x.com", "thread_id": "t-c", "received_at": "2026-01-01T00:00:00+00:00", "route_decision": label},
+        ]
+    )
+    assert decision is not None
+    assert decision.provenance.tier is RouteTier.TIER2
 
 
 @pytest.mark.asyncio

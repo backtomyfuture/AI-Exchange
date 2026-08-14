@@ -28,7 +28,8 @@ class EmailProcessor:
         embedding_api_key: Optional[str] = None,
         embedding_base_url: Optional[str] = None,
         embedding_model: Optional[str] = None,
-        collection_name: str = "emails"
+        collection_name: str | None = None,
+        routing_collection_name: str | None = None,
     ):
         settings = get_settings()
         self.qdrant_client = QdrantClient(url=qdrant_url or settings.QDRANT_URL)
@@ -45,7 +46,10 @@ class EmailProcessor:
         )
         self.embedding_model = embedding_model or settings.EMBEDDING_MODEL
         
-        self.collection_name = collection_name
+        self.collection_name = collection_name or settings.QDRANT_EMAILS_COLLECTION
+        self.routing_collection_name = (
+            routing_collection_name or settings.QDRANT_ROUTING_SAMPLES_COLLECTION
+        )
         
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, 
@@ -83,15 +87,16 @@ class EmailProcessor:
             raise
 
     def init_collection(self):
-        try:
-            self.qdrant_client.get_collection(self.collection_name)
-            logger.info(f"Collection {self.collection_name} exists.")
-        except UnexpectedResponse:
-            logger.info(f"Collection {self.collection_name} does not exist. Creating...")
-            self.qdrant_client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=models.VectorParams(size=self.embedding_dim, distance=models.Distance.COSINE),
-            )
+        for name in (self.collection_name, self.routing_collection_name):
+            try:
+                self.qdrant_client.get_collection(name)
+                logger.info(f"Collection {name} exists.")
+            except UnexpectedResponse:
+                logger.info(f"Collection {name} does not exist. Creating...")
+                self.qdrant_client.create_collection(
+                    collection_name=name,
+                    vectors_config=models.VectorParams(size=self.embedding_dim, distance=models.Distance.COSINE),
+                )
 
     @staticmethod
     def generate_deterministic_uuid(content: str) -> str:
@@ -318,6 +323,10 @@ class EmailProcessor:
         priority: Optional[str] = None,
         intent: Optional[str] = None,
         need_reply: Optional[bool] = None,
+        human_verified: Optional[bool] = None,
+        draft_edited: Optional[bool] = None,
+        label_source: Optional[str] = None,
+        eligible_for_tier2: Optional[bool] = None,
     ) -> bool:
         """
         Write classification/routing labels back into Qdrant payload for already-ingested emails.
@@ -341,6 +350,14 @@ class EmailProcessor:
             payload_update["intent"] = intent
         if need_reply is not None:
             payload_update["need_reply"] = bool(need_reply)
+        if human_verified is not None:
+            payload_update["human_verified"] = bool(human_verified)
+        if draft_edited is not None:
+            payload_update["draft_edited"] = bool(draft_edited)
+        if label_source is not None:
+            payload_update["label_source"] = str(label_source)
+        if eligible_for_tier2 is not None:
+            payload_update["eligible_for_tier2"] = bool(eligible_for_tier2)
         if not payload_update:
             return False
 
@@ -348,18 +365,21 @@ class EmailProcessor:
             point_filter = models.Filter(
                 must=[models.FieldCondition(key="id", match=models.MatchValue(value=email_id))]
             )
-            self.qdrant_client.set_payload(
-                collection_name=self.collection_name,
-                payload=payload_update,
-                points=point_filter,
-                wait=False,
-            )
+            updated = False
+            for collection_name in (self.collection_name, self.routing_collection_name):
+                self.qdrant_client.set_payload(
+                    collection_name=collection_name,
+                    payload=payload_update,
+                    points=point_filter,
+                    wait=False,
+                )
+                updated = True
             logger.info(
                 "Updated Qdrant labels: email=%s field_count=%d",
                 fingerprint_identifier(email_id, namespace="email"),
                 len(payload_update),
             )
-            return True
+            return updated
         except UnexpectedResponse as exc:
             logger.error(
                 "Qdrant set-payload failed: email=%s error_type=%s",

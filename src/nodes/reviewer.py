@@ -174,6 +174,9 @@ async def review_draft(
             len(str(issues).encode("utf-8")),
         )
         if review_count >= 1:
+            from src.observability.metrics import record_reviewer_reject
+
+            record_reviewer_reject(source="reviewer")
             return build_manual_review_delta(
                 state,
                 "reviewer_rewrite_limit",
@@ -182,6 +185,9 @@ async def review_draft(
                     "issues": "reviewer_rewrite_limit",
                 },
             )
+        from src.observability.metrics import record_reviewer_rewrite
+
+        record_reviewer_rewrite()
         metadata = dict(metadata)
         metadata["review_count"] = review_count + 1
         metadata["review_issues"] = issues

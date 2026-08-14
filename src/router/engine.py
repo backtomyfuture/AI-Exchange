@@ -29,8 +29,9 @@ from src.safety.model_budget import enforce_model_input_budget, token_budget_fro
 
 logger = logging.getLogger(__name__)
 
-TIER2_MIN_HITS = 2
-TIER2_MIN_RATIO = 0.5
+TIER2_MIN_HITS = 3
+TIER2_MIN_RATIO = 0.67
+TIER2_MIN_SCORE = 0.75
 _MAILBOX_ADDRESS = re.compile(r"email_address='([^']+)'", re.IGNORECASE)
 
 
@@ -41,6 +42,10 @@ class _Tier3Result(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(ge=0.0, le=1.0)
     reason_code: str = Field(min_length=1, max_length=128)
+    priority: str | None = Field(default=None, pattern=r"^P[0-3]$")
+    intent: str | None = Field(default=None, max_length=32)
+    summary: str | None = Field(default=None, max_length=512)
+    reasoning: str | None = Field(default=None, max_length=512)
 
 
 def _address(value: object) -> str:
@@ -84,13 +89,22 @@ def classification_for_route(decision: RouteDecision) -> dict[str, Any]:
     return {}
 
 
-def _decision_delta(decision: RouteDecision) -> AgentState:
+def _decision_delta(
+    decision: RouteDecision,
+    *,
+    classification_extra: Mapping[str, Any] | None = None,
+) -> AgentState:
     stage = decision.provenance.tier.value
+    classification = classification_for_route(decision)
+    if classification_extra:
+        for key, value in classification_extra.items():
+            if value not in (None, ""):
+                classification[key] = value
     delta: AgentState = {
         "route_decision": decision.model_dump(mode="json"),
         "routing_stage": stage,
         "routing_log": [f"{stage} route={decision.route.value if decision.route else 'abstain'}"],
-        "classification": classification_for_route(decision),
+        "classification": classification,
     }
     if decision.route is CanonicalRoute.FORWARD:
         delta["draft_to"] = list(decision.params["fixed_recipients"])
@@ -233,15 +247,32 @@ class RoutingEngine:
         decision = HistoricalRouteConsensus(
             min_hits=TIER2_MIN_HITS,
             min_ratio=TIER2_MIN_RATIO,
+            min_score=TIER2_MIN_SCORE,
+            received_before=(state.get("email") or {}).get("received_at"),
         ).decide(hit for hit in (hits or []) if isinstance(hit, Mapping))
         return {} if decision is None else _decision_delta(decision)
 
     async def apply_tier3_fallback(self, state: AgentState) -> AgentState:
         email = state.get("email") or {}
+        neighbors = []
+        for hit in (state.get("routing_neighbors") or [])[:5]:
+            if not isinstance(hit, Mapping):
+                continue
+            neighbors.append(
+                {
+                    "id": str(hit.get("id") or "")[:80],
+                    "subject": str(hit.get("subject") or "")[:160],
+                    "route": str((hit.get("route_decision") or {}).get("route") or ""),
+                }
+            )
+        neighbor_text = json.dumps(neighbors, ensure_ascii=True) if neighbors else "[]"
         prompt = (
             "Classify this email into exactly one route. Return strict JSON with keys "
-            "route, params, confidence, reason_code. Routes: reply, forward, read_only, "
-            "no_action, manual_review. Forward params require fixed_recipients. "
+            "route, params, confidence, reason_code, priority, intent, summary, reasoning. "
+            "Routes: reply, forward, read_only, no_action, manual_review. "
+            "Forward params require fixed_recipients. priority must be P0-P3. "
+            "Neighbors are historical similar emails and are optional context only. "
+            f"Neighbors: {neighbor_text}\n"
             f"Subject: {str(email.get('subject') or '')[:500]}\n"
             f"Sender: {_address(email.get('sender'))[:320]}\n"
             f"Body: {str(email.get('body') or '')[:2000]}"
@@ -261,6 +292,14 @@ class RoutingEngine:
                 raise ValueError("router_schema_invalid")
             parsed = _Tier3Result.model_validate(json.loads(content))
             Decision(route=parsed.route, params=parsed.params)
+            extra = {
+                key: getattr(parsed, key)
+                for key in ("priority", "intent", "summary", "reasoning")
+                if getattr(parsed, key)
+            }
+            extra["tier3_metadata_complete"] = bool(
+                extra.get("priority") and extra.get("intent") and extra.get("summary")
+            )
             decision = RouteDecision(
                 outcome=DecisionOutcome.MATCHED,
                 route=parsed.route,
@@ -291,7 +330,8 @@ class RoutingEngine:
                 ),
                 reason_code="router_model_failed",
             )
-        return _decision_delta(decision)
+            extra = None
+        return _decision_delta(decision, classification_extra=extra)
 
     async def resolve_route(
         self,
@@ -365,6 +405,7 @@ __all__ = [
     "RoutingEngine",
     "TIER2_MIN_HITS",
     "TIER2_MIN_RATIO",
+    "TIER2_MIN_SCORE",
     "configure_routing_engine",
     "classification_for_route",
     "get_routing_engine",
