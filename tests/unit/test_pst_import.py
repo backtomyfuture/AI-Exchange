@@ -493,6 +493,27 @@ class TestExchangeImport:
         assert result.to == ["x@y.com", "z@w.com"]
         assert result.cc == []
 
+    def test_exchange_item_to_parsed_email_gateway_recipient_fields(self):
+        from scripts.import_pst import _exchange_item_to_parsed_email
+
+        item = {
+            "id": "AAMkGatewayRecipients123",
+            "subject": "Gateway recipients",
+            "sender": "a@b.com",
+            "to_recipients": [
+                "Mailbox(name='To User', email_address='to@example.com')",
+            ],
+            "cc_recipients": [
+                "Mailbox(name='Cc User', email_address='cc@example.com')",
+            ],
+            "body": "Hello",
+        }
+
+        result = _exchange_item_to_parsed_email(item, folder="INBOX")
+        assert result is not None
+        assert result.to == item["to_recipients"]
+        assert result.cc == item["cc_recipients"]
+
     def test_exchange_item_to_parsed_email_with_attachments(self):
         from scripts.import_pst import _exchange_item_to_parsed_email
 

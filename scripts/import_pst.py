@@ -488,8 +488,8 @@ def _exchange_item_to_parsed_email(
         sender = _parse_exchange_sender(
             item.get("sender") or item.get("from")
         )
-        to_raw = item.get("to", [])
-        cc_raw = item.get("cc", [])
+        to_raw = item.get("to") or item.get("to_recipients") or []
+        cc_raw = item.get("cc") or item.get("cc_recipients") or []
 
         # Handle both list and string formats
         if isinstance(to_raw, str):
