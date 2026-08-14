@@ -271,7 +271,8 @@ async def _resolve_and_persist_canonical_route(
             email_id=email_id,
             _effect_boundary=_effect_boundary,
         )
-        route_state = {**route_state, "routing_neighbors": hits}
+        neighbor_hits = list(getattr(hits, "hits", hits) or [])
+        route_state = {**route_state, "routing_neighbors": neighbor_hits}
         tier2 = await engine.apply_tier2_hits(route_state, hits)
         await _persist_route_evaluation(
             ctx,

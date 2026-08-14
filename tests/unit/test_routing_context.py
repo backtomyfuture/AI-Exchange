@@ -26,7 +26,7 @@ async def test_routing_retrieval_bundle_is_shared_with_both_route_tiers():
         }
     ]
 
-    with patch("src.exchange_service.get_retriever", return_value=retriever):
+    with patch("src.exchange_service.get_routing_retriever", return_value=retriever):
         bundle = await _routing_evidence_hits(
             {
                 "thread_id": "thread-1",
@@ -50,7 +50,7 @@ async def test_routing_retrieval_failure_is_not_presented_as_no_history():
     retriever = Mock()
     retriever.search_by_thread.side_effect = RuntimeError("qdrant unavailable")
 
-    with patch("src.exchange_service.get_retriever", return_value=retriever):
+    with patch("src.exchange_service.get_routing_retriever", return_value=retriever):
         bundle = await _routing_evidence_hits(
             {
                 "thread_id": "thread-1",
@@ -78,7 +78,7 @@ async def test_partial_routing_retrieval_preserves_thread_evidence():
     ]
     retriever.search.side_effect = RuntimeError("embedding unavailable")
 
-    with patch("src.exchange_service.get_retriever", return_value=retriever):
+    with patch("src.exchange_service.get_routing_retriever", return_value=retriever):
         bundle = await _routing_evidence_hits(
             {
                 "thread_id": "thread-1",

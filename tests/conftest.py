@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
 
 @pytest.fixture
 def mock_settings():
