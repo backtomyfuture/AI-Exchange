@@ -16,6 +16,7 @@ from scripts.import_pst import (
     ImportStats,
     ParsedEmail,
     _generate_email_id,
+    _infer_historical_route_decisions,
     _infer_folder_type,
     _parse_address_list,
     _parse_date,
@@ -103,6 +104,31 @@ class TestParsedEmail:
         assert d["attachments"] == []
         assert d["source_folder"] == "Inbox"
 
+    def test_to_dict_includes_historical_route_decision(self):
+        pe = ParsedEmail(
+            id="received_001",
+            subject="Historical",
+            sender="sender@example.com",
+            to=["owner@example.com"],
+            cc=[],
+            body="Hello World",
+            received_at="2024-01-01T10:00:00",
+            route_decision={
+                "outcome": "matched",
+                "route": "reply",
+                "params": {},
+                "provenance": {
+                    "tier": "system",
+                    "source_version": "history-import-route-v1",
+                    "evidence_ids": ["sent_001"],
+                    "confidence": 1.0,
+                },
+                "reason_code": "historical_sent_reply",
+            },
+        )
+
+        assert pe.to_dict()["route_decision"]["route"] == "reply"
+
 
 # ---------------------------------------------------------------------------
 # Email message parsing
@@ -152,6 +178,94 @@ class TestParseEmailMessage:
         result = parse_email_message(msg, folder="Inbox", raw_bytes=raw)
         assert result.in_reply_to == "<original@example.com>"
         assert result.conversation_id == "<original@example.com>"
+
+
+class TestHistoricalRouteInference:
+    def _received(self, **overrides):
+        values = {
+            "id": "received_001",
+            "subject": "Original subject",
+            "sender": "author@example.com",
+            "to": ["owner@example.com"],
+            "cc": [],
+            "body": "Original body",
+            "received_at": "2024-01-01T10:00:00+00:00",
+            "message_type": "received",
+            "internet_message_id": "<original@example.com>",
+        }
+        values.update(overrides)
+        return ParsedEmail(**values)
+
+    def _sent(self, **overrides):
+        values = {
+            "id": "sent_001",
+            "subject": "Re: Original subject",
+            "sender": "owner@example.com",
+            "to": ["author@example.com"],
+            "cc": [],
+            "body": "Reply body",
+            "received_at": "2024-01-01T11:00:00+00:00",
+            "message_type": "sent",
+            "internet_message_id": "<reply@example.com>",
+            "in_reply_to": "<original@example.com>",
+        }
+        values.update(overrides)
+        return ParsedEmail(**values)
+
+    def test_exact_sent_in_reply_to_marks_original_as_reply(self):
+        original = self._received()
+        sent = self._sent()
+
+        labeled = _infer_historical_route_decisions([original, sent])
+
+        assert labeled["received_001"]["route"] == "reply"
+        assert "sent_001" not in labeled
+
+    def test_forward_requires_forwarded_original_and_actual_recipient(self):
+        original = self._received()
+        sent = self._sent(
+            id="sent_forward_001",
+            subject="Fwd: Original subject",
+            to=["leader@example.com"],
+            body=(
+                "---------- Forwarded message ---------\n"
+                "From: author@example.com\n"
+                "Subject: Original subject\n\n"
+                "Original body"
+            ),
+            in_reply_to="",
+        )
+
+        labeled = _infer_historical_route_decisions([original, sent])
+
+        assert labeled["received_001"]["route"] == "forward"
+        assert labeled["received_001"]["params"]["fixed_recipients"] == [
+            "leader@example.com"
+        ]
+
+    def test_unproven_forward_is_left_unprocessed(self):
+        original = self._received()
+        sent = self._sent(
+            id="sent_forward_002",
+            subject="Fwd: Original subject",
+            to=[],
+            body="---------- Forwarded message ---------\nPlease see this.",
+            in_reply_to="",
+        )
+
+        labeled = _infer_historical_route_decisions([original, sent])
+
+        assert labeled == {}
+
+    def test_in_reply_to_with_multiple_ids_is_not_an_exact_reply_match(self):
+        original = self._received()
+        sent = self._sent(
+            in_reply_to="<other@example.com> <original@example.com>",
+        )
+
+        labeled = _infer_historical_route_decisions([original, sent])
+
+        assert labeled == {}
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +705,61 @@ class TestExchangeImport:
             assert stats.imported == 3
             assert stats.points_created == 0
 
+    def test_exchange_route_evidence_is_not_imported(self, capsys):
+        received = ParsedEmail(
+            id="received_001",
+            subject="Original subject",
+            sender="author@example.com",
+            to=["owner@example.com"],
+            cc=[],
+            body="Original body",
+            received_at="2024-01-01T10:00:00+00:00",
+            message_type="received",
+            source_folder="Inbox",
+            internet_message_id="<original@example.com>",
+        )
+        sent = ParsedEmail(
+            id="sent_001",
+            subject="Re: Original subject",
+            sender="owner@example.com",
+            to=["author@example.com"],
+            cc=[],
+            body="Reply body",
+            received_at="2024-01-01T11:00:00+00:00",
+            message_type="sent",
+            source_folder="Sent Items",
+            internet_message_id="<reply@example.com>",
+            in_reply_to="<original@example.com>",
+        )
+
+        def iter_for_folder(*, folder, **_kwargs):
+            return iter([received] if folder == "INBOX" else [sent])
+
+        with (
+            patch("scripts.import_pst.iter_from_exchange", side_effect=iter_for_folder),
+            patch("scripts.import_pst._infer_historical_route_decisions") as infer,
+        ):
+            infer.side_effect = _infer_historical_route_decisions
+            stats = run_import(
+                source=None,
+                dry_run=True,
+                source_type="exchange",
+                exchange_folder="INBOX",
+                exchange_limit=100,
+                exchange_all_mail=True,
+                route_evidence_folder="sent",
+            )
+
+        output = capsys.readouterr().out
+        assert stats.total == 1
+        assert stats.imported == 1
+        assert stats.route_reply == 1
+        assert stats.route_forward == 0
+        assert stats.route_unprocessed == 0
+        assert "Original subject" in output
+        assert "route=reply" in output
+        assert "Reply body" not in output
+
     def test_exchange_is_preferred_over_a_duplicate_local_supplement(
         self, tmp_path: Path, capsys
     ):
@@ -822,6 +991,64 @@ class TestExchangeImport:
 
         assert "missing-detail" not in caplog.text
         assert "not found" not in caplog.text
+
+    def test_exchange_detail_timeout_is_retried_once(self):
+        from scripts.import_pst import iter_from_exchange
+
+        detail_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal detail_calls
+            if request.url.path.endswith("/list"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "total": 1,
+                            "items": [{"id": "transient-detail"}],
+                        }
+                    },
+                )
+            detail_calls += 1
+            if detail_calls == 1:
+                raise httpx.ReadTimeout("transient")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "id": "transient-detail",
+                        "subject": "Recovered detail",
+                        "sender": "sender@example.com",
+                        "body": "Body",
+                    }
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        settings = SimpleNamespace(
+            EXCHANGE_API_URL="https://exchange.example/api/v1/exchange/emails",
+            EXCHANGE_API_KEY="secret",
+            EXCHANGE_ACCOUNT_ID=8,
+            EXCHANGE_SSL_VERIFY=True,
+        )
+        with (
+            patch("src.config.get_settings", return_value=settings),
+            patch("src.config.resolve_secret", return_value="secret"),
+            patch("httpx.Client", side_effect=client_factory),
+        ):
+            messages = list(
+                iter_from_exchange(folder="sent", limit=1, all_mail=True)
+            )
+
+        assert detail_calls == 2
+        assert len(messages) == 1
+        assert messages[0].subject == "Recovered detail"
 
     def test_exchange_list_count_mismatch_marks_the_import_incomplete(self):
         from scripts.import_pst import ExchangeImportIncomplete, iter_from_exchange

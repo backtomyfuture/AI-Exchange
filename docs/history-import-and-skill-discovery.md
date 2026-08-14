@@ -36,11 +36,38 @@ SOURCE                    PST/Mbox/EML 文件或 EML 目录
 --limit N                 Exchange 拉取上限
 --all-mail                包含已读邮件；历史回填必须显式使用
 --supplement PATH         Exchange 优先完成后，用 PST/Mbox/EML 补充缺失邮件
+--route-evidence-folder   额外读取一个 Exchange 文件夹作为 route_decision 证据；
+                          证据邮件本身不导入
+--route-evidence-limit    route_decision 证据邮件上限；默认沿用 --limit
 ```
 
 `--folder ALL` 会导入 Inbox、Sent Items 和非空的用户自建邮件文件夹，默认排除 Drafts、Outbox、Junk Email 和 Deleted Items。列表、详情或服务端总数不完整时，命令以失败退出，不把部分结果报告成完整导入。
 
 同一次 `--source exchange --supplement ...` 运行总是先读取 Exchange。Internet Message-ID 相同的本地副本会跳过；缺少 Message-ID 时使用规范化邮件签名兜底。摘要分别显示空正文、重复、失败、成功邮件和 Qdrant 点数；历史导入会等待 Qdrant 确认写入，Qdrant/Embedding 返回零点时进程以非零状态退出。
+
+### 历史 route_decision 证据
+
+导入器不会猜测历史路由，只给主导入范围内的收件邮件写入可验证的
+`route_decision`。已发送邮件可以通过 `--route-evidence-folder` 作为只读证据，但
+不会被导入。当前只启用两条判定：
+
+1. 已发送邮件的 `In-Reply-To` 与收件邮件的 `Internet Message-ID` 规范化后精确相等，
+   收件邮件标记为 `reply`；
+2. 已发送邮件明确包含转发标记，能够唯一对应原邮件，并且能取得至少一个实际 To
+   地址，原邮件标记为 `forward`，`params.fixed_recipients` 保存实际地址。
+
+转发正文缺少可验证的原发件人、原主题、原邮件标识或原文片段，收件人为空、对应
+不唯一，以及其他情况均不写 `route_decision`。已写入的历史邮件仍可作为普通
+`Historical RAG Context`，没有标签不等于导入失败，也不会自动进入 Tier 2 路由投票。
+
+例如，只导入 100 封 Inbox、读取 Sent 作为证据：
+
+```bash
+.venv/bin/python scripts/import_pst.py \
+  --source exchange --folder inbox --limit 100 --all-mail \
+  --route-evidence-folder sent --route-evidence-limit 200 \
+  --dry-run
+```
 
 PST 解析优先使用 `libpff-python`；不可用时，脚本会回退到已安装的 `readpst`。大文件可调大 `--batch-size`，但建议仍先执行 `--dry-run`。
 

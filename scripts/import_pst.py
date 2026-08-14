@@ -17,9 +17,10 @@ import email as email_lib
 import email.policy
 import email.utils
 import hashlib
-from itertools import chain
+import html as html_lib
 import logging
 import mailbox
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,9 @@ logger = logging.getLogger("pst_import")
 
 class ExchangeImportIncomplete(RuntimeError):
     """The Exchange source could not prove a complete bounded read."""
+
+
+_EXCHANGE_DETAIL_TIMEOUT_SECONDS = 55.0
 
 
 def _exchange_ssl_verify(settings) -> bool | str:
@@ -75,6 +79,7 @@ class ParsedEmail:
     internet_message_id: str = ""
     attachments_metadata: list[dict] = field(default_factory=list)
     import_source: str = "pst_import"
+    route_decision: dict | None = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -95,6 +100,8 @@ class ParsedEmail:
             "_import_source": self.import_source,
         }
         payload["history_dedupe_key"] = _history_dedupe_key(self)
+        if self.route_decision is not None:
+            payload["route_decision"] = self.route_decision
         return payload
 
 
@@ -118,6 +125,260 @@ def _history_dedupe_key(message: ParsedEmail) -> str:
         )
     )
     return f"signature:{hashlib.sha256(signature.encode('utf-8')).hexdigest()}"
+
+
+# ---------------------------------------------------------------------------
+# Conservative historical route inference
+# ---------------------------------------------------------------------------
+
+_FORWARDED_MESSAGE_MARKER = re.compile(
+    r"(?:"
+    r"^-{2,}\s*(?:forwarded message|original message)\s*-{2,}"
+    r"|^-{2,}\s*(?:转发邮件|原始邮件)\s*-{2,}"
+    r"|^\s*(?:转发邮件|原始邮件)\s*[:：-]"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FORWARDED_HEADER_PATTERNS = {
+    "from": re.compile(
+        r"^\s*(?:from|发件人)\s*[:：]\s*(.*?)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    "subject": re.compile(
+        r"^\s*(?:subject|主题)\s*[:：]\s*(.*?)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+}
+_EMAIL_ADDRESS_PATTERN = re.compile(
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+",
+    re.IGNORECASE,
+)
+
+
+def _normalize_message_id(value: str | None) -> str:
+    """Normalize whitespace only for an exact Message-ID comparison."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _plainish_body(value: object) -> str:
+    """Make forwarded-header detection work for plain text and simple HTML."""
+    text = html_lib.unescape(str(value or ""))
+    return re.sub(r"<[^>]*>", "\n", text)
+
+
+def _extract_address(value: object) -> str:
+    """Extract one concrete address from RFC or Exchange mailbox text."""
+    if isinstance(value, dict):
+        for key in ("email", "email_address", "address", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip().casefold()
+        return ""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    mailbox_match = re.search(
+        r"email_address=['\"]([^'\"]+)['\"]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if mailbox_match:
+        return mailbox_match.group(1).strip().casefold()
+    parsed = email_lib.utils.parseaddr(text)[1].strip()
+    if parsed and "@" in parsed:
+        return parsed.casefold()
+    address_match = _EMAIL_ADDRESS_PATTERN.search(text)
+    return address_match.group(0).casefold() if address_match else ""
+
+
+def _concrete_addresses(values: list[str]) -> list[str]:
+    """Return deduplicated concrete addresses in their first-seen order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        address = _extract_address(value)
+        if address and address not in seen:
+            seen.add(address)
+            result.append(address)
+    return result
+
+
+def _normalize_subject(value: str | None) -> str:
+    """Remove common reply/forward prefixes before exact subject comparison."""
+    subject = " ".join(str(value or "").split()).casefold()
+    while True:
+        stripped = re.sub(
+            r"^(?:(?:re|fw|fwd)\s*[:：]\s*|(?:回复|答复|转发)\s*[:：]\s*)",
+            "",
+            subject,
+        )
+        if stripped == subject:
+            return subject
+        subject = stripped
+
+
+def _forwarded_header(body: str, name: str) -> str:
+    match = _FORWARDED_HEADER_PATTERNS[name].search(body)
+    return " ".join(match.group(1).split()) if match else ""
+
+
+def _body_contains_original(body: str, original: ParsedEmail) -> bool:
+    """Require a bounded body fragment when no embedded Message-ID is present."""
+    original_body = " ".join(_plainish_body(original.body).split())
+    if len(original_body) < 8:
+        return False
+    fragment = original_body[:160].casefold()
+    return fragment in " ".join(body.split()).casefold()
+
+
+def _forwarded_original(
+    sent: ParsedEmail,
+    received: list[ParsedEmail],
+) -> ParsedEmail | None:
+    """Find one received message proven to be quoted by a sent forward."""
+    body = _plainish_body(sent.body)
+    if not _FORWARDED_MESSAGE_MARKER.search(body):
+        return None
+
+    forwarded_sender = _extract_address(_forwarded_header(body, "from"))
+    forwarded_subject = _normalize_subject(_forwarded_header(body, "subject"))
+    if not forwarded_sender or not forwarded_subject:
+        return None
+
+    candidates = [
+        original
+        for original in received
+        if _extract_address(original.sender) == forwarded_sender
+        and _normalize_subject(original.subject) == forwarded_subject
+    ]
+    if len(candidates) != 1:
+        return None
+
+    original = candidates[0]
+    normalized_body = _normalize_message_id(body)
+    message_id_proof = (
+        bool(original.internet_message_id)
+        and _normalize_message_id(original.internet_message_id) in normalized_body
+    )
+    if not message_id_proof and not _body_contains_original(body, original):
+        return None
+    return original
+
+
+def _historical_route_decision(
+    route: str,
+    *,
+    evidence_ids: list[str],
+    params: dict | None = None,
+    reason_code: str,
+) -> dict:
+    """Create a schema-compatible label for an observed historical action."""
+    return {
+        "outcome": "matched",
+        "route": route,
+        "params": params or {},
+        "provenance": {
+            "tier": "system",
+            "source_version": "history-import-route-v1",
+            "evidence_ids": evidence_ids[:16],
+            "confidence": 1.0,
+        },
+        "reason_code": reason_code,
+    }
+
+
+def _infer_historical_route_decisions(
+    messages: list[ParsedEmail],
+) -> dict[str, dict]:
+    """Infer only exact observed replies and proven forwards.
+
+    The returned mapping targets received messages.  Sent messages are evidence
+    and are never assigned a route decision themselves.  Any missing,
+    ambiguous, or conflicting evidence is deliberately left unlabeled.
+    """
+    received = [message for message in messages if message.message_type == "received"]
+    sent = [message for message in messages if message.message_type == "sent"]
+    candidates: dict[str, list[tuple[str, dict, str]]] = {}
+
+    def add_candidate(
+        original: ParsedEmail,
+        route: str,
+        decision: dict,
+        evidence_id: str,
+    ) -> None:
+        candidates.setdefault(original.id, []).append(
+            (route, decision, evidence_id)
+        )
+
+    for sent_message in sent:
+        exact_replies = [
+            original
+            for original in received
+            if _normalize_message_id(sent_message.in_reply_to)
+            and _normalize_message_id(sent_message.in_reply_to)
+            == _normalize_message_id(original.internet_message_id)
+        ]
+        if exact_replies:
+            # Message-IDs should be unique.  More than one match is not safe
+            # evidence, so do not assign this sent message to any original.
+            if len(exact_replies) == 1:
+                original = exact_replies[0]
+                add_candidate(
+                    original,
+                    "reply",
+                    _historical_route_decision(
+                        "reply",
+                        evidence_ids=[sent_message.id],
+                        reason_code="historical_sent_reply",
+                    ),
+                    sent_message.id,
+                )
+            continue
+
+        original = _forwarded_original(sent_message, received)
+        if original is None:
+            continue
+        recipients = _concrete_addresses(sent_message.to)
+        if not recipients:
+            continue
+        cc = _concrete_addresses(sent_message.cc)
+        params = {"fixed_recipients": recipients}
+        if cc:
+            params["cc"] = cc
+        add_candidate(
+            original,
+            "forward",
+            _historical_route_decision(
+                "forward",
+                evidence_ids=[sent_message.id],
+                params=params,
+                reason_code="historical_sent_forward",
+            ),
+            sent_message.id,
+        )
+
+    result: dict[str, dict] = {}
+    for original_id, rows in candidates.items():
+        signatures = {
+            (
+                route,
+                str(decision.get("params") or {}),
+            )
+            for route, decision, _evidence_id in rows
+        }
+        if len(signatures) != 1:
+            continue
+        route, first_decision, _ = rows[0]
+        evidence_ids = list(dict.fromkeys(row[2] for row in rows))
+        result[original_id] = {
+            **first_decision,
+            "provenance": {
+                **first_decision["provenance"],
+                "evidence_ids": evidence_ids[:16],
+            },
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +880,8 @@ def _fetch_exchange_emails(
         total_on_server: int | None = None
         detail_failures = 0
 
-        while len(results) < max_fetch:
-            page_size = min(PAGE_SIZE, max_fetch - len(results))
+        while offset < max_fetch:
+            page_size = min(PAGE_SIZE, max_fetch - offset)
             params = {**base_params, "limit": page_size, "offset": offset}
 
             page += 1
@@ -663,13 +924,38 @@ def _fetch_exchange_emails(
                 # Fetch full detail
                 encoded_id = quote(email_id, safe="")
                 detail_url = f"{api_url}/{encoded_id}"
+                detail_resp = None
+                for detail_attempt in range(2):
+                    try:
+                        detail_resp = http.get(
+                            detail_url,
+                            params={"account_id": account_id, "folder": folder},
+                            timeout=_EXCHANGE_DETAIL_TIMEOUT_SECONDS,
+                        )
+                    except (httpx.TimeoutException, httpx.TransportError) as e:
+                        if detail_attempt == 0:
+                            logger.warning(
+                                "Exchange 详情请求瞬时失败，重试一次: error_type=%s",
+                                type(e).__name__,
+                            )
+                            continue
+                        logger.warning(
+                            "Exchange 详情请求异常: error_type=%s",
+                            type(e).__name__,
+                        )
+                        detail_failures += 1
+                        break
+
+                    if detail_resp.status_code >= 500 and detail_attempt == 0:
+                        logger.warning(
+                            "Exchange 详情返回瞬时错误，重试一次: status=%s",
+                            detail_resp.status_code,
+                        )
+                        continue
+                    break
+
                 try:
-                    detail_resp = http.get(
-                        detail_url,
-                        params={"account_id": account_id, "folder": folder},
-                        timeout=30.0,
-                    )
-                    if detail_resp.status_code == 200:
+                    if detail_resp is not None and detail_resp.status_code == 200:
                         detail_data = detail_resp.json().get("data", {})
                         if detail_data:
                             if "id" not in detail_data:
@@ -684,7 +970,7 @@ def _fetch_exchange_emails(
                                 detail_failures += 1
                         else:
                             detail_failures += 1
-                    else:
+                    elif detail_resp is not None:
                         detail_failures += 1
                         logger.warning(
                             "Exchange 详情获取失败: status=%s",
@@ -693,7 +979,7 @@ def _fetch_exchange_emails(
                 except Exception as e:
                     detail_failures += 1
                     logger.warning(
-                        "Exchange 详情请求异常: error_type=%s",
+                        "Exchange 详情解析异常: error_type=%s",
                         type(e).__name__,
                     )
 
@@ -871,6 +1157,9 @@ class ImportStats:
     duplicates: int = 0
     failed: int = 0
     points_created: int = 0
+    route_reply: int = 0
+    route_forward: int = 0
+    route_unprocessed: int = 0
 
     def print_summary(self):
         print(f"\n{'━' * 50}")
@@ -881,6 +1170,9 @@ class ImportStats:
         print(f"  跳过 (重复): {self.duplicates}")
         print(f"  失败:        {self.failed}")
         print(f"  Qdrant 点数: {self.points_created}")
+        print(f"  route_decision=reply:   {self.route_reply}")
+        print(f"  route_decision=forward: {self.route_forward}")
+        print(f"  route_decision 未处理:   {self.route_unprocessed}")
         print(f"{'━' * 50}")
 
 
@@ -907,12 +1199,14 @@ def run_import(
     exchange_limit: int = 100,
     exchange_all_mail: bool = False,
     supplement_source: Path | None = None,
+    route_evidence_folder: str | None = None,
+    route_evidence_limit: int = 0,
 ) -> ImportStats:
     """Main import logic — detect source type, parse, and batch-ingest."""
     stats = ImportStats()
 
     if source_type == "exchange":
-        email_iter = iter_from_exchange(
+        primary_iter = iter_from_exchange(
             folder=exchange_folder,
             limit=exchange_limit,
             all_mail=exchange_all_mail,
@@ -920,17 +1214,57 @@ def run_import(
         mail_scope = "全部邮件" if exchange_all_mail else "未读邮件"
         limit_desc = f"最多 {exchange_limit} 封" if exchange_limit > 0 else "全部"
         source_desc = f"Exchange 服务器 [{exchange_folder}] ({mail_scope}, {limit_desc})"
+        primary_messages = list(primary_iter)
+        relation_messages = list(primary_messages)
+
+        if route_evidence_folder:
+            evidence_limit = route_evidence_limit or exchange_limit
+            if (
+                route_evidence_folder.casefold()
+                != exchange_folder.casefold()
+            ):
+                evidence_messages = list(
+                    iter_from_exchange(
+                        folder=route_evidence_folder,
+                        limit=evidence_limit,
+                        all_mail=True,
+                    )
+                )
+                relation_messages.extend(evidence_messages)
+                source_desc = (
+                    f"{source_desc}；路由证据 "
+                    f"[{route_evidence_folder}, 最多 {evidence_limit or '全部'} 封]"
+                )
+
         if supplement_source is not None:
             supplement_iter, supplement_desc = _iter_from_file_source(
                 supplement_source
             )
-            email_iter = chain(email_iter, supplement_iter)
+            supplement_messages = list(supplement_iter)
+            primary_messages.extend(supplement_messages)
+            relation_messages.extend(supplement_messages)
             source_desc = f"{source_desc} + 补充 {supplement_desc}"
+        email_messages = primary_messages
     else:
         assert source is not None
-        if supplement_source is not None:
+        if supplement_source is not None or route_evidence_folder:
             raise ValueError("supplement_source_requires_exchange")
         email_iter, source_desc = _iter_from_file_source(source)
+        email_messages = list(email_iter)
+        relation_messages = list(email_messages)
+
+    # A source can expose the same message through multiple folders or a local
+    # supplement.  Deduplicate the relation graph before inferring labels so
+    # duplicate copies cannot turn one proven match into an ambiguity.
+    unique_relation_messages: list[ParsedEmail] = []
+    seen_relation_keys: set[str] = set()
+    for message in relation_messages:
+        relation_key = _history_dedupe_key(message)
+        if relation_key in seen_relation_keys:
+            continue
+        seen_relation_keys.add(relation_key)
+        unique_relation_messages.append(message)
+    route_decisions = _infer_historical_route_decisions(unique_relation_messages)
 
     print("\n📧 邮件导入工具")
     print(f"   来源: {source_desc}")
@@ -955,7 +1289,7 @@ def run_import(
     seen_dedupe_keys: set[str] = set()
 
     try:
-        for parsed in email_iter:
+        for parsed in email_messages:
             stats.total += 1
 
             if not parsed.body.strip():
@@ -968,12 +1302,25 @@ def run_import(
                 continue
             seen_dedupe_keys.add(dedupe_key)
 
+            parsed.route_decision = route_decisions.get(parsed.id)
+            if parsed.route_decision is None:
+                stats.route_unprocessed += 1
+            elif parsed.route_decision.get("route") == "reply":
+                stats.route_reply += 1
+            elif parsed.route_decision.get("route") == "forward":
+                stats.route_forward += 1
+
             if dry_run:
                 _type_icon = "📤" if parsed.message_type == "sent" else "📥"
+                route = (
+                    parsed.route_decision.get("route")
+                    if parsed.route_decision
+                    else "unprocessed"
+                )
                 print(
                     f"  {_type_icon} [{parsed.source_folder}] "
                     f"{parsed.subject[:55]:<55} "
-                    f"({parsed.sender[:30]})"
+                    f"({parsed.sender[:30]}) route={route}"
                 )
                 stats.imported += 1
                 continue
@@ -1072,6 +1419,22 @@ def main():
         help="Exchange 优先导入后，用 PST/Mbox/EML 补充缺失历史邮件",
     )
     parser.add_argument(
+        "--route-evidence-folder",
+        default=None,
+        help=(
+            "仅 Exchange 模式：额外读取指定文件夹作为历史 route_decision 证据，"
+            "例如 sent；证据邮件本身不导入"
+        ),
+    )
+    parser.add_argument(
+        "--route-evidence-limit",
+        type=int,
+        default=0,
+        help=(
+            "route_decision 证据邮件上限；默认沿用 --limit，0 表示沿用 --limit"
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -1097,6 +1460,8 @@ def main():
             exchange_limit=args.limit,
             exchange_all_mail=args.all_mail,
             supplement_source=args.supplement,
+            route_evidence_folder=args.route_evidence_folder,
+            route_evidence_limit=args.route_evidence_limit,
         )
     else:
         if not args.source:
