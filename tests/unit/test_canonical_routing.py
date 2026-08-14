@@ -99,9 +99,10 @@ async def test_tier2_consensus_remains_authoritative_over_tier3():
         route=CanonicalRoute.READ_ONLY,
         params={},
         provenance=RouteProvenance(
-            tier=RouteTier.TIER3,
-            source_version="router-model-v1",
-            confidence=0.9,
+            tier=RouteTier.TIER1,
+            source_version="tier1-artifact-v1",
+            artifact_digest="a" * 64,
+            confidence=1.0,
         ),
         reason_code="historical_label",
     ).model_dump(mode="json")
@@ -111,8 +112,9 @@ async def test_tier2_consensus_remains_authoritative_over_tier3():
             {"email": {"subject": "FYI", "body": "notice", "sender": "a@example.com"}},
             RoutingEvidenceBundle.from_hits(
                 [
-                    {"id": "h1", "route_decision": historical},
-                    {"id": "h2", "route_decision": historical},
+                    {"id": "h1", "sender": "a@example.com", "thread_id": "t1", "score": 0.9, "route_decision": historical},
+                    {"id": "h2", "sender": "b@example.com", "thread_id": "t2", "score": 0.9, "route_decision": historical},
+                    {"id": "h3", "sender": "c@example.com", "thread_id": "t3", "score": 0.9, "route_decision": historical},
                 ]
             ),
         )

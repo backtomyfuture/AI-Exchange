@@ -17,7 +17,6 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from src.config import get_settings
 from src.domain.errors import DatabaseOperationError
 from src.graph.dependencies import GraphDependencies
 from src.graph.resource_locks import get_graph_resource_lock
