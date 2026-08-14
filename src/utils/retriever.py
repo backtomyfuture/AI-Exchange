@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import List, Optional, Any
 from openai import OpenAI, APIError, APIConnectionError
 
@@ -13,20 +14,44 @@ QdrantClient = None
 models = None
 
 
+def _parse_received_at(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _exclude_current_email(
     payloads: Iterable[object],
     *,
     exclude_email_id: str | None,
+    received_before: object = None,
     limit: int,
 ) -> list[dict]:
     """Filter the in-flight mail after a vector query without trusting Qdrant IDs."""
 
+    cutoff = _parse_received_at(received_before)
     results: list[dict] = []
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
         payload_email_id = payload.get("id") or payload.get("email_id")
         if exclude_email_id and payload_email_id == exclude_email_id:
+            continue
+        hit_received_at = _parse_received_at(payload.get("received_at"))
+        if cutoff is not None and hit_received_at is not None and hit_received_at >= cutoff:
             continue
         results.append(payload)
         if len(results) >= limit:
@@ -39,7 +64,7 @@ class EmailRetriever:
     """
     def __init__(
         self,
-        collection_name: str = "emails",
+        collection_name: str | None = None,
         qdrant_url: Optional[str] = None,
         embedding_api_key: Optional[str] = None,
         embedding_base_url: Optional[str] = None,
@@ -50,7 +75,7 @@ class EmailRetriever:
         self.client: Optional[Any] = None
         # Capture patchable class at construction time for test compatibility.
         self._qdrant_client_cls = QdrantClient
-        self.collection_name = collection_name
+        self.collection_name = collection_name or settings.QDRANT_EMAILS_COLLECTION
 
         api_base = embedding_base_url or settings.EMBEDDING_BASE_URL or "http://localhost:11434/v1"
         from src.config import resolve_secret
@@ -94,6 +119,7 @@ class EmailRetriever:
         limit: int = 5,
         *,
         exclude_email_id: str | None = None,
+        received_before: object = None,
     ) -> List[dict]:
         """
         Hybrid search based on text content and sender.
@@ -133,6 +159,7 @@ class EmailRetriever:
             return _exclude_current_email(
                 (hit.payload for hit in search_result.points),
                 exclude_email_id=exclude_email_id,
+                received_before=received_before,
                 limit=limit,
             )
         except Exception as exc:
@@ -152,6 +179,7 @@ class EmailRetriever:
         limit: int = 20,
         *,
         exclude_email_id: str | None = None,
+        received_before: object = None,
     ) -> List[dict]:
         """Search all emails in the same conversation thread."""
         if not thread_id:
@@ -183,6 +211,7 @@ class EmailRetriever:
             return _exclude_current_email(
                 (point.payload for point in points),
                 exclude_email_id=exclude_email_id,
+                received_before=received_before,
                 limit=limit,
             )
         except Exception as exc:
@@ -197,9 +226,23 @@ class EmailRetriever:
 _retriever_instance: Optional[EmailRetriever] = None
 
 
+_routing_retriever_instance: Optional[EmailRetriever] = None
+
+
 def get_retriever() -> EmailRetriever:
-    """获取 EmailRetriever 全局单例。"""
+    """获取写作语料 EmailRetriever 全局单例。"""
     global _retriever_instance
     if _retriever_instance is None:
         _retriever_instance = EmailRetriever()
     return _retriever_instance
+
+
+def get_routing_retriever() -> EmailRetriever:
+    """获取路由样本 EmailRetriever；失败时回退到 emails 语料。"""
+    global _routing_retriever_instance
+    if _routing_retriever_instance is None:
+        settings = get_settings()
+        _routing_retriever_instance = EmailRetriever(
+            collection_name=settings.QDRANT_ROUTING_SAMPLES_COLLECTION,
+        )
+    return _routing_retriever_instance

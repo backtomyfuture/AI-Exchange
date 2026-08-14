@@ -1146,6 +1146,112 @@ def iter_from_exchange(
 
 
 # ---------------------------------------------------------------------------
+# Historical route inference
+# ---------------------------------------------------------------------------
+
+_FORWARD_PREFIXES = ("fw:", "fwd:", "转发:")
+_REPLY_PREFIXES = ("re:", "回复:", "答复:")
+
+
+def _strip_subject_prefixes(subject: str) -> tuple[str, str | None]:
+    remaining = " ".join(str(subject or "").split())
+    action = None
+    while True:
+        folded = remaining.casefold()
+        matched = None
+        for prefix in (*_FORWARD_PREFIXES, *_REPLY_PREFIXES):
+            if folded.startswith(prefix):
+                matched = prefix
+                break
+        if matched is None:
+            return remaining, action
+        if action is None:
+            action = "forward" if matched in _FORWARD_PREFIXES else "reply"
+        remaining = remaining[len(matched):].lstrip()
+
+
+def _normalized_message_id(value: str) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _historical_decision(*, route: str, params: dict, reason_code: str) -> dict:
+    from src.router.decision import DecisionOutcome, RouteDecision, RouteProvenance, RouteTier
+    from src.router.tier1.schema import CanonicalRoute
+
+    return RouteDecision(
+        outcome=DecisionOutcome.MATCHED,
+        route=CanonicalRoute(route),
+        params=params,
+        provenance=RouteProvenance(
+            tier=RouteTier.HISTORICAL_INFERRED,
+            source_version="historical-inferred-v1",
+            confidence=0.4,
+        ),
+        reason_code=reason_code,
+        handoff_profile_id=(
+            "generic_reply_v1" if route == "reply" else "generic_forward_v1"
+        ),
+    ).model_dump(mode="json")
+
+
+def infer_historical_route_decisions(emails: list[ParsedEmail]) -> dict[str, dict]:
+    """Infer reply/forward labels from sent mail. Never guess read_only."""
+
+    by_message_id: dict[str, ParsedEmail] = {}
+    by_conversation: dict[str, list[ParsedEmail]] = {}
+    received: list[ParsedEmail] = []
+    sent: list[ParsedEmail] = []
+    for parsed_email in emails:
+        if parsed_email.message_type == "sent":
+            sent.append(parsed_email)
+            continue
+        if parsed_email.message_type != "received":
+            continue
+        received.append(parsed_email)
+        message_id = _normalized_message_id(parsed_email.internet_message_id)
+        if message_id:
+            by_message_id[message_id] = parsed_email
+        conversation_id = _normalized_message_id(parsed_email.conversation_id)
+        if conversation_id:
+            by_conversation.setdefault(conversation_id, []).append(parsed_email)
+
+    labels: dict[str, dict] = {}
+    for sent_email in sent:
+        target = None
+        in_reply_to = _normalized_message_id(sent_email.in_reply_to)
+        if in_reply_to:
+            target = by_message_id.get(in_reply_to)
+        if target is None:
+            conversation_id = _normalized_message_id(sent_email.conversation_id)
+            candidates = by_conversation.get(conversation_id, [])
+            if len(candidates) == 1:
+                target = candidates[0]
+        if target is None or target.id in labels:
+            continue
+        _, action = _strip_subject_prefixes(sent_email.subject)
+        if action == "forward" or (
+            action is None and _strip_subject_prefixes(target.subject)[0]
+            and sent_email.subject.casefold().startswith(("fw:", "fwd:", "转发:"))
+        ):
+            labels[target.id] = _historical_decision(
+                route="forward",
+                params={
+                    "fixed_recipients": list(sent_email.to),
+                    "cc": list(sent_email.cc),
+                },
+                reason_code="historical_forward",
+            )
+            continue
+        if in_reply_to or action == "reply":
+            labels[target.id] = _historical_decision(
+                route="reply",
+                params={"reply_mode": "sender_only"},
+                reason_code="historical_reply",
+            )
+    return labels
+
+
+# ---------------------------------------------------------------------------
 # Import engine
 # ---------------------------------------------------------------------------
 
@@ -1287,6 +1393,7 @@ def run_import(
 
     batch: list[dict] = []
     seen_dedupe_keys: set[str] = set()
+    parsed_emails: list[ParsedEmail] = []
 
     try:
         for parsed in email_messages:
@@ -1309,7 +1416,7 @@ def run_import(
                 stats.route_reply += 1
             elif parsed.route_decision.get("route") == "forward":
                 stats.route_forward += 1
-
+            parsed_emails.append(parsed)
             if dry_run:
                 _type_icon = "📤" if parsed.message_type == "sent" else "📥"
                 route = (
@@ -1354,6 +1461,22 @@ def run_import(
         except Exception as e:
             logger.error("最后批次失败: %s", e)
             stats.failed += len(batch)
+
+    if processor is not None and parsed_emails:
+        labeled = 0
+        for parsed in parsed_emails:
+            if not parsed.route_decision:
+                continue
+            processor.update_email_labels(
+                parsed.id,
+                route_decision=parsed.route_decision,
+                human_verified=False,
+                draft_edited=False,
+                label_source="historical_inferred",
+                eligible_for_tier2=False,
+            )
+            labeled += 1
+        logger.info("Wrote historical route labels: count=%d", labeled)
 
     stats.print_summary()
     return stats

@@ -228,6 +228,27 @@ async def send_final_email(
             original_email_data=email_data,
             reply_content=draft,
         )
+        from src.handoff.approval_feedback import record_human_route_outcome
+
+        log_row = None
+        get_log = getattr(ctx.db_manager, "get_email_approval_record", None)
+        if callable(get_log):
+            log_row = await get_log(email_id)
+        original_draft = None
+        waiting_since = None
+        if isinstance(log_row, dict):
+            original_draft = log_row.get("original_draft")
+            waiting_since = log_row.get("updated_at") or log_row.get("approval_at")
+        record_human_route_outcome(
+            ctx.email_processor,
+            email_id=email_id,
+            route_decision=state.get("route_decision"),
+            classification=state.get("classification") or {},
+            outcome="approved",
+            original_draft=original_draft,
+            final_draft=draft,
+            waiting_since=waiting_since,
+        )
     except Exception as exc:
         logger.error(
             "Post-send projection failed: error_type=%s",

@@ -11,6 +11,7 @@ class AgentState(TypedDict, total=False):
     email: dict[str, str]
     content_ref: dict[str, Any]
     classification: dict
+    routing_neighbors: list[dict[str, Any]]
     context_summaries: list[dict[str, str]]
     draft_id: str | None
     draft_to: list[str]

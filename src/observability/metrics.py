@@ -157,11 +157,116 @@ def record_card_dispatch(kind: str, delivered: bool) -> None:
     ).inc()
 
 
+approval_pending_oldest_seconds = Gauge(
+    "approval_pending_oldest_seconds",
+    "Age of the oldest waiting_approval email.",
+)
+
+approval_expired_total = Counter(
+    "approval_expired_total",
+    "Approvals expired by the 24h SLA and moved to manual_review.",
+)
+
+route_decisions_total = Counter(
+    "route_decisions_total",
+    "Final route decisions by tier.",
+    labelnames=("tier",),
+)
+
+manual_review_total = Counter(
+    "manual_review_total",
+    "Emails sent to manual review.",
+)
+
+reviewer_rewrite_total = Counter(
+    "reviewer_rewrite_total",
+    "Drafts sent back by the reviewer.",
+)
+
+reviewer_reject_total = Counter(
+    "reviewer_reject_total",
+    "Human or model rejections of a draft.",
+    labelnames=("source",),
+)
+
+approval_latency_seconds = Histogram(
+    "approval_latency_seconds",
+    "Time from waiting_approval to a human decision.",
+    buckets=(60, 300, 900, 1800, 3600, 7200, 14400, 28800, 86400),
+)
+
+approvals_as_written_total = Counter(
+    "approvals_as_written_total",
+    "Approvals sent without a human draft edit.",
+)
+
+approvals_after_edit_total = Counter(
+    "approvals_after_edit_total",
+    "Approvals sent after a human edited the draft.",
+)
+
+silent_route_total = Counter(
+    "silent_route_total",
+    "Emails ended as no_action or read_only.",
+    labelnames=("route", "rule_id"),
+)
+
+silent_route_share = Gauge(
+    "silent_route_share",
+    "Seven-day share of silent routes versus the rolling baseline.",
+    labelnames=("route",),
+)
+
+
 def record_email_status(status: str) -> None:
     """Increment ``emails_processed_total`` for the given status."""
     if not status:
         return
     emails_processed_total.labels(status=status).inc()
+
+
+def record_approval_expiry(event) -> None:
+    kind = getattr(event, "kind", "")
+    if kind == "expired":
+        approval_expired_total.inc(getattr(event, "count", 1) or 1)
+    oldest = float(getattr(event, "oldest_seconds", 0.0) or 0.0)
+    if oldest:
+        approval_pending_oldest_seconds.set(max(0.0, oldest))
+
+
+def record_route_decision(tier: str) -> None:
+    route_decisions_total.labels(tier=tier or "unknown").inc()
+
+
+def record_manual_review() -> None:
+    manual_review_total.inc()
+
+
+def record_reviewer_rewrite() -> None:
+    reviewer_rewrite_total.inc()
+
+
+def record_reviewer_reject(source: str = "human") -> None:
+    reviewer_reject_total.labels(source=source or "human").inc()
+
+
+def record_approval_latency(seconds: float) -> None:
+    approval_latency_seconds.observe(max(0.0, float(seconds)))
+
+
+def record_approval_quality(*, draft_edited: bool) -> None:
+    if draft_edited:
+        approvals_after_edit_total.inc()
+    else:
+        approvals_as_written_total.inc()
+
+
+def record_silent_route(route: str, *, rule_id: str = "none") -> None:
+    silent_route_total.labels(route=route or "unknown", rule_id=rule_id or "none").inc()
+
+
+def record_silent_route_share(route: str, share: float) -> None:
+    silent_route_share.labels(route=route or "unknown").set(max(0.0, float(share)))
 
 
 def record_durable_ingestion(
@@ -217,9 +322,29 @@ __all__ = [
     "polling_ingress_active",
     "polling_cursor_ready_gauge",
     "circuit_breaker_state",
+    "approval_pending_oldest_seconds",
+    "approval_expired_total",
+    "route_decisions_total",
+    "manual_review_total",
+    "reviewer_rewrite_total",
+    "reviewer_reject_total",
+    "approval_latency_seconds",
+    "approvals_as_written_total",
+    "approvals_after_edit_total",
+    "silent_route_total",
+    "silent_route_share",
     "record_card_dispatch",
     "record_circuit_breaker_state",
     "record_email_status",
+    "record_approval_expiry",
+    "record_route_decision",
+    "record_manual_review",
+    "record_reviewer_rewrite",
+    "record_reviewer_reject",
+    "record_approval_latency",
+    "record_approval_quality",
+    "record_silent_route",
+    "record_silent_route_share",
     "record_durable_ingestion",
     "render_metrics",
     "CONTENT_TYPE_LATEST",

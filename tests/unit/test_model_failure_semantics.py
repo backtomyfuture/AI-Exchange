@@ -367,32 +367,22 @@ async def test_empty_draft_requires_manual_review(graph_node_harness):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("need_reply", "confidence"),
+    "classification",
     [
-        ("false", 0.8),
-        (0, 0.8),
-        ("yes", 0.8),
-        (True, True),
+        {"priority": "P1", "intent": "咨询", "summary": "summary", "reasoning": "reason", "confidence": "0.8"},
+        {"priority": 1, "intent": "咨询", "summary": "summary", "reasoning": "reason", "confidence": 0.8},
+        {"priority": "P1", "intent": "咨询", "summary": "summary", "reasoning": "reason", "confidence": True},
     ],
 )
 async def test_categorizer_rejects_coerced_decision_types(
     graph_node_harness,
     route_decision_factory,
-    need_reply,
-    confidence,
+    classification,
 ):
     state = graph_node_harness.state(
         {"id": "categorizer-strict", "subject": "Q", "body": "body"},
         route_decision=route_decision_factory("reply"),
     )
-    classification = {
-        "priority": "P1",
-        "need_reply": need_reply,
-        "intent": "咨询",
-        "summary": "summary",
-        "reasoning": "reason",
-        "confidence": confidence,
-    }
 
     with patch(
         "src.nodes.categorizer.with_llm_retry",

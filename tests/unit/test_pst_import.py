@@ -83,6 +83,88 @@ class TestHelpers:
 # ---------------------------------------------------------------------------
 
 
+class TestHistoricalInference:
+    def test_reply_is_inferred_from_sent_in_reply_to(self):
+        from scripts.import_pst import infer_historical_route_decisions
+
+        inbox = ParsedEmail(
+            id="inbox-1",
+            subject="Please confirm",
+            sender="boss@example.com",
+            to=["me@example.com"],
+            cc=[],
+            body="Please confirm the plan.",
+            received_at="2024-01-01T10:00:00+00:00",
+            message_type="received",
+            internet_message_id="<inbox-1@example.com>",
+        )
+        sent = ParsedEmail(
+            id="sent-1",
+            subject="Re: Please confirm",
+            sender="me@example.com",
+            to=["boss@example.com"],
+            cc=[],
+            body="Confirmed.",
+            received_at="2024-01-01T11:00:00+00:00",
+            message_type="sent",
+            in_reply_to="<inbox-1@example.com>",
+        )
+
+        labels = infer_historical_route_decisions([inbox, sent])
+        assert set(labels) == {"inbox-1"}
+        decision = labels["inbox-1"]
+        assert decision["route"] == "reply"
+        assert decision["provenance"]["tier"] == "historical_inferred"
+
+    def test_forward_is_inferred_from_leftmost_prefix(self):
+        from scripts.import_pst import infer_historical_route_decisions
+
+        inbox = ParsedEmail(
+            id="inbox-2",
+            subject="Weekly report",
+            sender="peer@example.com",
+            to=["me@example.com"],
+            cc=[],
+            body="Please review.",
+            received_at="2024-01-02T10:00:00+00:00",
+            message_type="received",
+            conversation_id="conv-2",
+        )
+        sent = ParsedEmail(
+            id="sent-2",
+            subject="FW: 转发: Weekly report",
+            sender="me@example.com",
+            to=["leader@example.com"],
+            cc=["cc@example.com"],
+            body="呈阅",
+            received_at="2024-01-02T11:00:00+00:00",
+            message_type="sent",
+            conversation_id="conv-2",
+        )
+
+        labels = infer_historical_route_decisions([inbox, sent])
+        assert labels["inbox-2"]["route"] == "forward"
+        assert labels["inbox-2"]["params"]["fixed_recipients"] == ["leader@example.com"]
+        assert labels["inbox-2"]["params"]["cc"] == ["cc@example.com"]
+        assert labels["inbox-2"]["provenance"]["tier"] == "historical_inferred"
+
+    def test_read_only_and_manual_review_are_not_guessed(self):
+        from scripts.import_pst import infer_historical_route_decisions
+
+        inbox = ParsedEmail(
+            id="inbox-3",
+            subject="FYI",
+            sender="notice@example.com",
+            to=["me@example.com"],
+            cc=[],
+            body="For your information.",
+            received_at="2024-01-03T10:00:00+00:00",
+            message_type="received",
+        )
+
+        assert infer_historical_route_decisions([inbox]) == {}
+
+
 class TestParsedEmail:
     def test_to_dict(self):
         pe = ParsedEmail(

@@ -8,8 +8,7 @@ from src.graph.state_factory import (
     hydrate_email_from_state,
     sanitize_graph_delta,
 )
-from src.safety.attachments import AttachmentPolicy
-from src.safety.input_limits import input_limits_from_settings
+from src.safety.attachments import get_attachment_policy
 from src.safety.model_budget import (
     ModelInputTooLarge,
     enforce_model_input_budget,
@@ -32,11 +31,7 @@ def _visual_analysis_inputs(email: object) -> list[dict[str, str]]:
     if not isinstance(attachments, list):
         return []
 
-    attachment_policy = AttachmentPolicy(
-        max_bytes=input_limits_from_settings(
-            get_settings()
-        ).attachment_single_bytes
-    )
+    attachment_policy = get_attachment_policy()
     images: list[dict[str, str]] = []
     for attachment in attachments:
         if not isinstance(attachment, dict):

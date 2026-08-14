@@ -175,8 +175,28 @@ class TestEmailRetriever:
 
         assert results == [{"id": "mail-old", "thread_id": "thread-123"}]
         assert mock_qdrant_client.scroll.call_args.kwargs["limit"] == 7
-    
-    
+
+    def test_search_excludes_hits_not_older_than_the_current_email(
+        self,
+        retriever,
+        mock_qdrant_client,
+        mock_openai_client,
+    ):
+        mock_embedding_response = Mock()
+        mock_embedding_response.data = [Mock(embedding=[0.1, 0.2])]
+        mock_openai_client.embeddings.create.return_value = mock_embedding_response
+        newer = Mock(payload={"id": "mail-new", "received_at": "2026-02-02T00:00:00+00:00"})
+        older = Mock(payload={"id": "mail-old", "received_at": "2026-01-01T00:00:00+00:00"})
+        mock_qdrant_client.query_points.return_value = Mock(points=[newer, older])
+
+        results = retriever.search(
+            "query",
+            limit=2,
+            received_before="2026-02-01T00:00:00+00:00",
+        )
+
+        assert [item["id"] for item in results] == ["mail-old"]
+
     def test_search_by_thread_empty_thread_id(self, retriever):
         """测试空线程ID时返回空列表"""
         results = retriever.search_by_thread("")

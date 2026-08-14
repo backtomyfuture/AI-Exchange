@@ -131,25 +131,6 @@ async def generate_draft(
 </quoted_history>
 </email_content>""")
     ])
-    # Forwarding skills may have already persisted their fixed draft in categorizer.
-    raw_decision = state.get("route_decision") or {}
-    route = raw_decision.get("route") if isinstance(raw_decision, dict) else None
-    if route == "forward":
-        draft_id = state.get("draft_id")
-        if not draft_id:
-            draft_id = await dependencies.drafts.save_draft(
-                state["email_id"],
-                "呈阅",
-            )
-        return sanitize_graph_delta(
-            state,
-            {
-                "draft_id": draft_id,
-                "approval_status": "pending",
-                "next_step": "approval",
-            },
-        )
-
     if isinstance(plan, dict) and plan.get("writer_mode") == "fixed":
         fixed_draft = plan.get("fixed_draft")
         if not isinstance(fixed_draft, str) or not fixed_draft.strip():

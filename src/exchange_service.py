@@ -31,6 +31,7 @@ from src.graph.state_factory import (
 from src.graph.resource_locks import get_graph_resource_lock
 from src.handoff.evidence import EvidenceAdapterRegistry, WritingEvidenceRetriever
 from src.handoff.models import HandoffDisposition
+from src.handoff.labels import eligible_for_tier2, label_source_for
 from src.handoff.profiles import get_handoff_profile
 from src.router.decision import RouteDecision
 from src.router.context import RoutingAssessment, RoutingEvidenceBundle
@@ -43,7 +44,7 @@ from src.safety.manual_review import (
 )
 from src.security.redaction import fingerprint_identifier
 from src.utils.email_body_projection import project_email_body_for_model
-from src.utils.retriever import get_retriever
+from src.utils.retriever import get_retriever, get_routing_retriever
 from src.storage import ContentRef
 from src.ingestion.processing import (
     BeforeExternalEffect,
@@ -112,7 +113,7 @@ async def _routing_evidence_hits(
         str(email_data.get("body") or ""),
         unique_body=email_data.get("unique_body"),
     )
-    retriever = get_retriever()
+    retriever = get_routing_retriever()
     results: list[dict[str, Any]] = []
     retrieval_status = "available"
     thread_id = email_data.get("thread_id") or email_data.get("conversation_id")
@@ -133,6 +134,7 @@ async def _routing_evidence_hits(
                     thread_id=str(thread_id),
                     limit=5,
                     exclude_email_id=email_id,
+                    received_before=email_data.get("received_at"),
                 )
             )
         except (ExternalEffectAuthorizationError, StaleFence):
@@ -165,6 +167,7 @@ async def _routing_evidence_hits(
                 sender=email_data.get("sender"),
                 limit=remaining,
                 exclude_email_id=email_id,
+                received_before=email_data.get("received_at"),
             )
             seen = {row.get("id") for row in results if isinstance(row, Mapping)}
             results.extend(
@@ -210,13 +213,21 @@ async def _persist_route_evaluation(
         )
 
 
+def _classification_from_tier3_delta(delta: Mapping[str, Any], decision: RouteDecision) -> dict[str, object]:
+    classification = _route_classification(decision)
+    extra = delta.get("classification")
+    if isinstance(extra, Mapping):
+        classification.update(dict(extra))
+    return classification
+
+
 async def _resolve_and_persist_canonical_route(
     email_id: str,
     email_data: Mapping[str, object],
     ctx,
     *,
     _effect_boundary: ExternalEffectBoundary,
-) -> RouteDecision:
+) -> tuple[RouteDecision, dict[str, object]]:
     """Recover or finalize one route before graph work and user-visible effects."""
     scope = _effect_boundary.scope
     get_decision = getattr(ctx.db_manager, "get_route_decision_for_attempt", None)
@@ -226,10 +237,11 @@ async def _resolve_and_persist_canonical_route(
     existing = await get_decision(scope=scope)
     if existing is not None:
         existing_decision = RouteDecision.model_validate(existing)
-        return await persist(
+        persisted = await persist(
             scope=scope,
             decision_raw=existing_decision.model_dump(mode="json"),
         )
+        return persisted, _route_classification(persisted)
 
     projected = deepcopy(dict(email_data))
     body_projection = project_email_body_for_model(
@@ -247,16 +259,19 @@ async def _resolve_and_persist_canonical_route(
         evaluation=tier1_state.get("_route_evaluation"),
     )
     raw = tier1_state.get("route_decision")
+    classification_extra: dict[str, object] = {}
     if raw is not None:
         decision = engine.with_default_handoff_profile(
             RouteDecision.model_validate(raw)
         )
+        classification_extra = dict(tier1_state.get("classification") or {})
     else:
         hits = await _routing_evidence_hits(
             projected,
             email_id=email_id,
             _effect_boundary=_effect_boundary,
         )
+        route_state = {**route_state, "routing_neighbors": hits}
         tier2 = await engine.apply_tier2_hits(route_state, hits)
         await _persist_route_evaluation(
             ctx,
@@ -269,6 +284,7 @@ async def _resolve_and_persist_canonical_route(
             decision = engine.with_default_handoff_profile(
                 RouteDecision.model_validate(raw)
             )
+            classification_extra = dict(tier2.get("classification") or {})
         else:
             await _authorize_external_effect(
                 _effect_boundary,
@@ -294,9 +310,14 @@ async def _resolve_and_persist_canonical_route(
             decision = engine.with_default_handoff_profile(
                 RouteDecision.model_validate(tier3.get("route_decision"))
             )
-    return await persist(
+            classification_extra = dict(tier3.get("classification") or {})
+    persisted = await persist(
         scope=scope,
         decision_raw=decision.model_dump(mode="json"),
+    )
+    return persisted, _classification_from_tier3_delta(
+        {"classification": classification_extra},
+        persisted,
     )
 
 
@@ -312,6 +333,10 @@ async def _prepare_durable_handoff(
     if decision.route not in {CanonicalRoute.REPLY, CanonicalRoute.FORWARD}:
         return {}, None
     if not decision.handoff_profile_id:
+        return {}, "handoff_profile_failed"
+    try:
+        get_handoff_profile(decision.handoff_profile_id)
+    except KeyError:
         return {}, "handoff_profile_failed"
     scope = _effect_boundary.scope
     persist_plan = getattr(ctx.db_manager, "persist_handoff_plan", None)
@@ -540,6 +565,11 @@ async def _run_ai_pipeline(
                 ],
                 "classification": _route_classification(decision),
             }
+            if isinstance(durable_context.get("classification"), Mapping):
+                route_delta["classification"] = {
+                    **route_delta["classification"],
+                    **dict(durable_context["classification"]),
+                }
             for key in (
                 "handoff_plan",
                 "handoff_plan_digest",
@@ -806,6 +836,22 @@ async def _deliver_pipeline_result(
             is HandoffDisposition.MANUAL_REVIEW
         )
     if is_manual_review:
+        from src.observability.metrics import record_manual_review, record_route_decision
+
+        record_route_decision(decision.provenance.tier.value)
+        record_manual_review()
+        await asyncio.to_thread(
+            ctx.email_processor.update_email_labels,
+            email_id,
+            pipeline_result.get("route_decision"),
+            classification.get("priority", "P1"),
+            classification.get("intent", "审批"),
+            False,
+            human_verified=False,
+            draft_edited=False,
+            label_source=label_source_for(decision, outcome="manual_review"),
+            eligible_for_tier2=False,
+        )
         request = ManualReviewNotificationRequest(
             email_id=email_id,
             email_data=dict(email_data),
@@ -835,6 +881,10 @@ async def _deliver_pipeline_result(
                 classification.get("priority", "P3"),
                 classification.get("intent", "Unknown"),
                 classification.get("need_reply"),
+                human_verified=False,
+                draft_edited=False,
+                label_source=label_source_for(decision),
+                eligible_for_tier2=eligible_for_tier2(decision=decision),
             )
             if _effect_boundary is not None and labels_updated is not True:
                 raise GuardedExternalEffectFailed()
@@ -845,6 +895,15 @@ async def _deliver_pipeline_result(
                 raise GuardedExternalEffectFailed() from None
             logger.warning("update_email_labels failed: error_type=%s", type(exc).__name__)
         route = decision.route
+        from src.observability.metrics import record_route_decision, record_silent_route
+
+        record_route_decision(decision.provenance.tier.value)
+        if route is CanonicalRoute.NO_ACTION:
+            rule_ids = decision.provenance.rule_ids or ["none"]
+            record_silent_route(route.value, rule_id=str(rule_ids[0]))
+        elif route is CanonicalRoute.READ_ONLY:
+            rule_ids = decision.provenance.rule_ids or ["none"]
+            record_silent_route(route.value, rule_id=str(rule_ids[0]))
         if route is CanonicalRoute.NO_ACTION:
             await ctx.db_manager.update_status(email_id, "no_action")
             try:
@@ -1503,7 +1562,7 @@ async def _run_ai_path(
         durable_handoff_error: str | None = None
         decision: RouteDecision | None = None
         if _effect_boundary is not None:
-            decision = await _resolve_and_persist_canonical_route(
+            decision, classification = await _resolve_and_persist_canonical_route(
                 thread_id,
                 email_data,
                 ctx,
@@ -1512,6 +1571,7 @@ async def _run_ai_path(
             durable_context = {
                 "route_decision": decision.model_dump(mode="json"),
                 "inbox_id": _effect_boundary.scope.inbox_id,
+                "classification": classification,
             }
             handoff_context, durable_handoff_error = await _prepare_durable_handoff(
                 thread_id,

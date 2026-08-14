@@ -24,6 +24,7 @@ class RouteTier(StrEnum):
     TIER2 = "tier2"
     TIER3 = "tier3"
     SYSTEM = "system"
+    HISTORICAL_INFERRED = "historical_inferred"
 
 
 class RouteProvenance(BaseModel):

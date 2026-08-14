@@ -60,7 +60,7 @@ Human-in-the-Loop 审批。系统的核心价值包括：
 设计目标是：
 
 1. Tier 1：YAML 硬规则，低延迟、可解释；
-2. Tier 2：Qdrant 中带真实标签的历史样本；
+2. Tier 2：Qdrant `routing_samples` 中带真实标签、且 `eligible_for_tier2=true` 的历史样本；
 3. Tier 3：只有 Tier 1/2 放弃或低置信度时才由 LLM 兜底；
 4. 三层只能产生一个权威 `RouteDecision`，后续节点不得覆盖。
 
@@ -83,13 +83,19 @@ Qdrant 是可重建的检索投影，不是权威业务存储。PostgreSQL 或�
 
 目标数据职责应分离：
 
-- 路由样本：每封邮件一个规范化决策标签，供 Tier 2 使用；
-- 历史正文：可按段检索的文本，供草稿上下文使用；
+- 路由样本：`routing_samples` 集合，每封邮件一个规范化决策标签，供 Tier 2 使用；
+- 历史正文：`emails` 集合，可按段检索的文本，供草稿上下文使用；
 - 风格/偏好：版本化用户画像或可检索偏好。
 
-`scripts/import_pst.py` 负责手工、通常一次性的 PST/Mbox/EML/Exchange 历史导入；它写入在线
-RAG 使用的同一 Qdrant `emails` 集合。PST 原始邮件只有进入 Qdrant 并不等于形成 Tier 2 数据；必须补充真实的回复行为、动作、意图、优先级、
-标签来源、置信度和版本。
+当前实现双写标签到 `emails` 与 `routing_samples`。Tier 2 只读 `routing_samples`，并排除
+Tier3、`historical_inferred`、改稿批准和拒绝样本。写作检索仍读 `emails`。
+
+`scripts/import_pst.py` 负责手工、通常一次性的 PST/Mbox/EML/Exchange 历史导入；它写入
+`emails` 语料，并按 Sent 邮件的 reply/forward 关系补 `HISTORICAL_INFERRED` 标签。这些
+标签不得进入 Tier 2 投票池。
+
+审批 SLA：`waiting_approval` 超过 24 小时会原子转入 `manual_review`，旧卡片因 CAS
+失效，并发送人工复核通知。原样批准可进入 Tier 2；改稿批准、拒绝和超时都是负样本。
 
 `scripts/discover_skills.py` 只应生成候选规则。目标生命周期是：
 

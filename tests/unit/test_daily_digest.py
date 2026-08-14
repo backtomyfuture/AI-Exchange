@@ -58,6 +58,17 @@ def test_reporting_window_uses_completed_shanghai_18_to_18_boundary() -> None:
     assert at_boundary.label == "2026-08-04 18:00~2026-08-05 18:00"
 
 
+def test_silent_share_alert_marks_digest_header() -> None:
+    snapshot = _snapshot()
+    object.__setattr__(snapshot, "silent_share_alert", True)
+    object.__setattr__(snapshot, "silent_share", 0.8)
+    object.__setattr__(snapshot, "silent_baseline_share", 0.1)
+    object.__setattr__(snapshot, "silent_count", 8)
+    header, text = render_daily_digest(snapshot, is_backfill=False, max_bytes=12_000)[0]
+    assert header.startswith("【需关注】")
+    assert "静默路由占比偏离基线" in text
+
+
 def test_zero_volume_digest_is_plain_text_and_has_all_three_sections() -> None:
     header, text = render_daily_digest(
         _snapshot(),
@@ -70,6 +81,7 @@ def test_zero_volume_digest_is_plain_text_and_has_all_three_sections() -> None:
     assert "需关注事项" in text
     assert "邮件清单" in text
     assert "收到邮件：0" in text
+    assert "【需关注】" not in header
     assert "今日无新邮件" in text
     assert "interactive" not in text
     assert "card" not in text.lower()

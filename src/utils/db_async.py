@@ -1261,6 +1261,32 @@ class AsyncDatabaseManager:
                 message="handoff transition failed",
             ) from None
 
+    async def get_email_approval_record(self, email_id: str) -> dict[str, Any] | None:
+        """Return the fields needed to score a human approval outcome."""
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT id, status, original_draft, final_draft, classification,
+                               updated_at, approval_at
+                        FROM emails_log
+                        WHERE id = %s
+                        """,
+                        (email_id,),
+                    )
+                    return await cur.fetchone()
+        except psycopg.Error as exc:
+            logger.error(
+                "Failed to get approval record: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="get_email_approval_record",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="approval record read failed",
+            ) from None
+
     async def get_email_status(self, email_id: str) -> str | None:
         """Return the persisted processing status for an email, if present."""
         try:
@@ -1608,6 +1634,51 @@ class AsyncDatabaseManager:
                 operation="compare_and_set_status",
                 retryable=isinstance(exc, psycopg.OperationalError),
                 message="email status compare-and-set failed",
+            ) from None
+
+    async def list_expired_approvals(
+        self,
+        *,
+        older_than,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return waiting_approval rows older than the SLA cutoff."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError("invalid_expired_approval_limit")
+        try:
+            async with self.get_connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT l.id,
+                               l.updated_at,
+                               l.original_draft,
+                               l.final_draft,
+                               l.classification,
+                               d.inbox_id,
+                               d.decision_json,
+                               h.version AS handoff_version,
+                               h.payload_revision
+                        FROM emails_log l
+                        LEFT JOIN tier1_decisions d ON d.external_email_id = l.id
+                        LEFT JOIN handoff_runs h ON h.inbox_id = d.inbox_id
+                        WHERE l.status = 'waiting_approval'
+                          AND l.updated_at < %s
+                        ORDER BY l.updated_at ASC
+                        LIMIT %s
+                        """,
+                        (older_than, limit),
+                    )
+                    return list(await cur.fetchall())
+        except psycopg.Error as exc:
+            logger.error(
+                "Expired approval scan failed: error_type=%s",
+                type(exc).__name__,
+            )
+            raise DatabaseOperationError(
+                operation="list_expired_approvals",
+                retryable=isinstance(exc, psycopg.OperationalError),
+                message="expired approval scan failed",
             ) from None
 
     async def compare_and_set_manual_review(

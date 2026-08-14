@@ -32,8 +32,6 @@ from src.ingestion.processing import (
     PreFeishuDeliveryFailure,
 )
 from src.router.decision import RouteDecision
-from src.safety.attachments import AttachmentPolicy
-from src.safety.input_limits import input_limits_from_settings
 from src.safety.manual_review import normalize_manual_review_code
 from src.safety.recipients import (
     ResolvedRecipients,
@@ -755,9 +753,9 @@ class EmailFeishuDelivery:
         if not isinstance(attachments, list):
             return replace(request, email_data=email_data), ()
 
-        attachment_policy = AttachmentPolicy(
-            max_bytes=input_limits_from_settings(get_settings()).attachment_single_bytes
-        )
+        from src.safety.attachments import get_attachment_policy
+
+        attachment_policy = get_attachment_policy()
         links: list[dict[str, str]] = []
         uploaded_tokens: list[str] = []
         for ordinal, attachment in enumerate(select_business_attachments(email_data)):

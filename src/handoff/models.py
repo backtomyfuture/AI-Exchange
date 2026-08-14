@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 EvidenceSource = Literal["mail_thread", "semantic_history", "exchange_contact"]
-WriterMode = Literal["llm", "template_then_llm", "fixed"]
+WriterMode = Literal["llm", "fixed"]
 
 
 class HandoffDisposition(StrEnum):

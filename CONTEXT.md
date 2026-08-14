@@ -7,6 +7,14 @@ This context turns an inbound email into machine reasoning and human review mate
 **Inbound Email**:
 The complete message received from Exchange, including its envelope, body, inline images, and business attachments.
 
+**External Sender**:
+The sender of an Inbound Email whose normalized address is outside the configured internal email domains. It is provenance about where the message came from, not a risk verdict: an Inbound Email from an External Sender follows the ordinary Intake Guard and routing path unless it independently triggers a deterministic suppression or quarantine condition.
+_Avoid_: Automatically unsafe sender, quarantined email
+
+**External Mail Warning**:
+A presentation or security notice inserted by Exchange or a mail gateway to warn the recipient that an Inbound Email came from outside the organization. It is a warning label, not an Intake Decision, and does not by itself authorize suppression or quarantine.
+_Avoid_: Intake Decision, spam verdict
+
 **Historical Email**:
 A previously sent or received email, including its message-thread context, used as past evidence for email assistance and live RAG retrieval. It excludes instant-message conversations such as Feishu or WeChat.
 _Avoid_: Chat history, instant-message history
@@ -36,15 +44,19 @@ A manually initiated, normally one-time analysis of Historical Email that uses t
 _Avoid_: Continuous learning, automatic rule creation
 
 **Historical RAG Context**:
-The shared Qdrant corpus of Historical Email used to retrieve relevant prior examples while processing a new Inbound Email. It is not limited to skill discovery.
-_Avoid_: Discovery-only corpus, separate historical index
+The shared Qdrant `emails` corpus of Historical Email used to retrieve relevant prior examples while processing a new Inbound Email. It is not limited to skill discovery.
+_Avoid_: Discovery-only corpus, routing-sample index
+
+**Routing Sample**:
+A Qdrant `routing_samples` point that stores one Canonical Route Decision plus eligibility flags for Historical Route Consensus. Writing retrieval must not read this collection.
+_Avoid_: Historical RAG Context, draft evidence
 
 **Declarative Tier 1 Skill**:
 A production routing rule represented by bounded data rather than executable `handler.py`. It may match an email and declare one Canonical Route Decision, including a versioned Handoff Profile for a writing route; it never sends email or names arbitrary executable code.
 _Avoid_: Generated code, automatic sending
 
 **Intake Guard**:
-A conservative deterministic gate after durable normalization and deduplication but before business routing, retrieval, or model calls. It returns only pass, suppress, or quarantine; it does not classify business intent or perform fuzzy spam detection.
+A conservative deterministic gate after durable normalization and deduplication but before business routing, retrieval, or model calls. It returns only pass, suppress, or quarantine; it does not classify business intent, treat an External Sender as unsafe by default, or perform fuzzy spam detection.
 _Avoid_: Tier 1 no_action, spam classifier
 
 **Intake Decision**:
