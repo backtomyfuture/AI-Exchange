@@ -87,8 +87,10 @@ Qdrant 是可重建的检索投影，不是权威业务存储。PostgreSQL 或�
 - 历史正文：`emails` 集合，可按段检索的文本，供草稿上下文使用；
 - 风格/偏好：版本化用户画像或可检索偏好。
 
-当前实现双写标签到 `emails` 与 `routing_samples`。Tier 2 只读 `routing_samples`，并排除
-Tier3、`historical_inferred`、改稿批准和拒绝样本。写作检索仍读 `emails`。
+标签写入会更新 `emails` payload，并把带向量的副本 upsert 到 `routing_samples`。
+`set_payload` 不会创建缺失 point，所以 routing 集合必须显式复制，Tier 2 才读得到样本。
+Tier 2 只读 `routing_samples`，并排除 Tier3、`historical_inferred`、改稿批准和拒绝样本。
+写作检索仍读 `emails`。
 
 `scripts/import_pst.py` 负责手工、通常一次性的 PST/Mbox/EML/Exchange 历史导入；它写入
 `emails` 语料，并按 Sent 邮件的 reply/forward 关系补 `HISTORICAL_INFERRED` 标签。这些

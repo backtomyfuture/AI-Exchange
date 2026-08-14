@@ -362,24 +362,28 @@ class EmailProcessor:
             return False
 
         try:
+            self.init_collection()
             point_filter = models.Filter(
                 must=[models.FieldCondition(key="id", match=models.MatchValue(value=email_id))]
             )
-            updated = False
-            for collection_name in (self.collection_name, self.routing_collection_name):
-                self.qdrant_client.set_payload(
-                    collection_name=collection_name,
-                    payload=payload_update,
-                    points=point_filter,
-                    wait=False,
-                )
-                updated = True
+            self.qdrant_client.set_payload(
+                collection_name=self.collection_name,
+                payload=payload_update,
+                points=point_filter,
+                wait=False,
+            )
+            copied = self._upsert_routing_sample(
+                email_id,
+                payload_update=payload_update,
+                point_filter=point_filter,
+            )
             logger.info(
-                "Updated Qdrant labels: email=%s field_count=%d",
+                "Updated Qdrant labels: email=%s field_count=%d routing_copied=%s",
                 fingerprint_identifier(email_id, namespace="email"),
                 len(payload_update),
+                copied,
             )
-            return updated
+            return True
         except UnexpectedResponse as exc:
             logger.error(
                 "Qdrant set-payload failed: email=%s error_type=%s",
@@ -401,6 +405,73 @@ class EmailProcessor:
                 type(exc).__name__,
             )
             return False
+
+    def _scroll_points(
+        self,
+        collection_name: str,
+        point_filter: models.Filter,
+        *,
+        with_vectors: bool = False,
+    ) -> list[Any]:
+        points: list[Any] = []
+        offset = None
+        while True:
+            batch, offset = self.qdrant_client.scroll(
+                collection_name=collection_name,
+                scroll_filter=point_filter,
+                limit=64,
+                offset=offset,
+                with_payload=True,
+                with_vectors=with_vectors,
+            )
+            points.extend(batch)
+            if offset is None:
+                break
+        return points
+
+    def _upsert_routing_sample(
+        self,
+        email_id: str,
+        *,
+        payload_update: Dict[str, Any],
+        point_filter: models.Filter,
+    ) -> bool:
+        """Copy labelled email points into the isolated routing-sample collection.
+
+        ``set_payload`` cannot create missing points. Tier 2 only reads
+        ``routing_samples``, so a label write must upsert a real copy there.
+        """
+
+        source_points = self._scroll_points(
+            self.collection_name,
+            point_filter,
+            with_vectors=True,
+        )
+        routing_points = []
+        for record in source_points:
+            vector = getattr(record, "vector", None)
+            point_id = getattr(record, "id", None)
+            if point_id is None or not vector:
+                continue
+            payload = dict(getattr(record, "payload", None) or {})
+            payload.update(payload_update)
+            if "id" not in payload:
+                payload["id"] = email_id
+            routing_points.append(
+                models.PointStruct(id=point_id, vector=vector, payload=payload)
+            )
+        if not routing_points:
+            logger.warning(
+                "No email vectors to copy into routing samples: email=%s",
+                fingerprint_identifier(email_id, namespace="email"),
+            )
+            return False
+        self.qdrant_client.upsert(
+            collection_name=self.routing_collection_name,
+            points=routing_points,
+            wait=False,
+        )
+        return True
 
     def process_sent_email(self, original_email_data: dict, reply_content: str, reply_id: str = None) -> bool:
         """
