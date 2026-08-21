@@ -162,6 +162,45 @@ async def test_tier3_requires_strict_route_json_and_fails_closed():
 
 
 @pytest.mark.asyncio
+async def test_tier3_keeps_valid_route_when_intent_metadata_is_long():
+    engine = RoutingEngine(artifact=_artifact(), me_email="me@example.com")
+    model = AsyncMock()
+    model.ainvoke.return_value = Mock(
+        content=json.dumps(
+            {
+                "route": "read_only",
+                "params": {},
+                "confidence": 0.88,
+                "reason_code": "informational_notice",
+                "explicit_current_action": False,
+                "priority": "P3",
+                "intent": "informational_update_" + ("x" * 40),
+                "summary": "Informational update",
+                "reasoning": "No current action is addressed to the mailbox owner.",
+            }
+        )
+    )
+
+    with patch("src.providers.factory.get_llm_for_role", return_value=model):
+        delta = await engine.apply_tier3_fallback(
+            {
+                "email": {
+                    "sender": "sender@example.com",
+                    "to": ["me@example.com"],
+                    "cc": [],
+                    "subject": "Update",
+                    "body": "For your information.",
+                }
+            }
+        )
+
+    decision = RouteDecision.model_validate(delta["route_decision"])
+    assert decision.route is CanonicalRoute.READ_ONLY
+    assert delta["classification"]["intent"].startswith("informational_update_")
+    assert delta["classification"]["tier3_metadata_complete"] is True
+
+
+@pytest.mark.asyncio
 async def test_tier3_accepts_json_code_fence_from_model():
     engine = RoutingEngine(artifact=_artifact(), me_email="q-fu@tianjin-air.com")
     model = AsyncMock()

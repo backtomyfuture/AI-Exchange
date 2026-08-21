@@ -54,7 +54,10 @@ class _Tier3Result(BaseModel):
     reason_code: str = Field(min_length=1, max_length=128)
     explicit_current_action: StrictBool = False
     priority: str | None = Field(default=None, pattern=r"^P[0-3]$")
-    intent: str | None = Field(default=None, max_length=32)
+    # Intent is descriptive metadata, not route authority. Keep it within the
+    # same bounded projection budget as other classification text so a verbose
+    # label cannot invalidate an otherwise valid route decision.
+    intent: str | None = Field(default=None, max_length=512)
     summary: str | None = Field(default=None, max_length=512)
     reasoning: str | None = Field(default=None, max_length=512)
 
