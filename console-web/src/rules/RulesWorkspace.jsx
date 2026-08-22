@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { ArrowRight, Beaker, CheckCircle2, ChevronLeft, CircleAlert, Code2, FileCode2, LoaderCircle, Save, ShieldCheck, SlidersHorizontal, Sparkles } from "lucide-react";
-import { request } from "../lib/api";
+import { getRule, request } from "../lib/api";
 import { labelForRoute } from "../lib/labels.zh-CN";
 
 const formLabels = {
@@ -49,23 +49,36 @@ const optionLabels = {
 
 function RulesWorkspace({ rules, activeRule, setActiveRule, onSaved, onError }) {
   const [showEditor, setShowEditor] = useState(false);
+  const [loadingRuleId, setLoadingRuleId] = useState("");
+  const openRule = async (rule) => {
+    setLoadingRuleId(rule.rule_id);
+    try {
+      const detail = await getRule(rule.rule_id);
+      setActiveRule(detail);
+      setShowEditor(true);
+    } catch (cause) {
+      onError(cause.message);
+    } finally {
+      setLoadingRuleId("");
+    }
+  };
   return (
     <div className="rules-layout">
       <section className="content-header">
         <div><div className="eyebrow"><span className="eyebrow-line" /> 治理 / TIER 1 注册表</div><h1>规则草稿</h1><p>编写确定性路由意图，使用生产编译器校验后，再按既有流程人工发布。</p></div>
-        <button className="primary-button" onClick={() => { setActiveRule(null); setShowEditor(true); }}><Sparkles size={15} /> 新建规则草稿</button>
+        <button className="primary-button" disabled={Boolean(loadingRuleId)} onClick={() => { setActiveRule(null); setShowEditor(true); }}><Sparkles size={15} /> 新建规则草稿</button>
       </section>
       <div className="rule-warning"><ShieldCheck size={16} /><div><strong>仅写入本地文件。</strong> 保存只写入 <code>tier1_rules/</code>，Console 不会提交、重启、热加载或部署生产服务。</div></div>
-      {showEditor ? <RuleEditor rule={activeRule} onClose={() => setShowEditor(false)} onSaved={(message) => { setShowEditor(false); onSaved(message); }} onError={onError} /> : <RuleTable rules={rules} onEdit={(rule) => { setActiveRule(rule); setShowEditor(true); }} />}
+      {showEditor ? <RuleEditor rule={activeRule} onClose={() => setShowEditor(false)} onSaved={(message) => { setShowEditor(false); onSaved(message); }} onError={onError} /> : <RuleTable rules={rules} onEdit={openRule} loadingRuleId={loadingRuleId} />}
     </div>
   );
 }
 
-function RuleTable({ rules, onEdit }) {
+function RuleTable({ rules, onEdit, loadingRuleId }) {
   return (
     <section className="panel rule-table-panel">
       <div className="panel-header"><div><div className="panel-title">规则注册表</div><div className="panel-caption">{rules.length} 个本地清单</div></div><Code2 size={16} className="muted-icon" /></div>
-      {!rules.length ? <div className="empty-state rule-empty"><FileCode2 size={26} /><span>没有加载规则清单</span><small>新建草稿后即可开始编写。</small></div> : <div className="rule-table"><div className="rule-table-row rule-table-head"><span>规则 ID</span><span>路由</span><span>状态</span><span>负责人</span><span /></div>{rules.map((rule) => <button className="rule-table-row" key={rule.rule_id} onClick={() => onEdit(rule)}><span className="rule-id"><span className="rule-glyph" />{rule.rule_id}<small>v{rule.rule_version} · {rule.filename}</small></span><span className={`route-text route-text-${rule.route}`}>{labelForRoute(rule.route)}</span><span><span className={`status-pill status-pill-${rule.status}`}>{rule.status === "proposed" ? "待审核" : rule.status === "enabled" ? "已启用" : "已停用"}</span></span><span className="owner-text">{rule.owner || "—"}</span><ArrowRight size={15} /></button>)}</div>}
+      {!rules.length ? <div className="empty-state rule-empty"><FileCode2 size={26} /><span>没有加载规则清单</span><small>新建草稿后即可开始编写。</small></div> : <div className="rule-table"><div className="rule-table-row rule-table-head"><span>规则 ID</span><span>路由</span><span>状态</span><span>负责人</span><span /></div>{rules.map((rule) => <button className="rule-table-row" type="button" disabled={Boolean(loadingRuleId)} key={rule.rule_id} onClick={() => onEdit(rule)}><span className="rule-id"><span className="rule-glyph" />{rule.rule_id}<small>v{rule.rule_version} · {rule.filename}</small></span><span className={`route-text route-text-${rule.route}`}>{labelForRoute(rule.route)}</span><span><span className={`status-pill status-pill-${rule.status}`}>{rule.status === "proposed" ? "待审核" : rule.status === "enabled" ? "已启用" : "已停用"}</span></span><span className="owner-text">{rule.owner || "—"}</span><ArrowRight size={15} /></button>)}</div>}
     </section>
   );
 }
