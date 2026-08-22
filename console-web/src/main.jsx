@@ -3,13 +3,14 @@ import { createRoot } from "react-dom/client";
 import { CheckCircle2, CircleAlert } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import "@xyflow/react/dist/style.css";
-import { request, getTrace, listEmails, listRules } from "./lib/api";
+import { getTier1Observability, request, getTrace, listEmails, listRules } from "./lib/api";
 import { labelForStatus } from "./lib/labels.zh-CN";
 import { Sidebar } from "./layout/Sidebar";
 import { Topbar } from "./layout/Topbar";
 import { TraceWorkspace } from "./trace/TraceWorkspace";
 import { TraceNode, TraceNodeDetails } from "./trace/TraceNode";
 import { RulesWorkspace } from "./rules/RulesWorkspace";
+import { Tier1ObservabilityWorkspace } from "./tier1/Tier1ObservabilityWorkspace";
 import "./styles.css";
 
 const DEFAULT_FILTERS = {
@@ -27,8 +28,9 @@ const DEFAULT_FILTERS = {
 function readUrlState() {
   if (typeof window === "undefined") return { view: "trace", selectedId: "", selectedStage: "route_decision" };
   const params = new URLSearchParams(window.location.search);
+  const requestedView = params.get("view");
   return {
-    view: params.get("view") === "rules" ? "rules" : "trace",
+    view: requestedView === "rules" || requestedView === "tier1" ? requestedView : "trace",
     selectedId: params.get("email") || "",
     selectedStage: params.get("stage") || "route_decision"
   };
@@ -65,9 +67,12 @@ function App() {
   const [trace, setTrace] = useState(null);
   const [routeDecision, setRouteDecision] = useState(null);
   const [rules, setRules] = useState([]);
+  const [tier1Observation, setTier1Observation] = useState(null);
+  const [tier1Window, setTier1Window] = useState("30d");
   const [activeRule, setActiveRule] = useState(null);
   const [loading, setLoading] = useState(false);
   const [traceLoading, setTraceLoading] = useState(false);
+  const [tier1Loading, setTier1Loading] = useState(false);
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [lastUpdated, setLastUpdated] = useState("");
@@ -127,17 +132,40 @@ function App() {
     }
   }, []);
 
+  const loadTier1Observation = useCallback(async () => {
+    setTier1Loading(true);
+    setError("");
+    try {
+      const [nextObservation, nextRules] = await Promise.all([
+        getTier1Observability(tier1Window),
+        listRules()
+      ]);
+      setTier1Observation(nextObservation);
+      setRules(nextRules);
+      setLastUpdated(new Date().toISOString());
+    } catch (cause) {
+      setError(cause.message || "Tier 1 观察数据加载失败");
+    } finally {
+      setTier1Loading(false);
+    }
+  }, [tier1Window]);
+
   const refresh = useCallback(async () => {
+    if (view === "tier1") {
+      await loadTier1Observation();
+      return;
+    }
     const data = await loadEmails();
     const nextId = selectedId && data?.items?.some((email) => email.external_email_id === selectedId)
       ? selectedId
       : data?.items?.[0]?.external_email_id;
     if (nextId) await loadTrace(nextId);
-  }, [loadEmails, loadTrace, selectedId]);
+  }, [loadEmails, loadTier1Observation, loadTrace, selectedId, view]);
 
   useEffect(() => { loadEmails(); }, [loadEmails]);
   useEffect(() => { loadTrace(); }, [loadTrace]);
   useEffect(() => { if (view === "rules") loadRules(); }, [loadRules, view]);
+  useEffect(() => { if (view === "tier1") loadTier1Observation(); }, [loadTier1Observation, view]);
   useEffect(() => {
     if (trace && !trace.nodes.some((node) => node.id === selectedStage)) {
       setSelectedStage(trace.nodes[0]?.id || "route_decision");
@@ -154,7 +182,7 @@ function App() {
     const params = new URLSearchParams(window.location.search);
     if (selectedId) params.set("email", selectedId); else params.delete("email");
     if (selectedStage) params.set("stage", selectedStage); else params.delete("stage");
-    if (view === "rules") params.set("view", "rules"); else params.delete("view");
+    if (view === "rules" || view === "tier1") params.set("view", view); else params.delete("view");
     const query = params.toString();
     window.history.replaceState(null, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
   }, [selectedId, selectedStage, view]);
@@ -175,7 +203,7 @@ function App() {
 
   const handleViewChange = useCallback((nextView) => {
     setView(nextView);
-    if (nextView === "rules") setFocusMode(false);
+    if (nextView !== "trace") setFocusMode(false);
   }, [setFocusMode]);
 
   return (
@@ -189,6 +217,10 @@ function App() {
           onViewChange={handleViewChange}
           emailCount={emails.total}
           ruleCount={rules.length}
+          tier1SignalCount={
+            (tier1Observation?.summary?.conflict_count || 0)
+            + (tier1Observation?.summary?.error_count || 0)
+          }
         />
         <main className="main-content">
           {error && <div className="error-banner"><CircleAlert size={16} /><span>{error}</span><button type="button" onClick={() => setError("")}>关闭</button></div>}
@@ -210,13 +242,21 @@ function App() {
               selectedStage={selectedStage}
               onSelectStage={setSelectedStage}
             />
-          ) : (
+          ) : view === "rules" ? (
             <RulesWorkspace
               rules={rules}
               activeRule={activeRule}
               setActiveRule={setActiveRule}
               onSaved={(message) => { setToast(message); loadRules(); }}
               onError={setError}
+            />
+          ) : (
+            <Tier1ObservabilityWorkspace
+              observation={tier1Observation}
+              rules={rules}
+              window={tier1Window}
+              onWindowChange={setTier1Window}
+              loading={tier1Loading}
             />
           )}
         </main>

@@ -55,6 +55,22 @@ _Avoid_: Historical RAG Context, draft evidence
 A production routing rule represented by bounded data rather than executable `handler.py`. It may match an email and declare one Canonical Route Decision, including a versioned Handoff Profile for a writing route; it never sends email or names arbitrary executable code.
 _Avoid_: Generated code, automatic sending
 
+**Tier 1 Ruleset Release**:
+The immutable compiled set of enabled Declarative Tier 1 Skills identified by its artifact digest. It is the audit boundary for determining which Rule Versions were evaluated for an Inbound Email.
+_Avoid_: Current rules directory, Git commit
+
+**Rule Match Rate**:
+For one Rule Version within one Tier 1 Ruleset Release, the number of Inbound Email for which the rule matched divided by the number evaluated against a release containing that version. It measures matching coverage, not decision correctness or approval quality.
+_Avoid_: Accuracy, approval rate
+
+**Conflict Involvement**:
+The participation of one Declarative Tier 1 Skill in a runtime conflict with a different authoritative action. Each participating rule is counted without assigning a single root cause.
+_Avoid_: Rule fault, sole conflict owner
+
+**Exploratory Tier 1 Replay Report**:
+A private, side-effect-free report that evaluates a selected post-reset email corpus against one Tier 1 Ruleset Release. It informs rule review but is neither production traffic nor a release gate.
+_Avoid_: Production replay, release approval
+
 **Intake Guard**:
 A conservative deterministic gate after durable normalization and deduplication but before business routing, retrieval, or model calls. It returns only pass, suppress, or quarantine; it does not classify business intent, treat an External Sender as unsafe by default, or perform fuzzy spam detection.
 _Avoid_: Tier 1 no_action, spam classifier

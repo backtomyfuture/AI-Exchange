@@ -10,7 +10,7 @@ is a Vite/React single-page application. The API binds only to loopback in
 the documented run command and is not mounted into `src.server` or shipped in
 the production Compose image.
 
-The API exposes two read-only projection interfaces:
+The API exposes three read-only projection interfaces:
 
 - `GET /api/emails` lists one bounded row per durable inbox identity.
 - `GET /api/emails/{external_email_id}/trace` assembles the fixed business-stage
@@ -18,6 +18,10 @@ The API exposes two read-only projection interfaces:
   `handoff_runs`, `handoff_executions`, `execution_payload_revisions`,
   `approved_execution_envelopes`, `audit_events`, and the legacy
   `emails_log` enrichment row.
+- `GET /api/observability/tier1` aggregates bounded Tier 1 evaluation metadata
+  for a selected reporting window. It exposes only outcomes, rule IDs and
+  versions, route metadata, and artifact digests; it never reads email bodies,
+  attachments, drafts, or checkpoints.
 
 The rule interface reads and writes only the local `tier1_rules/` working tree.
 `POST /api/rules/validate` runs the real `compile_registry()` pipeline in a

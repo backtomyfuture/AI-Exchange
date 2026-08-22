@@ -20,6 +20,9 @@ from console_api.models import (
     RouteDecisionDetail,
     RouteEvaluationStep,
     SenderInfo,
+    Tier1ObservabilityResponse,
+    Tier1ObservationSummary,
+    Tier1RuleObservation,
     TraceEdge,
     TraceNode,
 )
@@ -412,6 +415,137 @@ class ConsoleDatabase:
             for row in rows
         ]
         return EmailListResponse(items=items, page=page, page_size=page_size, total=total)
+
+    async def tier1_observability(
+        self,
+        *,
+        window: str,
+        start_at: datetime,
+    ) -> Tier1ObservabilityResponse:
+        """Return a bounded, content-free Tier 1 observation projection."""
+
+        inbox = self._relation("event_inbox")
+        route_traces = self._relation("route_evaluation_traces")
+        summary_query = sql.SQL(
+            """
+            SELECT
+                COUNT(*)::integer AS evaluated_count,
+                COUNT(*) FILTER (WHERE trace.outcome = 'matched')::integer AS matched_count,
+                COUNT(*) FILTER (WHERE trace.outcome = 'abstain')::integer AS abstained_count,
+                COUNT(*) FILTER (WHERE trace.outcome = 'conflict')::integer AS conflict_count,
+                COUNT(*) FILTER (WHERE trace.outcome = 'error')::integer AS error_count,
+                COUNT(
+                    DISTINCT NULLIF(trace.safe_detail_json ->> 'artifact_digest', '')
+                )::integer AS artifact_count
+            FROM {route_traces} AS trace
+            JOIN {inbox} AS inbox ON inbox.id = trace.inbox_id
+            WHERE inbox.account_id = %s
+              AND trace.tier = 'tier1'
+              AND trace.started_at >= %s
+            """
+        ).format(route_traces=route_traces, inbox=inbox)
+        rule_query = sql.SQL(
+            """
+            WITH filtered AS (
+                SELECT
+                    trace.inbox_id,
+                    trace.outcome,
+                    trace.matched_rule_ids,
+                    trace.safe_detail_json
+                FROM {route_traces} AS trace
+                JOIN {inbox} AS inbox ON inbox.id = trace.inbox_id
+                WHERE inbox.account_id = %s
+                  AND trace.tier = 'tier1'
+                  AND trace.started_at >= %s
+            ),
+            artifact_evaluations AS (
+                SELECT
+                    NULLIF(safe_detail_json ->> 'artifact_digest', '') AS artifact_digest,
+                    COUNT(*)::integer AS evaluated_count
+                FROM filtered
+                GROUP BY NULLIF(safe_detail_json ->> 'artifact_digest', '')
+            ),
+            rule_events AS (
+                SELECT
+                    NULLIF(filtered.safe_detail_json ->> 'artifact_digest', '') AS artifact_digest,
+                    NULLIF(rule.item ->> 'rule_id', '') AS rule_id,
+                    CASE
+                        WHEN rule.item ->> 'rule_version' ~ '^[1-9][0-9]*$'
+                        THEN (rule.item ->> 'rule_version')::integer
+                        ELSE NULL
+                    END AS rule_version,
+                    NULLIF(rule.item ->> 'route', '') AS route,
+                    CASE WHEN filtered.outcome = 'matched' THEN 1 ELSE 0 END AS match_increment,
+                    CASE WHEN filtered.outcome = 'conflict' THEN 1 ELSE 0 END AS conflict_increment
+                FROM filtered
+                CROSS JOIN LATERAL jsonb_array_elements(filtered.matched_rule_ids) AS rule(item)
+                WHERE filtered.outcome IN ('matched', 'conflict')
+            )
+            SELECT
+                rule_events.artifact_digest,
+                rule_events.rule_id,
+                rule_events.rule_version,
+                rule_events.route,
+                COALESCE(SUM(match_increment), 0)::integer AS match_count,
+                COALESCE(SUM(conflict_increment), 0)::integer AS conflict_involvement_count,
+                artifact_evaluations.evaluated_count
+            FROM rule_events
+            JOIN artifact_evaluations
+              ON artifact_evaluations.artifact_digest
+                 IS NOT DISTINCT FROM rule_events.artifact_digest
+            WHERE rule_id IS NOT NULL
+            GROUP BY rule_events.artifact_digest, rule_events.rule_id,
+                     rule_events.rule_version, rule_events.route,
+                     artifact_evaluations.evaluated_count
+            ORDER BY conflict_involvement_count DESC, match_count DESC, rule_id ASC
+            """
+        ).format(route_traces=route_traces, inbox=inbox)
+        async with self._connection() as cursor:
+            await cursor.execute(summary_query, (self._settings.account_id, start_at))
+            summary_row = await cursor.fetchone() or {}
+            await cursor.execute(rule_query, (self._settings.account_id, start_at))
+            rule_rows = await cursor.fetchall()
+
+        evaluated_count = int(summary_row.get("evaluated_count") or 0)
+        matched_count = int(summary_row.get("matched_count") or 0)
+        summary = Tier1ObservationSummary(
+            evaluated_count=evaluated_count,
+            matched_count=matched_count,
+            abstained_count=int(summary_row.get("abstained_count") or 0),
+            conflict_count=int(summary_row.get("conflict_count") or 0),
+            error_count=int(summary_row.get("error_count") or 0),
+            artifact_count=int(summary_row.get("artifact_count") or 0),
+            match_rate=(matched_count / evaluated_count) if evaluated_count else 0.0,
+        )
+        rules = [
+            Tier1RuleObservation(
+                artifact_digest=_text(row.get("artifact_digest"), limit=64),
+                rule_id=str(row["rule_id"]),
+                rule_version=(
+                    int(row["rule_version"])
+                    if row.get("rule_version") is not None
+                    else None
+                ),
+                route=_text(row.get("route"), limit=64),
+                match_count=int(row.get("match_count") or 0),
+                match_share_of_evaluations=(
+                    int(row.get("match_count") or 0)
+                    / int(row.get("evaluated_count") or 0)
+                    if int(row.get("evaluated_count") or 0)
+                    else 0.0
+                ),
+                conflict_involvement_count=int(
+                    row.get("conflict_involvement_count") or 0
+                ),
+            )
+            for row in rule_rows
+        ]
+        return Tier1ObservabilityResponse(
+            window=window,
+            window_started_at=start_at,
+            summary=summary,
+            rules=rules,
+        )
 
     async def trace(self, external_email_id: str) -> PipelineTrace | None:
         if not external_email_id.strip() or len(external_email_id) > 1024:

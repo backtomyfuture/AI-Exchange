@@ -1,7 +1,15 @@
 import React from "react";
-import { Activity, ChevronLeft, ChevronRight, Database, SlidersHorizontal } from "lucide-react";
+import { Activity, BarChart3, ChevronLeft, ChevronRight, Database, SlidersHorizontal } from "lucide-react";
 
-export function Sidebar({ collapsed, onToggle, view, onViewChange, emailCount, ruleCount }) {
+export function Sidebar({
+  collapsed,
+  onToggle,
+  view,
+  onViewChange,
+  emailCount,
+  ruleCount,
+  tier1SignalCount
+}) {
   return (
     <aside className={`sidebar ${collapsed ? "sidebar-collapsed" : ""}`}>
       <div className="sidebar-topline">
@@ -33,6 +41,15 @@ export function Sidebar({ collapsed, onToggle, view, onViewChange, emailCount, r
         title={collapsed ? "规则草稿" : undefined}
       >
         <SlidersHorizontal size={17} /><span>规则草稿</span><span className="nav-count">{ruleCount || "—"}</span>
+      </button>
+      <button
+        type="button"
+        className={`nav-item ${view === "tier1" ? "active" : ""}`}
+        onClick={() => onViewChange("tier1")}
+        aria-label="Tier 1 观察"
+        title={collapsed ? "Tier 1 观察" : undefined}
+      >
+        <BarChart3 size={17} /><span>Tier 1 观察</span><span className="nav-count">{tier1SignalCount || "—"}</span>
       </button>
       <div className="sidebar-spacer" />
       {!collapsed && (

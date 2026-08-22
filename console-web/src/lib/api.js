@@ -38,3 +38,6 @@ export function emailListParams(filters = {}) {
 export const listEmails = (filters) => request(`/api/emails?${emailListParams(filters)}`);
 export const getTrace = (emailId) => request(`/api/emails/${encodeURIComponent(emailId)}/trace`);
 export const listRules = () => request("/api/rules");
+export const getTier1Observability = (window = "30d") => request(
+  `/api/observability/tier1?window=${encodeURIComponent(window)}`
+);

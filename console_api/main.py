@@ -10,7 +10,8 @@ of the production Compose application.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,9 +29,18 @@ from console_api.models import (
     RuleSaveResponse,
     RuleSummary,
     RuleValidationResponse,
+    Tier1ObservabilityResponse,
 )
 from console_api.rules import RuleStore, RuleStoreError
 from console_api.settings import ConsoleSettings, get_console_settings, running_in_production
+
+
+_TIER1_WINDOWS: dict[str, timedelta] = {
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "90d": timedelta(days=90),
+}
 
 
 def _database(settings: ConsoleSettings = Depends(get_console_settings)) -> ConsoleDatabase:
@@ -110,6 +120,22 @@ def create_app() -> FastAPI:
                 has_anomaly=has_anomaly,
                 received_from=received_from,
                 received_to=received_to,
+            )
+        except Exception as exc:
+            raise _safe_error(exc) from exc
+
+    @application.get(
+        "/api/observability/tier1",
+        response_model=Tier1ObservabilityResponse,
+    )
+    async def tier1_observability(
+        window: Literal["24h", "7d", "30d", "90d"] = Query(default="30d"),
+        database: ConsoleDatabase = Depends(_database),
+    ):
+        try:
+            return await database.tier1_observability(
+                window=window,
+                start_at=datetime.now(UTC) - _TIER1_WINDOWS[window],
             )
         except Exception as exc:
             raise _safe_error(exc) from exc

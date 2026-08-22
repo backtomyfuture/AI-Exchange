@@ -39,6 +39,33 @@ class EmailListResponse(ConsoleModel):
     total: int
 
 
+class Tier1ObservationSummary(ConsoleModel):
+    evaluated_count: int = Field(ge=0)
+    matched_count: int = Field(ge=0)
+    abstained_count: int = Field(ge=0)
+    conflict_count: int = Field(ge=0)
+    error_count: int = Field(ge=0)
+    artifact_count: int = Field(ge=0)
+    match_rate: float = Field(ge=0.0, le=1.0)
+
+
+class Tier1RuleObservation(ConsoleModel):
+    artifact_digest: str | None = None
+    rule_id: str
+    rule_version: int | None = Field(default=None, ge=1)
+    route: str | None = None
+    match_count: int = Field(ge=0)
+    match_share_of_evaluations: float = Field(ge=0.0, le=1.0)
+    conflict_involvement_count: int = Field(ge=0)
+
+
+class Tier1ObservabilityResponse(ConsoleModel):
+    window: Literal["24h", "7d", "30d", "90d"]
+    window_started_at: datetime
+    summary: Tier1ObservationSummary
+    rules: list[Tier1RuleObservation] = Field(default_factory=list)
+
+
 class TraceNode(ConsoleModel):
     id: str
     label: str

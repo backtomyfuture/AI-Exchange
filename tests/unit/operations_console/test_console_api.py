@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,14 @@ from console_api.database import (
     _safe_projection,
 )
 from console_api.main import _database, create_app
-from console_api.models import PipelineTrace, RouteDecisionDetail, RouteEvaluationStep, TraceNode
+from console_api.models import (
+    PipelineTrace,
+    RouteDecisionDetail,
+    RouteEvaluationStep,
+    Tier1ObservabilityResponse,
+    Tier1ObservationSummary,
+    TraceNode,
+)
 from console_api.rules import RuleStore, RuleStoreError
 from console_api.settings import ConsoleSettings
 
@@ -209,6 +217,38 @@ def test_route_decision_endpoint_returns_structured_steps():
     assert response.json()["steps"][1]["status"] == "not_triggered"
 
 
+def test_tier1_observability_endpoint_returns_safe_aggregate():
+    app = create_app()
+    observation = Tier1ObservabilityResponse(
+        window="7d",
+        window_started_at=datetime(2026, 8, 20, tzinfo=UTC),
+        summary=Tier1ObservationSummary(
+            evaluated_count=10,
+            matched_count=6,
+            abstained_count=3,
+            conflict_count=1,
+            error_count=0,
+            artifact_count=1,
+            match_rate=0.6,
+        ),
+    )
+
+    class FakeDatabase:
+        async def tier1_observability(self, *, window, start_at):
+            assert window == "7d"
+            assert start_at.tzinfo is UTC
+            return observation
+
+    app.dependency_overrides[_database] = lambda: FakeDatabase()
+    try:
+        response = TestClient(app).get("/api/observability/tier1?window=7d")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["conflict_count"] == 1
+
+
 def test_authoritative_event_order_prefers_business_processing_owner():
     rendered = str(_authoritative_event_order())
 
@@ -250,6 +290,62 @@ async def test_console_queries_do_not_replace_create_trace_with_update(monkeypat
     for query in (list_query, trace_query):
         assert "processing_inbox_id IS NOT NULL THEN 0" in query
         assert "inbox.change_kind = 'create' THEN 1" in query
+
+
+@pytest.mark.asyncio
+async def test_tier1_observability_uses_only_route_metadata(monkeypatch, tmp_path):
+    database = ConsoleDatabase(_settings(tmp_path))
+
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+
+        async def execute(self, query, _params=None):
+            self.queries.append(str(query))
+
+        async def fetchone(self):
+            return {
+                "evaluated_count": 4,
+                "matched_count": 2,
+                "abstained_count": 1,
+                "conflict_count": 1,
+                "error_count": 0,
+                "artifact_count": 1,
+            }
+
+        async def fetchall(self):
+            return [
+                {
+                    "artifact_digest": "a" * 64,
+                    "rule_id": "rule-1",
+                    "rule_version": 2,
+                    "route": "reply",
+                    "match_count": 2,
+                    "conflict_involvement_count": 1,
+                    "evaluated_count": 4,
+                }
+            ]
+
+    cursor = Cursor()
+
+    @asynccontextmanager
+    async def connection():
+        yield cursor
+
+    monkeypatch.setattr(database, "_connection", connection)
+
+    result = await database.tier1_observability(
+        window="30d",
+        start_at=datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+    assert result.summary.match_rate == 0.5
+    assert result.rules[0].match_share_of_evaluations == 0.5
+    assert result.rules[0].conflict_involvement_count == 1
+    assert len(cursor.queries) == 2
+    assert "trace.tier = 'tier1'" in cursor.queries[0]
+    assert "jsonb_array_elements(filtered.matched_rule_ids)" in cursor.queries[1]
+    assert "body" not in cursor.queries[1].casefold()
 
 
 def test_trace_endpoint_uses_business_stage_projection():
